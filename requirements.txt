@@ -1,0 +1,12 @@
+ai-edge-litert
+datasets
+huggingface_hub
+numpy
+nvidia-modelopt
+onnx
+onnxruntime
+onnx_graphsurgeon
+optimum[onnxruntime]
+polygraphy
+tokenizers
+transformers

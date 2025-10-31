@@ -1,0 +1,5 @@
+soundfile
+torchcodec
+whisper-openai
+jiwer
+openpyxl
