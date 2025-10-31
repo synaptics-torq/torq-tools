@@ -23,6 +23,7 @@ _EXPORT_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
 def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
     if (curr_opset := get_model_opset(model)) >= target_opset:
         logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
+        return model
     upgraded = version_converter.convert_version(model, target_opset)
     logger.info("Upgraded model opset to %d", target_opset)
     return upgraded
@@ -213,6 +214,12 @@ class FP32Converter:
 
             if node.op == "ConstantOfShape" and (val := node.attrs.get("value")) is not None:
                 self._convert_tensor(val, node, "value", is_attr=True)
+
+            if node.op == "Resize":
+                self._convert_tensor(node.inputs[0], node, 0)
+                if (out := node.outputs[0]).dtype == np.float32:
+                    out.dtype = self._export_onnx_dtype
+                continue
 
             for i, inp in enumerate(list(node.inputs)):
                 if inp.name in skip_names:
