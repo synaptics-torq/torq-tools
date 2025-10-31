@@ -4,7 +4,7 @@ from typing import Final
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
-from ...utils.torq import add_iree_args
+from ...utils.compile import add_iree_args
 
 
 DEFAULT_INPUT_AUDIO_S: Final[int] = 5

@@ -34,7 +34,7 @@ from ...utils.onnx import (
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
 )
-from ...utils.torq import (
+from ...utils.compile import (
     process_iree_args,
     export_iree
 )

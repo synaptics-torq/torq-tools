@@ -38,7 +38,7 @@ Issues = "https://github.com/synaptics-torq/torq-tools/issues"
 
 [project.scripts]
 torq-convert-fp32  = "torq.tools.convert_fp32:main"
-torq-compile-model = "torq.utils.torq:main"
+torq-compile-model = "torq.utils.compile:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
 
