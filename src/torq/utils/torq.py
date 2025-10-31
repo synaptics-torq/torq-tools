@@ -164,7 +164,7 @@ def add_iree_args(parser: argparse.ArgumentParser):
         action="append",
         default=[],
         metavar="ARG [=VALUE] | FILE",
-        help="IREE compile arg, provide as `--arg` or `--arg=value` or a flagfile"
+        help="IREE compile arg, provide as `--ic-arg arg` or `--ic-arg arg=value` or a flagfile"
     )
     group.add_argument(
         "--cross-compile",
