@@ -1,5 +1,0 @@
-# minimum requirements for inference with Torq docker
-ai-edge-litert
-onnxruntime
-soundfile
-tokenizers
