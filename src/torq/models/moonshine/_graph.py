@@ -5,7 +5,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
-from ...utils.graph import (
+from ...graph_edit import (
     OnnxGraphEdit,
     DimMatchType,
     FixedDimMapping,
