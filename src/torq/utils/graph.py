@@ -28,13 +28,36 @@ class FixedDimMapping:
 
 @dataclass
 class OnnxGraphEdit(ABC):
+    graph: gs.Graph
     graph_name: str
 
     def __post_init__(self):
         self._logger = logging.getLogger(f"{self.name}[{self.graph_name}]")
 
     @abstractmethod
-    def __call__(self, node: gs.Node): ...
+    def match(self, node: gs.Node) -> bool: ...
+
+    @abstractmethod
+    def transform(self, node: gs.Node): ...
+
+    def finalize(self, node: gs.Node):
+        pass
+
+    def apply_edit(self, node: gs.Node):
+        if self.match(node):
+            self.transform(node)
+            self.finalize(node)
+
+    def _check_node_op(self, node: gs.Node, expected_op: str):
+        if not isinstance(node, gs.Node):
+            self._logger.error("Expected gs.Node instance, got '%s'", str(type(node)))
+            raise TypeError(f"{self.name}[{self.graph_name}]: Expected gs.Node instance, got '{type(node)}'")
+        if node.op != expected_op:
+            self._logger.error("Expected '%s' node, got '%s'", expected_op, node.op)
+            raise ValueError(f"{self.name}[{self.graph_name}]: Expected '{expected_op}' node, got '{node.op}'")
+
+    def __call__(self, node: gs.Node):
+        self.apply_edit(node)
 
     @property
     def name(self) -> str:
