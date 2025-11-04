@@ -11,8 +11,6 @@ try:
 except ImportError:
     IREE_C_PYAPI = False
 
-from .logging import configure_logging
-
 logger = logging.getLogger("Torq-compile")
 
 
@@ -255,7 +253,11 @@ def main():
     add_iree_args(parser)
     args = parser.parse_args()
 
-    configure_logging(args.logging)
+    try:
+        from .logging import configure_logging
+        configure_logging(args.logging)
+    except ImportError:
+        pass
 
     if not args.model.exists():
         print(f"Invalid model file/directory '{args.model}'")
