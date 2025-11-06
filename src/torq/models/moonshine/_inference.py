@@ -10,10 +10,13 @@ import numpy as np
 import ai_edge_litert.interpreter as lite_rt
 import onnxruntime as ort
 
-from ...inference.runners import (
+from torq.runtime import (
     InferenceRunner,
+    VMFBInferenceRunner
+)
+
+from ...inference.runners import (
     ORTInferenceRunner,
-    IREEInferenceRunner,
     TFLiteInferenceRunner
 )
 
@@ -129,8 +132,8 @@ class MoonshineDynamic(MoonshineBase):
         n_threads: int | None = None
     ) -> "MoonshineDynamic":
         return cls(
-            IREEInferenceRunner(encoder_model, n_threads=n_threads),
-            IREEInferenceRunner(decoder_model, n_threads=n_threads),
+            VMFBInferenceRunner(encoder_model, n_threads=n_threads),
+            VMFBInferenceRunner(decoder_model, n_threads=n_threads),
             model_size,
             max_inp_len
         )
@@ -288,9 +291,9 @@ class MoonshineStatic(MoonshineBase):
         n_threads: int | None = None
     ) -> "MoonshineStatic":
         return cls(
-            IREEInferenceRunner(encoder_model, n_threads=n_threads),
-            IREEInferenceRunner(decoder_model, n_threads=n_threads),
-            IREEInferenceRunner(decoder_with_past_model, n_threads=n_threads),
+            VMFBInferenceRunner(encoder_model, n_threads=n_threads),
+            VMFBInferenceRunner(decoder_model, n_threads=n_threads),
+            VMFBInferenceRunner(decoder_with_past_model, n_threads=n_threads),
             model_size,
             max_inp_len,
             max_dec_len
@@ -478,8 +481,8 @@ def load_moonshine(
     else:
         if kind == "vmfb":
             return MoonshineDynamic(
-                IREEInferenceRunner(encoder, n_threads=n_threads),
-                IREEInferenceRunner(decoder_merged, n_threads=n_threads, function="merged"),
+                VMFBInferenceRunner(encoder, n_threads=n_threads),
+                VMFBInferenceRunner(decoder_merged, n_threads=n_threads, function="merged"),
                 model_size,
                 max_inp_len
             )
