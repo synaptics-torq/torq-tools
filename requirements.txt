@@ -1,8 +1,6 @@
 ai-edge-litert
 datasets
 huggingface_hub
-iree-base-compiler[onnx]    # TODO: point to torq-compiler
-iree-base-runtime           # TODO: point to torq-compiler
 numpy
 nvidia-modelopt
 onnx

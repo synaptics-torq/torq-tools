@@ -17,10 +17,9 @@ classifiers = [
 license = { "file" = "LICENSE" }
 readme = "README.md"
 dependencies = [
+    "ai_edge_litert",
     "datasets",
     "huggingface_hub",
-    "iree-base-compiler[onnx]",
-    "iree-base-runtime",
     "numpy",
     "nvidia-modelopt",
     "onnx",
@@ -38,7 +37,7 @@ Issues = "https://github.com/synaptics-torq/torq-tools/issues"
 
 [project.scripts]
 torq-convert-fp32  = "torq.tools.convert_fp32:main"
-torq-compile-model = "torq.utils.compile:main"
+torq-compile-model = "torq.compile:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
 
