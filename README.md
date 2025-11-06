@@ -2,7 +2,11 @@
 Collection of tools for the development of Torq models
 
 ## Installation
-You can install this repository either as a pip package or as a Git submodule within another project.
+**The Torq compiler is required to run Torq tools.** 
+<br>Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler as a release package or a Docker.
+
+
+Once the compiler is available, this repository can be installed either as a pip package or as a Git submodule within another project.
 First, clone the repository:
 ```bash
 git clone https://github.com/synaptics-torq/torq-tools.git
@@ -11,12 +15,16 @@ torq_tools_dir=$(readlink -f torq-tools)
 
 ### Option 1: Install with pip
 Installing via pip makes `torq-tools` available system-wide (or within your virtual environment).
-A virtual environment is **strongly recommended**, as this project depends on several large packages.
+A virtual environment is **strongly recommended**, as this project depends on several large packages. 
+
+- **If using the compiler release package:**
+  Activate the same virtual environment that was used to set it up.
+- **If using Docker:**
+  You can use the system Python environment, as it already operates within an isolated environment.
 ```bash
 cd your_project
-python3 -m venv .venv
 source .venv/bin/activate
-pip install $torq_tools_dir
+pip install $torq_tools_dir --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 > [!TIP]
