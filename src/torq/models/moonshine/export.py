@@ -15,6 +15,13 @@ from datasets import load_dataset, Audio
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, AutoProcessor
 from onnxruntime.transformers.optimizer import optimize_model
+from torq.compile import (
+    process_iree_args,
+    export_iree
+)
+from torq.utils.logging import (
+    configure_logging,
+)
 
 from . import (
     ONNX_DTYPES,
@@ -25,18 +32,11 @@ from . import (
 
 from ._graph import MoonshineOnnxGraphEditor
 from ._inference import MoonshineDynamic, MoonshineStatic
-from ...utils.logging import (
-    configure_logging,
-)
 from ...utils.onnx import (
     get_model_opset,
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
-)
-from ...utils.compile import (
-    process_iree_args,
-    export_iree
 )
 from ...tools.convert_fp32 import (
     convert_model
