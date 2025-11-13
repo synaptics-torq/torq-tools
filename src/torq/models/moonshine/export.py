@@ -38,7 +38,7 @@ from ...utils.onnx import (
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
 )
-from ...tools.convert_fp32 import (
+from ...tools.convert_dtype.onnx import (
     convert_model
 )
 
