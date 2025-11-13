@@ -647,7 +647,7 @@ class MoonshineModelExporter:
             self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(iree_export_dir), onnx_path.stem)
 
 
-def export_moonshine(args: argparse.Namespace):
+def export_moonshine_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = MoonshineModelExporter(
         args.model_size,
@@ -673,7 +673,7 @@ def export_moonshine(args: argparse.Namespace):
 def main():
     parser = argparse.ArgumentParser(description="Export Moonshine to Torq")
     add_moonshine_export_args(parser)
-    export_moonshine(parser.parse_args())
+    export_moonshine_from_args(parser.parse_args())
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ def main():
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
-        from .moonshine.export import export_moonshine
-        export_moonshine(args)
+        from .moonshine.export import export_moonshine_from_args
+        export_moonshine_from_args(args)
 
 
 if __name__ == "__main__":
