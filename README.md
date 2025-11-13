@@ -137,7 +137,7 @@ python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_iree_o
 If `torq-tools` was installed as a Python package, all major tools are also exposed as CLI commands.
 ```bash
 # convert to bf16
-torq-convert-fp32 -e bf16 -i model_fp32.onnx -o model_bf16.onnx
+torq-convert-fp32 onnx -e bf16 -i model_fp32.onnx -o model_bf16.onnx
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
@@ -154,7 +154,7 @@ torq-infer-model moonshine apostle.wav -m models/moonshine_iree_onnx/ -s tiny --
 ### Using in code
 You can import and use the same tools programmatically through the torq namespace:
 ```python
->>> from torq.tools.convert_fp32 import convert_model
+>>> from torq.tools.convert_dtype.onnx import convert_model
 >>> from torq.models.moonshine.export import MoonshineModelExporter
 >>> exporter = MoonshineModelExporter(...)
 >>> exporter.export_onnx()
