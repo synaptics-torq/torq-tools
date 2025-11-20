@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
 import argparse
 
 from .moonshine import add_moonshine_infer_args

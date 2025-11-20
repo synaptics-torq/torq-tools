@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
 import argparse
 from dataclasses import dataclass
 from typing import Any, Final

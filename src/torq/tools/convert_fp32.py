@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
 import argparse
 
 from .convert_dtype.onnx import add_onnx_fp32_convert_args
