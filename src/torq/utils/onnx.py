@@ -8,9 +8,11 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from shutil import rmtree
+from typing import Union
 
 import onnx
 import onnx_graphsurgeon as gs
+import numpy as np
 
 
 logger = logging.getLogger(__name__)
@@ -232,6 +234,34 @@ def extract_subgraphs(
         if matches:
             subgraphs_dirs.append(subgraphs_dir)
     return subgraphs_dirs
+
+
+DTypeLike = Union[int, np.dtype, type, str, None]
+
+def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
+    if typ1 is typ2:
+        return True
+    if typ1 == typ2:
+        return True
+
+    def _to_np_dtype(typ: DTypeLike) -> np.dtype | None:
+        if typ is None:
+            return None
+        if isinstance(typ, np.dtype):
+            return typ
+        if isinstance(typ, int):
+            try:
+                return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(typ))
+            except (TypeError, ValueError, KeyError):
+                return None
+        try:
+            return np.dtype(typ)
+        except TypeError:
+            return None
+
+    dt1 = _to_np_dtype(typ1)
+    dt2 = _to_np_dtype(typ2)
+    return dt1 is not None and dt2 is not None and dt1 == dt2
 
 
 if __name__ == "__main__":
