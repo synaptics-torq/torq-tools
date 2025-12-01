@@ -49,9 +49,6 @@ def convert_model(
     max_float: float = 1e9,
     target_opset: int = 22,
 ):
-    if export_dtype == "fp16" and not use_modelopt:
-        logger.warning("FP16 conversion is only available via TensorRT modelopt")
-        use_modelopt = True
 
     if use_modelopt:
         try:
@@ -59,8 +56,6 @@ def convert_model(
         except ImportError:
             logger.warning("Cannot import TensorRT modelopt, falling back to manual conversion")
             use_modelopt = False
-            if export_dtype == "fp16":
-                raise RuntimeError("No available path for converting FP32 to FP16, please install TensorRT modelopt")
 
     if use_modelopt:
         converted_model = autocast.convert_to_mixed_precision(
@@ -149,6 +144,10 @@ class OnnxDtypeConverterBase(ABC):
         if not is_same_dtype(tensor.dtype, self._original_onnx_dtype):
             logger.debug("Skipping non-%s tensor '%s'", self._original_dtype_str, tensor.name)
             return
+        if tensor.name in self._convert_exceptions:
+            logger.debug("Skipping dtype conversion of explicitly marked tensor '%s' (%s)",
+                         tensor.name, self._convert_exceptions[tensor.name])
+            return
 
         if isinstance(tensor, gs.Variable):
             # special handling not needed for runtime tensors
@@ -172,15 +171,19 @@ class OnnxDtypeConverterBase(ABC):
                         new_const_name,
                         tensor.values.astype(np_type)
                     )
-            logger.debug("Add %s initialzier '%s'", self._export_dtype_str, new_const.name)
-            if is_attr:
-                assert isinstance(idx, str), "Node attribute index must be a string"
-                node.attrs[idx] = new_const
-                logger.debug("Set attr '%s' of node '%s' to '%s'", str(idx), node.name, new_const.name)
-            else:
-                assert isinstance(idx, int), "Node input index must be an integer"
-                node.inputs[idx] = new_const
-                logger.debug("Set input %d of node '%s' to '%s'", int(idx), node.name, new_const.name)
+            logger.debug("Add %s initializer '%s'", self._export_dtype_str, new_const.name)
+            try:
+                if is_attr:
+                    assert isinstance(idx, str), "Node attribute index must be a string"
+                    node.attrs[idx] = new_const
+                    logger.debug("Set attr '%s' of node '%s' to '%s'", str(idx), node.name, new_const.name)
+                else:
+                    assert isinstance(idx, int), "Node input index must be an integer"
+                    node.inputs[idx] = new_const
+                    logger.debug("Set input %d of node '%s' to '%s'", int(idx), node.name, new_const.name)
+            except (IndexError, ValueError, KeyError) as e:
+                typ = "attribute" if is_attr else "input"
+                logger.error("Failed to update %s %s ('%s') of node '%s'", typ, str(idx), tensor.name, node.name)
         else:
             logger.warning("Skipping conversion due to invalid tensor type '%s'", str(type(tensor)))
 
@@ -209,7 +212,7 @@ class OnnxDtypeConverterBase(ABC):
                         if val is graph_inp:
                             node.inputs[i] = inp_new
                             logger.debug("Update node '%s' to accept %s input '%s'", node.name, self._export_dtype_str, inp_new.name)
-                self._convert_exceptions[graph_inp.name] = "model input and convert_io=False"
+                self._convert_exceptions[graph_inp.name] = "graph input and convert_io=False"
 
     def _update_outputs(self, graph: gs.Graph):
         for i, graph_out in enumerate(list(graph.outputs)):
@@ -231,7 +234,7 @@ class OnnxDtypeConverterBase(ABC):
                 )[0]
                 graph.outputs[i] = out_new
                 logger.debug("Add %s cast node for output '%s'", self._original_dtype_str, out_name)
-                self._convert_exceptions[out_name] = "model output and convert_io=False"
+                self._convert_exceptions[out_name] = "graph output and convert_io=False"
 
     def _check_tensor_dtypes(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
         all_tensors: list[str] = []
@@ -271,6 +274,8 @@ class OnnxDtypeConverterBase(ABC):
         # convert subgraphs (if any)
         for g in subgraphs:
             self._convert_graph(g)
+            self._update_inputs(g)
+            self._update_outputs(g)
             conv_info = self._check_conversion(g)
             all_tensors += conv_info[0]
             not_converted += conv_info[1]
@@ -282,6 +287,8 @@ class OnnxDtypeConverterBase(ABC):
         conv_info = self._check_conversion(root)
         all_tensors += conv_info[0]
         not_converted += conv_info[1]
+
+        onnx.save_model(gs.export_onnx(root), "temp.onnx")
 
         new_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(root), check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
@@ -322,34 +329,44 @@ class FP32Converter(OnnxDtypeConverterBase):
 
         self._direct_cast = direct_cast
 
+    @staticmethod
+    def _is_fp32(tensor: gs.Variable | gs.Constant) -> bool:
+        dtype = getattr(tensor, "export_dtype", None) or tensor.dtype
+        return is_same_dtype(dtype, np.float32)
+
     def _convert_graph(
         self,
         graph: gs.Graph
     ):
         skip_names = {i.name for i in graph.inputs} | {o.name for o in graph.outputs}
         for node in list(graph.nodes):
-            if node.op == "Cast":
-                if is_same_dtype((cast_out := node.outputs[0]).dtype, np.float32):
-                    if self._direct_cast:
-                        cast_out.dtype = self._export_onnx_dtype
-                        node.attrs["to"] = self._export_onnx_dtype
-                        logger.debug("Update Cast op '%s' to directly cast to %s", node.name, self._export_dtype_str)
-                    else:
-                        consumers: list[gs.Node] = list(cast_out.outputs)
-                        out_f16: gs.Variable = graph.layer(
-                            name=cast_out.name + f"_cast_fp32_to_{self._export_dtype_str}",
-                            op="Cast",
-                            inputs=[cast_out],
-                            outputs=[gs.Variable(cast_out.name + f"_{self._export_dtype_str}", dtype=self._export_onnx_dtype, shape=cast_out.shape)],
-                            attrs={"to": self._export_onnx_dtype},
-                        )[0]
-                        for consumer in consumers:
-                            for i, inp in enumerate(consumer.inputs):
-                                if inp is cast_out:
-                                    consumer.inputs[i] = out_f16
-                                    logger.debug("Add fp32 -> %s Cast node to feed '%s'", self._export_dtype_str, consumer.name)
+            # special case: Cast -> properly handle casts to fp32
+            if node.op == "Cast" and self._is_fp32(cast_out := node.outputs[0]):
+                if cast_out.name in self._convert_exceptions:
+                    logger.debug("Skipping dtype conversion of explicitly marked fp32 cast output '%s'", cast_out.name)
+                    continue
+                if self._direct_cast:
+                    cast_out.dtype = self._export_onnx_dtype
+                    node.attrs["to"] = self._export_onnx_dtype
+                    logger.debug("Update Cast op '%s' to directly cast to %s", node.name, self._export_dtype_str)
+                else:
+                    self._convert_exceptions[cast_out.name] = "Cast output and direct_cast=False"
+                    consumers: list[gs.Node] = list(cast_out.outputs)
+                    out_f16: gs.Variable = graph.layer(
+                        name=cast_out.name + f"_cast_fp32_to_{self._export_dtype_str}",
+                        op="Cast",
+                        inputs=[cast_out],
+                        outputs=[gs.Variable(cast_out.name + f"_{self._export_dtype_str}", dtype=self._export_onnx_dtype, shape=cast_out.shape)],
+                        attrs={"to": self._export_onnx_dtype},
+                    )[0]
+                    for consumer in consumers:
+                        for i, inp in enumerate(consumer.inputs):
+                            if inp is cast_out:
+                                consumer.inputs[i] = out_f16
+                                logger.debug("Add fp32 -> %s Cast node to feed '%s'", self._export_dtype_str, consumer.name)
                 continue
 
+            # special case: DQL -> input and scale output must be fp32
             if node.op == "DynamicQuantizeLinear":
                 inp_f32: gs.Variable = graph.layer(
                     name=node.name + "_inp_cast_f32",
@@ -359,9 +376,11 @@ class FP32Converter(OnnxDtypeConverterBase):
                     attrs={"to": onnx.TensorProto.FLOAT},
                 )[0]
                 node.inputs[0] = inp_f32
+                self._convert_exceptions[inp_f32.name] = "DynamicQuantizeLinear input"
                 logger.debug("Add %s -> fp32 Cast node to input of DQL node '%s'", self._export_dtype_str, node.name)
 
                 scale_out: gs.Variable = node.outputs[1]
+                self._convert_exceptions[scale_out.name] = "DynamicQuantizeLinear output"
                 consumers: list[gs.Node] = list(scale_out.outputs)
                 scale_out_f16: gs.Variable = graph.layer(
                     name=node.name + f"_scale_cast_{self._export_dtype_str}",
@@ -377,15 +396,18 @@ class FP32Converter(OnnxDtypeConverterBase):
                             logger.debug("Add fp32 -> %s Cast node to feed '%s'", self._export_dtype_str, consumer.name)
                 continue
 
+            # special case: Constant -> constant value stored as an attribute
             if node.op == "Constant" and (val := node.attrs.get("value")) is not None:
                 self._convert_tensor(val, node, graph, "value", is_attr=True)
 
+            # special case: ConstantOfShape -> constant value stored as an attribute
             if node.op == "ConstantOfShape" and (val := node.attrs.get("value")) is not None:
                 self._convert_tensor(val, node, graph, "value", is_attr=True)
 
+            # special case: Resize -> only input and output can be cast to bf16
             if node.op == "Resize" and node.inputs[0].name not in skip_names:
                 self._convert_tensor(node.inputs[0], node, graph, 0)
-                if is_same_dtype((out := node.outputs[0]).dtype, np.float32) and out.name not in skip_names:
+                if self._is_fp32(out := node.outputs[0]) and out.name not in skip_names:
                     out.dtype = self._export_onnx_dtype
                 continue
 
@@ -400,9 +422,12 @@ class FP32Converter(OnnxDtypeConverterBase):
                 if out.name in skip_names:
                     logger.debug("Skipping dtype conversion of model output '%s'", out.name)
                     continue
-                if is_same_dtype(out.dtype, np.float32):
+                if self._is_fp32(out):
                     out.dtype = self._export_onnx_dtype
-        logger.info("Updated graph dtypes to %s", self._export_dtype_str)
+                    if node.op == "Cast":
+                        node.attrs["to"] = self._export_onnx_dtype
+
+        logger.info("Updated graph '%s' dtypes to %s", graph.name, self._export_dtype_str)
     
 
 def add_onnx_fp32_convert_args(parser: argparse.ArgumentParser):
