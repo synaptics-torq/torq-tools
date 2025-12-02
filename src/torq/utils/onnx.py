@@ -264,5 +264,14 @@ def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
     return dt1 is not None and dt2 is not None and dt1 == dt2
 
 
+def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
+    if (curr_opset := get_model_opset(model)) >= target_opset:
+        logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
+        return model
+    upgraded = onnx.version_converter.convert_version(model, target_opset)
+    logger.info("Upgraded model opset to %d", target_opset)
+    return upgraded
+
+
 if __name__ == "__main__":
     pass

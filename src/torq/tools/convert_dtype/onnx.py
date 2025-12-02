@@ -12,10 +12,9 @@ from typing import Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
-from onnx import version_converter
 from torq.utils.logging import add_logging_args, configure_logging
 
-from ...utils.onnx import get_model_opset, is_same_dtype
+from ...utils.onnx import is_same_dtype, upgrade_model
 
 logger = logging.getLogger("FP32-Converter")
 
