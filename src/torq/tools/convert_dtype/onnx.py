@@ -33,54 +33,6 @@ _ONNX_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
 }
 
 
-def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
-    if (curr_opset := get_model_opset(model)) >= target_opset:
-        logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
-        return model
-    upgraded = version_converter.convert_version(model, target_opset)
-    logger.info("Upgraded model opset to %d", target_opset)
-    return upgraded
-
-
-def convert_model(
-    input_model: str | os.PathLike,
-    output_model: str | os.PathLike,
-    export_dtype: str,
-    use_modelopt: bool = False,
-    convert_io: bool = False,
-    max_float: float = 1e9,
-    target_opset: int = 22,
-):
-
-    if use_modelopt:
-        try:
-            from modelopt.onnx import autocast
-        except ImportError:
-            logger.warning("Cannot import TensorRT modelopt, falling back to manual conversion")
-            use_modelopt = False
-
-    if use_modelopt:
-        converted_model = autocast.convert_to_mixed_precision(
-            str(input_model),
-            export_dtype,
-            data_max=max_float,
-            init_max=max_float,
-            keep_io_types=not convert_io
-        )
-    else:
-        input_model = onnx.load(input_model)
-        input_model = upgrade_model(input_model, target_opset)
-        converted_model = FP32Converter(
-            export_dtype,
-            convert_io=convert_io
-        ).convert_model(input_model)
-
-    export_dir = Path(output_model).parent
-    export_dir.mkdir(parents=True, exist_ok=True)
-    onnx.save(converted_model, output_model)
-    logger.info("Saved converted model to '%s'", str(output_model))
-
-
 class OnnxDtypeConverterBase(ABC):
 
     def __init__(
@@ -90,6 +42,10 @@ class OnnxDtypeConverterBase(ABC):
         convert_io: bool = False,
         direct_cast: bool = True,
     ):
+        if export_dtype not in self.allowed_dtypes():
+            raise ValueError(
+                f"Invalid export dtype '{export_dtype}', select from {sorted(self.allowed_dtypes())}"
+            )
         self._original_dtype_str = original_dtype
         self._export_dtype_str = export_dtype
         self._convert_io = convert_io
@@ -129,6 +85,10 @@ class OnnxDtypeConverterBase(ABC):
 
     def _is_original_dtype(self, dtype) -> bool:
         return is_same_dtype(dtype, self._original_onnx_dtype)
+
+    @classmethod
+    @abstractmethod
+    def allowed_dtypes(cls) -> tuple[str, ...]: ...
 
     @abstractmethod
     def _convert_graph(
@@ -386,6 +346,10 @@ class FP32Converter(OnnxDtypeConverterBase):
     ):
         super().__init__("fp32", export_dtype, convert_io, direct_cast)
 
+    @classmethod
+    def allowed_dtypes(cls) -> tuple[str, ...]:
+        return ("bf16", "fp16")
+
     def _convert_graph(
         self,
         graph: gs.Graph
@@ -481,11 +445,6 @@ class Int64Converter(OnnxDtypeConverterBase):
         convert_io: bool = False,
         direct_cast: bool = True
     ):
-        allowed_exports = {"int32", "int16", "int8"}
-        if export_dtype not in allowed_exports:
-            raise ValueError(
-                f"Invalid export dtype '{export_dtype}', select from {sorted(allowed_exports)}"
-            )
         super().__init__("int64", export_dtype, convert_io, direct_cast)
 
         self._original_sdtype_str  = self._original_dtype_str
@@ -497,6 +456,10 @@ class Int64Converter(OnnxDtypeConverterBase):
         self._original_onnx_udtype = self._validate_dtype(self._original_udtype_str)
         self._export_onnx_sdtype   = self._export_onnx_dtype
         self._export_onnx_udtype   = self._validate_dtype(self._export_udtype_str)
+
+    @classmethod
+    def allowed_dtypes(cls) -> tuple[str, ...]:
+        return ("int32", "int16", "int8")
 
     def _is_original_dtype(self, dtype) -> bool:
         return (
@@ -606,7 +569,88 @@ class Int64Converter(OnnxDtypeConverterBase):
         return super()._check_tensor_dtypes(graph)
 
 
-def add_onnx_fp32_convert_args(parser: argparse.ArgumentParser):
+def _convert_modelopt(
+    input_model: str | os.PathLike,
+    convert_dtype: str,
+    convert_io: bool,
+    max_float: float,
+):
+    allowed_modelopt_dtypes = {"fp16", "bf16"}
+    if convert_dtype not in allowed_modelopt_dtypes:
+        raise ValueError(
+            f"Invalid convert dtype '{convert_dtype}' for modelopt, "
+            f"choose from {sorted(allowed_modelopt_dtypes)}"
+        )
+    try:
+        from modelopt.onnx import autocast
+    except ImportError as exc:
+        raise RuntimeError(
+            "Requested use_modelopt=True but TensorRT Model Optimizer "
+            "('modelopt') is not installed. Install it or set use_modelopt=False."
+        ) from exc
+
+    return autocast.convert_to_mixed_precision(
+        str(input_model),
+        convert_dtype,
+        data_max=max_float,
+        init_max=max_float,
+        keep_io_types=not convert_io,
+    )
+
+
+def _convert_internal(
+    input_model: str | os.PathLike,
+    convert_dtype: str,
+    convert_io: bool,
+    target_opset: int,
+):
+    model = onnx.load(input_model)
+    model = upgrade_model(model, target_opset)
+
+    if convert_dtype in FP32Converter.allowed_dtypes():
+        converter = FP32Converter(convert_dtype, convert_io=convert_io)
+    elif convert_dtype in Int64Converter.allowed_dtypes():
+        converter = Int64Converter(convert_dtype, convert_io=convert_io)
+    else:
+        allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(Int64Converter.allowed_dtypes())
+        raise ValueError(
+            f"Invalid convert dtype '{convert_dtype}', choose from {allowed_dtypes}"
+        )
+
+    return converter.convert_model(model)
+
+
+def convert_model(
+    input_model: str | os.PathLike,
+    output_model: str | os.PathLike,
+    convert_dtype: str,
+    use_modelopt: bool = False,
+    convert_io: bool = False,
+    max_float: float = 1e9,
+    target_opset: int = 22,
+):
+    if use_modelopt:
+        converted_model = _convert_modelopt(
+            input_model,
+            convert_dtype=convert_dtype,
+            convert_io=convert_io,
+            max_float=max_float,
+        )
+    else:
+        converted_model = _convert_internal(
+            input_model,
+            convert_dtype=convert_dtype,
+            convert_io=convert_io,
+            target_opset=target_opset,
+        )
+
+    export_dir = Path(output_model).parent
+    export_dir.mkdir(parents=True, exist_ok=True)
+    onnx.save(converted_model, output_model)
+    logger.info("Saved converted model to '%s'", str(output_model))
+
+
+def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "-i", "--input",
         type=str,
@@ -620,10 +664,10 @@ def add_onnx_fp32_convert_args(parser: argparse.ArgumentParser):
         help="Output ONNX model path"
     )
     parser.add_argument(
-        "-e", "--export-dtype",
+        "-d", "--dtype",
         type=str,
         metavar="DTYPE",
-        choices=["fp16", "bf16"],
+        choices=FP32Converter.allowed_dtypes() + Int64Converter.allowed_dtypes(),
         required=True,
         help="Export data type (choices: %(choices)s)"
     )
@@ -654,12 +698,12 @@ def add_onnx_fp32_convert_args(parser: argparse.ArgumentParser):
     add_logging_args(parser)
 
 
-def onnx_fp32_convert_from_args(args: argparse.Namespace):
+def onnx_dtype_convert_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     convert_model(
         args.input,
         args.output,
-        args.export_dtype,
+        args.dtype,
         args.modelopt,
         args.convert_io,
         args.max_float,
@@ -669,8 +713,8 @@ def onnx_fp32_convert_from_args(args: argparse.Namespace):
 
 def main():
     parser = argparse.ArgumentParser()
-    add_onnx_fp32_convert_args(parser)
-    onnx_fp32_convert_from_args(parser.parse_args())
+    add_onnx_dtype_convert_args(parser)
+    onnx_dtype_convert_from_args(parser.parse_args())
 
 
 if __name__ == "__main__":
