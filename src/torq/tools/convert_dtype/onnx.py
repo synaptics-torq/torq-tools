@@ -286,6 +286,27 @@ class OnnxDtypeConverterBase(ABC):
         self,
         input_model: onnx.ModelProto
     ) -> onnx.ModelProto:
+        try:
+            input_model = onnx.shape_inference.infer_shapes(
+                input_model,
+                check_type=True,
+                strict_mode=True,
+            )
+        except onnx.shape_inference.InferenceError as e:
+            logger.warning(
+                "ONNX shape inference failed; proceeding with original model: %s",
+                e,
+                exc_info=True,
+            )
+        try:
+            onnx.checker.check_model(input_model, full_check=True)
+        except onnx.checker.ValidationError as e:
+            logger.warning(
+                "ONNX model validation failed; model may be malformed: %s",
+                e,
+                exc_info=True,
+            )
+
         root, *subgraphs = self._collect_all_graphs(gs.import_onnx(input_model))
         all_tensors: list[str] = []
         not_converted: list[str] = []
@@ -523,7 +544,7 @@ class Int64Converter(OnnxDtypeConverterBase):
                 dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
                     if isinstance (tensor_dtype, int) else str(tensor_dtype)
                 logger.warning(
-                    "Promoting to int64: tensor '%s' (%s) from input %d of %s op '%s'",
+                    "Promoting to int64: tensor '%s' (dtype: %s), required for input %d of %s op '%s'",
                     tensor.name, dtype_str, idx, node.op, node.name,
                 )
                 tensor.dtype = onnx.TensorProto.INT64
