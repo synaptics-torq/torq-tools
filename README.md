@@ -85,12 +85,19 @@ pip install -r "$torq_tools_dir/src/torq/models/moonshine/requirements.txt"
 `torq-tools` can be used directly from the command line or imported into application code via the `torq` namespace.
 
 ### Available tools
-#### Convert ONNX fp32 models to bf16 or fp16
+#### Convert ONNX model dtype
 Convert fp32 ONNX models to lower-precision formats such as bf16 or fp16.
 Particularly useful for getting bf16 models, which have native hardware acceleration in the Torq runtime.
 ```bash
-python3 -m src.torq.tools.convert_fp32 -e bf16 -i model_fp32.onnx -o model_bf16.onnx
+python3 -m src.torq.tools.convert_dtype -d bf16 -i model_fp32.onnx -o model_bf16.onnx
 ```
+This tool can also downcast int64 tensors to int32 or smaller integer data types like int16 and int8.
+```bash
+python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.onnx
+```
+> [!WARNING]
+> Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64. 
+> Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
 
 #### Export supported models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
@@ -137,7 +144,7 @@ python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_iree_o
 If `torq-tools` was installed as a Python package, all major tools are also exposed as CLI commands.
 ```bash
 # convert to bf16
-torq-convert-fp32 onnx -e bf16 -i model_fp32.onnx -o model_bf16.onnx
+torq-convert-dtype onnx -d bf16 -i model_fp32.onnx -o model_bf16.onnx
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
