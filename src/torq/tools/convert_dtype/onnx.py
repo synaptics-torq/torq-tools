@@ -267,7 +267,7 @@ class OnnxDtypeConverterBase(ABC):
                         graph.name, tensor_name, self._export_dtype_str
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         "Graph '%s': tensor '%s' not converted to %s (%s)",
                         graph.name, tensor_name, self._export_dtype_str, exc_reason
                     )
@@ -306,8 +306,6 @@ class OnnxDtypeConverterBase(ABC):
         conv_info = self._check_conversion(root)
         all_tensors += conv_info[0]
         not_converted += conv_info[1]
-
-        onnx.save_model(gs.export_onnx(root), "temp.onnx")
 
         new_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(root), check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
@@ -414,25 +412,14 @@ class FP32Converter(OnnxDtypeConverterBase):
 class Int64Converter(OnnxDtypeConverterBase):
 
     # as of onnx v1.21.0
-    _ENFORCED_INT64_IO_ALL: Final[dict[str, tuple[tuple[int, ...], ...]]] = {
+    _ENFORCED_INT64_IO: Final[dict[str, tuple[tuple[int, ...], ...]]] = {
         "ConstantOfShape": ((0,),), # v25: inputs: (input, )
         "Expand": ((1,),),          # v13: inputs: (shape, )
         "Pad": ((1, 3),),           # v25: inputs: (pads, axes)
+        "ReduceMean": ((1,),),      # v18: inputs: (axes, )
         "Reshape": ((1,),),         # v25: inputs: (shape, )
         "Resize": ((3,),),          # v19: inputs: (sizes, )
         "Slice": ((1, 2, 3, 4),),   # v13: inputs: (starts, ends, axes, steps)
-        "Squeeze": ((1,),),         # v25: inputs: (axes, )
-        "Tile": ((1,),),            # v13: inputs: (repeats, )
-        "TopK": ((1,), (1,)),       # v24: inputs: (K, ), outputs: (I, )
-        "Unsqueeze": ((1,),),       # v25: inputs: (axes, )
-    }
-    # some inputs allow int32 but not int16/int8
-    _ENFORCED_INT64_IO_INT32: Final[dict[str, tuple[tuple[int, ...], ...]]] = {
-        "ConstantOfShape": ((0,),), # v25: inputs: (input, )
-        "Expand": ((1,),),          # v13: inputs: (shape, )
-        "Pad": ((1,),),             # v25: inputs: (pads, )
-        "Reshape": ((1,),),         # v25: inputs: (shape, )
-        "Resize": ((3,),),          # v19: inputs: (sizes, )
         "Squeeze": ((1,),),         # v25: inputs: (axes, )
         "Tile": ((1,),),            # v13: inputs: (repeats, )
         "TopK": ((1,), (1,)),       # v24: inputs: (K, ), outputs: (I, )
@@ -531,8 +518,16 @@ class Int64Converter(OnnxDtypeConverterBase):
                 return
             tensor = coll[idx]
             tensor_dtype = getattr(tensor, "export_dtype", None) or tensor.dtype
-            if self._is_original_dtype(tensor_dtype):
-                self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires int64"
+            if not self._is_original_dtype(tensor_dtype):
+                # warn of ONNX spec mismatch
+                dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
+                    if isinstance (tensor_dtype, int) else str(tensor_dtype)
+                logger.warning(
+                    "Promoting to int64: tensor '%s' (%s) from input %d of %s op '%s'",
+                    tensor.name, dtype_str, idx, node.op, node.name,
+                )
+                tensor.dtype = onnx.TensorProto.INT64
+            self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires int64"
 
         skip_names = {i.name for i in graph.inputs} | {o.name for o in graph.outputs}
         for node in list(graph.nodes):
@@ -540,10 +535,17 @@ class Int64Converter(OnnxDtypeConverterBase):
                 self._handle_cast(node, graph)
                 continue
 
-            ENFORCED_INT64_IO = self._ENFORCED_INT64_IO_INT32 if \
-                self._export_onnx_sdtype == onnx.TensorProto.INT32 \
-                else self._ENFORCED_INT64_IO_ALL
-            if enforced := ENFORCED_INT64_IO.get(node.op):
+            if node.op == "Constant" and not node.name and not node.inputs:
+                if self._is_original_dtype(node.outputs[0].dtype):
+                    logger.warning(
+                        "Skipping int64 tensor %s originating from unnamed Constant node",
+                        node.outputs[0].name
+                    )
+                    self._convert_exceptions[node.outputs[0].name] = \
+                        "int64 output from unnamed Constant node"
+                    continue
+
+            if enforced := self._ENFORCED_INT64_IO.get(node.op):
                 assert len(enforced) >= 1, "Invalid tensor indices for INT64 enforced I/O"
                 inp_indices = enforced[0]
                 out_indices = enforced[1] if len(enforced) > 1 else ()
