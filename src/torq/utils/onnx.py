@@ -221,7 +221,7 @@ def extract_subgraphs(
         subgraphs_dir = Path(save_dir) / chain_name
         subgraphs_dir.mkdir(exist_ok=True, parents=True)
         for f in subgraphs_dir.iterdir():
-            if f.is_file() and f.suffix in (".onnx", ".mlir", ".vmfb") and chain_name in f.name:
+            if f.is_file() and f.suffix == ".onnx" and chain_name in f.name:
                 f.unlink()
             if f.is_dir() and chain_name in f.name:
                 rmtree(f, ignore_errors=True)
@@ -231,6 +231,16 @@ def extract_subgraphs(
                 break
             output_path = subgraphs_dir / f"{chain_name}_{i + 1}.onnx"
             onnx.utils.extract_model(model_path, output_path, match["inputs"], match["outputs"])
+            graph = gs.import_onnx(onnx.load(output_path))
+            graph.name = "main"
+            graph = graph.cleanup(
+                remove_unused_graph_inputs=True,
+                remove_unused_node_outputs=True
+            ).toposort()
+            extracted = gs.export_onnx(graph)
+            extracted = onnx.shape_inference.infer_shapes(extracted, check_type=True, strict_mode=True)
+            onnx.checker.check_model(extracted, full_check=True)
+            onnx.save(extracted, output_path)
         if matches:
             subgraphs_dirs.append(subgraphs_dir)
     return subgraphs_dirs
