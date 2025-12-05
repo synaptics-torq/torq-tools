@@ -255,6 +255,32 @@ class OnnxDtypeConverterBase(ABC):
                 continue
             self._update_output(graph, graph_out, i)
 
+    def _fold_literal_constants(self, graph: gs.Graph):
+        for node in graph.nodes:
+            if node.op != "Constant" or node.inputs:
+                continue
+            if not isinstance((value := node.attrs.get("value")), gs.Constant):
+                continue
+            const_node_out: gs.Variable = node.outputs[0]
+            const_init: gs.Constant = gs.Constant(
+                name=const_node_out.name or (node.name or self._random_tag()) + "_folded",
+                values=value.values
+            )
+            consumers: list[gs.Node] = list(const_node_out.outputs)
+            for consumer in consumers:
+                for i, inp in enumerate(consumer.inputs):
+                    if inp is const_node_out:
+                        consumer.inputs[i] = const_init
+            node.outputs.clear()
+            logger.debug(
+                "Graph '%s': folded literal Constant producer node for '%s' into graph initializer",
+                graph.name, const_node_out.name
+            )
+        graph = graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True
+        ).toposort()
+
     def _check_tensor_dtypes(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
         all_tensors: list[str] = []
         not_converted: list[str] = []
@@ -313,6 +339,7 @@ class OnnxDtypeConverterBase(ABC):
 
         # convert subgraphs (if any)
         for g in subgraphs:
+            self._fold_literal_constants(g)
             self._convert_graph(g)
             self._update_inputs(g)
             self._update_outputs(g)
@@ -321,6 +348,7 @@ class OnnxDtypeConverterBase(ABC):
             not_converted += conv_info[1]
 
         # convert root graph
+        self._fold_literal_constants(root)
         self._convert_graph(root)
         self._update_inputs(root)
         self._update_outputs(root)
