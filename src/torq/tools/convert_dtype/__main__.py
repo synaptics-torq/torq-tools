@@ -3,7 +3,7 @@
 
 import argparse
 
-from .convert_dtype.onnx import add_onnx_fp32_convert_args
+from .onnx import add_onnx_dtype_convert_args
 
 
 def main():
@@ -11,10 +11,14 @@ def main():
     model_type = parser.add_subparsers(dest="model_type", required=True)
 
     onnx_type = model_type.add_parser("onnx", help="Convert ONNX FP32 models")
-    add_onnx_fp32_convert_args(onnx_type)
+    add_onnx_dtype_convert_args(onnx_type)
 
     args = parser.parse_args()
 
     if args.model_type == "onnx":
-        from .convert_dtype.onnx import onnx_fp32_convert_from_args
-        onnx_fp32_convert_from_args(args)
+        from .onnx import onnx_dtype_convert_from_args
+        onnx_dtype_convert_from_args(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -8,13 +8,42 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from shutil import rmtree
+from typing import Union
 
 import onnx
 import onnx_graphsurgeon as gs
+import numpy as np
 
 
 logger = logging.getLogger(__name__)
 
+
+__all__ = [
+    # CLI helpers
+    "add_onnx_args",
+
+    # model inspection
+    "get_model_opset",
+    "get_model_ops_count",
+    "check_dynamic_shapes",
+    "print_onnx_model_inputs_outputs_info",
+
+    # subgraph extraction
+    "extract_boundary_tensors",
+    "extract_subgraphs",
+
+    # DType utilities
+    "DTypeLike",
+    "is_same_dtype",
+
+    # Transformations
+    "upgrade_model",
+]
+
+
+# -----------------------------------------------------------------------------
+# CLI helpers
+# -----------------------------------------------------------------------------
 
 def add_onnx_args(
     parser: argparse.ArgumentParser,
@@ -68,46 +97,9 @@ def add_onnx_args(
         )
 
 
-def print_onnx_model_inputs_outputs_info(model: onnx.ModelProto | str | os.PathLike):
-    if isinstance(model, (str, os.PathLike)):
-        model = onnx.load(model)
-
-    model_gs = gs.import_onnx(model)
-
-    input_consumers = defaultdict(list)
-    graph_input_names = {i.name: (i.shape, i.dtype) for i in model_gs.inputs}
-
-    for node in model_gs.nodes:
-        for input in node.inputs:
-            name = input.name
-            if name in graph_input_names:
-                input_consumers[name].append(node)
-
-    print(f"\n\nModel inputs info:\n")
-    for name in sorted(graph_input_names):
-        shape, dtype = graph_input_names[name]
-        consumers = input_consumers.get(name, [])
-        if consumers:
-            consumers = "\n\t".join([f"'{node.name}'" for node in consumers])
-            print(f"Input '{name}' ({dtype}{shape}) consumed by:\n\t{consumers}")
-        else:
-            print(f"Input '{name}' ({dtype}{shape}) is not consumed by any node")
-
-    output_names = {o.name: (o.shape, o.dtype) for o in model_gs.outputs}
-    output_to_node = {out.name: node for node in model_gs.nodes for out in node.outputs}
-
-    print(f"\n\nModel outputs info:\n")
-    for name, (shape, dtype) in output_names.items():
-        node = output_to_node.get(name)
-        if node:
-            print(f"Output '{name}' ({dtype}{shape}) produced by:\n\t'{node.name}'")
-        elif name in {i.name for i in model_gs.graph.input}:
-            print(f"Output '{name}' is a passthrough from graph input")
-        elif name in {init.name for init in model_gs.graph.initializer}:
-            print(f"Output '{name}' is from initializer")
-        else:
-            print(f"Output '{name}' has no known producer (invalid?)")
-
+# -----------------------------------------------------------------------------
+# Model inspection utilities
+# -----------------------------------------------------------------------------
 
 def get_model_opset(
     model: str | os.PathLike | onnx.ModelProto,
@@ -155,6 +147,51 @@ def check_dynamic_shapes(model: onnx.ModelProto) -> dict[str, list[int | str]]:
             dynamic_shapes[tensor_name] = tensor.shape
     return dynamic_shapes
 
+
+def print_onnx_model_inputs_outputs_info(model: onnx.ModelProto | str | os.PathLike):
+    if isinstance(model, (str, os.PathLike)):
+        model = onnx.load(model)
+
+    model_gs = gs.import_onnx(model)
+
+    input_consumers = defaultdict(list)
+    graph_input_names = {i.name: (i.shape, i.dtype) for i in model_gs.inputs}
+
+    for node in model_gs.nodes:
+        for input in node.inputs:
+            name = input.name
+            if name in graph_input_names:
+                input_consumers[name].append(node)
+
+    print(f"\n\nModel inputs info:\n")
+    for name in sorted(graph_input_names):
+        shape, dtype = graph_input_names[name]
+        consumers = input_consumers.get(name, [])
+        if consumers:
+            consumers = "\n\t".join([f"'{node.name}'" for node in consumers])
+            print(f"Input '{name}' ({dtype}{shape}) consumed by:\n\t{consumers}")
+        else:
+            print(f"Input '{name}' ({dtype}{shape}) is not consumed by any node")
+
+    output_names = {o.name: (o.shape, o.dtype) for o in model_gs.outputs}
+    output_to_node = {out.name: node for node in model_gs.nodes for out in node.outputs}
+
+    print(f"\n\nModel outputs info:\n")
+    for name, (shape, dtype) in output_names.items():
+        node = output_to_node.get(name)
+        if node:
+            print(f"Output '{name}' ({dtype}{shape}) produced by:\n\t'{node.name}'")
+        elif name in {i.name for i in model_gs.graph.input}:
+            print(f"Output '{name}' is a passthrough from graph input")
+        elif name in {init.name for init in model_gs.graph.initializer}:
+            print(f"Output '{name}' is from initializer")
+        else:
+            print(f"Output '{name}' has no known producer (invalid?)")
+
+
+# -----------------------------------------------------------------------------
+# Subgraph extraction
+# -----------------------------------------------------------------------------
 
 def extract_boundary_tensors(
     model: onnx.ModelProto,
@@ -219,7 +256,7 @@ def extract_subgraphs(
         subgraphs_dir = Path(save_dir) / chain_name
         subgraphs_dir.mkdir(exist_ok=True, parents=True)
         for f in subgraphs_dir.iterdir():
-            if f.is_file() and f.suffix in (".onnx", ".mlir", ".vmfb") and chain_name in f.name:
+            if f.is_file() and f.suffix == ".onnx" and chain_name in f.name:
                 f.unlink()
             if f.is_dir() and chain_name in f.name:
                 rmtree(f, ignore_errors=True)
@@ -229,9 +266,64 @@ def extract_subgraphs(
                 break
             output_path = subgraphs_dir / f"{chain_name}_{i + 1}.onnx"
             onnx.utils.extract_model(model_path, output_path, match["inputs"], match["outputs"])
+            graph = gs.import_onnx(onnx.load(output_path))
+            graph.name = "main"
+            graph = graph.cleanup(
+                remove_unused_graph_inputs=True,
+                remove_unused_node_outputs=True
+            ).toposort()
+            extracted = gs.export_onnx(graph)
+            extracted = onnx.shape_inference.infer_shapes(extracted, check_type=True, strict_mode=True)
+            onnx.checker.check_model(extracted, full_check=True)
+            onnx.save(extracted, output_path)
         if matches:
             subgraphs_dirs.append(subgraphs_dir)
     return subgraphs_dirs
+
+
+# -----------------------------------------------------------------------------
+# DType utilities
+# -----------------------------------------------------------------------------
+
+DTypeLike = Union[int, np.dtype, type, str, None]
+
+def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
+    if typ1 is typ2:
+        return True
+    if typ1 == typ2:
+        return True
+
+    def _to_np_dtype(typ: DTypeLike) -> np.dtype | None:
+        if typ is None:
+            return None
+        if isinstance(typ, np.dtype):
+            return typ
+        if isinstance(typ, int):
+            try:
+                return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(typ))
+            except (TypeError, ValueError, KeyError):
+                return None
+        try:
+            return np.dtype(typ)
+        except TypeError:
+            return None
+
+    dt1 = _to_np_dtype(typ1)
+    dt2 = _to_np_dtype(typ2)
+    return dt1 is not None and dt2 is not None and dt1 == dt2
+
+
+# -----------------------------------------------------------------------------
+# Transformations
+# -----------------------------------------------------------------------------
+
+def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
+    if (curr_opset := get_model_opset(model)) >= target_opset:
+        logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
+        return model
+    upgraded = onnx.version_converter.convert_version(model, target_opset)
+    logger.info("Upgraded model opset to %d", target_opset)
+    return upgraded
 
 
 if __name__ == "__main__":
