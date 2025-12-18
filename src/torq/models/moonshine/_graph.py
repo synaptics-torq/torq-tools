@@ -214,10 +214,7 @@ class AddCurrLenInput(OnnxGraphEdit):
 
         gather_out: gs.Variable = gather_node.outputs[0]
         consumers: list[gs.Node] = list(gather_out.outputs)
-        for consumer in consumers:
-            for i, inp in enumerate(consumer.inputs):
-                if inp is gather_out:
-                    consumer.inputs[i] = self.cur_len
+        self.rewire_consumers(consumers, gather_out, self.cur_len)
 
         # disconnect Shape + Gather branch
         node.inputs.clear()
@@ -370,10 +367,7 @@ class RemoveIsNaN(OnnxGraphEdit):
             )
         where_out: gs.Variable = where_node.outputs[0]
         consumers: list[gs.Node] = list(where_out.outputs)
-        for consumer in consumers:
-            for i, inp in enumerate(consumer.inputs):
-                if inp is where_out:
-                    consumer.inputs[i] = producer
+        self.rewire_consumers(consumers, where_out, producer)
 
         # disconnect IsNaN -> Where chain
         node.inputs.clear()
