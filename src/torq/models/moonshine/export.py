@@ -142,6 +142,10 @@ class MoonshineModelExporter:
         self._export_dir.mkdir(parents=True, exist_ok=True)
         self._export_paths: dict[str, Path] = {}
 
+    @property
+    def export_dir(self) -> Path:
+        return self._export_dir
+
     def check_model(self, model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
         if model.ir_version > 10:
             self._logger.warning(
