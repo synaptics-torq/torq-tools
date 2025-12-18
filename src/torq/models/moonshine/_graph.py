@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 from dataclasses import dataclass
+from enum import Enum, auto
+import hashlib
 import os
 
 import onnx
@@ -598,13 +600,163 @@ class ReplaceInt64FloatCast(OnnxGraphEdit):
             inputs=[lookup_output, shape_batched],
             outputs=[gs.Variable(name=lookup_output.name + "_batched", dtype=cast_dtype, shape=int_inp.shape)]
         )[0]
-        for consumer in consumers:
-            for i, inp in enumerate(consumer.inputs):
-                if inp is float_out:
-                    consumer.inputs[i] = lookup_output_batched
+        self.rewire_consumers(consumers, float_out, lookup_output_batched)
         node.outputs.clear()
 
         self._logger.debug("Replaced int -> %s Cast node '%s' with look-up table", cast_dtype_str, node.name)
+
+class ConstantBroadcastPolicy(Enum):
+    """
+    Strategy for handling broadcastable constants during graph edits.
+
+    - `DEFER_RUNTIME`: Insert `Expand` nodes so constants broadcast at runtime (lower memory, slower inference).
+    - `MATERIALIZE`: Pre-broadcast constants and store the expanded tensor (faster inference, higher memory).
+    - `SKIP`: Leave constants untouched and let downstream tools handle broadcasting.
+    """
+    DEFER_RUNTIME = auto()
+    MATERIALIZE = auto()
+    SKIP = auto()
+
+@dataclass
+class BroadcastOpInputs(OnnxGraphEdit):
+    """
+    Add explicit `Expand` nodes for broadcasting op inputs to output shape.
+
+    Args:
+        ops (list[str]): Ops to apply explicit input broadcasting, will apply to all ops if list is empty.
+        out_idx (int): Index of output to use as broadcast target shape (default: 0).
+        inp_idx (list[int]): Only broadcast inputs at these indices (default: None, broadcast all inputs).
+        constants_policy (ConstantBroadcastPolicy): How to treat constant inputs (default: skip).
+    """
+
+    ops: list[str]
+    out_idx: int = 0
+    inp_idx: list[int] | None = None
+    constants_policy: ConstantBroadcastPolicy = ConstantBroadcastPolicy.SKIP
+
+    def __post_init__(self):
+        self.inp_idx = self.inp_idx or []
+        return super().__post_init__()
+
+    @staticmethod
+    def _has_valid_shape(tensor: gs.Constant | gs.Variable) -> bool:
+        try:
+            shape = getattr(tensor, "shape", None)
+            return shape is not None and all(isinstance(d, (int, np.integer)) for d in shape)
+        except TypeError:
+            raise ValueError(f"{tensor.name}, {tensor.shape}")
+
+    @staticmethod
+    def _unique_tensor_id(tensor: gs.Constant | gs.Variable, hash_length: int = 8) -> str:
+        inputs = [getattr(n, "name", str(n)) for n in tensor.inputs]
+        outputs = [getattr(n, "name", str(n)) for n in tensor.outputs]
+        id_str = tensor.name + ":" + "|".join(inputs) + ">>" + "|".join(outputs)
+        return hashlib.sha256(id_str.encode()).hexdigest()[:hash_length]
+
+    def _add_broadcast_to_tensor(self, tensor: gs.Constant | gs.Variable, bcast_shape: list[int]):
+        # create copy of initial consumers to prevent cycle later
+        consumers: list[gs.Node] = tensor.outputs.copy()
+        bcast_shape_const: gs.Constant = gs.Constant(
+            name=tensor.name + "_bcast_shape",
+            values=np.array(bcast_shape).astype(np.int64)
+        )
+        bcast_out: gs.Variable = self.graph.layer(
+            name=tensor.name + "_bcast",
+            op="Expand",
+            inputs=[tensor, bcast_shape_const],
+            outputs=[gs.Variable(name=tensor.name + "_expanded", dtype=tensor.dtype, shape=bcast_shape)]
+        )[0]
+        self.rewire_consumers(consumers, tensor, bcast_out)
+
+    def match(self, node: gs.Node) -> bool:
+        if self.ops and node.op not in self.ops:
+            return False
+        if not node.inputs or not node.outputs:
+            return False
+
+        if not (0 <= self.out_idx < len(node.outputs)):
+            self._logger.warning(
+                "Received invalid output index; valid: %s, received: %s",
+                list(range(len(node.outputs))), self.out_idx
+            )
+            return False
+        if not self._has_valid_shape(node.outputs[self.out_idx]):
+            return False
+
+        target_inp_idxs = self.inp_idx or list(range(len(node.inputs)))
+        if any(i < 0 or i >= len(node.inputs) for i in target_inp_idxs):
+            self._logger.warning(
+                "Received invalid input indices; valid: %s, received: %s",
+                list(range(len(node.inputs))), self.inp_idx
+            )
+            return False
+        return all(self._has_valid_shape(node.inputs[i]) for i in target_inp_idxs)
+
+    def transform(self, node: gs.Node):
+        target_out: gs.Variable = node.outputs[self.out_idx]
+        assert isinstance(target_out, gs.Variable), "Node output must be `gs.Variable`"
+        if not self._has_valid_shape(target_out):
+            raise ValueError(
+                "Missing valid integer shape info for output '%s' (node: %s, '%s')",
+                target_out.name, node.op, node.name
+            )
+        bcast_shape: list[int] = list(target_out.shape)
+        target_inp_idxs = self.inp_idx or list(range(len(node.inputs)))
+        bcast_done: set[str] = set()
+
+        for i in target_inp_idxs:
+            inp = node.inputs[i]
+            if self._unique_tensor_id(inp) in bcast_done:
+                continue
+
+            if not self._has_valid_shape(inp):
+                self._logger.warning(
+                    "Broadcasting input '%s' with no valid integer shape info (node: %s, '%s')",
+                    inp.name, node.op, node.name
+                )
+            
+            if list(inp.shape) == bcast_shape:
+                continue
+            
+            if isinstance(inp, gs.Variable):
+                self._add_broadcast_to_tensor(inp, bcast_shape)
+            elif isinstance(inp, gs.Constant):
+                if getattr(inp, "dtype", None) is None:
+                    self._logger.warning(
+                        "Skipping broadcast of initializer '%s' due to missing dtype info",
+                        inp.name
+                    )
+                    continue
+                if self.constants_policy == ConstantBroadcastPolicy.SKIP:
+                    continue
+                if self.constants_policy == ConstantBroadcastPolicy.DEFER_RUNTIME:
+                    self._add_broadcast_to_tensor(inp, bcast_shape)
+                elif self.constants_policy == ConstantBroadcastPolicy.MATERIALIZE:
+                    export_dtype = inp.export_dtype
+                    if inp.dtype == onnx.TensorProto.BFLOAT16:
+                        dtype = np.float32
+                        export_dtype = onnx.TensorProto.BFLOAT16
+                    else:
+                        dtype = onnx.helper.tensor_dtype_to_np_dtype(inp.dtype) \
+                            if isinstance(inp.dtype, int) else inp.dtype
+                    bcast_values = np.broadcast_to(inp.values, bcast_shape).astype(dtype)
+                    bcast_const = gs.Constant(
+                        name=inp.name + "_bcast",
+                        values=bcast_values,
+                        export_dtype=export_dtype
+                    )
+                    bcast_const.outputs = inp.outputs
+                    inp.outputs.clear()
+                else:
+                    raise ValueError(f"Invalid constant broadcast policy '{self.constants_policy}'")
+            else:
+                raise ValueError(f"Invalid input tensor type '{type(inp)}'")
+            
+            bcast_done.add(self._unique_tensor_id(inp))
+            self._logger.debug(
+                "Broadcasted input '%s' of %s node '%s' to %s",
+                inp.name, node.op, node.name, bcast_shape
+            )
 
 
 class MoonshineOnnxGraphEditor(OnnxGraphEditor):
@@ -740,4 +892,14 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
         max_int: int
     ):
         self.apply_edit(ReplaceInt64FloatCast(self._graph, self._graph_name, max_int))
+        return self
+    
+    def broadcast_op_inputs(
+        self,
+        ops: list[str],
+        output_idx: int = 0,
+        inputs_idx: list[int] = None,
+        constants_policy: ConstantBroadcastPolicy = ConstantBroadcastPolicy.SKIP,
+    ):
+        self.apply_edit(BroadcastOpInputs(self._graph, self._graph_name, ops, output_idx, inputs_idx, constants_policy))
         return self

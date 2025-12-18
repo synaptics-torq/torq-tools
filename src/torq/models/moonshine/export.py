@@ -109,6 +109,7 @@ class MoonshineModelExporter:
             floor(floor(floor(self._num_samples / 64 - 127 / 64) / 3) / 2) - 1
         )
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
+        self._broadcast_ops = edit_args.get("broadcast_ops", None)
 
         if onnx_source_dir and (onnx_source_dir := Path(onnx_source_dir)).exists():
             self._onnx_dir = onnx_source_dir
@@ -416,6 +417,12 @@ class MoonshineModelExporter:
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
 
+        # Broadcast op inputs to match output shape
+        if self._broadcast_ops is not None:
+            editor.broadcast_op_inputs(
+                ops=self._broadcast_ops,
+            )
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
@@ -430,6 +437,11 @@ class MoonshineModelExporter:
             editor.dequantize_projections_matmul(
                 hidden_size=int(self._config.hidden_size),
                 vocab_size=int(self._config.vocab_size)
+            )
+        # Broadcast op inputs to match output shape
+        if self._broadcast_ops is not None:
+            editor.broadcast_op_inputs(
+                ops=self._broadcast_ops,
             )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
@@ -669,7 +681,8 @@ def export_moonshine_from_args(args: argparse.Namespace):
         use_optimum=args.use_optimum,
         convert_dtype=args.convert_dtype,
         skip_export=args.skip_export,
-        replace_int_bf16_cast=args.replace_int_bf16_cast
+        replace_int_bf16_cast=args.replace_int_bf16_cast,
+        broadcast_ops=args.broadcast_ops
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtype:

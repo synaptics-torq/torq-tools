@@ -92,6 +92,14 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         choices=["encoder", "decoder", "decoder_with_past", "decoder_merged"],
         help="Skip export of specific components"
     )
+    parser.add_argument(
+        "--broadcast-ops",
+        type=str,
+        metavar="OP",
+        nargs="*",
+        default=None,
+        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
+    )
     add_logging_args(parser)
     add_iree_args(parser)
 
