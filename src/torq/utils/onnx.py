@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import logging
 import os
+import re
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from shutil import rmtree
@@ -279,6 +281,36 @@ def extract_subgraphs(
         if matches:
             subgraphs_dirs.append(subgraphs_dir)
     return subgraphs_dirs
+
+
+def normalize_layer_name(
+    name: str,
+    *,
+    replacement: str = "_",
+    collapse: bool = True,
+    strip: bool = True,
+    lowercase: bool = False,
+) -> str:
+    """Normalize an ONNX layer name into a safe version for use in model I/O."""
+
+    _VALID_CHARS = re.compile(r"[^0-9a-zA-Z_]")
+
+    if not name:
+        return "unnamed"
+
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = name.replace("\\", replacement).replace("/", replacement)
+    name = _VALID_CHARS.sub(replacement, name)
+
+    if collapse:
+        name = re.sub(rf"{re.escape(replacement)}+", replacement, name)
+    if strip:
+        name = name.strip(replacement)
+    if lowercase:
+        name = name.lower()
+
+    return name or "unnamed"
 
 
 # -----------------------------------------------------------------------------
