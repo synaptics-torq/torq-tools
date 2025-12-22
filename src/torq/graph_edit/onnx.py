@@ -203,3 +203,46 @@ class OnnxGraphEditor:
                     str(old_shape),
                     str(tensor.shape)
                 )
+
+    def _reorder_graph_io(
+        self,
+        io_type: str,
+        io_name: str,
+        new_pos: int
+    ):
+        assert io_type in ("input", "output")
+        io_tensors = self._graph.inputs if io_type == "input" else self._graph.outputs
+
+        # Normalize new_pos to a concrete [0, len] insertion index
+        n = len(io_tensors)
+        if new_pos < 0:
+            new_pos = n + new_pos + 1  # so -1 means "end"
+        new_pos = max(0, min(new_pos, n))
+
+        for i, t in enumerate(io_tensors):
+            if not isinstance(t, gs.Variable):
+                self._logger.warning("Found non variable graph %s '%s', (%s)", io_type, getattr(t, "name", "<unnamed>"), type(t))
+                continue
+            if t.name == io_name:
+                io_tensors.pop(i)
+                if new_pos > i:
+                    new_pos -= 1
+                io_tensors.insert(new_pos, t)
+                return
+
+        self._logger.warning("%s '%s' (type: %s) not found in graph; no reordering performed", io_type.capitalize(), io_name)
+
+
+    def reorder_graph_input(
+        self,
+        input_name: str,
+        new_pos: int
+    ):
+        self._reorder_graph_io("input", input_name, new_pos)
+
+    def reorder_graph_output(
+        self,
+        output_name: str,
+        new_pos: int
+    ):
+        self._reorder_graph_io("output", output_name, new_pos)
