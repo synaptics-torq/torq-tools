@@ -71,6 +71,7 @@ class MoonshineModelExporter:
         model_size: Literal["base", "tiny"] = "tiny",
         model_dtype: str = "float",
         split_encoder: bool = False,
+        extract_embeddings: bool = False,
         static_models: bool = True,
         *,
         max_audio_s: int = 5,
@@ -92,6 +93,7 @@ class MoonshineModelExporter:
         self._model_size = model_size
         self._model_dtype = model_dtype
         self._split_encoder = split_encoder
+        self._extract_embeddings = extract_embeddings
         self._static_models = static_models
         self._models_dir = Path(models_dir)
         self._show_model_info = show_model_info
@@ -108,6 +110,8 @@ class MoonshineModelExporter:
         self._enc_seq_len = (
             floor(floor(floor(self._num_samples / 64 - 127 / 64) / 3) / 2) - 1
         )
+        self._hidden_size = int(self._config.hidden_size)
+        self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
 
@@ -435,8 +439,8 @@ class MoonshineModelExporter:
         # Manually dequantize projection scores
         if self._model_dtype in ("quantized", "quantized_4bit"):
             editor.dequantize_projections_matmul(
-                hidden_size=int(self._config.hidden_size),
-                vocab_size=int(self._config.vocab_size)
+                hidden_size=self._hidden_size,
+                vocab_size=self._vocab_size
             )
         # Broadcast op inputs to match output shape
         if self._broadcast_ops is not None:
@@ -444,8 +448,29 @@ class MoonshineModelExporter:
                 ops=self._broadcast_ops,
             )
 
+        if self._extract_embeddings:
+            # Extract token embeddings LUT
+            embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
+            embeddings_inp = "token_embedding"
+            editor.extract_token_embeddings(
+                self._hidden_size,
+                self._vocab_size,
+                embeddings_npy,
+                inp_name=embeddings_inp
+            )
+            editor.reorder_graph_input(embeddings_inp, 0)
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
+
+    def _dedup_decoder_embeddings_npy(self, emb_dir: str | os.PathLike):
+        emb_dir = Path(emb_dir)
+        if (d_emb_p := emb_dir / f"decoder_token_embeddings.npy").exists() \
+            and (dp_emb_p := emb_dir / f"decoder_with_past_token_embeddings.npy").exists():
+            d_emb = np.load(d_emb_p)
+            dp_emb = np.load(dp_emb_p)
+            if np.array_equal(d_emb, dp_emb):
+                dp_emb_p.unlink()
 
     def make_static(self):
         if self._merged_decoder:
@@ -497,6 +522,7 @@ class MoonshineModelExporter:
             self._patch_static_encoder(model_path, component)
         else:
             self._patch_static_decoder(model_path, component)
+            self._dedup_decoder_embeddings_npy(Path(model_path).parent)
 
     def export_onnx(self, validate: bool = True):
         if self._static_models:
@@ -602,6 +628,10 @@ class MoonshineModelExporter:
                 runner.last_infer_time * 1000,
                 result
             )
+        self._logger.info(
+            "(ONNX-validation) Avg. inference time: %.3f ms",
+            runner.avg_infer_time * 1000
+        )
 
     def convert_models(self, convert_dir: str | os.PathLike | None = None):
         if not self._convert_dtype:
@@ -672,6 +702,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         args.model_size,
         args.dtype,
         args.split_encoder,
+        args.extract_embeddings,
         not args.dynamic_models,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,

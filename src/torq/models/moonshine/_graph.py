@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 import hashlib
 import os
 
@@ -15,6 +16,10 @@ from ...graph_edit import (
     DimMatchType,
     FixedDimMapping,
     OnnxGraphEditor
+)
+
+from ...utils.onnx import (
+    normalize_layer_name
 )
 
 @dataclass
@@ -758,6 +763,63 @@ class BroadcastOpInputs(OnnxGraphEdit):
                 inp.name, node.op, node.name, bcast_shape
             )
 
+@dataclass
+class ExtractConstantLUT(OnnxGraphEdit):
+
+    lut_shape: tuple[int, ...]
+    save_to: os.PathLike | str
+    inp_name: str | None = None
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Gather" or len(node.inputs) < 2:
+            return False
+        if node.attrs.get("axis", None) != 0:
+            return False
+        lut = node.inputs[0]
+        if not isinstance(lut, gs.Constant):
+            return False
+        lut_shape = lut.values.shape
+        if lut_shape == self.lut_shape:
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        if not (node.op == "Gather" and len(node.inputs) >= 2 and isinstance((lut := node.inputs[0]), gs.Constant)):
+            raise ValueError(f"Gather node '{node.name}' does not have a constant data input")
+        if (axis := node.attrs.get("axis", None)) != 0:
+            raise ValueError(f"Only support axis = 0 for LUT, found axis = {axis} for Gather node '{node.name}'")
+        
+        lut_data = lut.values
+        if not isinstance(lut_data, np.ndarray):
+            self._logger.warning("Constant data is not NumPy array, attempting to load lazy values")
+            try:
+                lut_data = lut_data.load()
+            except AttributeError as e:
+                raise ValueError(f"Constant data for {node.name} is not loadable") from e
+            if not isinstance(lut_data, np.ndarray):
+                raise ValueError(f"Invalid Constant data type: {type(lut_data)}")
+        
+        self.save_to = Path(self.save_to)
+        self.save_to.parent.mkdir(parents=True, exist_ok=True)
+        np.save(self.save_to, lut_data)
+
+        if not self.inp_name:
+            self.inp_name = f"extracted_lut_{normalize_layer_name(node.name)}_input"
+        lut_out: gs.Variable = node.outputs[0]
+        consumers: list[gs.Node] = list(lut_out.outputs)        
+        lut_entry_inp = gs.Variable(
+            name=self.inp_name,
+            dtype=lut_out.dtype,
+            shape=lut_out.shape
+        )
+        self.rewire_consumers(consumers, lut_out, lut_entry_inp)
+        self.graph.inputs.append(lut_entry_inp)
+        node.outputs.clear()
+        self._logger.debug(
+            "Extracted LUT from '%s', consumers redirected to graph input '%s'",
+            node.name, self.inp_name
+        )
+
 
 class MoonshineOnnxGraphEditor(OnnxGraphEditor):
 
@@ -902,4 +964,14 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
         constants_policy: ConstantBroadcastPolicy = ConstantBroadcastPolicy.SKIP,
     ):
         self.apply_edit(BroadcastOpInputs(self._graph, self._graph_name, ops, output_idx, inputs_idx, constants_policy))
+        return self
+
+    def extract_token_embeddings(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        save_to: os.PathLike | str,
+        inp_name: str = "token_embedding"
+    ):
+        self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
         return self

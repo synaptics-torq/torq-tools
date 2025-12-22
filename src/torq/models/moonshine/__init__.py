@@ -62,6 +62,12 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Split merged encoder into preprocessor and encoder models"
     )
     parser.add_argument(
+        "--extract-embeddings",
+        action="store_true",
+        default=False,
+        help="Extract large embeddings tables into external .npy data"
+    )
+    parser.add_argument(
         "--dynamic-models",
         action="store_true",
         default=False,
