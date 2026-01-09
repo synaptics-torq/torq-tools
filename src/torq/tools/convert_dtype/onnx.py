@@ -263,7 +263,7 @@ class OnnxDtypeConverterBase(ABC):
                 continue
             const_node_out: gs.Variable = node.outputs[0]
             const_init: gs.Constant = gs.Constant(
-                name=const_node_out.name or (node.name or self._random_tag()) + "_folded",
+                name=(const_node_out.name or node.name) + "_folded",
                 values=value.values
             )
             consumers: list[gs.Node] = list(const_node_out.outputs)
