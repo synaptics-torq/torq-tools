@@ -217,6 +217,7 @@ class MoonshineStatic(MoonshineBase):
             cache_name: (1, self._n_kv_heads, self._max_dec_len, self._head_dim)
             for cache_name in self._dec_cache_names
         }
+        self._token_embeddings: np.ndarray | None = self._find_token_embeddings()
 
     @classmethod
     def from_onnx(
@@ -302,6 +303,23 @@ class MoonshineStatic(MoonshineBase):
             max_dec_len
         )
 
+    def _find_token_embeddings(
+        self,
+        emb_pattern: str = "decoder*token_embeddings.npy",
+    ) -> np.ndarray | None:
+        paths = []
+        for model in (self._decoder, self._decoder_with_past):
+            paths.extend(model.model_path.parent.glob(emb_pattern))
+        if not paths:
+            return None
+
+        paths = list({p.resolve(): p for p in paths}.values())
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+            )
+        return np.load(paths[0])
+
     def _pad_cache_tensor(
         self, cache_name: str, cache_values: np.ndarray
     ) -> np.ndarray:
@@ -337,22 +355,29 @@ class MoonshineStatic(MoonshineBase):
         for k, v in zip(cache_tensors, new_values):
             self._kv_cache[k] = self._pad_cache_tensor(k, v)
 
+    def _get_decoder_token_input(
+        self,
+        input_tokens: list[int]
+    ) -> dict[str, np.ndarray]:
+        if isinstance(self._token_embeddings, np.ndarray):
+            last_tok = input_tokens[-1]
+            return {"token_embedding": np.expand_dims(self._token_embeddings[last_tok], axis=(0, 1))}
+        return {"input_ids": np.array([input_tokens], dtype=np.int64)}
+
     def _run_decoder(
         self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        input_ids = np.array([input_tokens], dtype=np.int64)
+        decoder_inputs = self._get_decoder_token_input(input_tokens)
         if seq_len == 0:
-            decoder_inputs = {
-                "input_ids": input_ids,
+            decoder_inputs.update({
                 "encoder_hidden_states": encoder_out,
-            }
+            })
             logits, *cache = self._decoder.infer(decoder_inputs)
         else:
-            decoder_inputs = {
-                "input_ids": input_ids,
+            decoder_inputs.update({
                 **self._kv_cache,
                 "current_len": np.array([[seq_len]], dtype=np.int64),
-            }
+            })
             logits, *cache = self._decoder_with_past.infer(decoder_inputs)
         next_token = logits[0, -1].argmax().item()
         return next_token, cache

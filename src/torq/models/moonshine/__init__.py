@@ -62,6 +62,12 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Split merged encoder into preprocessor and encoder models"
     )
     parser.add_argument(
+        "--extract-embeddings",
+        action="store_true",
+        default=False,
+        help="Extract large embeddings tables into external .npy data"
+    )
+    parser.add_argument(
         "--dynamic-models",
         action="store_true",
         default=False,
@@ -91,6 +97,14 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         nargs="+",
         choices=["encoder", "decoder", "decoder_with_past", "decoder_merged"],
         help="Skip export of specific components"
+    )
+    parser.add_argument(
+        "--broadcast-ops",
+        type=str,
+        metavar="OP",
+        nargs="*",
+        default=None,
+        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
     add_logging_args(parser)
     add_iree_args(parser)
