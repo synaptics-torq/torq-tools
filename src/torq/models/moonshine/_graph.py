@@ -385,6 +385,49 @@ class RemoveIsNaN(OnnxGraphEdit):
 
 
 @dataclass
+class RemoveRedundantCasts(OnnxGraphEdit):
+    """
+    Remove redundant Cast ops where input dtype == output dtype
+    """
+
+    @staticmethod
+    def _to_onnx_dtype(dtype: np.dtype | int | None) -> int | None:
+        if dtype is None:
+            return None
+        if isinstance(dtype, int):
+            return dtype
+        try:
+            return onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+        except Exception:
+            return None
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Cast" or not node.inputs or not node.outputs:
+            return False
+        inp_dtype = self._to_onnx_dtype(getattr(node.inputs[0], "dtype", None))
+        if inp_dtype is None:
+            return False
+        cast_to = node.attrs.get("to", None)
+        if isinstance(cast_to, int) and inp_dtype == cast_to:
+            return True
+        out_dtype = self._to_onnx_dtype(getattr(node.outputs[0], "dtype", None))
+        return out_dtype is not None and inp_dtype == out_dtype
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Cast")
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        consumers: list[gs.Node] = list(out.outputs)
+        self.rewire_consumers(consumers, out, inp)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is out:
+                self.graph.outputs[i] = inp
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.debug("Removed redundant Cast node '%s'", node.name)
+
+
+@dataclass
 class MoveOutputFromConcat(OnnxGraphEdit):
     """
     Move outputs from Concat nodes to their consumer Pad nodes for compatibility.
@@ -934,6 +977,12 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
         self
     ):
         self.apply_edit(RemoveIsNaN(self._graph, self._graph_name))
+        return self
+
+    def remove_redundant_casts(
+        self
+    ):
+        self.apply_edit(RemoveRedundantCasts(self._graph, self._graph_name))
         return self
 
     def move_output_from_concat(

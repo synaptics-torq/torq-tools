@@ -376,6 +376,8 @@ class MoonshineModelExporter:
         editor = MoonshineOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
 
+        # Remove redundant Cast ops
+        editor.remove_redundant_casts()
         # Remove isNaN ops
         editor.remove_isNaN()
         # Move model output if it's fed by a Concat node which has a Pad consumer
