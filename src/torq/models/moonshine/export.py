@@ -462,6 +462,9 @@ class MoonshineModelExporter:
             )
             editor.reorder_graph_input(embeddings_inp, 0)
 
+        # Replace Pad ops with Concat ops
+        editor.replace_pad_with_concat()
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
