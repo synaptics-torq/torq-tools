@@ -1,0 +1,39 @@
+name: Publish code to other repository
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: 'Target repository name'
+        required: true
+        default: 'torq-tools'
+
+jobs:
+  push-to-repo:    
+    name: Push code to other repository
+    runs-on: ubuntu-latest
+    environment: torq-tools
+    steps:
+      - name: Generate GitHub token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PUBLISHING_APP_ID }}
+          private-key: ${{ secrets.PUBLISHING_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to other repository
+        run: |
+
+          # remove original authentication header that uses  GITHUB_TOKEN (this doesn't have push rights to the public repo)
+          git config --local --unset-all http.https://github.com/.extraheader
+
+          REPO_URL="https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/${{github.repository_owner}}/${{ inputs.target_repository }}.git"
+
+          # push without forcing so that we fail if things were merged in the other repo in meantime
+          git push "$REPO_URL" main:main
