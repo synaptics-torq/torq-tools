@@ -51,7 +51,7 @@ def add_onnx_args(
     parser: argparse.ArgumentParser,
     *,
     model_dtypes: list[str] | None = None,
-    convert_dtypes: list[str] | None = None,
+    convert_dtypes: bool = False,
     allow_no_opt: bool = True,
 ):
     group = parser.add_argument_group("ONNX args")
@@ -91,11 +91,10 @@ def add_onnx_args(
         )
     if convert_dtypes:
         group.add_argument(
-            "--convert-dtype",
-            type=str,
-            metavar="DTYPE",
-            choices=convert_dtypes,
-            help="Convert FP32 model to 16-bit float dtype (choices: %(choices)s)"
+            "--convert-dtypes",
+            action="store_true",
+            default=False,
+            help="Convert model to supported dtypes"
         )
 
 
