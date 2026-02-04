@@ -16,7 +16,7 @@ from torq.utils.logging import add_logging_args, configure_logging
 
 from ...utils.onnx import is_same_dtype, upgrade_model
 
-logger = logging.getLogger("FP32-Converter")
+logger = logging.getLogger("ONNX-Dtype-Converter")
 
 _ONNX_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
     "fp32": onnx.TensorProto.FLOAT,
