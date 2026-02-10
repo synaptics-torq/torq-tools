@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import json
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -26,16 +28,46 @@ from ...inference.runners import (
     TFLiteInferenceRunner
 )
 
+DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named SmolLM. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
 
-class SmolLMBase(ABC):
 
-    DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named SmolLM. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
+@dataclass(frozen=True)
+class ModelConfig:
+    n_layers: int
+    n_kv_heads: int
+    head_dim: int
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int | None = None
+    instruct_model: bool = False
+
+    @classmethod
+    def from_json_config(cls, json_file: str | os.PathLike, instruct_model: bool = False) -> "ModelConfig":
+        with open(json_file) as f:
+            config = json.load(f)
+        try:
+            return cls(
+                config["num_hidden_layers"],
+                config["num_key_value_heads"],
+                config["hidden_size"] // config["num_attention_heads"],
+                config["bos_token_id"],
+                config["eos_token_id"],
+                config.get("pad_token_id"),
+                instruct_model
+            )
+        except KeyError as e:
+            raise ValueError(f"Model config missing required metadata: {e}")
+
+
+class SmolLM2Base(ABC):
 
     def __init__(
         self,
         model: InferenceRunner,
+        config: ModelConfig,
         max_prompt_tokens: int | None,
         max_gen_tokens: int | None,
+        tokenizer: Tokenizer,
         sys_prompt: str | None,
         *,
         temperature: float = 0.0,
@@ -45,40 +77,29 @@ class SmolLMBase(ABC):
         self._model = model
         self._max_prompt_tokens = max_prompt_tokens
         self._max_gen_tokens = max_gen_tokens
+        self._tokenizer = tokenizer
+        self._sys_prompt = sys_prompt
         self._max_total_tokens = self._calc_max_total_tokens(self._max_prompt_tokens, self._max_gen_tokens)
         self._max_user_tokens: int | None = None
-        self._sys_prompt = sys_prompt or self.DEFAULT_SYS_PROMPT
         self._temperature = temperature
         self._top_p = top_p
-        self._tokenizer: Tokenizer = Tokenizer.from_file(hf_hub_download("HuggingFaceTB/SmolLM2-135M-Instruct", "tokenizer.json"))
-
-        # from HuggingFaceTB/SmolLM-135M/config.json
-        self._n_layers: int = 30
-        self._n_kv_heads: int = 3
-        self._head_dim: int = 64
-        self._start_token_id: int = 1
-        self._end_token_id: int = 2
-        self._pad_token_id: int = 2
-        self._encoder_pad_id: int = 2
-        self._start_token: str = self._tokenizer.decode([self._start_token_id], skip_special_tokens=False)
-        self._end_token: str = self._tokenizer.decode([self._end_token_id], skip_special_tokens=False)
+        
+        self._n_layers: int = config.n_layers
+        self._n_kv_heads: int = config.n_kv_heads
+        self._head_dim: int = config.head_dim
+        self._instruct_model: bool = config.instruct_model
+        self._bos_token_id: int = config.bos_token_id
+        self._eos_token_id: int = config.eos_token_id
+        self._pad_token_id: int = config.pad_token_id or 0
+        self._nl_token_id: int = self._tokenizer.encode("\n").ids[0]
+        self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
+        self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
+        self._logger.info("Loaded model '%s'", str(self._model.model_path))
 
         self._n_tokens_gen: int = 0
         self._infer_times: deque[float] = deque(maxlen=100)
-        self._warmup_len: int = 0
-
-        self._kv_cache: dict[str, np.ndarray] = {
-            f"past_key_values.{i}.{typ}": np.zeros(
-                (1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32
-            )
-            for i in range(self._n_layers)
-            for typ in ("key", "value")
-        }
-        self._all_cache_names: list[str] = list(self._kv_cache)
-        self._dec_cache_names: list[str] = [
-            k for k in self._all_cache_names if "encoder" not in k
-        ]
-        self._gen_start_token = self.warmup()
+        self._kv_cache = self._init_cache()
+        self._warmup_len = self.warmup() if self._instruct_model else 0
         self._reset_cache_state = deepcopy(self._kv_cache)
 
     @property
@@ -93,6 +114,27 @@ class SmolLMBase(ABC):
     def max_inp_len(self) -> int | None:
         return self._max_user_tokens if self._max_user_tokens is not None else self._max_prompt_tokens
 
+    @abstractmethod
+    def _init_cache(self) -> dict[str, np.ndarray]: ...
+    
+    @abstractmethod
+    def _llm_step(self, token: int, curr_seq_len: int) -> tuple[int, list[np.ndarray]]: ...
+
+    @abstractmethod
+    def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool: ...
+
+    @abstractmethod
+    def _run(self, input: list[int], max_gen_tokens: int | None = None) -> list[int]: ...
+
+    @staticmethod
+    def _calc_max_total_tokens(max_prompt_tokens: int | None, max_gen_tokens: int | None) -> int | None:
+        if isinstance(max_prompt_tokens, (int, float)) and isinstance(max_gen_tokens, (int, float)):
+            return int(max_prompt_tokens + max_gen_tokens)
+        return None
+
+    def _reset_cache(self):
+        self._kv_cache.update(self._reset_cache_state)
+
     def _format_input_tokens(self, input: list[int]) -> np.ndarray:
 
         max_len = self.max_inp_len
@@ -105,16 +147,10 @@ class SmolLMBase(ABC):
                 input = np.pad(
                     input,
                     (0, max_len - len(input)),
-                    constant_values=self._encoder_pad_id,
+                    constant_values=self._pad_token_id,
                 ).tolist()
 
         return input
-
-    @staticmethod
-    def _calc_max_total_tokens(max_prompt_tokens: int | None, max_gen_tokens: int | None) -> int | None:
-        if isinstance(max_prompt_tokens, (int, float)) and isinstance(max_gen_tokens, (int, float)):
-            return int(max_prompt_tokens + max_gen_tokens)
-        return None
 
     def sample_next_token(
         self,
@@ -143,15 +179,6 @@ class SmolLMBase(ABC):
         kept_probs = kept_probs / kept_probs.sum()
 
         return int(np.random.choice(keep, p=kept_probs))
-    
-    @abstractmethod
-    def _llm_step(self, token: int, curr_seq_len: int): ...
-
-    @abstractmethod
-    def _run(self, input: list[int], max_gen_tokens: int | None = None) -> list[int]: ...
-
-    def _reset_cache(self):
-        self._kv_cache.update(self._reset_cache_state)
 
     def _prefill_prompt(self, prompt_tokens: list[int], start_seq_len: int = 0) -> tuple[int, int]:
         num_tokens_gen = start_seq_len
@@ -163,13 +190,14 @@ class SmolLMBase(ABC):
         return next_token, num_tokens_gen
     
     def _tokenize_input(self, input: str, role: str) -> list[int]:
+        if not self._instruct_model:
+            return self._tokenizer.encode(input).ids
         if role == "assistant":
-            return self._tokenizer.encode(self._start_token + role + "\n").ids
-        return self._tokenizer.encode(self._start_token + role + "\n" + input + self._end_token + "\n").ids
+            return self._tokenizer.encode(self._bos_token + role + "\n").ids
+        return self._tokenizer.encode(self._bos_token + role + "\n" + input + self._eos_token + "\n").ids
 
     def run(self, input: str, max_gen_tokens: int | None = None) -> str:
         self._reset_cache()
-        # inp_tokens = self._tokenize_input(self._sys_prompt, "system")
         inp_tokens = self._tokenize_input(input, "user")
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
@@ -178,7 +206,10 @@ class SmolLMBase(ABC):
         self._infer_times.append(et - st)
         return output
 
-    def warmup(self):
+    def warmup(self) -> int:
+        if not self._instruct_model:
+            self._logger.warning("Not an instruct model, skipping system prompt warm-up")
+            return 0
         sys_tokens = self._tokenize_input(self._sys_prompt, "system")
         if isinstance(self._max_prompt_tokens, int):
             if len(sys_tokens) > self._max_prompt_tokens:
@@ -187,44 +218,62 @@ class SmolLMBase(ABC):
             self._max_user_tokens = max(0, self._max_prompt_tokens - len(sys_tokens))
             if self._max_user_tokens < 1:
                 self._logger.warning("No tokens left for user prompt")
-        self._warmup_len = len(sys_tokens)
-        gen_start_token, _ = self._prefill_prompt(sys_tokens, start_seq_len=0)
+        warmup_len = len(sys_tokens)
+        self._prefill_prompt(sys_tokens, start_seq_len=0)
         if self._max_user_tokens is not None:
             self._logger.debug(
                 "Warm-up complete: %d tokens consumed by system prompt, %d tokens remaining for user input",
-                self._warmup_len,
+                warmup_len,
                 self._max_user_tokens,
             )
         else:
             self._logger.debug(
                 "Warm-up complete: %d tokens consumed by system prompt",
-                self._warmup_len,
+                warmup_len,
             )
-        return gen_start_token
+        return warmup_len
 
 
-class SmolLMDynamic(SmolLMBase):
+class SmolLMDynamic(SmolLM2Base):
 
     def __init__(
         self,
         model: InferenceRunner,
         max_prompt_tokens: int | None = None,
         max_gen_tokens: int | None = None,
+        instruct_model: bool = False,
+        repo_id: str | None = None
     ):
-        super().__init__(model, max_prompt_tokens, max_gen_tokens, "You are a helpful AI maths assistant; provide ONLY the final numerical result as the answer, DO NOT elaborate.",)
-
-        self._logger.info("Loaded model '%s'", str(self._model.model_path))
+        if repo_id is None:
+            repo_id: str = "HuggingFaceTB/SmolLM2-135M"
+            if instruct_model:
+                repo_id += "-Instruct"
+        super().__init__(
+            model,
+            ModelConfig.from_json_config(
+                hf_hub_download(repo_id, "config.json"),
+                instruct_model
+            ),
+            max_prompt_tokens,
+            max_gen_tokens,
+            Tokenizer.from_file(
+                hf_hub_download(repo_id, "tokenizer.json")
+            ),
+            DEFAULT_SYS_PROMPT if instruct_model else None
+        )
 
     @classmethod
     def from_onnx(
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
-        n_threads: int | None = None
+        n_threads: int | None = None,
+        instruct_model: bool = False
     ) -> "SmolLMDynamic":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
-            max_inp_len
+            max_prompt_tokens=max_inp_len,
+            instruct_model=instruct_model
         )
 
     @classmethod
@@ -232,12 +281,23 @@ class SmolLMDynamic(SmolLMBase):
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
-        n_threads: int | None = None
+        n_threads: int | None = None,
+        instruct_model: bool = False
     ) -> "SmolLMDynamic":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
-            max_inp_len
+            max_prompt_tokens=max_inp_len,
+            instruct_model=instruct_model
         )
+
+    def _init_cache(self) -> dict[str, np.ndarray]:
+        return {
+            f"past_key_values.{i}.{typ}": np.zeros(
+                (1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32
+            )
+            for i in range(self._n_layers)
+            for typ in ("key", "value")
+        }
 
     def _update_cache(self, new_values: list[np.ndarray]):
         for k, v in zip(self._kv_cache.keys(), new_values):
@@ -259,6 +319,13 @@ class SmolLMDynamic(SmolLMBase):
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
 
+    def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
+        if next_token == self._eos_token_id:
+            return True
+        if not self._instruct_model:
+            # WARNING: relying on "\n\n" is fragile but is the best we have right now
+            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+
     def _run(
         self,
         inp_tokens: list[int],
@@ -267,8 +334,8 @@ class SmolLMDynamic(SmolLMBase):
         self._max_gen_tokens = max_gen_tokens or self._max_gen_tokens
         inp_tokens = self._format_input_tokens(inp_tokens)
         next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
-        gen_tokens = []
-        while next_token != self._end_token_id:
+        gen_tokens = [next_token]
+        while not self._stop_decoding(next_token, gen_tokens):
             if isinstance(self._max_gen_tokens, int) and len(gen_tokens) >= self._max_gen_tokens:
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
@@ -276,7 +343,6 @@ class SmolLMDynamic(SmolLMBase):
             self._update_cache(cache)
             gen_tokens.append(next_token)
             curr_seq_len += 1
-        
         self._n_tokens_gen = len(gen_tokens)
         return gen_tokens
 
