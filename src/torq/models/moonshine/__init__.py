@@ -45,7 +45,7 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
     add_onnx_args(
         parser,
         model_dtypes=ONNX_DTYPES + OPTIMUM_DTYPES,
-        convert_dtypes=["bf16", "fp16"],
+        convert_dtypes=True,
         allow_no_opt=False,
     )
     parser.add_argument(

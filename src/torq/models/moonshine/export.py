@@ -80,7 +80,7 @@ class MoonshineModelExporter:
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         use_optimum: bool = False,
-        convert_dtype: str | None = None,
+        convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
         **edit_args
     ):
@@ -97,7 +97,7 @@ class MoonshineModelExporter:
         self._static_models = static_models
         self._models_dir = Path(models_dir)
         self._show_model_info = show_model_info
-        self._convert_dtype = convert_dtype
+        self._convert_dtypes = convert_dtypes
         self._onnx_export_dtype = _FP_EXPORT_DTYPE_MAPPING.get(
             self._model_dtype,
             onnx.TensorProto.FLOAT
@@ -376,6 +376,8 @@ class MoonshineModelExporter:
         editor = MoonshineOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
 
+        # Remove redundant Cast ops
+        editor.remove_redundant_casts()
         # Remove isNaN ops
         editor.remove_isNaN()
         # Move model output if it's fed by a Concat node which has a Pad consumer
@@ -459,6 +461,9 @@ class MoonshineModelExporter:
                 inp_name=embeddings_inp
             )
             editor.reorder_graph_input(embeddings_inp, 0)
+
+        # Replace Pad ops with Concat ops
+        editor.replace_pad_with_concat()
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
@@ -634,25 +639,28 @@ class MoonshineModelExporter:
         )
 
     def convert_models(self, convert_dir: str | os.PathLike | None = None):
-        if not self._convert_dtype:
-            self._logger.warning("Skipping conversion as convert dtype is not set")
+        if not self._convert_dtypes:
+            self._logger.warning("Skipping conversion as convert_dtypes==False")
         convert_dir = convert_dir or (
             self._models_dir
             / self._hf_repo
             / "export"
             / "onnx"
             / self._model_size
-            / self._convert_dtype
+            / "converted"
             / ("static" if self._static_models else "dynamic")
         )
         for comp, model_path in self._export_paths.items():
             if comp == "preprocessor":
                 shutil.copy2(model_path, convert_dir)
                 continue
-            self._logger.info("(ONNX-convert) Converting model '%s' to dtype %s...", str(model_path), self._convert_dtype)
+            self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(model_path))
             converted_model_path = convert_dir / model_path.name
-            convert_model(model_path, converted_model_path, self._convert_dtype)
-            self._logger.info("(ONNX-convert) Successfully converted model to dtype %s @ '%s'", self._convert_dtype, str(converted_model_path))
+            convert_model(model_path, converted_model_path, "bf16")
+            self._logger.info("(ONNX-convert) Successfully converted model to dtype bf16 @ '%s'", str(converted_model_path))
+            self._logger.info("(ONNX-convert) Converting model '%s' to dtype int32...", str(model_path))
+            convert_model(converted_model_path, converted_model_path, "int32")
+            self._logger.info("(ONNX-convert) Successfully converted model to dtype int32 @ '%s'", str(converted_model_path))
             self._export_paths[comp] = converted_model_path
             self._logger.debug("(ONNX-convert) Update %s model path to '%s'", comp, str(converted_model_path))
 
@@ -668,13 +676,13 @@ class MoonshineModelExporter:
             / "export"
             / "iree"
             / self._model_size
-            / (self._convert_dtype if (self._convert_dtype and self._model_dtype == "float") else self._model_dtype)
+            / ("converted" if (self._convert_dtypes and self._model_dtype == "float") else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
         for comp, onnx_path in self._export_paths.items():
             if comp == "preprocessor":
                 continue
-            if (self._model_dtype == "bf16" or self._convert_dtype == "bf16") and self._replace_int_bf16_cast:
+            if (self._model_dtype == "bf16" or self._convert_dtypes) and self._replace_int_bf16_cast:
                 self._replace_int_to_bf16_casts(onnx_path, comp)
             self._logger.info("(IREE-export) Exporting %s model @ '%s' to IREE...", comp, str(onnx_path))
             model = onnx.load(onnx_path)
@@ -710,13 +718,13 @@ def export_moonshine_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         use_optimum=args.use_optimum,
-        convert_dtype=args.convert_dtype,
+        convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )
     exporter.export_onnx(validate=not args.skip_validation)
-    if args.convert_dtype:
+    if args.convert_dtypes:
         exporter.convert_models()
     if not args.skip_iree:
         exporter.export_iree(iree_compile_args=process_iree_args(args))
