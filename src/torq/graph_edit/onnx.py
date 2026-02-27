@@ -9,6 +9,11 @@ from collections.abc import Iterable, Mapping, Sequence
 
 import onnx
 import onnx_graphsurgeon as gs
+import re
+
+_MUL_RE = re.compile(
+    r"^\s*(\d+)\s*\*\s*([A-Za-z_]\w*)\s*$|^\s*([A-Za-z_]\w*)\s*\*\s*(\d+)\s*$"
+)
 
 
 class DimMatchType(Enum):
@@ -179,6 +184,15 @@ class OnnxGraphEditor:
 
     def fix_io_dims(self, to_fix: list[FixedDimMapping] | None = None):
         to_fix = tuple(to_fix or [])
+
+        # Build a simple symbol->value map from the provided fixed dims
+        # (works for u0/u3/s26 if you pass them in)
+        symvals: dict[str, int] = {}
+        for fd in to_fix:
+            # Only map simple identifiers like u0/u3/s26
+            if isinstance(fd.match_name, str) and fd.match_type == DimMatchType.EXACT and fd.match_name.isidentifier():
+                symvals[fd.match_name] = int(fd.value)
+
         for tensor in self._graph.inputs + self._graph.outputs:
             old_shape = list(tensor.shape)
             for i, dim in enumerate(tensor.shape):
@@ -192,6 +206,22 @@ class OnnxGraphEditor:
                         tensor.shape[i] = fixed_dim.value
                         break
                 else: # no match found, unexpected dim!
+                     # 2) If no match, try resolving "K*sym" or "sym*K"
+                    m = _MUL_RE.match(dim)
+                    print("m: ", m)
+                    if m:
+                        if m.group(1) and m.group(2):
+                            k = int(m.group(1))
+                            sym = m.group(2)
+                        else:
+                            sym = m.group(3)
+                            k = int(m.group(4))
+
+                        if sym in symvals:
+                            tensor.shape[i] = k * symvals[sym]
+                            print("tensor shape: ", tensor.shape[i])
+                            continue  # resolved, move to next dim
+
                     raise ValueError(
                         f"Unexpected dynamic dimension '{dim}' in tensor '{tensor.name}'"
                     )
