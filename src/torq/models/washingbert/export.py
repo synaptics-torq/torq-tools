@@ -19,7 +19,11 @@ from torq.compile import (
 )
 from torq.utils.logging import configure_logging
 
+from huggingface_hub import hf_hub_download
+
 from . import (
+    HF_MODEL_REPO,
+    HF_MODEL_FILES,
     LABEL_FILES,
     MODEL_COMPONENTS,
     ONNX_DTYPES,
@@ -69,6 +73,8 @@ class WashingBERTModelExporter:
             self._onnx_dir = onnx_source_dir
         else:
             self._onnx_dir = self._models_dir / "WashingBERT" / "source" / "onnx"
+            self._onnx_dir.mkdir(parents=True, exist_ok=True)
+            self._hf_download_model()
 
         self._label_map = LabelMap.from_dir(self._onnx_dir)
         self._logger.info(
@@ -110,12 +116,26 @@ class WashingBERTModelExporter:
         onnx.checker.check_model(model, full_check=True)
         return model
 
+    def _hf_download_model(self):
+        """Download WashingBERT model and label files from HuggingFace."""
+        for filename in HF_MODEL_FILES:
+            dest = self._onnx_dir / filename
+            if dest.exists():
+                self._logger.debug("Already exists: '%s'", dest)
+                continue
+            self._logger.info("Downloading '%s' from %s...", filename, HF_MODEL_REPO)
+            hf_hub_download(
+                HF_MODEL_REPO,
+                filename,
+                local_dir=self._onnx_dir,
+            )
+
     def _load_onnx(self) -> onnx.ModelProto:
         model_path = self._onnx_dir / MODEL_COMPONENTS["model"]
         if not model_path.exists():
             raise FileNotFoundError(
                 f"WashingBERT ONNX model not found at '{model_path}'. "
-                f"Place your model.onnx in '{self._onnx_dir}/'."
+                f"Download failed or use --onnx-source-dir to point to a local copy."
             )
         self._logger.info("Loading ONNX model from '%s'", model_path)
         return onnx.load(model_path)
@@ -174,7 +194,7 @@ class WashingBERTModelExporter:
         self._logger.info("Checking model...")
         static_model = self.check_model(static_model)
 
-        self._export_path = self._export_dir / "model.onnx"
+        self._export_path = self._export_dir / MODEL_COMPONENTS["model"]
         onnx.save(static_model, self._export_path)
 
         if not self._no_optimize:

@@ -26,8 +26,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from huggingface_hub import hf_hub_download
 
-from . import HF_TOKENIZER_REPO, DEFAULT_MAX_SEQ_LEN
+from . import HF_MODEL_REPO, HF_MODEL_FILES, HF_TOKENIZER_REPO, MODEL_COMPONENTS, DEFAULT_MAX_SEQ_LEN
 from ._inference import WashingBERTRunner, LabelMap
 
 
@@ -37,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WashingBERT-demo")
 
-DEFAULT_MODEL_PATH = "models/WashingBERT/source/onnx/model.onnx"
+DEFAULT_MODELS_DIR = "models/WashingBERT/source/onnx"
 
 SAMPLE_SENTENCES: list[tuple[str, str]] = [
     ("白いシャツの黄ばみを落としたい",      "Remove yellowing from white shirt"),
@@ -113,8 +114,15 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=DEFAULT_MODEL_PATH,
-        help="Path to WashingBERT ONNX model (default: %(default)s)",
+        default=None,
+        help="Path to WashingBERT ONNX model (downloads from HuggingFace if not provided)",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=DEFAULT_MODELS_DIR,
+        metavar="DIR",
+        help="Directory to download/cache HF model files (default: %(default)s)",
     )
     parser.add_argument(
         "--max-seq-len",
@@ -142,10 +150,22 @@ def main():
     )
     args = parser.parse_args()
 
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Error: model not found at '{model_path}'", file=sys.stderr)
-        sys.exit(1)
+    if args.model:
+        model_path = Path(args.model)
+        if not model_path.exists():
+            print(f"Error: model not found at '{model_path}'", file=sys.stderr)
+            sys.exit(1)
+    else:
+        models_dir = Path(args.models_dir)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nDownloading WashingBERT from {HF_MODEL_REPO}...")
+        for filename in HF_MODEL_FILES:
+            if not (models_dir / filename).exists():
+                print(f"  Downloading {filename}...")
+                hf_hub_download(HF_MODEL_REPO, filename, local_dir=models_dir)
+            else:
+                print(f"  Cached: {filename}")
+        model_path = models_dir / MODEL_COMPONENTS["model"]
 
     runner = WashingBERTRunner.from_onnx(
         model_path,

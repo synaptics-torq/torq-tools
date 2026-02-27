@@ -11,7 +11,15 @@ from ...utils.demo import add_common_args
 from ...utils.onnx import add_onnx_args
 
 
+HF_MODEL_REPO: Final[str] = "Synaptics/WashingBERT"
 HF_TOKENIZER_REPO: Final[str] = "line-corporation/line-distilbert-base-japanese"
+
+HF_MODEL_FILES: Final[list[str]] = [
+    "best_multi_task_model_fp16.onnx",
+    "intent_classes.json",
+    "types_classes.json",
+    "sec_types_classes.json",
+]
 
 LABEL_FILES: Final[dict[str, str]] = {
     "intents": "intent_classes.json",
@@ -20,7 +28,7 @@ LABEL_FILES: Final[dict[str, str]] = {
 }
 
 MODEL_COMPONENTS: Final[dict[str, str]] = {
-    "model": "model.onnx",
+    "model": "best_multi_task_model_fp16.onnx",
 }
 
 ONNX_DTYPES: Final[list[str]] = ["float", "fp32", "fp16", "bf16"]
