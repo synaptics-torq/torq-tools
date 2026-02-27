@@ -80,6 +80,7 @@ markers = [
 ]
 washingbert = [
     "transformers",
+    "fugashi",
     "mecab-python3",
     "unidic-lite",
     "sentencepiece",

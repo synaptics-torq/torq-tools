@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 transformers
+fugashi
 mecab-python3
 unidic-lite
 sentencepiece
