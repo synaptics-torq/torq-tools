@@ -14,7 +14,20 @@ from typing import Literal, Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+from onnxruntime.transformers.optimizer import optimize_model
 from transformers import AutoConfig
+from torq.utils.logging import (
+    configure_logging,
+)
+
+from . import add_smollm2_export_args
+from ._graph import SmolLM2OnnxGraphEditor
+from ...utils.onnx import (
+    get_model_opset,
+    get_model_ops_count,
+    print_onnx_model_inputs_outputs_info,
+    check_dynamic_shapes,
+)
 
 _FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
     "float": onnx.TensorProto.FLOAT,
@@ -33,13 +46,12 @@ class SmolLM2ModelExporter:
         extract_embeddings: bool = False,
         static_models: bool = True,
         *,
-        input_tokens: int = 128,
+        max_input_tokens: int = 128,
         output_ratio: float = 0.5,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtype: str | None = None,
-        skip_export: list[str] | None = None,
         **edit_args
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -50,16 +62,15 @@ class SmolLM2ModelExporter:
 
         self._extract_embeddings = extract_embeddings
         self._static_models = static_models
-        self._input_tokens = input_tokens
-        self._output_tokens = floor(output_ratio * input_tokens)
+        self._max_input_tokens = max_input_tokens
+        self._max_output_tokens = floor(output_ratio * max_input_tokens)
         self._models_dir = Path(models_dir)
         self._show_model_info = show_model_info
         self._convert_dtype = convert_dtype
         self._onnx_export_dtype = _FP_EXPORT_DTYPE_MAPPING.get(
-            self._model_dtype,
+            "fp32",
             onnx.TensorProto.FLOAT
         )
-        self._skip_export = set(skip_export or [])
         self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
         if instruct_model:
             self._hf_repo += "-Instruct"
@@ -72,16 +83,16 @@ class SmolLM2ModelExporter:
         if onnx_source_dir and (onnx_source_dir := Path(onnx_source_dir)).exists():
             self._onnx_dir = onnx_source_dir
         else:
-            self._onnx_dir = self._models_dir / "source"
+            self._onnx_dir = self._models_dir / self._hf_repo / "source" / "fp32"
             self._onnx_dir.mkdir(parents=True, exist_ok=True)
             self._optimum_export_model()
         
         self._model: onnx.ModelProto = self._load_onnx()
-        self._export_dir = self._onnx_dir / "export" / ("static" if self._static_models else "dynamic")
+        self._export_dir = self._models_dir / self._hf_repo / "export" / "fp32" / ("static" if self._static_models else "dynamic")
         if self._export_dir.exists():
             shutil.rmtree(self._export_dir, ignore_errors=True)
         self._export_dir.mkdir(parents=True, exist_ok=True)
-        self._export_paths: Path | None = None
+        self._export_path: Path | None = None
 
     @property
     def export_dir(self) -> Path:
@@ -106,8 +117,7 @@ class SmolLM2ModelExporter:
                     [
                         "optimum-cli", "export", "onnx",
                         str(self._onnx_dir),
-                        "--model", f"{self._hf_repo}-{self._model_size}",
-                        "--dtype", self._model_dtype,
+                        "--model", f"{self._hf_repo}",
                         "--opset", "22",
                         "--optimize", "O1",
                     ],
@@ -125,3 +135,171 @@ class SmolLM2ModelExporter:
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
         return onnx.load(model_path)
+
+    def _make_model_static(
+        self, model: onnx.ModelProto
+    ) -> onnx.ModelProto:
+        """
+        Make model static by replacing dynamic dimensions with fixed values and applying necessary transformations.
+
+        Replaces KV caching and other dynamic operations with static equivalents.
+
+        Args:
+            model (onnx.ModelProto): ONNX decoder model to modify
+
+        Returns:
+            onnx.ModelProto: The modified decoder model with static dimensions and transformations applied
+
+        Raises:
+            ValueError: If an unexpected dynamic dimension is found in the model inputs, outputs, or nodes
+        """
+
+        graph: gs.Graph = gs.import_onnx(model)
+        self._logger.debug(
+            "Set export data type to %s for model data type fp32",
+            onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype),
+        )
+        
+        editor = SmolLM2OnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor.fix_io(self._max_output_tokens)
+
+        # Remove isNaN ops
+        editor.remove_isNaN()
+
+        cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
+        graph.inputs.append(cur_len_2d)
+        cur_len = graph.layer(
+            name="current_len_to_1d",
+            op="Squeeze",
+            inputs=[cur_len_2d, [0]],
+            outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
+        )[0]
+
+        (
+            editor
+            # Replace dynamic KV cache
+            .replace_dynamic_kv_cache(cur_len, self._max_output_tokens)
+            # Add causal attention score mask
+            .mask_future_attn_scores(cur_len, self._max_output_tokens)
+            # Replace dynamic sequence length getter with `cur_len`
+            .add_curr_len_input(cur_len)
+            # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
+            .convert_to_static_index()
+        )
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return new_model
+
+    def _patch_static_model(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = SmolLM2OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+
+        # Fold MatMul A @ B where B is a scalar into Mul
+        editor.fold_scalar_matmul()
+        # Broadcast op inputs to match output shape
+        if self._broadcast_ops is not None:
+            editor.broadcast_op_inputs(
+                ops=self._broadcast_ops,
+            )
+
+        if self._extract_embeddings:
+            # Extract token embeddings LUT
+            embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
+            embeddings_inp = "token_embedding"
+            editor.extract_token_embeddings(
+                self._hidden_size,
+                self._vocab_size,
+                embeddings_npy,
+                inp_name=embeddings_inp
+            )
+            editor.reorder_graph_input(embeddings_inp, 0)
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def make_static(self):
+        self._logger.info("(decoder_with_past) Making graph static...")
+        self._model = self.check_model(self._model)
+        self._model = self._make_model_static(self._model)
+
+    def optimize_model(self, model_path: str | os.PathLike):
+        optimized = optimize_model(
+            str(model_path),
+            model_type="bert",
+            num_heads=self._config.num_attention_heads,
+            hidden_size=self._config.hidden_size,
+            only_onnxruntime=True,
+            verbose=False,
+        )
+        optimized.save_model_to_file(str(model_path))
+        optimized_model = onnx.load(model_path)
+        optimized_model = onnx.shape_inference.infer_shapes(
+            optimized_model, check_type=True, strict_mode=True, data_prop=False
+        )
+        onnx.save(optimized_model, model_path)
+
+    def apply_post_static_patches(self, model_path: str | os.PathLike):
+        self._patch_static_model(model_path)
+
+    def export_onnx(self, validate: bool = True):
+        if self._static_models:
+            self.make_static()
+
+
+        self._export_path = self._export_dir / f"model.onnx"
+        self._logger.info("(decoder_with_past) Checking model...")
+        self._model = self.check_model(self._model)
+        onnx.save(self._model, self._export_path)
+        self._logger.info("(decoder_with_past) Optimizing model...")
+        self.optimize_model(self._export_path)
+        if self._static_models:
+            self._logger.info("(decoder_with_past) Applying post-static conversion patches...")
+            self.apply_post_static_patches(self._export_path)
+        self.check_model(onnx.load(self._export_path))
+        if self._static_models:
+            self._logger.info("(decoder_with_past) Verifying static shapes...")
+            dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_path))
+            if dynamic_shapes:
+                raise ValueError(
+                    f"Model 'decoder_with_past' still has dynamic shapes: {json.dumps(dynamic_shapes)}"
+                )
+        if self._show_model_info:
+            print(f"\n\nInfo for model '{self._export_path}':")
+            print_onnx_model_inputs_outputs_info(self._export_path)
+            print(f"\nModel ops summary:")
+            print(
+                json.dumps(
+                    get_model_ops_count(onnx.load(self._export_path)), indent=4
+                ),
+                end="\n\n",
+            )
+        self._logger.info("(decoder_with_past) Saved model to '%s'", str(self._export_path))
+
+
+def export_smollm2_from_args(args: argparse.Namespace):
+    configure_logging(args.logging)
+    exporter = SmolLM2ModelExporter(
+        args.model_size,
+        args.instruct_model,
+        args.extract_embeddings,
+        not args.dynamic_models,
+        max_input_tokens=args.max_input_tokens,
+        output_ratio=args.output_ratio,
+        models_dir=args.models_dir,
+        onnx_source_dir=args.onnx_source_dir,
+        show_model_info=args.show_model_info,
+        convert_dtype=args.convert_dtype,
+        replace_int_bf16_cast=args.replace_int_bf16_cast,
+        broadcast_ops=args.broadcast_ops
+    )
+    exporter.export_onnx(validate=not args.skip_validation)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export SmolLM2 to Torq")
+    add_smollm2_export_args(parser)
+    export_smollm2_from_args(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()
