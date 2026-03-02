@@ -112,13 +112,13 @@ def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int],
                 # when onnx.shape_inference.infer_shapes is executed, but below is for
                 # tensors that have a value directly related with the output (u0).
                 
-                # This tensor has a relation of u0 * 300
+                # This tensor dimension exptects a value that is u0 * 300
                 if name == 'val_13092':
                     d.dim_value = 300 * int(vars['u0']) 
                     d.ClearField("dim_param")
                     continue
 
-                # Rest of tensors expects the output value.
+                # Rest of tensors expects the output value (u0).
                 if unknown == True:
                     d.dim_value = int(vars['u0'])
                     d.ClearField("dim_param")
