@@ -35,7 +35,7 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         "-s",
         "--model-size",
         type=str,
-        choices=["base", "tiny"],
+        choices=MODEL_SIZES,
         default=DEFAULT_MODEL_SIZE,
         help="SmolLM2 model size to export (default: %(default)s)",
     )
@@ -91,3 +91,50 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
     )
     add_logging_args(parser)
     add_iree_args(parser)
+
+
+def add_smollm2_infer_args(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "inputs",
+        type=str,
+        nargs="+",
+        help="Input prompts (space-separated).",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        type=str,
+        required=True,
+        metavar=".onnx | .vmfb",
+        help="Path to SmolLM2 model",
+    )
+    parser.add_argument(
+        "-s", "--model-size",
+        type=str,
+        choices=MODEL_SIZES,
+        default=DEFAULT_MODEL_SIZE,
+        help="SmolLM2 model size (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--max-gen-tokens",
+        type=int,
+        help="Maximum tokens to generate",
+    )
+    parser.add_argument(
+        "--max-inp-len",
+        type=int,
+        help="Maximum input length",
+    )
+    parser.add_argument(
+        "--instruct-model",
+        action="store_true",
+        default=False,
+        help="Is instruct model"
+    )
+    parser.add_argument(
+        "--dynamic-model",
+        action="store_true",
+        default=False,
+        help="Is dynamic model"
+    )
+    add_common_args(parser)
+    add_logging_args(parser)

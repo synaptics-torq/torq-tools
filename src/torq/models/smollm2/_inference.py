@@ -9,12 +9,9 @@ from abc import ABC, abstractmethod
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final
 
 import numpy as np
-import ai_edge_litert.interpreter as lite_rt
-import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
@@ -234,7 +231,7 @@ class SmolLM2Base(ABC):
         return warmup_len
 
 
-class SmolLMDynamic(SmolLM2Base):
+class SmolLM2Dynamic(SmolLM2Base):
 
     def __init__(
         self,
@@ -268,12 +265,14 @@ class SmolLMDynamic(SmolLM2Base):
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
         n_threads: int | None = None,
-        instruct_model: bool = False
-    ) -> "SmolLMDynamic":
+        instruct_model: bool = False,
+        repo_id: str | None = None
+    ) -> "SmolLM2Dynamic":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
-            instruct_model=instruct_model
+            instruct_model=instruct_model,
+            repo_id=repo_id
         )
 
     @classmethod
@@ -282,12 +281,14 @@ class SmolLMDynamic(SmolLM2Base):
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
         n_threads: int | None = None,
-        instruct_model: bool = False
-    ) -> "SmolLMDynamic":
+        instruct_model: bool = False,
+        repo_id: str | None = None
+    ) -> "SmolLM2Dynamic":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
-            instruct_model=instruct_model
+            instruct_model=instruct_model,
+            repo_id=repo_id
         )
 
     def _init_cache(self) -> dict[str, np.ndarray]:
@@ -332,6 +333,126 @@ class SmolLMDynamic(SmolLM2Base):
         max_gen_tokens: int | None = None
     ) -> list[int]:
         self._max_gen_tokens = max_gen_tokens or self._max_gen_tokens
+        inp_tokens = self._format_input_tokens(inp_tokens)
+        next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
+        gen_tokens = [next_token]
+        while not self._stop_decoding(next_token, gen_tokens):
+            if isinstance(self._max_gen_tokens, int) and len(gen_tokens) >= self._max_gen_tokens:
+                self._logger.warning("Max generation tokens reached, stopping early")
+                break
+            next_token, cache = self._llm_step(next_token, curr_seq_len)
+            self._update_cache(cache)
+            gen_tokens.append(next_token)
+            curr_seq_len += 1
+        self._n_tokens_gen = len(gen_tokens)
+        return gen_tokens
+
+
+class SmolLM2Static(SmolLM2Base):
+
+    def __init__(
+        self,
+        model: InferenceRunner,
+        max_prompt_tokens: int,
+        max_gen_tokens: int,
+        instruct_model: bool = False,
+        repo_id: str | None = None
+    ):
+        if repo_id is None:
+            repo_id: str = "HuggingFaceTB/SmolLM2-135M"
+            if instruct_model:
+                repo_id += "-Instruct"
+        super().__init__(
+            model,
+            ModelConfig.from_json_config(
+                hf_hub_download(repo_id, "config.json"),
+                instruct_model
+            ),
+            max_prompt_tokens,
+            max_gen_tokens,
+            Tokenizer.from_file(
+                hf_hub_download(repo_id, "tokenizer.json")
+            ),
+            DEFAULT_SYS_PROMPT if instruct_model else None
+        )
+
+    @classmethod
+    def from_onnx(
+        cls,
+        model_path: str | os.PathLike,
+        max_gen_tokens: int,
+        max_inp_len: int | None = None,
+        n_threads: int | None = None,
+        instruct_model: bool = False,
+        repo_id: str | None = None
+    ) -> "SmolLM2Static": 
+        return cls(
+            ORTInferenceRunner(model_path, n_threads=n_threads),
+            max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
+            instruct_model=instruct_model,
+            repo_id=repo_id
+        )
+
+    @classmethod
+    def from_vmfb(
+        cls,
+        model_path: str | os.PathLike,
+        max_gen_tokens: int,
+        max_inp_len: int | None = None,
+        n_threads: int | None = None,
+        instruct_model: bool = False,
+        repo_id: str | None = None
+    ) -> "SmolLM2Static":
+        return cls(
+            VMFBInferenceRunner(model_path, n_threads=n_threads),
+            max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
+            instruct_model=instruct_model,
+            repo_id=repo_id
+        )
+
+    def _init_cache(self) -> dict[str, np.ndarray]:
+        return {
+            f"past_key_values.{i}.{typ}": np.zeros(
+                [1, self._n_kv_heads, self._max_gen_tokens, self._head_dim], dtype=np.float32
+            )
+            for i in range(self._n_layers)
+            for typ in ("key", "value")
+        }
+
+    def _update_cache(self, new_values: list[np.ndarray]):
+        for k, v in zip(self._kv_cache.keys(), new_values):
+            self._kv_cache[k] = v
+
+    def _llm_step(
+        self, token: int, curr_seq_len: int
+    ) -> tuple[int, list[np.ndarray]]:
+        input_ids = np.array([[token]], dtype=np.int64)
+        pos_ids = np.array([[curr_seq_len]], dtype=np.int64)
+        inputs = {
+            "input_ids": input_ids,
+            "position_ids": pos_ids,
+            **self._kv_cache
+        }
+        logits, *cache = self._model.infer(inputs)
+        next_token = self.sample_next_token(logits[0, -1])
+        return next_token, cache
+
+    def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
+        if next_token == self._eos_token_id:
+            return True
+        if not self._instruct_model:
+            # WARNING: relying on "\n\n" is fragile but is the best we have right now
+            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+
+    def _run(
+        self,
+        inp_tokens: list[int],
+        max_gen_tokens: int | None = None
+    ) -> list[int]:
+        if isinstance(max_gen_tokens, int) and 0 <=  max_gen_tokens < self._max_gen_tokens:
+            self._max_gen_tokens = max_gen_tokens
         inp_tokens = self._format_input_tokens(inp_tokens)
         next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
         gen_tokens = [next_token]
