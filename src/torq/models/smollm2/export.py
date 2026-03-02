@@ -22,6 +22,7 @@ from torq.utils.logging import (
 
 from . import add_smollm2_export_args
 from ._graph import SmolLM2OnnxGraphEditor
+from ._inference import SmolLM2Dynamic, SmolLM2Static
 from ...utils.onnx import (
     get_model_opset,
     get_model_ops_count,
@@ -277,6 +278,74 @@ class SmolLM2ModelExporter:
                 end="\n\n",
             )
         self._logger.info("(decoder_with_past) Saved model to '%s'", str(self._export_path))
+
+        if validate:
+            self.validate_onnx()
+
+    def validate_onnx(self, n_iters: int = 5):
+        # simple dataset to test functional equivalence
+        prompts = [
+            # very short (position_ids = 0 edge case)
+            "Hello",
+
+            # normal medium-length prompt
+            "The quick brown fox jumps over the lazy dog.",
+
+            # repetitive tokens (attention accumulation / stability)
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+
+            # non-ASCII / multi-token UTF-8
+            "こんにちは世界",
+
+            # structured / punctuation-heavy (tokenizer edge cases)
+            "def foo(x): return x * 2 # simple test"
+        ]
+        n_threads: int = os.cpu_count()
+
+        if self._static_models:
+            runner = SmolLM2Static.from_onnx(
+                self._export_path,
+                self._max_gen_tokens,
+                n_threads=n_threads,
+                instruct_model=self._instruct_model,
+                repo_id=self._hf_repo
+            )
+        else:
+            runner = SmolLM2Dynamic.from_onnx(
+                self._export_path,
+                n_threads=n_threads,
+                instruct_model=self._instruct_model,
+                repo_id=self._hf_repo
+            )
+        val_runner = SmolLM2Dynamic.from_onnx(
+            self._onnx_dir /  "model.onnx",
+            n_threads=n_threads,
+            instruct_model=self._instruct_model,
+            repo_id=self._hf_repo
+        )
+
+        for i in range(n_iters):
+            if i >= len(prompts):
+                self._logger.warning("(ONNX-validation) No more samples to validate, stopping")
+                break
+        
+            input = prompts[i]
+            output = runner.run(input)
+            val_output = val_runner.run(input)
+            if output != val_output:
+                result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_output},\nGenerated:\n{output}"
+            else:
+                result = f"Validation successful, identical outputs"
+            self._logger.info(
+                "(ONNX-validation) [iter %d, %.3f ms]: %s",
+                i,
+                runner.last_infer_time / 1e6,
+                result
+            )
+        self._logger.info(
+            "(ONNX-validation) Avg. inference time: %.3f ms",
+            runner.avg_infer_time / 1e6
+        )
 
 
 def export_smollm2_from_args(args: argparse.Namespace):
