@@ -1021,9 +1021,7 @@ class FumiOnnxGraphEditor(OnnxGraphEditor):
 
     def fix_fumi_io(self, text_len: int, audio_u0: int, audio_u3: int | None = None):
         if audio_u3 is None:
-            audio_u3 = audio_u0  # if u3 is just another alias
-
-        # sanity check for texts exists, rank-2, etc... (keep your checks)
+            audio_u3 = audio_u0 
 
         # freeze the *symbols* (not "300*u0")
         self.fix_io_dims([

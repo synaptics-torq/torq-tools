@@ -205,10 +205,9 @@ class OnnxGraphEditor:
                     if fixed_dim.matches(dim):
                         tensor.shape[i] = fixed_dim.value
                         break
-                else: # no match found, unexpected dim!
-                     # 2) If no match, try resolving "K*sym" or "sym*K"
+                else:
+                     # If no match, try resolving "K*sym" or "sym*K" expressions
                     m = _MUL_RE.match(dim)
-                    print("m: ", m)
                     if m:
                         if m.group(1) and m.group(2):
                             k = int(m.group(1))
@@ -219,7 +218,6 @@ class OnnxGraphEditor:
 
                         if sym in symvals:
                             tensor.shape[i] = k * symvals[sym]
-                            print("tensor shape: ", tensor.shape[i])
                             continue  # resolved, move to next dim
 
                     raise ValueError(

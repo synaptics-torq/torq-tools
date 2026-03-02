@@ -59,15 +59,28 @@ _ALLOWED_AST_NODES = (
     ast.FloorDiv, ast.Div, ast.Mod, ast.USub, ast.UAdd, ast.Constant, ast.Name
 )
 
-def _handle_unknown_dim():
-    return "unknown"
+def has_unk_dimparam(vi: onnx.ValueInfoProto) -> bool:
+    tt = vi.type.tensor_type
+    if not tt.HasField("shape"):
+        return False
+    for d in tt.shape.dim:
+        if d.dim_param and d.dim_param.strip().startswith("unk__"):
+            return True
+    return False
+
+def drop_unk_value_info(model: onnx.ModelProto) -> onnx.ModelProto:
+    g = model.graph
+    kept = [vi for vi in g.value_info if not has_unk_dimparam(vi)]
+    del g.value_info[:]
+    g.value_info.extend(kept)
+    return model
 
 def _safe_eval_dim_expr(expr: str, vars: dict[str, int]) -> int:
     """
     Safely eval expressions like '20*u0 + 1' using only + -
     """
     if "unk" in expr: 
-        return _handle_unknown_dim()
+        return "unknown"
 
     if '+' in expr:
         op = '+'
@@ -77,8 +90,6 @@ def _safe_eval_dim_expr(expr: str, vars: dict[str, int]) -> int:
         op = None
 
     expression = expr.split(op) if op is not None else [expr,0]
-    print("expression ->: ",expression)
-    
     var, const = expression
     var = var.split('*')
     varValue = int(var[0]) * int(vars[var[1]])
@@ -86,18 +97,8 @@ def _safe_eval_dim_expr(expr: str, vars: dict[str, int]) -> int:
     
     return varValue
 
-
-    '''tree = ast.parse(expr, mode="eval")
-    for n in ast.walk(tree):
-        if not isinstance(n, _ALLOWED_AST_NODES):
-            raise ValueError(f"Unsupported dim expr: {expr} (node {type(n).__name__})")
-        if isinstance(n, ast.Name) and n.id not in vars:
-            raise ValueError(f"Unknown symbol '{n.id}' in dim expr: {expr}")
-    val = eval(compile(tree, "<dim_expr>", "eval"), {"__builtins__": {}}, dict(vars))
-    return int(val)'''
-
-def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int]) -> onnx.ModelProto:
-    def _fix_shape(shape):
+def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int], unknown) -> onnx.ModelProto:
+    def _fix_shape(shape, name):
         if shape is None:
             return
         
@@ -109,21 +110,35 @@ def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int])
             s = d.dim_param.strip()
             s = s.replace(" ", "")
             
-            # 1) exact symbol
+            # Set a value when the shape is only the variable. e.g. 's26' or 'u0'
             if s in vars:
-                print("exact symbol: ",s, 'new value: ',int(vars[s]))
                 d.dim_value = int(vars[s])
                 d.ClearField("dim_param")
-                #d.dim_param = ""
                 continue
 
-            # 2) expression containing symbols
             try:
-                print('new value: ', _safe_eval_dim_expr(s, vars))
-                if _safe_eval_dim_expr(s, vars) != "unknown":
-                    d.dim_value = _safe_eval_dim_expr(s, vars)
-                    #d.dim_param = ""
+                # Evaluate expressions like '300*u0 + 1' and set the resulting value to the tensor
+                expression = _safe_eval_dim_expr(s, vars)
+                if  expression != "unknown":
+                    d.dim_value = expression
                     d.ClearField("dim_param")
+                    continue
+
+                # Below are tensors with unknown (unk__) shapes, most of them take a value 
+                # when onnx.shape_inference.infer_shapes is executed, but below is for
+                # tensors that have a value directly related with the output (u0).
+                
+                # This tensor has a relation of u0 * 300
+                if name == 'val_13092':
+                    d.dim_value = 300 * int(vars['u0']) 
+                    d.ClearField("dim_param")
+                    continue
+
+                # Rest of tensors expects the output value.
+                if unknown == True:
+                    d.dim_value = int(vars['u0'])
+                    d.ClearField("dim_param")
+
             except Exception:
                 # leave it if we can't resolve it
                 pass
@@ -131,24 +146,17 @@ def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int])
     g = model.graph
     # Iterate over each tensor
     for vi in list(g.input) + list(g.output) + list(g.value_info):
-
-        print('*'*20)
-        print(vi.name)
-        print(vi.type.tensor_type.shape)
-
         tt = vi.type.tensor_type
         if tt.HasField("shape"):
-            _fix_shape(tt.shape)
+            _fix_shape(tt.shape, vi.name)
 
     return model
 
 
 class FumiModelExporter:
-
     COMPONENTS = {
         "model": "fumi_f_ja.onnx"
     }
-
 
     def __init__(
         self,
@@ -247,26 +255,33 @@ class FumiModelExporter:
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         return {"model": onnx.load(self._onnx_model_path)}
-    
-
 
     def _make_fumi_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = FumiOnnxGraphEditor.from_onnx(model, "model", self._onnx_export_dtype)
 
-        # Your existing IO-freeze (texts length + any other input dims you handle)
+        # Convert I/O to static
         editor.fix_fumi_io(self._text_len, self._audio_u0, self._audio_u3)
-
         static_model = editor.to_onnx(override_ir=model.ir_version)
 
         # Populate value_info as much as possible before rewriting
-        static_model = onnx.shape_inference.infer_shapes(static_model, data_prop=False)
+        static_model = onnx.shape_inference.infer_shapes(static_model, check_type=True, strict_mode=False, data_prop=True)
 
         # Now eliminate remaining symbolic dim_params everywhere (including "20*u0 + 1")
         static_model = force_all_dim_params_to_values(static_model, {
             "s26": self._text_len,
             "u0": self._audio_u0,
             "u3": self._audio_u3,
-        })
+        }, unknown = False)
+
+        # Infer unknown shapes (unk__) after setting a value to variables (s26, u0, u3)
+        static_model = onnx.shape_inference.infer_shapes(static_model, check_type=True, strict_mode=False, data_prop=True)
+
+        # Set a value to remaining unknown shapes (unk__)
+        static_model = force_all_dim_params_to_values(static_model, {
+            "s26": self._text_len,
+            "u0": self._audio_u0,
+            "u3": self._audio_u3,
+        }, unknown = True)
 
         return static_model
 
