@@ -59,22 +59,6 @@ _ALLOWED_AST_NODES = (
     ast.FloorDiv, ast.Div, ast.Mod, ast.USub, ast.UAdd, ast.Constant, ast.Name
 )
 
-def has_unk_dimparam(vi: onnx.ValueInfoProto) -> bool:
-    tt = vi.type.tensor_type
-    if not tt.HasField("shape"):
-        return False
-    for d in tt.shape.dim:
-        if d.dim_param and d.dim_param.strip().startswith("unk__"):
-            return True
-    return False
-
-def drop_unk_value_info(model: onnx.ModelProto) -> onnx.ModelProto:
-    g = model.graph
-    kept = [vi for vi in g.value_info if not has_unk_dimparam(vi)]
-    del g.value_info[:]
-    g.value_info.extend(kept)
-    return model
-
 def _safe_eval_dim_expr(expr: str, vars: dict[str, int]) -> int:
     """
     Safely eval expressions like '20*u0 + 1' using only + -
