@@ -130,7 +130,6 @@ class OnnxGraphEditor:
             remove_unused_graph_inputs=True,
             remove_unused_node_outputs=True
         ).toposort()
-        onnx.save(gs.export_onnx(self._graph), "temp.onnx")
         onnx_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(self._graph),
             check_type=check_type,
