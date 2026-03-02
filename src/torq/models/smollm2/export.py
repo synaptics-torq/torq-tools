@@ -16,6 +16,10 @@ import onnx
 import onnx_graphsurgeon as gs
 from onnxruntime.transformers.optimizer import optimize_model
 from transformers import AutoConfig
+from torq.compile import (
+    process_iree_args,
+    export_iree
+)
 from torq.utils.logging import (
     configure_logging,
 )
@@ -28,6 +32,9 @@ from ...utils.onnx import (
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
+)
+from ...tools.convert_dtype.onnx import (
+    convert_model
 )
 
 _FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
@@ -51,7 +58,7 @@ class SmolLM2ModelExporter:
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
-        convert_dtype: str | None = None,
+        convert_dtypes: bool = False,
         **edit_args
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -66,7 +73,7 @@ class SmolLM2ModelExporter:
         self._max_gen_tokens = max_gen_tokens
         self._models_dir = Path(models_dir)
         self._show_model_info = show_model_info
-        self._convert_dtype = convert_dtype
+        self._convert_dtypes = convert_dtypes
         self._onnx_export_dtype = _FP_EXPORT_DTYPE_MAPPING.get(
             "fp32",
             onnx.TensorProto.FLOAT
@@ -88,7 +95,14 @@ class SmolLM2ModelExporter:
             self._optimum_export_model()
         
         self._model: onnx.ModelProto = self._load_onnx()
-        self._export_dir = self._models_dir / self._hf_repo / "export" / "fp32" / ("static" if self._static_models else "dynamic")
+        self._export_dir = (
+            self._models_dir
+            / self._hf_repo
+            / "export"
+            / "onnx"
+            / "fp32"
+            / ("static" if self._static_models else "dynamic")
+        )
         if self._export_dir.exists():
             shutil.rmtree(self._export_dir, ignore_errors=True)
         self._export_dir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +235,16 @@ class SmolLM2ModelExporter:
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
+    def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = SmolLM2OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+
+        # Repalce potentially unsupported int64 -> float cast with lookup table
+        editor.replace_int64_float_cast(max_int=self._max_gen_tokens)
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
     def make_static(self):
         self._logger.info("(decoder_with_past) Making graph static...")
         self._model = self.check_model(self._model)
@@ -347,6 +371,62 @@ class SmolLM2ModelExporter:
             runner.avg_infer_time / 1e6
         )
 
+    def convert_models(self, convert_dir: str | os.PathLike | None = None):
+        if not self._convert_dtypes:
+            self._logger.warning("Skipping conversion as convert_dtypes==False")
+        convert_dir = Path(convert_dir) if convert_dir else (
+            self._models_dir 
+            / self._hf_repo
+            / "export"
+            / "onnx"
+            / "converted"
+            / ("static" if self._static_models else "dynamic")
+        )
+        self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(self._export_path))
+        converted_model_path = convert_dir / self._export_path.name
+        convert_model(self._export_path, converted_model_path, "bf16")
+        self._logger.info("(ONNX-convert) Successfully converted model to dtype bf16 @ '%s'", str(self._export_path))
+        self._logger.info("(ONNX-convert) Converting model '%s' to dtype int32...", str(self._export_path))
+        convert_model(converted_model_path, converted_model_path, "int32")
+        self._logger.info("(ONNX-convert) Successfully converted model to dtype int32 @ '%s'", str(converted_model_path))
+        self._export_path = converted_model_path
+        self._logger.debug("(ONNX-convert) Update decoder_with_past model path to '%s'", str(converted_model_path))
+
+    def export_iree(
+        self,
+        iree_export_dir: str | os.PathLike | None = None,
+        iree_compile_args: list[str] | None = None,
+        use_iree_cli: bool = False,
+    ):
+        iree_export_dir = iree_export_dir or (
+            self._models_dir
+            / self._hf_repo
+            / "export"
+            / "iree"
+            / ("converted" if self._convert_dtypes else "fp32")
+            / ("static" if self._static_models else "dynamic")
+        )
+        if self._convert_dtypes and self._replace_int_bf16_cast:
+            self._replace_int_to_bf16_casts(self._export_path)
+        self._logger.info("(IREE-export) Exporting decoder_with_past model @ '%s' to IREE...", str(self._export_path))
+        model = onnx.load(self._export_path)
+        graph = gs.import_onnx(model)
+        graph.name = "main"
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        model = gs.export_onnx(graph)
+        self.check_model(model)
+        onnx.save(model, self._export_path)
+        export_iree(
+            self._export_path,
+            iree_export_dir,
+            opset=get_model_opset(model),
+            compiler_args=iree_compile_args,
+            use_iree_cli=use_iree_cli
+        )
+        self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(iree_export_dir), self._export_path.stem)
+
 
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
@@ -359,11 +439,15 @@ def export_smollm2_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
-        convert_dtype=args.convert_dtype,
+        convert_dtypes=args.convert_dtypes,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )
     exporter.export_onnx(validate=not args.skip_validation)
+    if args.convert_dtypes:
+        exporter.convert_models()
+    if not args.skip_iree:
+        exporter.export_iree(iree_compile_args=process_iree_args(args))
 
 
 def main():
