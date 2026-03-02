@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 import numpy as np
@@ -375,6 +376,7 @@ class SmolLM2Static(SmolLM2Base):
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
+        self._token_embeddings: np.ndarray | None = self._find_token_embeddings()
 
     @classmethod
     def from_onnx(
@@ -412,6 +414,22 @@ class SmolLM2Static(SmolLM2Base):
             repo_id=repo_id
         )
 
+    def _find_token_embeddings(
+        self,
+        emb_pattern: str = "token_embeddings.npy",
+    ) -> np.ndarray | None:
+        paths = []
+        paths.extend(Path(self._model.model_path).parent.glob(emb_pattern))
+        if not paths:
+            return None
+
+        paths = list({p.resolve(): p for p in paths}.values())
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+            )
+        return np.load(paths[0])
+
     def _init_cache(self) -> dict[str, np.ndarray]:
         return {
             f"past_key_values.{i}.{typ}": np.zeros(
@@ -428,13 +446,19 @@ class SmolLM2Static(SmolLM2Base):
     def _llm_step(
         self, token: int, curr_seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        input_ids = np.array([[token]], dtype=np.int64)
+        if isinstance(self._token_embeddings, np.ndarray):
+            inputs = {
+                "token_embedding": np.expand_dims(self._token_embeddings[token], axis=(0, 1))
+            }
+        else:
+            inputs = {
+                "input_ids": np.array([[token]], dtype=np.int64)
+            }
         pos_ids = np.array([[curr_seq_len]], dtype=np.int64)
-        inputs = {
-            "input_ids": input_ids,
+        inputs.update({
             "position_ids": pos_ids,
             **self._kv_cache
-        }
+        })
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
