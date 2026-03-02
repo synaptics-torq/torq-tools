@@ -166,8 +166,12 @@ class SmolLM2ModelExporter:
         # Remove isNaN ops
         editor.remove_isNaN()
 
-        cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
-        graph.inputs.append(cur_len_2d)
+        for inp in graph.inputs:
+            if inp.name == "position_ids":
+                cur_len_2d = inp
+                break
+        else:
+            raise ValueError("Position ID input ('position_ids') not found in graph")
         cur_len = graph.layer(
             name="current_len_to_1d",
             op="Squeeze",
