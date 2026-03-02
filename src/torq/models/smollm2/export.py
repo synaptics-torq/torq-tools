@@ -389,6 +389,10 @@ class SmolLM2ModelExporter:
         self._logger.info("(ONNX-convert) Converting model '%s' to dtype int32...", str(self._export_path))
         convert_model(converted_model_path, converted_model_path, "int32")
         self._logger.info("(ONNX-convert) Successfully converted model to dtype int32 @ '%s'", str(converted_model_path))
+        if (token_emb_npy := (self._export_path.parent / "token_embeddings.npy")).exists():
+            copied_emb_npy = convert_dir / "token_embeddings.npy"
+            shutil.copy2(token_emb_npy, copied_emb_npy)
+            self._logger.debug("(ONNX-convert) Copied token embeddings '%s' -> '%s'", str(token_emb_npy), str(copied_emb_npy))
         self._export_path = converted_model_path
         self._logger.debug("(ONNX-convert) Update decoder_with_past model path to '%s'", str(converted_model_path))
 
