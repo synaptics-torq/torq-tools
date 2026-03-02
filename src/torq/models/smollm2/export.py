@@ -46,8 +46,7 @@ class SmolLM2ModelExporter:
         extract_embeddings: bool = False,
         static_models: bool = True,
         *,
-        max_input_tokens: int = 128,
-        output_ratio: float = 0.5,
+        max_gen_tokens: int = 64,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -60,10 +59,10 @@ class SmolLM2ModelExporter:
                 f"Invalid model size '{model_size}', choose one of: ['135M', '360M', '1.7B']"
             )
 
+        self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
         self._static_models = static_models
-        self._max_input_tokens = max_input_tokens
-        self._max_output_tokens = floor(output_ratio * max_input_tokens)
+        self._max_gen_tokens = max_gen_tokens
         self._models_dir = Path(models_dir)
         self._show_model_info = show_model_info
         self._convert_dtype = convert_dtype
@@ -72,7 +71,7 @@ class SmolLM2ModelExporter:
             onnx.TensorProto.FLOAT
         )
         self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
-        if instruct_model:
+        if self._instruct_model:
             self._hf_repo += "-Instruct"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._hidden_size = int(self._config.hidden_size)
@@ -161,7 +160,7 @@ class SmolLM2ModelExporter:
         )
         
         editor = SmolLM2OnnxGraphEditor(graph, self._onnx_export_dtype)
-        editor.fix_io(self._max_output_tokens)
+        editor.fix_io(self._max_gen_tokens)
 
         # Remove isNaN ops
         editor.remove_isNaN()
@@ -182,9 +181,9 @@ class SmolLM2ModelExporter:
         (
             editor
             # Replace dynamic KV cache
-            .replace_dynamic_kv_cache(cur_len, self._max_output_tokens)
+            .replace_dynamic_kv_cache(cur_len, self._max_gen_tokens)
             # Add causal attention score mask
-            .mask_future_attn_scores(cur_len, self._max_output_tokens)
+            .mask_future_attn_scores(cur_len, self._max_gen_tokens)
             # Replace dynamic sequence length getter with `cur_len`
             .add_curr_len_input(cur_len)
             # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
@@ -287,8 +286,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         args.instruct_model,
         args.extract_embeddings,
         not args.dynamic_models,
-        max_input_tokens=args.max_input_tokens,
-        output_ratio=args.output_ratio,
+        max_gen_tokens=args.max_gen_tokens,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,

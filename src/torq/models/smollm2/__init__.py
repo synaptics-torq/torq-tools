@@ -9,8 +9,7 @@ from ...utils.onnx import add_onnx_args
 
 
 DEFAULT_MODEL_SIZE: Final[str] = "135M"
-DEFAULT_INPUT_TOKENS: Final[int] = 128
-DEFAULT_OUTPUT_RATIO: Final[float] = 0.5
+DEFAULT_GEN_TOKENS: Final[int] = 64
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["135M", "360M", "1.7B"]
@@ -18,18 +17,11 @@ MODEL_SIZES: Final[list[str]] = ["135M", "360M", "1.7B"]
 
 def add_smollm2_export_args(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "-i",
-        "--max-input-tokens",
+        "-t",
+        "--max-gen-tokens",
         type=int,
-        default=DEFAULT_INPUT_TOKENS,
+        default=DEFAULT_GEN_TOKENS,
         help="Input audio length in seconds (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-r",
-        "--output-ratio",
-        type=float,
-        default=DEFAULT_OUTPUT_RATIO,
-        help="Output to input token ratio (default: %(default)s)",
     )
     parser.add_argument(
         "-s",
