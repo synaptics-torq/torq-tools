@@ -127,6 +127,7 @@ class SmolLM2ModelExporter:
     def _optimum_export_model(self):
         if not (self._onnx_dir /  "model.onnx").exists():
             try:
+                self._logger.debug("Exporting model with optimum-cli...")
                 check_output(
                     [
                         "optimum-cli", "export", "onnx",
@@ -148,7 +149,16 @@ class SmolLM2ModelExporter:
         model_path = self._onnx_dir /  "model.onnx"
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
-        return onnx.load(model_path)
+        model = onnx.load(model_path)
+        orig_ir = model.ir_version
+        graph = gs.import_onnx(model)
+        graph.name = "main"
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        model = gs.export_onnx(graph)
+        model.ir_version = orig_ir
+        return model
 
     def _make_model_static(
         self, model: onnx.ModelProto
