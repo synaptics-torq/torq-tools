@@ -96,6 +96,12 @@ def add_onnx_args(
             default=False,
             help="Convert model to supported dtypes"
         )
+        group.add_argument(
+            "--preserve-io-dtypes",
+            action="store_true",
+            default=False,
+            help="Preserve model input/output dtypes by adding runtime casts"
+        )
 
 
 # -----------------------------------------------------------------------------

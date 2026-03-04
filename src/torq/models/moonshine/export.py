@@ -14,6 +14,7 @@ from typing import Literal, Final
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
+import ml_dtypes
 from datasets import load_dataset, Audio
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, AutoProcessor
@@ -638,7 +639,7 @@ class MoonshineModelExporter:
             runner.avg_infer_time * 1000
         )
 
-    def convert_models(self, convert_dir: str | os.PathLike | None = None):
+    def convert_models(self, convert_dir: str | os.PathLike | None = None, preserve_io: bool = False):
         if not self._convert_dtypes:
             self._logger.warning("Skipping conversion as convert_dtypes==False")
         convert_dir = convert_dir or (
@@ -656,11 +657,18 @@ class MoonshineModelExporter:
                 continue
             self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(model_path))
             converted_model_path = convert_dir / model_path.name
-            convert_model(model_path, converted_model_path, "bf16")
+            convert_model(model_path, converted_model_path, "bf16", convert_io=not preserve_io)
             self._logger.info("(ONNX-convert) Successfully converted model to dtype bf16 @ '%s'", str(converted_model_path))
             self._logger.info("(ONNX-convert) Converting model '%s' to dtype int32...", str(model_path))
-            convert_model(converted_model_path, converted_model_path, "int32")
+            convert_model(converted_model_path, converted_model_path, "int32", convert_io=not preserve_io)
             self._logger.info("(ONNX-convert) Successfully converted model to dtype int32 @ '%s'", str(converted_model_path))
+            for embeddings_file in ("decoder_token_embeddings.npy", "decoder_with_past_token_embeddings.npy"):
+                if (embeddings_npy := model_path.parent / embeddings_file).exists():
+                    embeddings: np.ndarray = np.load(embeddings_npy)
+                    embeddings_bf16 = embeddings.astype(np.dtype(ml_dtypes.bfloat16))
+                    embeddings_bf16_npy = converted_model_path.parent / embeddings_file
+                    np.save(embeddings_bf16_npy, embeddings_bf16)
+                    self._logger.debug("(ONNX-convert) Saved bf16 token embeddings to '%s'", str(embeddings_bf16_npy))
             self._export_paths[comp] = converted_model_path
             self._logger.debug("(ONNX-convert) Update %s model path to '%s'", comp, str(converted_model_path))
 
@@ -725,7 +733,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
-        exporter.convert_models()
+        exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
         exporter.export_iree(iree_compile_args=process_iree_args(args))
 
