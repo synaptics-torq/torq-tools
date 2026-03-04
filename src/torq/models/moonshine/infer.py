@@ -42,7 +42,7 @@ def infer_moonshine(args: argparse.Namespace):
 def main():
     parser = argparse.ArgumentParser("Run Moonshine inference")
     add_moonshine_infer_args(parser)
-    infer_moonshine(parser.parse_args)
+    infer_moonshine(parser.parse_args())
 
 
 if __name__ == "__main__":
