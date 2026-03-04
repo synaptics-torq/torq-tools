@@ -15,7 +15,8 @@ from ...graph_edit import (
     OnnxGraphEdit,
     DimMatchType,
     FixedDimMapping,
-    OnnxGraphEditor
+    OnnxGraphEditor,
+    rewire_consumers
 )
 
 from ...utils.onnx import (
@@ -221,7 +222,7 @@ class AddCurrLenInput(OnnxGraphEdit):
 
         gather_out: gs.Variable = gather_node.outputs[0]
         consumers: list[gs.Node] = list(gather_out.outputs)
-        self.rewire_consumers(consumers, gather_out, self.cur_len)
+        rewire_consumers(consumers, gather_out, self.cur_len)
 
         # disconnect Shape + Gather branch
         node.inputs.clear()
@@ -374,7 +375,7 @@ class RemoveIsNaN(OnnxGraphEdit):
             )
         where_out: gs.Variable = where_node.outputs[0]
         consumers: list[gs.Node] = list(where_out.outputs)
-        self.rewire_consumers(consumers, where_out, producer)
+        rewire_consumers(consumers, where_out, producer)
 
         # disconnect IsNaN -> Where chain
         node.inputs.clear()
@@ -418,7 +419,7 @@ class RemoveRedundantCasts(OnnxGraphEdit):
         inp = node.inputs[0]
         out = node.outputs[0]
         consumers: list[gs.Node] = list(out.outputs)
-        self.rewire_consumers(consumers, out, inp)
+        rewire_consumers(consumers, out, inp)
         for i, graph_out in enumerate(self.graph.outputs):
             if graph_out is out:
                 self.graph.outputs[i] = inp
@@ -648,7 +649,7 @@ class ReplaceInt64FloatCast(OnnxGraphEdit):
             inputs=[lookup_output, shape_batched],
             outputs=[gs.Variable(name=lookup_output.name + "_batched", dtype=cast_dtype, shape=int_inp.shape)]
         )[0]
-        self.rewire_consumers(consumers, float_out, lookup_output_batched)
+        rewire_consumers(consumers, float_out, lookup_output_batched)
         node.outputs.clear()
 
         self._logger.debug("Replaced int -> %s Cast node '%s' with look-up table", cast_dtype_str, node.name)
@@ -714,7 +715,7 @@ class BroadcastOpInputs(OnnxGraphEdit):
             inputs=[tensor, bcast_shape_const],
             outputs=[gs.Variable(name=tensor.name + "_expanded", dtype=tensor.dtype, shape=bcast_shape)]
         )[0]
-        self.rewire_consumers(consumers, tensor, bcast_out)
+        rewire_consumers(consumers, tensor, bcast_out)
 
     def match(self, node: gs.Node) -> bool:
         if self.ops and node.op not in self.ops:
@@ -855,7 +856,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
             dtype=lut_out.dtype,
             shape=lut_out.shape
         )
-        self.rewire_consumers(consumers, lut_out, lut_entry_inp)
+        rewire_consumers(consumers, lut_out, lut_entry_inp)
         self.graph.inputs.append(lut_entry_inp)
         node.outputs.clear()
         self._logger.debug(
@@ -1062,7 +1063,7 @@ class ReplacePadWithConcat(OnnxGraphEdit):
 
         if not any(b or a for b, a in axis_pads):
             consumers: list[gs.Node] = list(out.outputs)
-            self.rewire_consumers(consumers, out, data)
+            rewire_consumers(consumers, out, data)
             for i, graph_out in enumerate(self.graph.outputs):
                 if graph_out is out:
                     self.graph.outputs[i] = data

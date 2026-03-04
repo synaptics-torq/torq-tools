@@ -11,6 +11,17 @@ import onnx
 import onnx_graphsurgeon as gs
 
 
+def rewire_consumers(
+    consumers: list[gs.Node],
+    orig: gs.Constant | gs.Variable,
+    new: gs.Constant | gs.Variable
+):
+    for consumer in consumers:
+        for i, inp in enumerate(consumer.inputs):
+            if inp is orig:
+                consumer.inputs[i] = new
+
+
 class DimMatchType(Enum):
     EXACT    = auto()
     CONTAINS = auto()
@@ -36,17 +47,6 @@ class OnnxGraphEdit(ABC):
 
     def __post_init__(self):
         self._logger = logging.getLogger(f"{self.name}[{self.graph_name}]")
-
-    @staticmethod
-    def rewire_consumers(
-        consumers: list[gs.Node],
-        orig: gs.Constant | gs.Variable,
-        new: gs.Constant | gs.Variable
-    ):
-        for consumer in consumers:
-            for i, inp in enumerate(consumer.inputs):
-                if inp is orig:
-                    consumer.inputs[i] = new
 
     @abstractmethod
     def match(self, node: gs.Node) -> bool: ...
