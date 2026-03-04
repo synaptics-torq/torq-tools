@@ -14,6 +14,7 @@ from typing import Literal, Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import ml_dtypes
 from onnxruntime.transformers.optimizer import optimize_model
 from transformers import AutoConfig
 from torq.compile import (
@@ -381,7 +382,7 @@ class SmolLM2ModelExporter:
             runner.avg_infer_time / 1e6
         )
 
-    def convert_models(self, convert_dir: str | os.PathLike | None = None):
+    def convert_models(self, convert_dir: str | os.PathLike | None = None, preserve_io: bool = False):
         if not self._convert_dtypes:
             self._logger.warning("Skipping conversion as convert_dtypes==False")
         convert_dir = Path(convert_dir) if convert_dir else (
@@ -394,15 +395,17 @@ class SmolLM2ModelExporter:
         )
         self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(self._export_path))
         converted_model_path = convert_dir / self._export_path.name
-        convert_model(self._export_path, converted_model_path, "bf16")
+        convert_model(self._export_path, converted_model_path, "bf16", convert_io=not preserve_io)
         self._logger.info("(ONNX-convert) Successfully converted model to dtype bf16 @ '%s'", str(self._export_path))
         self._logger.info("(ONNX-convert) Converting model '%s' to dtype int32...", str(self._export_path))
-        convert_model(converted_model_path, converted_model_path, "int32")
+        convert_model(converted_model_path, converted_model_path, "int32", convert_io=not preserve_io)
         self._logger.info("(ONNX-convert) Successfully converted model to dtype int32 @ '%s'", str(converted_model_path))
-        if (token_emb_npy := (self._export_path.parent / "token_embeddings.npy")).exists():
-            copied_emb_npy = convert_dir / "token_embeddings.npy"
-            shutil.copy2(token_emb_npy, copied_emb_npy)
-            self._logger.debug("(ONNX-convert) Copied token embeddings '%s' -> '%s'", str(token_emb_npy), str(copied_emb_npy))
+        if (embeddings_npy := (self._export_path.parent / "token_embeddings.npy")).exists():
+            embeddings: np.ndarray = np.load(embeddings_npy)
+            embeddings_bf16 = embeddings.astype(np.dtype(ml_dtypes.bfloat16))
+            embeddings_bf16_npy = converted_model_path.parent / "token_embeddings.npy"
+            np.save(embeddings_bf16_npy, embeddings_bf16)
+            self._logger.debug("(ONNX-convert) Saved bf16 token embeddings to '%s'", str(embeddings_bf16_npy))
         self._export_path = converted_model_path
         self._logger.debug("(ONNX-convert) Update decoder_with_past model path to '%s'", str(converted_model_path))
 
