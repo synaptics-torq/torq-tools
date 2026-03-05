@@ -3,8 +3,10 @@
 
 from . import (
     moonshine,
+    smollm2,
 )
 
 all = [
     "moonshine",
+    "smollm2",
 ]
