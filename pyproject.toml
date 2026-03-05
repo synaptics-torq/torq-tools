@@ -20,6 +20,7 @@ dependencies = [
     "ai_edge_litert",
     "datasets",
     "huggingface_hub",
+    "ml_dtypes",
     "numpy",
     "nvidia-modelopt",
     "onnx",
