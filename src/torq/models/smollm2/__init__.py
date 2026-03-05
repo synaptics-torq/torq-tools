@@ -74,6 +74,12 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         help="Replace int64 -> bf16 casts with a look-up table"
     )
     parser.add_argument(
+        "--keep-individual-kv-io",
+        action="store_true",
+        default=False,
+        help="Keep KV I/O as separate key, value tensors instead of combining"
+    )
+    parser.add_argument(
         "--broadcast-ops",
         type=str,
         metavar="OP",

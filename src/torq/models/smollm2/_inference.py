@@ -357,12 +357,14 @@ class SmolLM2Static(SmolLM2Base):
         max_prompt_tokens: int,
         max_gen_tokens: int,
         instruct_model: bool = False,
-        repo_id: str | None = None
+        repo_id: str | None = None,
+        combined_kv_io: bool = True
     ):
         if repo_id is None:
             repo_id: str = "HuggingFaceTB/SmolLM2-135M"
             if instruct_model:
                 repo_id += "-Instruct"
+        self._combined_kv_io = combined_kv_io
         super().__init__(
             model,
             ModelConfig.from_json_config(
@@ -386,14 +388,16 @@ class SmolLM2Static(SmolLM2Base):
         max_inp_len: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
-        repo_id: str | None = None
+        repo_id: str | None = None,
+        combined_kv_io: bool = True
     ) -> "SmolLM2Static": 
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
-            repo_id=repo_id
+            repo_id=repo_id,
+            combined_kv_io=combined_kv_io
         )
 
     @classmethod
@@ -404,14 +408,16 @@ class SmolLM2Static(SmolLM2Base):
         max_inp_len: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
-        repo_id: str | None = None
+        repo_id: str | None = None,
+        combined_kv_io: bool = True
     ) -> "SmolLM2Static":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
-            repo_id=repo_id
+            repo_id=repo_id,
+            combined_kv_io=combined_kv_io
         )
 
     def _find_token_embeddings(
@@ -431,6 +437,13 @@ class SmolLM2Static(SmolLM2Base):
         return np.load(paths[0])
 
     def _init_cache(self) -> dict[str, np.ndarray]:
+        if self._combined_kv_io:
+            return {
+                f"past_key_values.{i}.key_value": np.zeros(
+                    [1, 2 * self._n_kv_heads, self._max_gen_tokens, self._head_dim], dtype=np.float32
+                )
+                for i in range(self._n_layers)
+            }
         return {
             f"past_key_values.{i}.{typ}": np.zeros(
                 [1, self._n_kv_heads, self._max_gen_tokens, self._head_dim], dtype=np.float32

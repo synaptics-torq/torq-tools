@@ -53,6 +53,7 @@ class SmolLM2ModelExporter:
         model_size: Literal["135M", "360M", "1.7B"] = "135M",
         instruct_model: bool = False,
         extract_embeddings: bool = False,
+        keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
         max_gen_tokens: int = 64,
@@ -70,6 +71,7 @@ class SmolLM2ModelExporter:
 
         self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
+        self._keep_individual_kv_io = keep_individual_kv_io
         self._static_models = static_models
         self._max_gen_tokens = max_gen_tokens
         self._models_dir = Path(models_dir)
@@ -242,6 +244,14 @@ class SmolLM2ModelExporter:
                 inp_name=embeddings_inp
             )
             editor.reorder_graph_input(embeddings_inp, 0)
+
+        if not self._keep_individual_kv_io:
+            editor.combine_kv_io_tensors([
+                1,                                                              # B
+                self._config.num_key_value_heads,                               # H
+                self._max_gen_tokens,                                           # L
+                self._config.hidden_size // self._config.num_attention_heads    # D
+            ])
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
@@ -451,6 +461,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         args.model_size,
         args.instruct_model,
         args.extract_embeddings,
+        args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
         models_dir=args.models_dir,
