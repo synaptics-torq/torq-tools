@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
+# Core dependencies (always needed)
+onnx
+numpy
+
+# For ONNX → TFLite conversion (use .venv_cvte with specific onnx/tf versions)
+onnx2tf
+onnx_graphsurgeon
+tensorflow>=2.18.1
+
+# For int8 TFLite layer extraction
+flatbuffers>=24.3.25
