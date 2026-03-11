@@ -6,6 +6,7 @@ datasets
 huggingface_hub
 numpy
 nvidia-modelopt
+ml_dtypes
 onnx
 onnxruntime
 onnx_graphsurgeon
