@@ -830,6 +830,48 @@ def export_customer_b(
         comp_output_dir = output_dir / comp_name
 
         # Step 1: ONNX → TFLite
+        if comp_name == "all_lstm":
+            # all_lstm uses a specialised pipeline (manual TF model build)
+            mixed_tflite_path_lstm = comp_output_dir / "all_lstm" / f"{onnx_path.stem}_fc_int16x8_mixed.tflite"
+
+            if skip_tflite:
+                if not mixed_tflite_path_lstm.exists():
+                    _logger.error("No existing mixed TFLite found for %s at %s — run without --skip-tflite first",
+                                  comp_name, mixed_tflite_path_lstm)
+                    continue
+                _logger.info("Using existing mixed TFLite: %s", mixed_tflite_path_lstm)
+            else:
+                if not onnx_path.exists():
+                    _logger.error("ONNX model not found: %s", onnx_path)
+                    continue
+
+                fp32_tflite_path = convert_all_lstm_onnx_to_tflite(
+                    onnx_path,
+                    comp_output_dir,
+                )
+
+                # Default approach: quantize FC ops at the TFLite level.
+                # This wraps each FC with QUANTIZE/DEQUANTIZE and uses
+                # int16 activations + int8 weights + INT64 bias directly
+                # in the flatbuffer, then converts the mixed TFLite to MLIR.
+                # The INT64 bias avoids the i48 crash in iree-opt.
+                mixed_tflite_path_lstm = quantize_fc_ops_in_tflite(
+                    fp32_tflite_path,
+                    output_path=fp32_tflite_path.parent / f"{onnx_path.stem}_fc_int16x8_mixed.tflite",
+                )
+                _logger.info("Mixed int16x8 TFLite: %s", mixed_tflite_path_lstm.name)
+
+            mlir_path = convert_tflite_to_mlir(mixed_tflite_path_lstm, comp_output_dir)
+            _logger.info("int16x8-FC MLIR: %s", mlir_path.name)
+
+            if not skip_iree:
+                vmfb_path = comp_output_dir / mlir_path.with_suffix(".vmfb").name
+                _compile_2610(mlir_path, vmfb_path, comp_name)
+                _logger.info("VMFB written: %s", vmfb_path)
+            else:
+                _logger.info("Skipping IREE compilation for %s", comp_name)
+            continue
+
         if skip_tflite:
             suffix = "_int8.tflite" if quantize_int8 else "_float32.tflite"
             tflite_path = comp_output_dir / onnx_path.stem / f"{onnx_path.stem}{suffix}"
@@ -843,35 +885,6 @@ def export_customer_b(
         else:
             if not onnx_path.exists():
                 _logger.error("ONNX model not found: %s", onnx_path)
-                continue
-
-            # all_lstm uses a specialised pipeline (manual TF model build)
-            if comp_name == "all_lstm":
-                fp32_tflite_path = convert_all_lstm_onnx_to_tflite(
-                    onnx_path,
-                    comp_output_dir,
-                )
-
-                # Default approach: quantize FC ops at the TFLite level.
-                # This wraps each FC with QUANTIZE/DEQUANTIZE and uses
-                # int16 activations + int8 weights + INT64 bias directly
-                # in the flatbuffer, then converts the mixed TFLite to MLIR.
-                # The INT64 bias avoids the i48 crash in iree-opt.
-                mixed_tflite_path = quantize_fc_ops_in_tflite(
-                    fp32_tflite_path,
-                    output_path=fp32_tflite_path.parent / f"{onnx_path.stem}_fc_int16x8_mixed.tflite",
-                )
-                _logger.info("Mixed int16x8 TFLite: %s", mixed_tflite_path.name)
-
-                mlir_path = convert_tflite_to_mlir(mixed_tflite_path, comp_output_dir)
-                _logger.info("int16x8-FC MLIR: %s", mlir_path.name)
-
-                if not skip_iree:
-                    vmfb_path = comp_output_dir / mlir_path.with_suffix(".vmfb").name
-                    _compile_2610(mlir_path, vmfb_path, comp_name)
-                    _logger.info("VMFB written: %s", vmfb_path)
-                else:
-                    _logger.info("Skipping IREE compilation for %s", comp_name)
                 continue
 
             tflite_path = convert_onnx_to_tflite(
