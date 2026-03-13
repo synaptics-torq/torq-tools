@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 """
-Quantize FULLY_CONNECTED ops in a fp32 TFLite model to int16×int8 mixed precision.
+Quantize FULLY_CONNECTED, CONV_2D, DEPTHWISE_CONV_2D, and TRANSPOSE_CONV ops
+in a fp32 TFLite model to int16×int8 mixed precision.
 
-Each FC op is wrapped: fp32 → QUANTIZE(int16) → FC(int16, int8, int64_bias) → DEQUANTIZE(int16→fp32).
+Each target op is wrapped:
+  fp32 → QUANTIZE(int16) → OP(int16, int8, int64_bias) → DEQUANTIZE(int16→fp32).
 All other ops remain fp32.  The result can be converted to TOSA MLIR via
 ``iree-import-tflite`` + ``iree-opt`` without the i48 crash.
 
-Key design decision: every FC gets an explicit INT64 bias (zero-filled if the
-original had no bias).  This prevents TF's TOSA lowering from synthesising an
-implicit i48 zero-bias tensor that crashes ``iree-opt``.
+Key design decision: every target op gets an explicit INT64 bias (zero-filled
+if the original had no bias).  This prevents TF's TOSA lowering from
+synthesising an implicit i48 zero-bias tensor that crashes ``iree-opt``.
 """
 
 import copy
@@ -25,8 +27,25 @@ _logger = logging.getLogger(__name__)
 
 # TFLite builtin operator codes
 _FULLY_CONNECTED_CODE = 9
+_CONV_2D_CODE = 3
+_DEPTHWISE_CONV_2D_CODE = 4
+_TRANSPOSE_CONV_CODE = 67
 _QUANTIZE_CODE = 114
 _DEQUANTIZE_CODE = 6
+
+# Ops to quantize and their input layout:
+#   (weight_input_index, bias_input_index, output_channels_axis_in_weight)
+# TRANSPOSE_CONV has a different input layout:
+#   inputs=[output_shape, weight, input, bias]
+# The weight is at index 1, bias at index 3, and OC axis is 0.
+# The torq backend's reverseTConvWeights now pads kernel dims to multiples of
+# stride, so kernels like 5×2 are handled correctly.
+_TARGET_OP_INFO = {
+    _FULLY_CONNECTED_CODE: (1, 2, 0),     # inputs=[input, weight, bias], weight=[out, in]
+    _CONV_2D_CODE: (1, 2, 0),             # inputs=[input, weight, bias], weight=[out, kH, kW, in]
+    _DEPTHWISE_CONV_2D_CODE: (1, 2, 3),   # inputs=[input, weight, bias], weight=[1, kH, kW, out]
+    _TRANSPOSE_CONV_CODE: (1, 3, 0),      # inputs=[output_shape, weight, input, bias], weight=[out, kH, kW, in]
+}
 
 
 def _find_or_add_opcode(model: tfl.ModelT, builtin_code: int) -> int:
@@ -75,7 +94,7 @@ def quantize_fc_ops_in_tflite(
     fp32_tflite_path: Path,
     output_path: Path | None = None,
 ) -> Path:
-    """Quantize all FC ops in a fp32 TFLite to int16×int8 mixed precision.
+    """Quantize FC, Conv2D, DepthwiseConv2D, and TransposeConv ops to int16×int8.
 
     Parameters
     ----------
@@ -112,25 +131,43 @@ def quantize_fc_ops_in_tflite(
     model.buffers.append(empty_buf)
     empty_buf_idx = len(model.buffers) - 1
 
-    # Identify all FC operator indices
-    fc_indices = []
+    # Identify all target operator indices
+    target_indices = []  # (operator_index, opcode, op_name)
     for oi, op in enumerate(sg.operators):
         oc = model.operatorCodes[op.opcodeIndex]
         code = oc.deprecatedBuiltinCode if oc.deprecatedBuiltinCode != 127 else oc.builtinCode
-        if code == _FULLY_CONNECTED_CODE:
-            fc_indices.append(oi)
+        if code in _TARGET_OP_INFO:
+            op_name = {_FULLY_CONNECTED_CODE: "FC", _CONV_2D_CODE: "CONV_2D",
+                       _DEPTHWISE_CONV_2D_CODE: "DEPTHWISE_CONV_2D",
+                       _TRANSPOSE_CONV_CODE: "TRANSPOSE_CONV"}.get(code, f"OP{code}")
+            target_indices.append((oi, code, op_name))
 
-    _logger.info("Found %d FULLY_CONNECTED ops to quantize", len(fc_indices))
+    op_counts = {}
+    for _, code, name in target_indices:
+        op_counts[name] = op_counts.get(name, 0) + 1
+    for name, cnt in sorted(op_counts.items()):
+        _logger.info("Found %d %s ops to quantize", cnt, name)
 
-    # Process each FC in reverse order (so insertion indices stay valid)
+    # Process each target op in reverse order (so insertion indices stay valid)
     ops_inserted = 0
-    for fc_oi in reversed(fc_indices):
-        fc_op = sg.operators[fc_oi]
+    for target_oi, op_code, op_name in reversed(target_indices):
+        target_op = sg.operators[target_oi]
+        wt_input_idx, bias_input_idx, out_ch_axis = _TARGET_OP_INFO[op_code]
 
-        inp_tidx = int(fc_op.inputs[0])
-        wt_tidx = int(fc_op.inputs[1])
-        bias_tidx = int(fc_op.inputs[2]) if len(fc_op.inputs) > 2 and int(fc_op.inputs[2]) >= 0 else -1
-        out_tidx = int(fc_op.outputs[0])
+        # For TRANSPOSE_CONV: inputs=[output_shape, weight, input, bias]
+        # The actual data input is at index 2, not 0
+        if op_code == _TRANSPOSE_CONV_CODE:
+            inp_tidx = int(target_op.inputs[2])
+        else:
+            inp_tidx = int(target_op.inputs[0])
+
+        wt_tidx = int(target_op.inputs[wt_input_idx])
+        bias_tidx = (
+            int(target_op.inputs[bias_input_idx])
+            if len(target_op.inputs) > bias_input_idx and int(target_op.inputs[bias_input_idx]) >= 0
+            else -1
+        )
+        out_tidx = int(target_op.outputs[0])
 
         inp_tensor = sg.tensors[inp_tidx]
         wt_tensor = sg.tensors[wt_tidx]
@@ -140,7 +177,7 @@ def quantize_fc_ops_in_tflite(
         wt_buf_idx = wt_tensor.buffer
         wt_data_raw = model.buffers[wt_buf_idx].data
         if wt_data_raw is None:
-            _logger.warning("FC[%d]: weight buffer is empty, skipping", fc_oi)
+            _logger.warning("%s[%d]: weight buffer is empty, skipping", op_name, target_oi)
             continue
 
         wt_fp32 = np.frombuffer(bytes(wt_data_raw), dtype=np.float32)
@@ -189,7 +226,7 @@ def quantize_fc_ops_in_tflite(
 
         # --- INT64 bias (always explicit to avoid i48 in TOSA) ---
         bias_scale = inp_scale * wt_scale
-        bias_dim = int(wt_tensor.shape[0])  # [output_units, input_units]
+        bias_dim = int(wt_tensor.shape[out_ch_axis])
 
         if bias_tidx >= 0:
             bias_tensor = sg.tensors[bias_tidx]
@@ -227,9 +264,19 @@ def quantize_fc_ops_in_tflite(
         q_op.builtinOptionsType = 0
         q_op.builtinOptions = None
 
-        # --- Rewire FC ---
-        fc_op.inputs = np.array([inp_int16_tidx, wt_int8_tidx, bias_int64_tidx], dtype=np.int32)
-        fc_op.outputs = np.array([out_int16_tidx], dtype=np.int32)
+        # --- Rewire target op ---
+        if op_code == _TRANSPOSE_CONV_CODE:
+            # TransposeConv: inputs=[output_shape, weight, input, bias]
+            target_op.inputs = np.array([
+                int(target_op.inputs[0]),  # output_shape (unchanged)
+                wt_int8_tidx,
+                inp_int16_tidx,
+                bias_int64_tidx,
+            ], dtype=np.int32)
+        else:
+            # FC / Conv2D / DepthwiseConv2D: inputs=[input, weight, bias]
+            target_op.inputs = np.array([inp_int16_tidx, wt_int8_tidx, bias_int64_tidx], dtype=np.int32)
+        target_op.outputs = np.array([out_int16_tidx], dtype=np.int32)
 
         # --- DEQUANTIZE op: int16 → fp32 ---
         dq_op = tfl.OperatorT()
@@ -239,9 +286,9 @@ def quantize_fc_ops_in_tflite(
         dq_op.builtinOptionsType = 0
         dq_op.builtinOptions = None
 
-        # Insert QUANTIZE before FC, DEQUANTIZE after
-        sg.operators.insert(fc_oi, q_op)
-        sg.operators.insert(fc_oi + 2, dq_op)
+        # Insert QUANTIZE before target op, DEQUANTIZE after
+        sg.operators.insert(target_oi, q_op)
+        sg.operators.insert(target_oi + 2, dq_op)
         ops_inserted += 2
 
     _logger.info("Inserted %d QUANTIZE/DEQUANTIZE ops", ops_inserted)

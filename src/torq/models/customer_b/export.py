@@ -699,25 +699,34 @@ def convert_onnx_to_tflite(
 
     primary_path: Path | None = None
 
+    # onnx2tf always produces a fp32 TFLite alongside the SavedModel
+    fp32_path = output_dir / f"{onnx_model_path.stem}_float32.tflite"
+    if not fp32_path.exists():
+        candidates = list(output_dir.glob("*.tflite"))
+        if candidates:
+            fp32_path = candidates[0]
+        else:
+            raise FileNotFoundError(f"No .tflite file produced in {output_dir}")
+
     if quantize_int8:
         int8_path = output_dir / f"{onnx_model_path.stem}_int8.tflite"
-        _convert_saved_model_to_int8_tflite(
-            output_dir,
-            int8_path,
-            num_calibration_samples=num_calibration_samples,
-        )
-        primary_path = int8_path
-    else:
-        # onnx2tf outputs a .tflite alongside the SavedModel
-        fp32_path = output_dir / f"{onnx_model_path.stem}_float32.tflite"
-        if not fp32_path.exists():
-            candidates = list(output_dir.glob("*.tflite"))
-            if candidates:
-                primary_path = candidates[0]
-            else:
-                raise FileNotFoundError(f"No .tflite file produced in {output_dir}")
-        else:
+        try:
+            _convert_saved_model_to_int8_tflite(
+                output_dir,
+                int8_path,
+                num_calibration_samples=num_calibration_samples,
+            )
+            primary_path = int8_path
+        except Exception:
+            _logger.warning(
+                "Int8 quantization failed for %s — falling back to fp32 TFLite. "
+                "Mixed-precision export will still work.",
+                onnx_model_path.stem,
+                exc_info=True,
+            )
             primary_path = fp32_path
+    else:
+        primary_path = fp32_path
 
     return primary_path
 
@@ -740,6 +749,463 @@ def _clean_env_for_iree_tools() -> dict[str, str]:
         env.pop(key, None)
     # Ensure the tool's own venv bin dir is first on PATH
     return env
+
+
+def _split_large_transpose_conv(tflite_path: Path, num_tiles: int = 8) -> Path:
+    """Split large TransposeConv ops along the output-channel axis.
+
+    The SL2610 has only 512 KB of LRAM.  When a TransposeConv has a weight
+    tensor that is too large (e.g. ``[256, 5, 2, 512]`` ≈ 1.3 MB after
+    restructuring), the compiler fails with *"unable to free enough space"*.
+
+    This function replaces each such TransposeConv with ``num_tiles`` smaller
+    TransposeConv ops (each producing ``OC / num_tiles`` output channels)
+    followed by a CONCATENATION along the channel axis.
+
+    Matching criterion: weight IC >= 256 **and** weight OC >= 128.
+
+    The original file is **not** modified.  A new file with
+    ``_split_tconv`` suffix is written next to it.
+    """
+    from tensorflow.lite.python import schema_py_generated as tfl_schema
+    import flatbuffers
+    import copy
+
+    with open(tflite_path, "rb") as f:
+        buf = bytearray(f.read())
+
+    model = tfl_schema.ModelT.InitFromPackedBuf(buf, 0)
+    sg = model.subgraphs[0]
+
+    TRANSPOSE_CONV = 67
+    CONCATENATION = 2
+
+    # Map from builtin code → opcode index
+    def _get_builtin_code(oc):
+        return oc.deprecatedBuiltinCode if oc.deprecatedBuiltinCode != 127 else oc.builtinCode
+
+    # --- Find TransposeConv ops that need splitting ---
+    ops_to_split = []  # list of operator indices
+    for oi, op in enumerate(sg.operators):
+        oc = model.operatorCodes[op.opcodeIndex]
+        if _get_builtin_code(oc) != TRANSPOSE_CONV:
+            continue
+
+        # TransposeConv inputs: [output_shape, weights, input, bias(opt)]
+        wt_tidx = int(op.inputs[1])
+        wt_tensor = sg.tensors[wt_tidx]
+        wt_shape = list(wt_tensor.shape)  # [OC, kH, kW, IC]
+
+        if len(wt_shape) != 4:
+            continue
+
+        oc_dim, _kh, _kw, ic_dim = wt_shape
+        if ic_dim >= 256 and oc_dim >= 128:
+            _logger.info(
+                "TransposeConv op %d: weight [%s] (IC=%d, OC=%d) — will split into %d tiles",
+                oi, "x".join(str(d) for d in wt_shape), ic_dim, oc_dim, num_tiles,
+            )
+            ops_to_split.append(oi)
+
+    if not ops_to_split:
+        _logger.info("No large TransposeConv ops found — nothing to split")
+        return tflite_path
+
+    # --- Ensure CONCATENATION opcode exists ---
+    concat_opcode_idx = None
+    for idx, oc in enumerate(model.operatorCodes):
+        if _get_builtin_code(oc) == CONCATENATION:
+            concat_opcode_idx = idx
+            break
+    if concat_opcode_idx is None:
+        new_oc = tfl_schema.OperatorCodeT()
+        new_oc.deprecatedBuiltinCode = CONCATENATION
+        new_oc.builtinCode = CONCATENATION
+        new_oc.version = 1
+        model.operatorCodes.append(new_oc)
+        concat_opcode_idx = len(model.operatorCodes) - 1
+
+    # --- Find TransposeConv opcode index (for sub-ops) ---
+    tconv_opcode_idx = None
+    for idx, oc in enumerate(model.operatorCodes):
+        if _get_builtin_code(oc) == TRANSPOSE_CONV:
+            tconv_opcode_idx = idx
+            break
+
+    # --- Numpy dtype from TFLite TensorType ---
+    _DTYPE_MAP = {
+        tfl_schema.TensorType.FLOAT32: np.float32,
+        tfl_schema.TensorType.INT8: np.int8,
+        tfl_schema.TensorType.INT16: np.int16,
+        tfl_schema.TensorType.INT32: np.int32,
+        tfl_schema.TensorType.INT64: np.int64,
+    }
+
+    # Process in reverse so indices stay valid
+    for oi in reversed(ops_to_split):
+        op = sg.operators[oi]
+
+        # --- Parse original tensors ---
+        oshape_tidx = int(op.inputs[0])  # output_shape tensor
+        wt_tidx = int(op.inputs[1])      # weights
+        inp_tidx = int(op.inputs[2])     # input activation
+        has_bias = len(op.inputs) >= 4 and int(op.inputs[3]) != -1
+        bias_tidx = int(op.inputs[3]) if has_bias else -1
+        out_tidx = int(op.outputs[0])
+
+        wt_tensor = sg.tensors[wt_tidx]
+        wt_shape = list(wt_tensor.shape)  # [OC, kH, kW, IC]
+        total_oc = wt_shape[0]
+        tile_oc = total_oc // num_tiles
+        assert tile_oc * num_tiles == total_oc, (
+            f"OC={total_oc} not divisible by num_tiles={num_tiles}"
+        )
+
+        # Read weight data
+        wt_dtype = _DTYPE_MAP[wt_tensor.type]
+        wt_buf = model.buffers[wt_tensor.buffer].data
+        wt_data = np.frombuffer(bytes(wt_buf), dtype=wt_dtype).reshape(wt_shape)
+
+        # Read bias data (if present)
+        bias_data = None
+        bias_dtype = None
+        if has_bias:
+            bias_tensor = sg.tensors[bias_tidx]
+            bias_dtype = _DTYPE_MAP[bias_tensor.type]
+            bias_buf = model.buffers[bias_tensor.buffer].data
+            bias_data = np.frombuffer(bytes(bias_buf), dtype=bias_dtype)
+
+        # Read original output shape tensor (constant [N, H, W, OC])
+        oshape_tensor = sg.tensors[oshape_tidx]
+        oshape_buf = model.buffers[oshape_tensor.buffer].data
+        orig_out_shape = np.frombuffer(bytes(oshape_buf), dtype=np.int32).copy()
+
+        # Original output tensor (for quantization params, type, etc.)
+        out_tensor = sg.tensors[out_tidx]
+
+        # Parse TransposeConvOptions
+        orig_opts = op.builtinOptions  # TransposeConvOptionsT
+
+        # --- Create per-tile ops ---
+        tile_out_tidxs = []
+        tile_ops = []
+
+        for t in range(num_tiles):
+            oc_start = t * tile_oc
+            oc_end = oc_start + tile_oc
+
+            # -- Tile weight tensor --
+            tile_wt = wt_data[oc_start:oc_end].copy()
+            tile_wt_buf = tfl_schema.BufferT()
+            tile_wt_buf.data = np.frombuffer(tile_wt.tobytes(), dtype=np.uint8)
+            model.buffers.append(tile_wt_buf)
+
+            tile_wt_tensor = tfl_schema.TensorT()
+            tile_wt_tensor.name = f"tconv_split_w_tile{t}".encode("utf-8")
+            tile_wt_shape = [tile_oc] + wt_shape[1:]
+            tile_wt_tensor.shape = np.array(tile_wt_shape, dtype=np.int32)
+            tile_wt_tensor.type = wt_tensor.type
+            tile_wt_tensor.buffer = len(model.buffers) - 1
+            tile_wt_tensor.isVariable = False
+            tile_wt_tensor.hasRank = True
+            # Copy weight quantization (per-channel: slice scales/zps)
+            if wt_tensor.quantization is not None:
+                wt_q = copy.deepcopy(wt_tensor.quantization)
+                if wt_q.scale is not None and len(wt_q.scale) == total_oc:
+                    wt_q.scale = wt_q.scale[oc_start:oc_end]
+                if wt_q.zeroPoint is not None and len(wt_q.zeroPoint) == total_oc:
+                    wt_q.zeroPoint = wt_q.zeroPoint[oc_start:oc_end]
+                tile_wt_tensor.quantization = wt_q
+            sg.tensors.append(tile_wt_tensor)
+            tile_wt_tidx = len(sg.tensors) - 1
+
+            # -- Tile bias tensor --
+            tile_bias_tidx = -1
+            if has_bias and bias_data is not None:
+                tile_bias = bias_data[oc_start:oc_end].copy()
+                tile_bias_buf_obj = tfl_schema.BufferT()
+                tile_bias_buf_obj.data = np.frombuffer(tile_bias.tobytes(), dtype=np.uint8)
+                model.buffers.append(tile_bias_buf_obj)
+
+                tile_bias_tensor = tfl_schema.TensorT()
+                tile_bias_tensor.name = f"tconv_split_b_tile{t}".encode("utf-8")
+                tile_bias_tensor.shape = np.array([tile_oc], dtype=np.int32)
+                tile_bias_tensor.type = sg.tensors[bias_tidx].type
+                tile_bias_tensor.buffer = len(model.buffers) - 1
+                tile_bias_tensor.isVariable = False
+                tile_bias_tensor.hasRank = True
+                if sg.tensors[bias_tidx].quantization is not None:
+                    tile_bias_tensor.quantization = copy.deepcopy(
+                        sg.tensors[bias_tidx].quantization
+                    )
+                    bq = tile_bias_tensor.quantization
+                    if bq.scale is not None and len(bq.scale) == total_oc:
+                        bq.scale = bq.scale[oc_start:oc_end]
+                    if bq.zeroPoint is not None and len(bq.zeroPoint) == total_oc:
+                        bq.zeroPoint = bq.zeroPoint[oc_start:oc_end]
+                sg.tensors.append(tile_bias_tensor)
+                tile_bias_tidx = len(sg.tensors) - 1
+
+            # -- Tile output_shape tensor (constant: [N, H, W, tile_oc]) --
+            tile_out_shape_arr = orig_out_shape.copy()
+            tile_out_shape_arr[-1] = tile_oc  # last dim = OC in NHWC
+            tile_oshape_buf = tfl_schema.BufferT()
+            tile_oshape_buf.data = np.frombuffer(tile_out_shape_arr.tobytes(), dtype=np.uint8)
+            model.buffers.append(tile_oshape_buf)
+
+            tile_oshape_tensor = tfl_schema.TensorT()
+            tile_oshape_tensor.name = f"tconv_split_oshape_tile{t}".encode("utf-8")
+            tile_oshape_tensor.shape = np.array(
+                list(oshape_tensor.shape), dtype=np.int32
+            )
+            tile_oshape_tensor.type = oshape_tensor.type
+            tile_oshape_tensor.buffer = len(model.buffers) - 1
+            tile_oshape_tensor.isVariable = False
+            tile_oshape_tensor.hasRank = True
+            sg.tensors.append(tile_oshape_tensor)
+            tile_oshape_tidx = len(sg.tensors) - 1
+
+            # -- Tile output tensor --
+            tile_out_tensor = tfl_schema.TensorT()
+            tile_out_tensor.name = f"tconv_split_out_tile{t}".encode("utf-8")
+            tile_out_shape = list(out_tensor.shape)
+            tile_out_shape[-1] = tile_oc  # NHWC: last dim is channels
+            tile_out_tensor.shape = np.array(tile_out_shape, dtype=np.int32)
+            tile_out_tensor.type = out_tensor.type
+            tile_out_tensor.buffer = 0  # runtime-allocated
+            tile_out_tensor.isVariable = False
+            tile_out_tensor.hasRank = True
+            if out_tensor.quantization is not None:
+                tile_out_tensor.quantization = copy.deepcopy(out_tensor.quantization)
+            sg.tensors.append(tile_out_tensor)
+            tile_out_tidx_ = len(sg.tensors) - 1
+            tile_out_tidxs.append(tile_out_tidx_)
+
+            # -- Build tiled TransposeConv op --
+            tile_op = tfl_schema.OperatorT()
+            tile_op.opcodeIndex = tconv_opcode_idx
+            inputs = [tile_oshape_tidx, tile_wt_tidx, inp_tidx]
+            if has_bias:
+                inputs.append(tile_bias_tidx)
+            tile_op.inputs = np.array(inputs, dtype=np.int32)
+            tile_op.outputs = np.array([tile_out_tidx_], dtype=np.int32)
+
+            # Copy the original TransposeConv options
+            tile_opts = tfl_schema.TransposeConvOptionsT()
+            tile_opts.padding = orig_opts.padding
+            tile_opts.strideW = orig_opts.strideW
+            tile_opts.strideH = orig_opts.strideH
+            tile_opts.fusedActivationFunction = orig_opts.fusedActivationFunction
+            tile_opts.quantizedBiasType = orig_opts.quantizedBiasType
+            tile_op.builtinOptionsType = tfl_schema.BuiltinOptions.TransposeConvOptions
+            tile_op.builtinOptions = tile_opts
+
+            tile_ops.append(tile_op)
+
+        # -- Build CONCATENATION op --
+        concat_op = tfl_schema.OperatorT()
+        concat_op.opcodeIndex = concat_opcode_idx
+        concat_op.inputs = np.array(tile_out_tidxs, dtype=np.int32)
+        concat_op.outputs = np.array([out_tidx], dtype=np.int32)
+
+        concat_opts = tfl_schema.ConcatenationOptionsT()
+        concat_opts.axis = len(out_tensor.shape) - 1  # channel axis (NHWC → last)
+        concat_opts.fusedActivationFunction = 0  # NONE
+        concat_op.builtinOptionsType = tfl_schema.BuiltinOptions.ConcatenationOptions
+        concat_op.builtinOptions = concat_opts
+
+        # -- Replace original op: insert tile ops before it, then replace
+        #    the (now shifted) original with the concat.
+        #    Deleting or disconnecting operators corrupts the flatbuffer
+        #    re-serialisation and causes TOSA bytecode assertion failures,
+        #    so we use in-place replacement (same pattern as
+        #    _replace_scatter_nd_with_concat). ---
+        for ti, tile_op in enumerate(tile_ops):
+            sg.operators.insert(oi + ti, tile_op)
+        sg.operators[oi + num_tiles] = concat_op
+
+    _logger.info(
+        "Split %d TransposeConv ops into %d tiles each in %s",
+        len(ops_to_split), num_tiles, tflite_path.name,
+    )
+
+    # Re-serialize
+    builder = flatbuffers.Builder(len(buf) * 2)
+    packed = model.Pack(builder)
+    builder.Finish(packed, b"TFL3")
+
+    out_path = tflite_path.with_name(
+        tflite_path.stem + "_split_tconv" + tflite_path.suffix
+    )
+    out_path.write_bytes(bytes(builder.Output()))
+    _logger.info(
+        "Wrote split-TransposeConv TFLite: %s (%.1f KB)",
+        out_path.name, out_path.stat().st_size / 1024,
+    )
+    return out_path
+
+
+def _replace_scatter_nd_with_concat(tflite_path: Path) -> Path:
+    """Replace ScatterND ops that pad a slice with zeros with CONCATENATION.
+
+    The ``all_conv`` model uses ``ScatterND`` to place a ``[1,1,N,1]`` tensor
+    into slot 0 or slot 1 of a zero-filled ``[1,2,N,1]`` tensor.  TOSA does
+    not support ``tfl.scatter_nd``, so this function replaces each such op
+    with a ``CONCATENATION`` of the updates tensor with a constant zero
+    tensor of the same shape, in the correct order along axis 1.
+
+    The detection is generic: any ``ScatterND`` whose indices are constant,
+    cover a single contiguous slice along some axis, and whose output has
+    exactly 2 slices along that axis is a candidate.
+
+    The original file is **not** modified.  A new file with ``_no_scatter``
+    suffix is written next to it.
+
+    Returns the path to the patched ``.tflite`` file (or a copy if no
+    ``ScatterND`` ops were found).
+    """
+    from tensorflow.lite.python import schema_py_generated as tfl_schema
+    import flatbuffers
+
+    with open(tflite_path, "rb") as f:
+        buf = bytearray(f.read())
+
+    model = tfl_schema.ModelT.InitFromPackedBuf(buf, 0)
+    sg = model.subgraphs[0]
+
+    SCATTER_ND = 122
+    CONCATENATION = 2
+
+    # --- Identify ScatterND ops ---
+    scatter_ops = []  # (operator_index, dim1_value)
+    for oi, op in enumerate(sg.operators):
+        oc = model.operatorCodes[op.opcodeIndex]
+        code = oc.deprecatedBuiltinCode if oc.deprecatedBuiltinCode != 127 else oc.builtinCode
+        if code != SCATTER_ND:
+            continue
+
+        # TFLite scatter_nd: inputs = [indices, updates, shape]
+        idx_tidx = int(op.inputs[0])
+        idx_tensor = sg.tensors[idx_tidx]
+        idx_buf = model.buffers[idx_tensor.buffer].data
+        if idx_buf is None:
+            continue  # dynamic indices — can't replace
+
+        idx_arr = np.frombuffer(bytes(idx_buf), dtype=np.int32).reshape(list(idx_tensor.shape))
+        # Shape is [1, 1, N, 1, ndims]  — last dim is the number of index dims
+        # Check that all indices target a single dim1 value
+        dim1_vals = sorted(set(idx_arr[:, :, :, :, 1].flatten().tolist()))
+        if len(dim1_vals) != 1:
+            continue  # indices span multiple dim1 slots — not our pattern
+
+        # Verify the output has exactly 2 slices along dim 1
+        out_tidx = int(op.outputs[0])
+        out_tensor = sg.tensors[out_tidx]
+        if int(out_tensor.shape[1]) != 2:
+            continue
+
+        scatter_ops.append((oi, dim1_vals[0]))
+
+    if not scatter_ops:
+        out_path = tflite_path.with_name(
+            tflite_path.stem + "_no_scatter" + tflite_path.suffix
+        )
+        import shutil
+        shutil.copy2(tflite_path, out_path)
+        return out_path
+
+    # Ensure CONCATENATION opcode exists
+    concat_opcode_idx = None
+    for idx, oc in enumerate(model.operatorCodes):
+        c = oc.deprecatedBuiltinCode if oc.deprecatedBuiltinCode != 127 else oc.builtinCode
+        if c == CONCATENATION:
+            concat_opcode_idx = idx
+            break
+    if concat_opcode_idx is None:
+        new_oc = tfl_schema.OperatorCodeT()
+        new_oc.deprecatedBuiltinCode = CONCATENATION
+        new_oc.builtinCode = CONCATENATION
+        new_oc.version = 1
+        model.operatorCodes.append(new_oc)
+        concat_opcode_idx = len(model.operatorCodes) - 1
+
+    # Create a single zero-constant tensor [1, 1, N, 1] for padding.
+    # We'll share it across all replacements with the same shape.
+    zero_tensors = {}  # shape_tuple → tensor_index
+
+    def _get_zero_tensor(shape_tuple):
+        if shape_tuple in zero_tensors:
+            return zero_tensors[shape_tuple]
+        zero_data = np.zeros(shape_tuple, dtype=np.float32)
+        zero_buf = tfl_schema.BufferT()
+        zero_buf.data = list(zero_data.tobytes())
+        model.buffers.append(zero_buf)
+        zero_buf_idx = len(model.buffers) - 1
+
+        t = tfl_schema.TensorT()
+        t.name = f"scatter_nd_replacement_zeros_{len(zero_tensors)}".encode("utf-8")
+        t.shape = np.array(list(shape_tuple), dtype=np.int32)
+        t.type = tfl_schema.TensorType.FLOAT32
+        t.buffer = zero_buf_idx
+        t.isVariable = False
+        t.hasRank = True
+        sg.tensors.append(t)
+        tidx = len(sg.tensors) - 1
+        zero_tensors[shape_tuple] = tidx
+        return tidx
+
+    # Replace each ScatterND with CONCATENATION
+    # Process in reverse order so operator indices stay valid
+    for oi, dim1_val in reversed(scatter_ops):
+        op = sg.operators[oi]
+        upd_tidx = int(op.inputs[1])  # updates tensor [1, 1, N, 1]
+        out_tidx = int(op.outputs[0])  # output tensor [1, 2, N, 1]
+
+        upd_tensor = sg.tensors[upd_tidx]
+        upd_shape = tuple(int(d) for d in upd_tensor.shape)  # (1, 1, N, 1)
+
+        zero_tidx = _get_zero_tensor(upd_shape)
+
+        # Build CONCATENATION op along axis=1
+        concat_op = tfl_schema.OperatorT()
+        concat_op.opcodeIndex = concat_opcode_idx
+
+        if dim1_val == 0:
+            # Data goes to slot 0, zeros to slot 1
+            concat_op.inputs = np.array([upd_tidx, zero_tidx], dtype=np.int32)
+        else:
+            # Zeros to slot 0, data goes to slot 1
+            concat_op.inputs = np.array([zero_tidx, upd_tidx], dtype=np.int32)
+
+        concat_op.outputs = np.array([out_tidx], dtype=np.int32)
+
+        # ConcatenationOptions: axis=1, fused_activation=NONE
+        concat_opts = tfl_schema.ConcatenationOptionsT()
+        concat_opts.axis = 1
+        concat_opts.fusedActivationFunction = 0  # NONE
+        concat_op.builtinOptionsType = tfl_schema.BuiltinOptions.ConcatenationOptions
+        concat_op.builtinOptions = concat_opts
+
+        # Replace the ScatterND op in place
+        sg.operators[oi] = concat_op
+
+    _logger.info(
+        "Replaced %d ScatterND ops with CONCATENATION in %s",
+        len(scatter_ops),
+        tflite_path.name,
+    )
+
+    # Re-serialize
+    builder = flatbuffers.Builder(len(buf) * 2)
+    packed = model.Pack(builder)
+    builder.Finish(packed, b"TFL3")
+
+    out_path = tflite_path.with_name(
+        tflite_path.stem + "_no_scatter" + tflite_path.suffix
+    )
+    out_path.write_bytes(bytes(builder.Output()))
+    _logger.info("Wrote patched TFLite: %s (%.1f KB)", out_path.name, out_path.stat().st_size / 1024)
+    return out_path
 
 
 def convert_tflite_to_mlir(
@@ -894,37 +1360,85 @@ def export_customer_b(
                 num_calibration_samples=num_calibration_samples,
             )
 
-        # Step 2: TFLite → TOSA → MLIR (primary int8)
-        mlir_path = convert_tflite_to_mlir(tflite_path, comp_output_dir)
+        # Step 1b: Replace ScatterND ops with CONCATENATION (TOSA compat)
+        tflite_path = _replace_scatter_nd_with_concat(Path(tflite_path))
 
-        # Step 2a: Mixed-precision (int16×int8 FC) path
-        # Locate the fp32 TFLite produced by onnx2tf alongside the int8 model
-        fp32_tflite_for_mixed = tflite_path.parent / f"{tflite_path.stem.replace('_int8', '')}_float32.tflite"
+        # Step 1c: Split large TransposeConv ops to fit in LRAM
+        tflite_path = _split_large_transpose_conv(Path(tflite_path))
+
+        # Step 2: TFLite → TOSA → MLIR (primary int8 / fp32)
+        mlir_path = None
+        try:
+            mlir_path = convert_tflite_to_mlir(tflite_path, comp_output_dir)
+        except subprocess.CalledProcessError:
+            _logger.warning(
+                "Primary TFLite → TOSA conversion failed for %s. "
+                "Will attempt mixed-precision path instead.",
+                comp_name,
+            )
+
+        # Step 2a: Mixed-precision (int16×int8) path
+        # Locate the original fp32 TFLite produced by onnx2tf.
+        # tflite_path may have been renamed by _replace_scatter_nd_with_concat,
+        # so strip suffixes to find the original.
+        base_stem = (tflite_path.stem
+                     .replace("_split_tconv", "")
+                     .replace("_no_scatter", "")
+                     .replace("_int8", "")
+                     .replace("_float32", ""))
+        fp32_tflite_for_mixed = tflite_path.parent / f"{base_stem}_float32.tflite"
         mixed_mlir_path = None
-        if fp32_tflite_for_mixed.exists():
+
+        # Check if the fully-processed mixed TFLite already exists (e.g.
+        # hand-crafted with correct quantisation for all ops including
+        # TransposeConv).  When --skip-tflite is set we prefer the existing
+        # artefact so we don't regenerate it (quantize_fc_ops_in_tflite only
+        # quantises FC/CONV_2D, leaving TransposeConv as fp32 which differs
+        # from the hand-built TFLite).
+        final_mixed_tflite = tflite_path.parent / f"{base_stem}_fc_int16x8_mixed_no_scatter_split_tconv.tflite"
+        if skip_tflite and final_mixed_tflite.exists():
+            _logger.info("Using existing mixed TFLite: %s", final_mixed_tflite)
+            try:
+                mixed_mlir_path = convert_tflite_to_mlir(final_mixed_tflite, comp_output_dir)
+                _logger.info("Mixed int16x8 MLIR: %s", mixed_mlir_path.name)
+            except subprocess.CalledProcessError:
+                _logger.warning(
+                    "Mixed TFLite → TOSA conversion failed for %s.",
+                    comp_name,
+                )
+        elif fp32_tflite_for_mixed.exists():
             mixed_tflite_path = quantize_fc_ops_in_tflite(
                 fp32_tflite_for_mixed,
                 output_path=fp32_tflite_for_mixed.parent / f"{fp32_tflite_for_mixed.stem.replace('_float32', '')}_fc_int16x8_mixed.tflite",
             )
             _logger.info("Mixed int16x8 TFLite: %s", mixed_tflite_path.name)
-            mixed_mlir_path = convert_tflite_to_mlir(mixed_tflite_path, comp_output_dir)
-            _logger.info("Mixed int16x8 MLIR: %s", mixed_mlir_path.name)
+            # Replace ScatterND ops before TOSA conversion
+            mixed_tflite_path = _replace_scatter_nd_with_concat(mixed_tflite_path)
+            # Split large TransposeConv ops to fit in LRAM
+            mixed_tflite_path = _split_large_transpose_conv(mixed_tflite_path)
+            try:
+                mixed_mlir_path = convert_tflite_to_mlir(mixed_tflite_path, comp_output_dir)
+                _logger.info("Mixed int16x8 MLIR: %s", mixed_mlir_path.name)
+            except subprocess.CalledProcessError:
+                _logger.warning(
+                    "Mixed TFLite → TOSA conversion failed for %s. "
+                    "The model may contain ops unsupported by TOSA (e.g. scatter_nd).",
+                    comp_name,
+                )
         else:
             _logger.info("No fp32 TFLite found at %s — skipping mixed-precision export", fp32_tflite_for_mixed)
 
-        # Step 3: Compile MLIR → VMFB
+        # Step 3: Compile MLIR → VMFB (mixed-precision only)
         if skip_iree:
             _logger.info("Skipping IREE compilation for %s", comp_name)
             continue
-
-        vmfb_path = comp_output_dir / mlir_path.with_suffix(".vmfb").name
-        _compile_2610(mlir_path, vmfb_path, comp_name)
-        _logger.info("VMFB written: %s", vmfb_path)
 
         if mixed_mlir_path is not None:
             mixed_vmfb_path = comp_output_dir / mixed_mlir_path.with_suffix(".vmfb").name
             _compile_2610(mixed_mlir_path, mixed_vmfb_path, f"{comp_name}_mixed")
             _logger.info("Mixed int16x8 VMFB written: %s", mixed_vmfb_path)
+        else:
+            _logger.error("No mixed MLIR available for %s — cannot compile", comp_name)
 
     _logger.info("Export complete → %s", output_dir)
 
