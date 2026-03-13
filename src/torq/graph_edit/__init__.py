@@ -6,6 +6,7 @@ from .onnx import (
     DimMatchType,
     FixedDimMapping,
     OnnxGraphEditor,
+    rewire_consumers
 )
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "DimMatchType",
     "FixedDimMapping",
     "OnnxGraphEditor",
+    "rewire_consumers"
 ]
