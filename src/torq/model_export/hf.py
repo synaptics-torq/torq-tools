@@ -12,14 +12,14 @@ __all__ = [
 
 def hf_download_models(
     repo: str,
-    components: dict[str, str],
+    models: list[str],
     subfolder: str,
     local_dir: str | os.PathLike,
 ):
-    for comp_model_name in components.values():
+    for model_name in models:
         hf_hub_download(
             repo,
-            comp_model_name,
+            model_name,
             subfolder=subfolder,
             local_dir=local_dir,
         )
@@ -27,7 +27,7 @@ def hf_download_models(
 
 def optimum_export_onnx(
     onnx_dir: str | os.PathLike,
-    model: str,
+    hf_repo: str,
     dtype: str,
     models: list[str],
     *,
@@ -42,7 +42,7 @@ def optimum_export_onnx(
     cmd = [
         "optimum-cli", "export", "onnx",
         str(onnx_dir),
-        "--model", model,
+        "--model", hf_repo,
         "--dtype", dtype,
         "--opset", str(opset),
     ]
