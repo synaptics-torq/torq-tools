@@ -61,10 +61,10 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
-            opt_config=ORTOptimizerConfig(
+            opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
                 hidden_size=self._config.hidden_size
-            )
+            )}
         )
 
     def _setup_dirs(self) -> list[Path]:
@@ -95,7 +95,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             self._models_dir
             / "export"
             / "iree"
-            / ("converted" if self._convert_dtypes else "fp32")
+            / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
         return onnx_dir, export_dir, convert_dir, iree_dir
@@ -135,8 +135,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
         graph: gs.Graph = gs.import_onnx(model)
         self._logger.debug(
-            "Set export data type to %s for model data type fp32",
-            onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype),
+            "Set export data type to %s for model data type %s",
+            onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
         editor = SmolLM2OnnxGraphEditor(graph, self._onnx_export_dtype)
