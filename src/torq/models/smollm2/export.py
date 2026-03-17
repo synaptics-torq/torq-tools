@@ -208,16 +208,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
-    def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike):
-        model = onnx.load(model_path)
-        editor = SmolLM2OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
-
-        # Repalce potentially unsupported int64 -> float cast with lookup table
-        editor.replace_int64_float_cast(max_int=self._max_gen_tokens)
-
-        new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
-
     def make_static(self):
         self._logger.info("(model) Making graph static...")
         self._components["model"] = self.check_model(self._components["model"])
