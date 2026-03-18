@@ -186,6 +186,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
         editor.fix_encoder_io(self._num_samples, self._enc_seq_len)
         new_encoder = editor.to_onnx(override_ir=model.ir_version)
+        graph = gs.import_onnx(new_encoder)
+        graph.name = "main"
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        new_encoder = gs.export_onnx(graph)
+        new_encoder.ir_version = model.ir_version
         return new_encoder
 
     def _make_decoder_model_static(
@@ -371,7 +378,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             preprocessor_model.ir_version = merged_model.ir_version
 
             encoder_ext = gs.import_onnx(onnx.load(encoder_path))
-            encoder_ext.name = graph.name
+            encoder_ext.name = "main"
             encoder_ext.inputs[0].name = "input_features"
             encoder_ext.cleanup(
                 remove_unused_graph_inputs=True, remove_unused_node_outputs=True
