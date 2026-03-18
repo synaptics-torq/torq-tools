@@ -68,7 +68,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._extract_embeddings = extract_embeddings
         self._onnx_source_dir = onnx_source_dir
         self._use_optimum = use_optimum
-        self._skip_export = set(skip_export or [])
         self._hf_repo = f"UsefulSensors/moonshine-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._num_samples = max_audio_s * 16_000
@@ -97,7 +96,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
-            opt_configs=opt_configs
+            opt_configs=opt_configs,
+            skip_export=skip_export,
         )
 
     def _setup_dirs(self) -> list[Path]:
