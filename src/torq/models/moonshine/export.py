@@ -541,13 +541,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
     ):
         skip = skip or []
         skip.append("preprocessor")
+        external_data = None if any(m in self._skip_export for m in ("decoder", "decoder_with_past")) else \
+        [(self._export_paths["decoder"].parent / "decoder_token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))]
         super().convert_models(
             convert_dir=convert_dir,
             preserve_io=preserve_io,
             skip=skip,
-            external_data=[
-                (self._export_paths["decoder"].parent / "decoder_token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))
-            ]
+            external_data=external_data,
         )
         for comp, model_path in self._export_paths.items():
             if comp == "preprocessor":
