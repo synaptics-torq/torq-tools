@@ -229,7 +229,7 @@ class OnnxGraphEditor:
                 io_tensors.insert(new_pos, t)
                 return
 
-        self._logger.warning("%s '%s' (type: %s) not found in graph; no reordering performed", io_type.capitalize(), io_name)
+        self._logger.warning("%s '%s' not found in graph; no reordering performed", io_type.capitalize(), io_name)
 
 
     def reorder_graph_input(
