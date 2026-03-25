@@ -765,11 +765,12 @@ class CombineKVCacheMixin:
                 kv_pairs.append((layer, entry["key"], entry["value"]))
             return kv_pairs
 
-        def _remove_io(tensor: gs.Variable, io_coll: list[gs.Variable]):
+        def _remove_io(tensor: gs.Variable, io_coll: list[gs.Variable]) -> int:
             for idx, io_tensor in enumerate(io_coll):
                 if tensor is io_tensor:
                     io_coll.pop(idx)
-                    break
+                    return idx
+            return -1
 
         def _concatenate_kv_input(
             layer: int,
@@ -863,9 +864,12 @@ class CombineKVCacheMixin:
             rewire_consumers(value_consumers, value_input, value_slice)
             key_input.outputs.clear()
             value_input.outputs.clear()
-            _remove_io(key_input, self._graph.inputs)
+            insert_pos = _remove_io(key_input, self._graph.inputs)
             _remove_io(value_input, self._graph.inputs)
-            self._graph.inputs.append(combined_input)
+            if insert_pos >= 0:
+                self._graph.inputs.insert(insert_pos, combined_input)
+            else:
+                self._graph.inputs.append(combined_input)
 
             self._logger.debug(
                 "Combined KV input layer %d: '%s' + '%s' -> '%s'",
@@ -901,9 +905,12 @@ class CombineKVCacheMixin:
                 ],
                 attrs={"axis": _H_DIM_AXIS},
             )[0]
-            _remove_io(key_output, self._graph.outputs)
+            insert_pos = _remove_io(key_output, self._graph.outputs)
             _remove_io(value_output, self._graph.outputs)
-            self._graph.outputs.append(combined_tensor)
+            if insert_pos >= 0:
+                self._graph.outputs.insert(insert_pos, combined_tensor)
+            else:
+                self._graph.outputs.append(combined_tensor)
 
             self._logger.debug(
                 "Combined KV output layer %d: '%s' + '%s' -> '%s'",

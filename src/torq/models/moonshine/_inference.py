@@ -60,8 +60,8 @@ class MoonshineBase(ABC):
                     (1, self._n_kv_heads, 1, self._head_dim),
                     dtype=np.float32,
                 )
-                for a in ("decoder", "encoder")
                 for i in range(self._n_layers)
+                for a in ("decoder", "encoder")
             }
             if self._combined_kv_io
             else {
