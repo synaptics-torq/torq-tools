@@ -99,7 +99,7 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Skip export of specific components"
     )
     parser.add_argument(
-        "--keep-individual-kv-io",
+        "--combine-kv-io",
         action="store_true",
         default=False,
         help="Keep KV I/O as separate key, value tensors instead of combining"
