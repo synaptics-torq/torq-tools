@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 import hashlib
 import os
+import re
 
 import onnx
 import onnx_graphsurgeon as gs
@@ -32,6 +34,7 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
 
@@ -704,6 +707,236 @@ class ExtractConstantLUT(OnnxGraphEdit):
             "Extracted LUT from '%s', consumers redirected to graph input '%s'",
             node.name, self.inp_name
         )
+
+
+class CombineKVCacheMixin:
+    """
+    Mixin for combining separate key/value cache I/O tensors along the heads axis.
+
+    Pairs key+value tensors per layer and merges them into single tensors
+    with doubled head dimension: [..., H, L, D] -> [..., 2*H, L, D].
+
+    Must be used with OnnxGraphEditor (defines self._graph, self._logger).
+    """
+
+    def combine_kv_io_tensors(
+        self,
+        kv_tensor_shape: list[int],
+        *,
+        input_prefix: str = "past_key_values",
+        output_prefix: str = "present",
+        kv_layer_re: str | re.Pattern = r"\.(\d+)\.(key|value)$",
+        combined_name_fmt: str = "{prefix}.{layer}"
+    ):
+        if isinstance(kv_layer_re, str):
+            kv_layer_re = re.compile(kv_layer_re)
+        # concatenate along H axis: [..., H, L, D] <-> [..., 2*H, L, D]
+        _H_DIM_AXIS = len(kv_tensor_shape) - 3
+
+        def _get_kv_pairs(
+            io_coll: list[gs.Variable], prefix: str
+        ) -> list[tuple[int, gs.Variable, gs.Variable]]:
+            io_dict: dict[int, dict[str, gs.Variable]] = defaultdict(dict)
+            for io in io_coll:
+                if not isinstance(io, gs.Variable):
+                    raise TypeError(f"Expected gs.Variable, got {type(io)}")
+                if list(io.shape) != kv_tensor_shape:
+                    continue
+                if not io.name.startswith(prefix):
+                    continue
+                m = kv_layer_re.search(io.name)
+                if m is None:
+                    continue
+                layer, role = int(m.group(1)), m.group(2)
+                if role in io_dict[layer]:
+                    raise ValueError(
+                        f"Duplicate {role} tensor for layer {layer}: "
+                        f"'{io_dict[layer][role].name}' and '{io.name}'"
+                    )
+                io_dict[layer][role] = io
+            kv_pairs: list[tuple[int, gs.Variable, gs.Variable]] = []
+            for layer in sorted(io_dict):
+                entry = io_dict[layer]
+                if "key" not in entry or "value" not in entry:
+                    raise ValueError(
+                        f"Layer {layer} is missing "
+                        f"{'key' if 'key' not in entry else 'value'} tensor"
+                    )
+                kv_pairs.append((layer, entry["key"], entry["value"]))
+            return kv_pairs
+
+        def _remove_io(tensor: gs.Variable, io_coll: list[gs.Variable]) -> int:
+            for idx, io_tensor in enumerate(io_coll):
+                if tensor is io_tensor:
+                    io_coll.pop(idx)
+                    return idx
+            return -1
+
+        def _concatenate_kv_input(
+            layer: int,
+            key_input: gs.Variable,
+            value_input: gs.Variable,
+            prefix: str,
+        ):
+            assert key_input.dtype == value_input.dtype
+            assert list(key_input.shape) == kv_tensor_shape
+            assert list(value_input.shape) == kv_tensor_shape
+            key_consumers: list[gs.Node] = key_input.outputs
+            value_consumers: list[gs.Node] = value_input.outputs
+
+            base = combined_name_fmt.format(prefix=prefix, layer=layer)
+            n_kv_heads = kv_tensor_shape[_H_DIM_AXIS]
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_input = gs.Variable(
+                name=f"{base}.key_value",
+                dtype=key_input.dtype,
+                shape=combined_shape
+            )
+            if not (kv_concat_axis := self._graph.tensors().get("kv_concat_axis")):
+                kv_concat_axis = gs.Constant(
+                    "kv_concat_axis",
+                    np.array([_H_DIM_AXIS], dtype=np.int64),
+                )
+            if not (kv_inp_key_starts := self._graph.tensors().get(
+                "kv_inp_key_starts"
+            )):
+                kv_inp_key_starts = gs.Constant(
+                    "kv_inp_key_starts", np.array([0], dtype=np.int64)
+                )
+            if not (kv_inp_key_ends := self._graph.tensors().get(
+                "kv_inp_key_ends"
+            )):
+                kv_inp_key_ends = gs.Constant(
+                    "kv_inp_key_ends",
+                    np.array([n_kv_heads], dtype=np.int64),
+                )
+            if not (kv_inp_value_starts := self._graph.tensors().get(
+                "kv_inp_value_starts"
+            )):
+                kv_inp_value_starts = gs.Constant(
+                    "kv_inp_value_starts",
+                    np.array([n_kv_heads], dtype=np.int64),
+                )
+            if not (kv_inp_value_ends := self._graph.tensors().get(
+                "kv_inp_value_ends"
+            )):
+                kv_inp_value_ends = gs.Constant(
+                    "kv_inp_value_ends",
+                    np.array([2 * n_kv_heads], dtype=np.int64),
+                )
+            key_slice: gs.Variable = self._graph.layer(
+                name=f"{base}.key_slice",
+                op="Slice",
+                inputs=[
+                    combined_input,
+                    kv_inp_key_starts,
+                    kv_inp_key_ends,
+                    kv_concat_axis,
+                ],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.key_from_combined",
+                        dtype=key_input.dtype,
+                        shape=key_input.shape,
+                    )
+                ],
+            )[0]
+            value_slice: gs.Variable = self._graph.layer(
+                name=f"{base}.value_slice",
+                op="Slice",
+                inputs=[
+                    combined_input,
+                    kv_inp_value_starts,
+                    kv_inp_value_ends,
+                    kv_concat_axis,
+                ],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.value_from_combined",
+                        dtype=value_input.dtype,
+                        shape=value_input.shape,
+                    )
+                ],
+            )[0]
+
+            rewire_consumers(key_consumers, key_input, key_slice)
+            rewire_consumers(value_consumers, value_input, value_slice)
+            key_input.outputs.clear()
+            value_input.outputs.clear()
+            insert_pos = _remove_io(key_input, self._graph.inputs)
+            _remove_io(value_input, self._graph.inputs)
+            if insert_pos >= 0:
+                self._graph.inputs.insert(insert_pos, combined_input)
+            else:
+                self._graph.inputs.append(combined_input)
+
+            self._logger.debug(
+                "Combined KV input layer %d: '%s' + '%s' -> '%s'",
+                layer,
+                key_input.name,
+                value_input.name,
+                combined_input.name,
+            )
+
+        def _concatenate_kv_output(
+            layer: int,
+            key_output: gs.Variable,
+            value_output: gs.Variable,
+            prefix: str,
+        ):
+            assert key_output.dtype == value_output.dtype
+            assert list(key_output.shape) == kv_tensor_shape
+            assert list(value_output.shape) == kv_tensor_shape
+
+            base = combined_name_fmt.format(prefix=prefix, layer=layer)
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_tensor: gs.Variable = self._graph.layer(
+                name=f"{base}_kv_concat",
+                op="Concat",
+                inputs=[key_output, value_output],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.key_value",
+                        dtype=key_output.dtype,
+                        shape=combined_shape,
+                    )
+                ],
+                attrs={"axis": _H_DIM_AXIS},
+            )[0]
+            insert_pos = _remove_io(key_output, self._graph.outputs)
+            _remove_io(value_output, self._graph.outputs)
+            if insert_pos >= 0:
+                self._graph.outputs.insert(insert_pos, combined_tensor)
+            else:
+                self._graph.outputs.append(combined_tensor)
+
+            self._logger.debug(
+                "Combined KV output layer %d: '%s' + '%s' -> '%s'",
+                layer,
+                key_output.name,
+                value_output.name,
+                combined_tensor.name,
+            )
+
+        input_pairs = _get_kv_pairs(self._graph.inputs, input_prefix)
+        output_pairs = _get_kv_pairs(self._graph.outputs, output_prefix)
+        self._logger.debug(
+            "Combining KV tensors: %d input pairs, %d output pairs (axis=%d)",
+            len(input_pairs),
+            len(output_pairs),
+            _H_DIM_AXIS,
+        )
+        for kv_info in input_pairs:
+            _concatenate_kv_input(*kv_info, input_prefix)
+        for kv_info in output_pairs:
+            _concatenate_kv_output(*kv_info, output_prefix)
+        self._graph = self._graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True,
+        ).toposort()
+        return self
 
 
 class CommonGraphEditsMixin:

@@ -476,7 +476,7 @@ class ReplacePadWithConcat(OnnxGraphEdit):
         self._logger.debug("Replaced Pad node '%s' with Concat ops", node.name)
 
 
-class MoonshineOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin):
+class MoonshineOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
 
     def __init__(
         self,

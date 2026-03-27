@@ -51,6 +51,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         model_dtype: str = "float",
         split_encoder: bool = False,
         extract_embeddings: bool = False,
+        keep_individual_kv_io: bool = True,
         static_models: bool = True,
         *,
         max_audio_s: int = 5,
@@ -66,6 +67,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._model_size = model_size
         self._split_encoder = split_encoder
         self._extract_embeddings = extract_embeddings
+        self._keep_individual_kv_io = keep_individual_kv_io
         self._onnx_source_dir = onnx_source_dir
         self._use_optimum = use_optimum
         self._hf_repo = f"UsefulSensors/moonshine-{self._model_size}"
@@ -316,6 +318,24 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         # Replace Pad ops with Concat ops
         editor.replace_pad_with_concat()
 
+        if not self._keep_individual_kv_io:
+            n_kv_heads = self._config.decoder_num_attention_heads
+            head_dim = self._hidden_size // n_kv_heads
+            with_past = "with_past" in component
+            dec_seq_len = self._max_tokens if with_past else 1
+            # Combine decoder (self-attn) key+value into single tensor per layer
+            editor.combine_kv_io_tensors(
+                [1, n_kv_heads, dec_seq_len, head_dim],
+                kv_layer_re=r"\.(\d+)\.decoder\.(key|value)$",
+                combined_name_fmt="{prefix}.{layer}.decoder"
+            )
+            # Combine encoder (cross-attn) key+value into single tensor per layer
+            editor.combine_kv_io_tensors(
+                [1, n_kv_heads, self._enc_seq_len, head_dim],
+                kv_layer_re=r"\.(\d+)\.encoder\.(key|value)$",
+                combined_name_fmt="{prefix}.{layer}.encoder"
+            )
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
@@ -484,7 +504,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                 decoder_model=self._export_dir / "decoder.onnx",
                 decoder_with_past_model=self._export_dir / "decoder_with_past.onnx",
                 model_size=self._model_size,
-                preprocessor_model=self._export_dir / "preprocessor.onnx" if self._split_encoder else None
+                preprocessor_model=self._export_dir / "preprocessor.onnx" if self._split_encoder else None,
+                combined_kv_io=not self._keep_individual_kv_io
             )
         else:
             runner = MoonshineDynamic.from_onnx(
@@ -582,6 +603,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         args.dtype,
         args.split_encoder,
         args.extract_embeddings,
+        not args.combine_kv_io,
         not args.dynamic_models,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,

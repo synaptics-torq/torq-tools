@@ -29,11 +29,13 @@ class MoonshineBase(ABC):
     def __init__(
         self,
         model_size: Literal["base", "tiny"],
-        max_inp_len: int | None
+        max_inp_len: int | None,
+        combined_kv_io: bool = False
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._model_size = model_size
         self._max_inp_len = max_inp_len
+        self._combined_kv_io = combined_kv_io
 
         if self._model_size == "tiny":
             self._n_layers: int = 6
@@ -43,6 +45,8 @@ class MoonshineBase(ABC):
             self._n_layers: int = 8
             self._n_kv_heads: int = 8
             self._head_dim: int = 52
+        if self._combined_kv_io:
+            self._n_kv_heads *= 2
         self._start_token_id: int = 1
         self._end_token_id: int = 2
         self._encoder_pad_id: int = 2
@@ -50,14 +54,25 @@ class MoonshineBase(ABC):
         self._n_tokens_gen: int = 0
         self._infer_times: deque[int] = deque(maxlen=100)
 
-        self._kv_cache: dict[str, np.ndarray] = {
-            f"past_key_values.{i}.{a}.{b}": np.zeros(
-                (1, self._n_kv_heads, 1, self._head_dim), dtype=np.float32
-            )
-            for i in range(self._n_layers)
-            for a in ("decoder", "encoder")
-            for b in ("key", "value")
-        }
+        self._kv_cache: dict[str, np.ndarray] = (
+            {
+                f"past_key_values.{i}.{a}.key_value": np.zeros(
+                    (1, self._n_kv_heads, 1, self._head_dim),
+                    dtype=np.float32,
+                )
+                for i in range(self._n_layers)
+                for a in ("decoder", "encoder")
+            }
+            if self._combined_kv_io
+            else {
+                f"past_key_values.{i}.{a}.{b}": np.zeros(
+                    (1, self._n_kv_heads, 1, self._head_dim), dtype=np.float32
+                )
+                for i in range(self._n_layers)
+                for a in ("decoder", "encoder")
+                for b in ("key", "value")
+            }
+        )
         self._all_cache_names: list[str] = list(self._kv_cache)
         self._dec_cache_names: list[str] = [
             k for k in self._all_cache_names if "encoder" not in k
@@ -102,7 +117,7 @@ class MoonshineDynamic(MoonshineBase):
         model_size: Literal["base", "tiny"],
         max_inp_len: int | None = None,
     ):
-        super().__init__(model_size, max_inp_len)
+        super().__init__(model_size, max_inp_len, combined_kv_io=False)
 
         self._encoder = encoder
         self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
@@ -199,9 +214,10 @@ class MoonshineStatic(MoonshineBase):
         model_size: Literal["base", "tiny"],
         max_inp_len: int,
         max_dec_len: int,
-        preprocessor: InferenceRunner | None = None
+        preprocessor: InferenceRunner | None = None,
+        combined_kv_io: bool = True
     ):
-        super().__init__(model_size, max_inp_len)
+        super().__init__(model_size, max_inp_len, combined_kv_io)
 
         self._encoder = encoder
         self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
@@ -227,7 +243,8 @@ class MoonshineStatic(MoonshineBase):
         decoder_with_past_model: str | os.PathLike,
         model_size: Literal["base", "tiny"],
         n_threads: int | None = None,
-        preprocessor_model: str | os.PathLike | None = None
+        preprocessor_model: str | os.PathLike | None = None,
+        combined_kv_io: bool = True
     ) -> "MoonshineStatic":
         input_ort = ort.InferenceSession(preprocessor_model or encoder_model, providers=['CPUExecutionProvider'])
         max_inp_len: int = next(
@@ -247,7 +264,8 @@ class MoonshineStatic(MoonshineBase):
             model_size,
             max_inp_len,
             max_dec_len,
-            ORTInferenceRunner(preprocessor_model) if preprocessor_model is not None else None
+            ORTInferenceRunner(preprocessor_model) if preprocessor_model is not None else None,
+            combined_kv_io=combined_kv_io
         )
 
     @classmethod
@@ -258,7 +276,8 @@ class MoonshineStatic(MoonshineBase):
         decoder_with_past_model: str | os.PathLike,
         model_size: Literal["base", "tiny"],
         n_threads: int | None = None,
-        preprocessor_model: str | os.PathLike | None = None
+        preprocessor_model: str | os.PathLike | None = None,
+        combined_kv_io: bool = True
     ) -> "MoonshineStatic":
         input_int = lite_rt.Interpreter(preprocessor_model or encoder_model)
         input_int.allocate_tensors()
@@ -280,7 +299,8 @@ class MoonshineStatic(MoonshineBase):
             model_size,
             max_inp_len,
             max_dec_len,
-            TFLiteInferenceRunner(preprocessor_model) if preprocessor_model is not None else None
+            TFLiteInferenceRunner(preprocessor_model) if preprocessor_model is not None else None,
+            combined_kv_io=combined_kv_io
         )
 
     @classmethod
@@ -292,7 +312,8 @@ class MoonshineStatic(MoonshineBase):
         model_size: Literal["base", "tiny"],
         max_inp_len: int,
         max_dec_len: int,
-        n_threads: int | None = None
+        n_threads: int | None = None,
+        combined_kv_io: bool = True
     ) -> "MoonshineStatic":
         return cls(
             VMFBInferenceRunner(encoder_model, n_threads=n_threads),
@@ -300,7 +321,8 @@ class MoonshineStatic(MoonshineBase):
             VMFBInferenceRunner(decoder_with_past_model, n_threads=n_threads),
             model_size,
             max_inp_len,
-            max_dec_len
+            max_dec_len,
+            combined_kv_io=combined_kv_io
         )
 
     def _find_token_embeddings(
