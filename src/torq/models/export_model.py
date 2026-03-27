@@ -5,6 +5,7 @@ import argparse
 
 from .moonshine import add_moonshine_export_args
 from .smollm2 import add_smollm2_export_args
+from .gemma3 import add_gemma3_export_args
 
 
 def main():
@@ -17,6 +18,9 @@ def main():
     smollm2 = model.add_parser("smollm2", help="Export SmolLM2 to Torq")
     add_smollm2_export_args(smollm2)
 
+    gemma3 = model.add_parser("gemma3", help="Export Gemma3 to Torq")
+    add_gemma3_export_args(gemma3)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -25,6 +29,9 @@ def main():
     elif args.model_name == "smollm2":
         from .smollm2.export import export_smollm2_from_args
         export_smollm2_from_args(args)
+    elif args.model_name == "gemma3":
+        from .gemma3.export import export_gemma3_from_args
+        export_gemma3_from_args(args)
 
 
 if __name__ == "__main__":
