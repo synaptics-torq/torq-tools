@@ -312,8 +312,8 @@ class DequantizeProjectionsMatMul(OnnxGraphEdit):
     Manually dequantize projection scores MatMul producer to prevent MLIR warnings.
 
     Args:
-        hidden_size (int): SmolLM2 hidden KV dims size
-        vocab_size (int): SmolLM2 vocabulary size
+        hidden_size (int): Model hidden KV dims size
+        vocab_size (int): Model vocabulary size
         export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
 
     Raises:
