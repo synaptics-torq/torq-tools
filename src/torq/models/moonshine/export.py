@@ -274,6 +274,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
 
+        # Replace constant Div ops with Mul
+        editor.replace_constant_div_with_mul()
         # Broadcast op inputs to match output shape
         if self._broadcast_ops is not None:
             editor.broadcast_op_inputs(
