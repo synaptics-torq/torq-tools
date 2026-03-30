@@ -17,6 +17,8 @@ DEFAULT_MODEL_SIZE: Final[str] = "tiny"
 ONNX_DTYPES: Final[list[str]] = ["float", "quantized", "quantized_4bit"]
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 STATIC_MODEL_COMPONENTS: Final[list[str]] = ["encoder", "decoder", "decoder_with_past"]
+DEFAULT_CONV_KERNEL_SIZES: Final[list[int]] = [127, 7, 3]
+DEFAULT_CONV_STRIDES: Final[list[int]] = [64, 3, 2]
 
 
 def add_moonshine_export_args(parser: argparse.ArgumentParser):

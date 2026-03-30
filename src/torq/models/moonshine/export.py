@@ -4,7 +4,6 @@
 import argparse
 import os
 import shutil
-from math import floor
 from pathlib import Path
 from typing import Literal, Final
 
@@ -23,6 +22,8 @@ from . import (
     ONNX_DTYPES,
     OPTIMUM_DTYPES,
     STATIC_MODEL_COMPONENTS,
+    DEFAULT_CONV_KERNEL_SIZES,
+    DEFAULT_CONV_STRIDES,
     add_moonshine_export_args,
 )
 
@@ -74,10 +75,12 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._num_samples = max_audio_s * 16_000
         self._max_tokens = max_audio_s * max_tok_per_s
-        self._enc_seq_len = (
-            floor(floor(floor(self._num_samples / 64 - 127 / 64) / 3) / 2) - 1
-        )
         self._hidden_size = int(self._config.hidden_size)
+        self._conv_kernel_sizes = getattr(self._config, 'conv_kernel_sizes', DEFAULT_CONV_KERNEL_SIZES)
+        self._conv_strides = getattr(self._config, 'conv_strides', DEFAULT_CONV_STRIDES)
+        self._enc_seq_len = self.compute_encoder_seq_len(
+            self._num_samples, self._conv_kernel_sizes, self._conv_strides
+        )
         self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
@@ -351,9 +354,36 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                 dp_emb_p.unlink()
 
     @staticmethod
-    def split_merged_encoder(merged_model: onnx.ModelProto) -> tuple[onnx.ModelProto, onnx.ModelProto]:
+    def compute_encoder_seq_len(
+        num_samples: int,
+        conv_kernel_sizes: list[int] = DEFAULT_CONV_KERNEL_SIZES,
+        conv_strides: list[int] = DEFAULT_CONV_STRIDES,
+    ) -> int:
+        """Compute encoder output sequence length from audio sample count and conv parameters.
+
+        Mirrors ``MoonshinePreTrainedModel._get_feat_extract_output_lengths``
+        from HuggingFace transformers, parameterised by the conv kernel sizes
+        and strides so it works for any Moonshine variant.
+        """
+        length = num_samples
+        for kernel_size, stride in zip(conv_kernel_sizes, conv_strides):
+            length = int((length - kernel_size) / stride + 1)
+        return length
+
+    @staticmethod
+    def split_merged_encoder(
+        merged_model: onnx.ModelProto,
+        hidden_size: int,
+    ) -> tuple[onnx.ModelProto, onnx.ModelProto]:
         assert merged_model.ir_version <= 10
         graph = gs.import_onnx(merged_model)
+
+        # Extract encoder sequence length dim name from the original model
+        enc_seq_len_dim = "encoder_sequence_length"
+        if graph.outputs:
+            out_shape = graph.outputs[0].shape
+            if len(out_shape) >= 2 and isinstance(out_shape[1], str):
+                enc_seq_len_dim = out_shape[1]
 
         preproc_out: gs.Node | None = None
         for node in graph.nodes:
@@ -393,6 +423,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             preprocessor_ext = gs.import_onnx(onnx.load(preprocessor_path))
             preprocessor_ext.name = graph.name
             preprocessor_ext.outputs[0].name = "input_features"
+            preprocessor_ext.outputs[0].shape = ["batch_size", hidden_size, enc_seq_len_dim]
             preprocessor_ext.cleanup(
                 remove_unused_graph_inputs=True, remove_unused_node_outputs=True
             ).toposort()
@@ -402,6 +433,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             encoder_ext = gs.import_onnx(onnx.load(encoder_path))
             encoder_ext.name = "main"
             encoder_ext.inputs[0].name = "input_features"
+            encoder_ext.inputs[0].shape = ["batch_size", hidden_size, enc_seq_len_dim]
             encoder_ext.cleanup(
                 remove_unused_graph_inputs=True, remove_unused_node_outputs=True
             ).toposort()
@@ -468,7 +500,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
         if self._split_encoder:
             self._components["preprocessor"], self._components["encoder"] = \
-                self.split_merged_encoder(self._components["encoder"])
+                self.split_merged_encoder(self._components["encoder"], self._hidden_size)
             self._components["preprocessor"] = self._make_encoder_model_static(self._components["preprocessor"])
             self._logger.info("(encoder) Encoder split into preprocessor and encoder models")
         self._logger.info("(encoder) Making graph static...")
