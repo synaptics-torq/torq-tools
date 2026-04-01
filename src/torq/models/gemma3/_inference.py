@@ -89,7 +89,8 @@ class Gemma3Base(ABC):
         self._bos_token_id: int = config.bos_token_id
         self._eos_token_id: int = config.eos_token_id
         self._pad_token_id: int = config.pad_token_id or 0
-        self._nl_token_id: int = self._tokenizer.encode("\n").ids[0]
+        self._nl_token_id: int = self._tokenizer.encode("\n").ids[-1]
+        self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
         self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
         self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
         self._logger.info("Loaded model '%s'", str(self._model.model_path))
@@ -327,9 +328,10 @@ class Gemma3Dynamic(Gemma3Base):
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
-        if not self._instruct_model:
-            # WARNING: relying on "\n\n" is fragile but is the best we have right now
-            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+        if not self._instruct_model and len(gen_tokens) > 2:
+            if next_token == self._double_nl_token_id:
+                return True
+            return all(t == self._nl_token_id for t in gen_tokens[-2:])
 
     def _run(
         self,
@@ -482,9 +484,10 @@ class Gemma3Static(Gemma3Base):
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
-        if not self._instruct_model:
-            # WARNING: relying on "\n\n" is fragile but is the best we have right now
-            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+        if not self._instruct_model and len(gen_tokens) > 2:
+            if next_token == self._double_nl_token_id:
+                return True
+            return all(t == self._nl_token_id for t in gen_tokens[-2:])
 
     def _run(
         self,
