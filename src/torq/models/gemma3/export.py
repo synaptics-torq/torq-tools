@@ -251,12 +251,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         else:
             runner = Gemma3Dynamic.from_onnx(
                 self._export_paths["model"],
+                max_gen_tokens=self._max_gen_tokens,
                 n_threads=n_threads,
                 instruct_model=self._instruct_model,
                 repo_id=self._hf_repo
             )
         val_runner = Gemma3Dynamic.from_onnx(
             self._onnx_dir /  "model.onnx",
+            max_gen_tokens=self._max_gen_tokens,
             n_threads=n_threads,
             instruct_model=self._instruct_model,
             repo_id=self._hf_repo

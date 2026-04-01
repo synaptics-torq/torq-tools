@@ -265,6 +265,7 @@ class Gemma3Dynamic(Gemma3Base):
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
+        max_gen_tokens: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None
@@ -272,6 +273,7 @@ class Gemma3Dynamic(Gemma3Base):
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id
         )
@@ -281,6 +283,7 @@ class Gemma3Dynamic(Gemma3Base):
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
+        max_gen_tokens: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None
@@ -288,6 +291,7 @@ class Gemma3Dynamic(Gemma3Base):
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id
         )
