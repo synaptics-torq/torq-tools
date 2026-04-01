@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 import hashlib
 import os
+import re
 
 import onnx
 import onnx_graphsurgeon as gs
@@ -286,8 +288,8 @@ class DequantizeProjectionsMatMul(OnnxGraphEdit):
     Manually dequantize projection scores MatMul producer to prevent MLIR warnings.
 
     Args:
-        hidden_size (int): Moonshine hidden KV dims size
-        vocab_size (int): Moonshine vocabulary size
+        hidden_size (int): SmolLM2 hidden KV dims size
+        vocab_size (int): SmolLM2 vocabulary size
         export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
 
     Raises:
@@ -383,49 +385,6 @@ class RemoveIsNaN(OnnxGraphEdit):
         where_node.outputs.clear()
 
         self._logger.debug("Removed unsupported IsNaN op '%s'", node.name)
-
-
-@dataclass
-class RemoveRedundantCasts(OnnxGraphEdit):
-    """
-    Remove redundant Cast ops where input dtype == output dtype
-    """
-
-    @staticmethod
-    def _to_onnx_dtype(dtype: np.dtype | int | None) -> int | None:
-        if dtype is None:
-            return None
-        if isinstance(dtype, int):
-            return dtype
-        try:
-            return onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
-        except Exception:
-            return None
-
-    def match(self, node: gs.Node) -> bool:
-        if node.op != "Cast" or not node.inputs or not node.outputs:
-            return False
-        inp_dtype = self._to_onnx_dtype(getattr(node.inputs[0], "dtype", None))
-        if inp_dtype is None:
-            return False
-        cast_to = node.attrs.get("to", None)
-        if isinstance(cast_to, int) and inp_dtype == cast_to:
-            return True
-        out_dtype = self._to_onnx_dtype(getattr(node.outputs[0], "dtype", None))
-        return out_dtype is not None and inp_dtype == out_dtype
-
-    def transform(self, node: gs.Node):
-        self._check_node_op(node, "Cast")
-        inp = node.inputs[0]
-        out = node.outputs[0]
-        consumers: list[gs.Node] = list(out.outputs)
-        rewire_consumers(consumers, out, inp)
-        for i, graph_out in enumerate(self.graph.outputs):
-            if graph_out is out:
-                self.graph.outputs[i] = inp
-        node.inputs.clear()
-        node.outputs.clear()
-        self._logger.debug("Removed redundant Cast node '%s'", node.name)
 
 
 @dataclass
@@ -864,291 +823,17 @@ class ExtractConstantLUT(OnnxGraphEdit):
             node.name, self.inp_name
         )
 
-@dataclass
-class ReplacePadWithConcat(OnnxGraphEdit):
-    """
-    Replace Pad ops with equivalent Concat ops using constant tensors.
-    """
 
-    def match(self, node: gs.Node) -> bool:
-        return node.op == "Pad"
-    
-    @staticmethod
-    def _is_empty_variable(tensor: gs.Variable) -> bool:
-        return (not tensor.name and not tensor.dtype and not tensor.shape)
-
-    @staticmethod
-    def _ensure_static_shape(tensor: gs.Tensor, node_name: str, label: str) -> list[int]:
-        shape = getattr(tensor, "shape", None)
-        if shape is None:
-            raise ValueError(f"Pad node '{node_name}' {label} has no shape information")
-        if not all(isinstance(d, (int, np.integer)) for d in shape):
-            raise ValueError(
-                f"Pad node '{node_name}' {label} has dynamic shape {shape}"
-            )
-        return [int(d) for d in shape]
-
-    @staticmethod
-    def _load_const_array(tensor: gs.Constant, node_name: str, label: str) -> np.ndarray:
-        if not isinstance(tensor, gs.Constant):
-            raise ValueError(f"Pad node '{node_name}' {label} must be constant, got {tensor}")
-        values = tensor.values
-        if not isinstance(values, np.ndarray):
-            try:
-                values = values.load()
-            except AttributeError as e:
-                raise ValueError(
-                    f"Pad node '{node_name}' {label} is not a loadable constant"
-                ) from e
-        return np.asarray(values)
-
-    @staticmethod
-    def _normalize_dtype(dtype, node_name: str) -> tuple[np.dtype, int | None]:
-        if dtype is None:
-            raise ValueError(f"Pad node '{node_name}' is missing dtype information")
-        if isinstance(dtype, int):
-            if dtype == onnx.TensorProto.BFLOAT16:
-                return np.dtype(np.float32), onnx.TensorProto.BFLOAT16
-            try:
-                return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(dtype)), None
-            except Exception as e:
-                raise ValueError(
-                    f"Pad node '{node_name}' has unsupported dtype {dtype}"
-                ) from e
-        try:
-            return np.dtype(dtype), None
-        except Exception as e:
-            raise ValueError(
-                f"Pad node '{node_name}' has unsupported dtype {dtype}"
-            ) from e
-
-    def _get_pad_value(self, node: gs.Node) -> object:
-        if len(node.inputs) >= 3 and node.inputs[2] is not None:
-            if self._is_empty_variable(node.inputs[2]):
-                values = np.array(0).astype(np.int64)
-            else:
-                values = self._load_const_array(node.inputs[2], node.name, "constant_value")
-        elif "value" in node.attrs:
-            values = np.asarray(node.attrs["value"])
-        elif "constant_value" in node.attrs:
-            values = np.asarray(node.attrs["constant_value"])
-        else:
-            return 0
-        if values.size != 1:
-            raise ValueError(
-                f"Pad node '{node.name}' constant_value must be scalar, got shape {values.shape}"
-            )
-        return values.reshape(()).item()
-
-    def _get_axis_pads(self, node: gs.Node, rank: int) -> list[tuple[int, int]]:
-        pads_values = None
-        if len(node.inputs) >= 2 and node.inputs[1] is not None:
-            pads_values = self._load_const_array(node.inputs[1], node.name, "pads")
-        elif "pads" in node.attrs:
-            pads_values = np.asarray(node.attrs["pads"])
-        if pads_values is None:
-            raise ValueError(f"Pad node '{node.name}' is missing pads")
-
-        pads_values = np.asarray(pads_values)
-        if not np.all(np.equal(pads_values, np.round(pads_values))):
-            raise ValueError(f"Pad node '{node.name}' pads must be integers")
-        pads_list = pads_values.astype(np.int64).flatten().tolist()
-
-        axes_values = None
-        if len(node.inputs) >= 4 and node.inputs[3] is not None:
-            axes_values = self._load_const_array(node.inputs[3], node.name, "axes")
-        elif "axes" in node.attrs:
-            axes_values = np.asarray(node.attrs["axes"])
-
-        if axes_values is None:
-            if len(pads_list) != 2 * rank:
-                raise ValueError(
-                    f"Pad node '{node.name}' pads length {len(pads_list)} "
-                    f"does not match rank {rank}"
-                )
-            return [(int(pads_list[i]), int(pads_list[i + rank])) for i in range(rank)]
-
-        axes_values = np.asarray(axes_values)
-        if not np.all(np.equal(axes_values, np.round(axes_values))):
-            raise ValueError(f"Pad node '{node.name}' axes must be integers")
-        axes = axes_values.astype(np.int64).flatten().tolist()
-        if len(pads_list) != 2 * len(axes):
-            raise ValueError(
-                f"Pad node '{node.name}' pads length {len(pads_list)} does not match axes {axes}"
-            )
-
-        axis_pads: list[tuple[int, int]] = [(0, 0)] * rank
-        for i, axis in enumerate(axes):
-            axis = int(axis)
-            if axis < 0:
-                axis += rank
-            if axis < 0 or axis >= rank:
-                raise ValueError(
-                    f"Pad node '{node.name}' has axis {axis} out of range for rank {rank}"
-                )
-            if axis_pads[axis] != (0, 0):
-                raise ValueError(
-                    f"Pad node '{node.name}' has duplicate axis {axis} in axes {axes}"
-                )
-            axis_pads[axis] = (int(pads_list[i]), int(pads_list[i + len(axes)]))
-        return axis_pads
-
-    @staticmethod
-    def _build_pad_const(
-        name: str,
-        base_shape: list[int],
-        axis: int,
-        pad_len: int,
-        pad_value: object,
-        np_dtype: np.dtype,
-        export_dtype: int | None
-    ) -> gs.Constant:
-        pad_shape = list(base_shape)
-        pad_shape[axis] = pad_len
-        if pad_value == 0:
-            values = np.zeros(pad_shape, dtype=np_dtype)
-        else:
-            values = np.full(pad_shape, pad_value, dtype=np_dtype)
-        return gs.Constant(name=name, values=values, export_dtype=export_dtype)
-
-    def transform(self, node: gs.Node):
-        self._check_node_op(node, "Pad")
-        if not node.inputs or not node.outputs:
-            raise ValueError(f"Pad node '{node.name}' must have inputs and outputs")
-
-        mode = node.attrs.get("mode", "constant")
-        if isinstance(mode, bytes):
-            mode = mode.decode()
-        if mode != "constant":
-            raise ValueError(
-                f"Pad node '{node.name}' has unsupported mode '{mode}'"
-            )
-
-        data = node.inputs[0]
-        out = node.outputs[0]
-
-        in_shape = self._ensure_static_shape(data, node.name, "input")
-        out_shape = self._ensure_static_shape(out, node.name, "output")
-        rank = len(in_shape)
-
-        axis_pads = self._get_axis_pads(node, rank)
-        if rank == 0 and any(b or a for b, a in axis_pads):
-            raise ValueError(f"Pad node '{node.name}' cannot pad a scalar input")
-
-        for before, after in axis_pads:
-            if before < 0 or after < 0:
-                raise ValueError(
-                    f"Pad node '{node.name}' has negative pads {axis_pads}"
-                )
-
-        expected_shape = [
-            in_shape[i] + axis_pads[i][0] + axis_pads[i][1] for i in range(rank)
-        ]
-        if out_shape != expected_shape:
-            raise ValueError(
-                f"Pad node '{node.name}' output shape {out_shape} does not match "
-                f"expected {expected_shape}"
-            )
-
-        in_dtype = getattr(data, "dtype", None)
-        out_dtype = getattr(out, "dtype", None)
-        in_np_dtype, in_export_dtype = self._normalize_dtype(in_dtype, node.name)
-        out_np_dtype, out_export_dtype = self._normalize_dtype(out_dtype, node.name)
-        if in_np_dtype != out_np_dtype or in_export_dtype != out_export_dtype:
-            raise ValueError(
-                f"Pad node '{node.name}' dtype mismatch input {in_dtype} vs output {out_dtype}"
-            )
-
-        pad_value = self._get_pad_value(node)
-
-        if not any(b or a for b, a in axis_pads):
-            consumers: list[gs.Node] = list(out.outputs)
-            rewire_consumers(consumers, out, data)
-            for i, graph_out in enumerate(self.graph.outputs):
-                if graph_out is out:
-                    self.graph.outputs[i] = data
-            node.inputs.clear()
-            node.outputs.clear()
-            self._logger.debug("Removed no-op Pad node '%s'", node.name)
-            return
-
-        pad_axes = [i for i, (b, a) in enumerate(axis_pads) if b or a]
-        last_axis = pad_axes[-1]
-
-        cur = data
-        cur_shape = list(in_shape)
-        for axis in range(rank):
-            before, after = axis_pads[axis]
-            if before == 0 and after == 0:
-                continue
-
-            concat_inputs: list[gs.Tensor] = []
-            if before > 0:
-                concat_inputs.append(
-                    self._build_pad_const(
-                        name=f"{node.name}_pad_pre_axis{axis}",
-                        base_shape=cur_shape,
-                        axis=axis,
-                        pad_len=before,
-                        pad_value=pad_value,
-                        np_dtype=in_np_dtype,
-                        export_dtype=in_export_dtype,
-                    )
-                )
-            concat_inputs.append(cur)
-            if after > 0:
-                concat_inputs.append(
-                    self._build_pad_const(
-                        name=f"{node.name}_pad_post_axis{axis}",
-                        base_shape=cur_shape,
-                        axis=axis,
-                        pad_len=after,
-                        pad_value=pad_value,
-                        np_dtype=in_np_dtype,
-                        export_dtype=in_export_dtype,
-                    )
-                )
-
-            new_shape = list(cur_shape)
-            new_shape[axis] = new_shape[axis] + before + after
-            if axis == last_axis:
-                concat_out = out
-                concat_out.shape = new_shape
-            else:
-                concat_out = gs.Variable(
-                    name=f"{node.name}_pad_axis{axis}_out",
-                    dtype=out_dtype,
-                    shape=new_shape,
-                )
-
-            concat_node = gs.Node(
-                op="Concat",
-                name=f"{node.name}_pad_axis{axis}",
-                inputs=concat_inputs,
-                outputs=[concat_out],
-                attrs={"axis": axis},
-            )
-            self.graph.nodes.append(concat_node)
-
-            cur = concat_out
-            cur_shape = new_shape
-
-        node.inputs.clear()
-        node.outputs.clear()
-        self._logger.debug("Replaced Pad node '%s' with Concat ops", node.name)
-
-
-class MoonshineOnnxGraphEditor(OnnxGraphEditor):
+class SmolLM2OnnxGraphEditor(OnnxGraphEditor):
 
     def __init__(
         self,
         graph: gs.Graph,
-        component: str,
         export_dtype: onnx.TensorProto.DataType | None = None
     ):
         super().__init__(
             graph,
-            component,
+            "decoder_with_past",
             export_dtype=export_dtype
         )
 
@@ -1156,59 +841,181 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
     def from_onnx(
         cls,
         onnx_model: str | os.PathLike | onnx.ModelProto,
-        component: str,
         export_dtype: onnx.TensorProto.DataType | None = None,
-    ) -> "MoonshineOnnxGraphEditor":
+    ) -> "SmolLM2OnnxGraphEditor":
         if not isinstance(onnx_model, onnx.ModelProto):
             onnx_model = onnx.load(onnx_model)
         graph = gs.import_onnx(onnx_model)
         return cls(
             graph,
-            component,
             export_dtype
         )
 
-    def fix_encoder_io(
+    def fix_io(
         self,
-        num_samples: int,
-        enc_seq_len: int,
+        seq_len: int,
         dims: list[FixedDimMapping] | None = None,
         *,
         batch_dim: str = "batch_size",
-        num_samples_dim: str = "num_samples",
-        enc_seq_len_dims: list[str] = ["encoder_sequence_length", "floor(floor(floor(num_samples/64 - 127/64)/3)/2) - 1"],
+        seq_len_dim: str = "sequence_length",
+        past_seq_len_dim: str = "past_sequence_length"
     ):
         to_fix = [
             FixedDimMapping(batch_dim, DimMatchType.EXACT, 1),
-            FixedDimMapping(num_samples_dim, DimMatchType.EXACT, num_samples),
+            FixedDimMapping(seq_len_dim, DimMatchType.EXACT, 1),
+            FixedDimMapping(past_seq_len_dim, DimMatchType.CONTAINS, seq_len),
         ]
-        to_fix.extend([
-            FixedDimMapping(seq_len_dim, DimMatchType.EXACT, enc_seq_len)
-            for seq_len_dim in enc_seq_len_dims
-        ])
         to_fix.extend(dims or [])
         self.fix_io_dims(to_fix)
 
-    def fix_decoder_io(
+    def combine_kv_io_tensors(
         self,
-        enc_seq_len: int,
-        dec_seq_len: int,
-        with_past: bool,
-        dims: list[FixedDimMapping] | None = None,
-        *,
-        batch_dim: str = "batch_size",
-        enc_seq_len_dim: str = "encoder_sequence_length",
-        dec_seq_len_dim: str = "decoder_sequence_length",
-        past_dec_seq_len_dim: str = "past_decoder_sequence_length"
+        kv_tensor_shape: list[int]
     ):
-        to_fix = [
-            FixedDimMapping(batch_dim, DimMatchType.EXACT, 1),
-            FixedDimMapping(enc_seq_len_dim, DimMatchType.CONTAINS, enc_seq_len),
-            FixedDimMapping(dec_seq_len_dim, DimMatchType.EXACT, 1),
-            FixedDimMapping(past_dec_seq_len_dim, DimMatchType.CONTAINS, dec_seq_len if with_past else 1)
-        ]
-        to_fix.extend(dims or [])
-        self.fix_io_dims(to_fix)
+        # matches "prefix....<layer_idx>.<key|value>" naming convention
+        _KV_LAYER_RE = re.compile(r"\.(\d+)\.(key|value)$")
+        # concatenate along H axis: [..., H, L, D] <-> [..., 2*H, L, D]
+        _H_DIM_AXIS = len(kv_tensor_shape) - 3
+
+        def _get_kv_pairs(io_coll: list[gs.Variable], prefix: str) -> list[tuple[int, gs.Variable, gs.Variable]]:
+            io_dict: dict[int, dict[str, gs.Variable]] = defaultdict(dict)
+            for io in io_coll:
+                if not isinstance(io, gs.Variable):
+                    raise TypeError(f"Expected gs.Variable, got {type(io)}")
+                if list(io.shape) != kv_tensor_shape:
+                    continue
+                if not io.name.startswith(prefix):
+                    continue
+                m = _KV_LAYER_RE.search(io.name)
+                if m is None:
+                    raise ValueError(
+                        f"Cannot extract layer index from KV tensor name '{io.name}'; "
+                        "expected '<prefix>...<layer_idx>.<key|value>' naming"
+                    )
+                layer, role = int(m.group(1)), m.group(2)
+                if role in io_dict[layer]:
+                    raise ValueError(
+                        f"Duplicate {role} tensor for layer {layer}: "
+                        f"'{io_dict[layer][role].name}' and '{io.name}'"
+                    )
+                io_dict[layer][role] = io
+            kv_pairs: list[tuple[int, gs.Variable, gs.Variable]] = []
+            for layer in sorted(io_dict):
+                entry = io_dict[layer]
+                if "key" not in entry or "value" not in entry:
+                    raise ValueError(
+                        f"Layer {layer} is missing {'key' if 'key' not in entry else 'value'} tensor"
+                    )
+                kv_pairs.append((layer, entry["key"], entry["value"]))
+            return kv_pairs
+
+        def _remove_io(tensor: gs.Variable, io_coll: list[gs.Variable]):
+            for idx, io_tensor in enumerate(io_coll):
+                if tensor is io_tensor:
+                    io_coll.pop(idx)
+                    break
+        
+        def _concatenate_kv_input(layer: int, key_input: gs.Variable, value_input: gs.Variable, prefix: str):
+            assert key_input.dtype == value_input.dtype
+            assert list(key_input.shape) == kv_tensor_shape
+            assert list(value_input.shape) == kv_tensor_shape
+            key_consumers: list[gs.Node] = key_input.outputs
+            value_consumers: list[gs.Node] = value_input.outputs
+
+            n_kv_heads = kv_tensor_shape[_H_DIM_AXIS]
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_input = gs.Variable(
+                name=f"{prefix}.{layer}.key_value",
+                dtype=key_input.dtype,
+                shape=combined_shape
+            )
+            if not (kv_concat_axis := self._graph.tensors().get("kv_concat_axis")):
+                kv_concat_axis = gs.Constant(
+                    "kv_concat_axis", np.array([_H_DIM_AXIS], dtype=np.int64)
+                )
+            if not (kv_inp_key_starts := self._graph.tensors().get("kv_inp_key_starts")):
+                kv_inp_key_starts = gs.Constant(
+                    "kv_inp_key_starts", np.array([0], dtype=np.int64)
+                )
+            if not (kv_inp_key_ends := self._graph.tensors().get("kv_inp_key_ends")):
+                kv_inp_key_ends = gs.Constant(
+                    "kv_inp_key_ends", np.array([n_kv_heads], dtype=np.int64)
+                )
+            if not (kv_inp_value_starts := self._graph.tensors().get("kv_inp_value_starts")):
+                kv_inp_value_starts = gs.Constant(
+                    "kv_inp_value_starts", np.array([n_kv_heads], dtype=np.int64)
+                )
+            if not (kv_inp_value_ends := self._graph.tensors().get("kv_inp_value_ends")):
+                kv_inp_value_ends = gs.Constant(
+                    "kv_inp_value_ends", np.array([2 * n_kv_heads], dtype=np.int64)
+                )
+            key_slice: gs.Variable = self._graph.layer(
+                name=f"{prefix}.{layer}.key_slice",
+                op="Slice",
+                inputs=[combined_input, kv_inp_key_starts, kv_inp_key_ends, kv_concat_axis],
+                outputs=[gs.Variable(
+                    name=f"{prefix}.{layer}.key_from_combined",
+                    dtype=key_input.dtype,
+                    shape=key_input.shape
+                )]
+            )[0]
+            value_slice: gs.Variable = self._graph.layer(
+                name=f"{prefix}.{layer}.value_slice",
+                op="Slice",
+                inputs=[combined_input, kv_inp_value_starts, kv_inp_value_ends, kv_concat_axis],
+                outputs=[gs.Variable(
+                    name=f"{prefix}.{layer}.value_from_combined",
+                    dtype=value_input.dtype,
+                    shape=value_input.shape
+                )]
+            )[0]
+
+            rewire_consumers(key_consumers, key_input, key_slice)
+            rewire_consumers(value_consumers, value_input, value_slice)
+            key_input.outputs.clear()
+            value_input.outputs.clear()
+            _remove_io(key_input, self._graph.inputs)
+            _remove_io(value_input, self._graph.inputs)
+            self._graph.inputs.append(combined_input)
+
+            self._logger.debug("Combined KV input layer %d: '%s' + '%s' -> '%s'", layer, key_input.name, value_input.name, combined_input.name)
+
+        def _concatenate_kv_output(layer: int, key_output: gs.Variable, value_output: gs.Variable, prefix: str):
+            assert key_output.dtype == value_output.dtype
+            assert list(key_output.shape) == kv_tensor_shape
+            assert list(value_output.shape) == kv_tensor_shape
+
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_tensor: gs.Variable = self._graph.layer(
+                name=f"{prefix}.{layer}_kv_concat",
+                op="Concat",
+                inputs=[key_output, value_output],
+                outputs=[gs.Variable(
+                    name=f"{prefix}.{layer}.key_value",
+                    dtype=key_output.dtype,
+                    shape=combined_shape
+                )],
+                attrs={"axis": _H_DIM_AXIS}
+            )[0]
+            _remove_io(key_output, self._graph.outputs)
+            _remove_io(value_output, self._graph.outputs)
+            self._graph.outputs.append(combined_tensor)
+
+            self._logger.debug("Combined KV output layer %d: '%s' + '%s' -> '%s'", layer, key_output.name, value_output.name, combined_tensor.name)
+
+        input_pairs = _get_kv_pairs(self._graph.inputs, "past_key_values")
+        output_pairs = _get_kv_pairs(self._graph.outputs, "present")
+        self._logger.info("Combining KV tensors: %d input pairs, %d output pairs (axis=%d)", len(input_pairs), len(output_pairs), _H_DIM_AXIS)
+        for kv_info in input_pairs:
+            _concatenate_kv_input(*kv_info, "past_key_values")
+        for kv_info in output_pairs:
+            _concatenate_kv_output(*kv_info, "present")
+        self._graph = self._graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True
+        ).toposort()
 
     def replace_dynamic_kv_cache(
         self,
@@ -1253,12 +1060,6 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
         self.apply_edit(RemoveIsNaN(self._graph, self._graph_name))
         return self
 
-    def remove_redundant_casts(
-        self
-    ):
-        self.apply_edit(RemoveRedundantCasts(self._graph, self._graph_name))
-        return self
-
     def move_output_from_concat(
         self,
         pad_len: int
@@ -1297,10 +1098,4 @@ class MoonshineOnnxGraphEditor(OnnxGraphEditor):
         inp_name: str = "token_embedding"
     ):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
-        return self
-    
-    def replace_pad_with_concat(
-        self,
-    ):
-        self.apply_edit(ReplacePadWithConcat(self._graph, self._graph_name))
         return self

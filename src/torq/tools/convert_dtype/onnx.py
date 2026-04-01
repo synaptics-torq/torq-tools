@@ -16,7 +16,7 @@ from torq.utils.logging import add_logging_args, configure_logging
 
 from ...utils.onnx import is_same_dtype, upgrade_model
 
-logger = logging.getLogger("FP32-Converter")
+logger = logging.getLogger("ONNX-Dtype-Converter")
 
 _ONNX_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
     "fp32": onnx.TensorProto.FLOAT,
@@ -464,6 +464,7 @@ class Int64Converter(OnnxDtypeConverterBase):
     _ENFORCED_INT64_IO: Final[dict[str, tuple[tuple[int, ...], ...]]] = {
         "ConstantOfShape": ((0,),), # v25: inputs: (input, )
         "Expand": ((1,),),          # v13: inputs: (shape, )
+        "GatherND": ((1,),),        # v13: inputs: (indices, )
         "Pad": ((1, 3),),           # v25: inputs: (pads, axes)
         "ReduceMean": ((1,),),      # v18: inputs: (axes, )
         "Reshape": ((1,),),         # v25: inputs: (shape, )

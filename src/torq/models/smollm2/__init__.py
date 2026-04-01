@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
-
 import argparse
 from typing import Final
 
@@ -11,41 +8,38 @@ from ...utils.demo import add_common_args
 from ...utils.onnx import add_onnx_args
 
 
-DEFAULT_INPUT_AUDIO_S: Final[int] = 5
-DEFAULT_DEC_TOK_PER_SEC: Final[int] = 6
-DEFAULT_MODEL_SIZE: Final[str] = "tiny"
-ONNX_DTYPES: Final[list[str]] = ["float", "quantized", "quantized_4bit"]
+DEFAULT_MODEL_SIZE: Final[str] = "135M"
+DEFAULT_GEN_TOKENS: Final[int] = 64
+DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
-STATIC_MODEL_COMPONENTS: Final[list[str]] = ["encoder", "decoder", "decoder_with_past"]
+MODEL_SIZES: Final[list[str]] = ["135M", "360M", "1.7B"]
 
 
-def add_moonshine_export_args(parser: argparse.ArgumentParser):
-    parser.add_argument(
-        "-i",
-        "--input-seconds",
-        type=int,
-        default=DEFAULT_INPUT_AUDIO_S,
-        help="Input audio length in seconds (default: %(default)s)",
-    )
+def add_smollm2_export_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "-t",
-        "--tokens-per-sec",
+        "--max-gen-tokens",
         type=int,
-        default=DEFAULT_DEC_TOK_PER_SEC,
-        help="Max number of tokens decoded per second (default: %(default)d)",
+        default=DEFAULT_GEN_TOKENS,
+        help="Input audio length in seconds (default: %(default)s)",
     )
     parser.add_argument(
         "-s",
         "--model-size",
         type=str,
-        choices=["base", "tiny"],
+        choices=MODEL_SIZES,
         default=DEFAULT_MODEL_SIZE,
-        help="Moonshine model size to export (default: %(default)s)",
+        help="SmolLM2 model size to export (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--instruct-model",
+        action="store_true",
+        default=False,
+        help="Export instruct model variant"
     )
     add_onnx_args(
         parser,
-        model_dtypes=ONNX_DTYPES + OPTIMUM_DTYPES,
-        convert_dtypes=True,
+        convert_dtypes=["bf16", "fp16"],
         allow_no_opt=False,
     )
     parser.add_argument(
@@ -54,12 +48,6 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         default="models",
         metavar="DIR",
         help="Base directory for source and export models (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--split-encoder",
-        action="store_true",
-        default=False,
-        help="Split merged encoder into preprocessor and encoder models"
     )
     parser.add_argument(
         "--extract-embeddings",
@@ -74,12 +62,6 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--use-optimum",
-        action="store_true",
-        default=False,
-        help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
-    )
-    parser.add_argument(
         "--skip-iree",
         action="store_true",
         default=False,
@@ -92,11 +74,10 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Replace int64 -> bf16 casts with a look-up table"
     )
     parser.add_argument(
-        "--skip-export",
-        type=str,
-        nargs="+",
-        choices=["encoder", "decoder", "decoder_with_past", "decoder_merged"],
-        help="Skip export of specific components"
+        "--keep-individual-kv-io",
+        action="store_true",
+        default=False,
+        help="Keep KV I/O as separate key, value tensors instead of combining"
     )
     parser.add_argument(
         "--broadcast-ops",
@@ -110,37 +91,48 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
     add_iree_args(parser)
 
 
-def add_moonshine_infer_args(parser: argparse.ArgumentParser):
+def add_smollm2_infer_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "inputs",
         type=str,
-        metavar="WAV",
         nargs="+",
-        help="WAV files for inference",
+        help="Input prompts (space-separated).",
     )
     parser.add_argument(
-        "-m", "--model-dir",
+        "-m", "--model",
         type=str,
         required=True,
-        metavar="DIR",
-        help="Path to Moonshine model directory",
+        metavar=".onnx | .vmfb",
+        help="Path to SmolLM2 model",
     )
     parser.add_argument(
         "-s", "--model-size",
         type=str,
-        required=True,
-        choices=["base", "tiny"],
-        help="Moonshine model size"
+        choices=MODEL_SIZES,
+        default=DEFAULT_MODEL_SIZE,
+        help="SmolLM2 model size (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--max-gen-tokens",
+        type=int,
+        help="Maximum tokens to generate",
     )
     parser.add_argument(
         "--max-inp-len",
         type=int,
-        help="Maximum input length (required for static VMFB models)",
+        help="Maximum input length",
     )
     parser.add_argument(
-        "--max-dec-len",
-        type=int,
-        help="Maximum decoder length (required for static VMFB models)",
+        "--instruct-model",
+        action="store_true",
+        default=False,
+        help="Is instruct model"
+    )
+    parser.add_argument(
+        "--dynamic-model",
+        action="store_true",
+        default=False,
+        help="Is dynamic model"
     )
     add_common_args(parser)
     add_logging_args(parser)
