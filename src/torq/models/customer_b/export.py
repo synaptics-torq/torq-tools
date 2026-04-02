@@ -432,17 +432,11 @@ def _build_all_lstm_saved_model(
         # StridedSlice op entirely.
         # ----------------------------------------------------------
 
-        # Squeeze 3-D inputs to 2-D for matmul:
-        #   x: [1, 1, 1024] → [1, 1024]
-        x_2d = tf.keras.layers.Reshape(
-            (input_size,), name=f"squeeze_x_{block_idx}"
-        )(x)
-        h_prev = tf.keras.layers.Reshape(
-            (hidden_size,), name=f"squeeze_h_{block_idx}"
-        )(h_states[block_idx])
-        c_prev = tf.keras.layers.Reshape(
-            (hidden_size,), name=f"squeeze_c_{block_idx}"
-        )(c_states[block_idx])
+        # Dense handles rank-3 [1,1,F] natively (matmul on last dim),
+        # so no Reshape squeeze needed.
+        x_2d = x
+        h_prev = h_states[block_idx]
+        c_prev = c_states[block_idx]
 
         # Per-gate input projections: x @ W_gate → [1, H]
         gate_names = ["i", "f", "c", "o"]
@@ -517,18 +511,10 @@ def _build_all_lstm_saved_model(
             name=f"h_new_{block_idx}"
         )([sig_o, tanh_c_new])
 
-        # lstm_out for LayerNorm: expand h_new [1,H] → [1,1,H]
-        lstm_out = tf.keras.layers.Reshape(
-            (1, hidden_size), name=f"expand_lstm_out_{block_idx}"
-        )(h_new)
-
-        # Store state outputs (expand back to [1,1,1024])
-        h_out = tf.keras.layers.Reshape(
-            (1, hidden_size), name=f"h_out_{block_idx}"
-        )(h_new)
-        c_out = tf.keras.layers.Reshape(
-            (1, hidden_size), name=f"c_out_{block_idx}"
-        )(c_new)
+        # Dense preserves rank-3, so h_new/c_new are already [1,1,H].
+        lstm_out = h_new
+        h_out = h_new
+        c_out = c_new
 
         h_out_names = ["inter_h_0", "inter_h_2", "348", "456"]
         c_out_names = ["inter_h_1", "inter_h_3", "349", "457"]
