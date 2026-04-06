@@ -276,6 +276,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
 
+        # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Broadcast op inputs to match output shape
         if self._broadcast_ops is not None:
             editor.broadcast_op_inputs(
@@ -289,6 +293,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
 
+        # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Fold MatMul A @ B where B is a scalar into Mul
         editor.fold_scalar_matmul()
         # Manually dequantize projection scores

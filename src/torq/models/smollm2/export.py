@@ -179,6 +179,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
         # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
         editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Fold MatMul A @ B where B is a scalar into Mul
         editor.fold_scalar_matmul()
         # Broadcast op inputs to match output shape

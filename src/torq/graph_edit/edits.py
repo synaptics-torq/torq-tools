@@ -35,6 +35,7 @@ __all__ = [
     "BroadcastOpInputs",
     "ExtractConstantLUT",
     "EliminateTranspose",
+    "CollapseReshapeChain",
     "CollapseGQABroadcast",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
@@ -579,8 +580,56 @@ class EliminateTranspose(OnnxGraphEdit):
 
         node.inputs.clear()
         node.outputs.clear()
-        self._logger.info(
-            "Eliminated Transpose '%s': %s -> %s", node.name, inp_shape, out_shape
+        if inp_shape == out_shape:
+            self._logger.debug(
+                "Eliminated Transpose '%s': %s -> %s", node.name, inp_shape, out_shape
+            )
+        else:
+            self._logger.debug(
+                "Folded Transpose '%s' into Reshape '%s'", node.name, node.name + "_fold_reshape"
+            )
+
+
+@dataclass
+class CollapseReshapeChain(OnnxGraphEdit):
+    """
+    Collapse consecutive Reshape ops into a single Reshape.
+
+    Matches a Reshape node whose only consumer is another Reshape,
+    and replaces the chain with a single Reshape from the first input
+    to the last output shape.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Reshape" or not node.inputs or not node.outputs:
+            return False
+        out = node.outputs[0]
+        if len(out.outputs) != 1:
+            return False
+        consumer: gs.Node = out.outputs[0]
+        return consumer.op == "Reshape"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Reshape")
+        data_inp = node.inputs[0]
+
+        # walk forward through all consecutive Reshapes
+        current = node
+        collapsed: list[str] = [node.name]
+        while True:
+            out = current.outputs[0]
+            if len(out.outputs) != 1 or out.outputs[0].op != "Reshape":
+                break
+            next_node: gs.Node = out.outputs[0]
+            current.inputs.clear()
+            current.outputs.clear()
+            collapsed.append(next_node.name)
+            current = next_node
+
+        # wire original data input into the final Reshape
+        current.inputs[0] = data_inp
+        self._logger.debug(
+            "Collapsed %d Reshapes into '%s'", len(collapsed), current.name
         )
 
 
@@ -1177,6 +1226,10 @@ class CommonGraphEditsMixin:
 
     def eliminate_transposes(self):
         self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
+        return self
+
+    def collapse_reshape_chains(self):
+        self.apply_edit(CollapseReshapeChain(self._graph, self._graph_name))
         return self
 
     def collapse_gqa_broadcast(self):
