@@ -34,6 +34,8 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "EliminateTranspose",
+    "CollapseGQABroadcast",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -495,6 +497,190 @@ class FoldScalarMatMul(OnnxGraphEdit):
         node.outputs.clear()
 
         self._logger.debug("Folded scalar MatMul node '%s' into Mul", node.name)
+
+
+@dataclass
+class EliminateTranspose(OnnxGraphEdit):
+    """
+    Eliminate Transpose ops that don't rearrange data in memory.
+
+    Handles two cases:
+    1. No-op: permuted shape equals input shape (e.g., transposing two dims of equal size).
+       The Transpose is bypassed entirely.
+    2. Data-preserving: permutation only swaps dims where at most one per cycle has size > 1
+       (e.g., ``[1,1,H,D]`` with ``perm=[0,2,1,3]`` → ``[1,H,1,D]`` when seq_len dim is 1).
+       The Transpose is replaced with an equivalent Reshape.
+    """
+
+    @staticmethod
+    def _is_data_preserving_perm(perm: list[int], shape: list[int]) -> bool:
+        visited = [False] * len(perm)
+        for i in range(len(perm)):
+            if visited[i] or perm[i] == i:
+                visited[i] = True
+                continue
+            cycle_dims: list[int] = []
+            j = i
+            while not visited[j]:
+                visited[j] = True
+                cycle_dims.append(shape[j])
+                j = perm[j]
+            if sum(1 for d in cycle_dims if d > 1) > 1:
+                return False
+        return True
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Transpose" or not node.inputs or not node.outputs:
+            return False
+        perm = node.attrs.get("perm", None)
+        if perm is None:
+            return False
+        inp_shape = getattr(node.inputs[0], "shape", None)
+        if inp_shape is None or not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+            return False
+
+        perm = [int(p) for p in perm]
+        shape = [int(d) for d in inp_shape]
+
+        return self._is_data_preserving_perm(perm, shape)
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Transpose")
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        inp_shape = [int(d) for d in inp.shape]
+        out_shape = [int(d) for d in out.shape]
+        consumers: list[gs.Node] = list(out.outputs)
+
+        if inp_shape == out_shape:
+            rewire_consumers(consumers, out, inp)
+            for i, graph_out in enumerate(self.graph.outputs):
+                if graph_out is out:
+                    self.graph.outputs[i] = inp
+        else:
+            shape_const = gs.Constant(
+                name=node.name + "_fold_shape",
+                values=np.array(out_shape, dtype=np.int64)
+            )
+            reshape_out: gs.Variable = self.graph.layer(
+                name=node.name + "_fold_reshape",
+                op="Reshape",
+                inputs=[inp, shape_const],
+                outputs=[gs.Variable(
+                    name=out.name + "_reshaped",
+                    dtype=out.dtype,
+                    shape=out_shape
+                )]
+            )[0]
+            rewire_consumers(consumers, out, reshape_out)
+            for i, graph_out in enumerate(self.graph.outputs):
+                if graph_out is out:
+                    self.graph.outputs[i] = reshape_out
+
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.info(
+            "Eliminated Transpose '%s': %s -> %s", node.name, inp_shape, out_shape
+        )
+
+
+@dataclass
+class CollapseGQABroadcast(OnnxGraphEdit):
+    """
+    Collapse Unsqueeze → Expand → Reshape GQA head broadcast into a single Expand.
+
+    In GQA attention, KV tensors ``[B, H_kv, S, D]`` are broadcast to match Q heads
+    via ``Unsqueeze(axis) → Expand → Reshape → [B, H_q, S, D]``.  When ``H_kv == 1``
+    the chain is equivalent to a single ``Expand`` because the head dim can be
+    broadcast directly.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Unsqueeze" or not node.inputs or not node.outputs:
+            return False
+        unsqueeze_out = node.outputs[0]
+        if len(unsqueeze_out.outputs) != 1:
+            return False
+        expand_node: gs.Node = unsqueeze_out.outputs[0]
+        if expand_node.op != "Expand" or not expand_node.outputs:
+            return False
+        expand_out = expand_node.outputs[0]
+        if len(expand_out.outputs) != 1:
+            return False
+        reshape_node: gs.Node = expand_out.outputs[0]
+        if reshape_node.op != "Reshape" or not reshape_node.outputs:
+            return False
+
+        inp_shape = getattr(node.inputs[0], "shape", None)
+        final_shape = getattr(reshape_node.outputs[0], "shape", None)
+        if inp_shape is None or final_shape is None:
+            return False
+        if not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+            return False
+        if not all(isinstance(d, (int, np.integer)) for d in final_shape):
+            return False
+
+        inp_shape = [int(d) for d in inp_shape]
+        final_shape = [int(d) for d in final_shape]
+
+        if len(inp_shape) != len(final_shape):
+            return False
+
+        axes = None
+        if len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+            axes = node.inputs[1].values.flatten().tolist()
+        elif "axes" in node.attrs:
+            axes = list(node.attrs["axes"])
+        if axes is None or len(axes) != 1:
+            return False
+        axis = int(axes[0])
+        ndim_after = len(inp_shape) + 1
+        if axis < 0:
+            axis = ndim_after + axis
+
+        # Collapsible when the dim adjacent to the insertion point is 1,
+        # meaning a direct Expand on the input can replace the full chain.
+        return 0 < axis <= len(inp_shape) and inp_shape[axis - 1] == 1
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Unsqueeze")
+        expand_node: gs.Node = node.outputs[0].outputs[0]
+        reshape_node: gs.Node = expand_node.outputs[0].outputs[0]
+
+        inp = node.inputs[0]
+        final_out = reshape_node.outputs[0]
+        final_shape = [int(d) for d in final_out.shape]
+        consumers: list[gs.Node] = list(final_out.outputs)
+
+        expand_shape_const = gs.Constant(
+            name=node.name + "_gqa_expand_shape",
+            values=np.array(final_shape, dtype=np.int64)
+        )
+        new_expand_out: gs.Variable = self.graph.layer(
+            name=node.name + "_gqa_expand",
+            op="Expand",
+            inputs=[inp, expand_shape_const],
+            outputs=[gs.Variable(
+                name=final_out.name + "_expanded",
+                dtype=final_out.dtype,
+                shape=final_shape
+            )]
+        )[0]
+        rewire_consumers(consumers, final_out, new_expand_out)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is final_out:
+                self.graph.outputs[i] = new_expand_out
+
+        node.inputs.clear()
+        node.outputs.clear()
+        expand_node.inputs.clear()
+        expand_node.outputs.clear()
+        reshape_node.inputs.clear()
+        reshape_node.outputs.clear()
+        self._logger.debug(
+            "Collapsed GQA broadcast at '%s' into single Expand -> %s",
+            node.name, final_shape
+        )
 
 
 class ConstantBroadcastPolicy(Enum):
@@ -987,4 +1173,12 @@ class CommonGraphEditsMixin:
 
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def eliminate_transposes(self):
+        self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
+        return self
+
+    def collapse_gqa_broadcast(self):
+        self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
         return self

@@ -181,6 +181,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = Gemma3OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
 
+        # Eliminate data-preserving Transpose ops (no-op K/V head transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse Unsqueeze→Expand→Reshape GQA broadcast into single Expand (KV_heads=1)
+        editor.collapse_gqa_broadcast()
         # Fold MatMul A @ B where B is a scalar into Mul
         editor.fold_scalar_matmul()
         # Broadcast op inputs to match output shape
