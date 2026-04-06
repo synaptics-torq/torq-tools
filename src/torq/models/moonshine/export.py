@@ -55,6 +55,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         keep_individual_kv_io: bool = True,
         static_models: bool = True,
         *,
+        hf_repo: str | None = None,
         max_audio_s: int = 5,
         max_tok_per_s: int = 6,
         models_dir: str | os.PathLike = "models",
@@ -71,7 +72,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._keep_individual_kv_io = keep_individual_kv_io
         self._onnx_source_dir = onnx_source_dir
         self._use_optimum = use_optimum
-        self._hf_repo = f"UsefulSensors/moonshine-{self._model_size}"
+        self._hf_repo = hf_repo or f"UsefulSensors/moonshine-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._num_samples = max_audio_s * 16_000
         self._max_tokens = max_audio_s * max_tok_per_s
@@ -109,6 +110,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
         if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
             onnx_dir = onnx_source_dir
+            print(self._models_dir)
         else:
             if self._use_optimum or self._model_dtype in OPTIMUM_DTYPES:
                 self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
@@ -639,6 +641,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         args.extract_embeddings,
         not args.combine_kv_io,
         not args.dynamic_models,
+        hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,
         models_dir=args.models_dir,

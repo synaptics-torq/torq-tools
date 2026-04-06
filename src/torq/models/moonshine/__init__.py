@@ -114,6 +114,11 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         default=None,
         help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        help="Moonshine model's HuggingFace repo ID (default: UsefulSensors/moonshine-{model_size})"
+    )
     add_logging_args(parser)
     add_iree_args(parser)
 
