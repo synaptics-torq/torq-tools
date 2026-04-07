@@ -497,6 +497,43 @@ class FoldScalarMatMul(OnnxGraphEdit):
         self._logger.debug("Folded scalar MatMul node '%s' into Mul", node.name)
 
 
+@dataclass
+class ReplaceConstantDivWithMul(OnnxGraphEdit):
+    """
+    Replaces x/C with x * C' where C' = 1/C is a newly computed constant.
+
+    Args:
+        export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
+
+    Raises:
+        TypeError: If divisor is not a constant tensor
+    """
+    export_dtype: onnx.TensorProto.DataType
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Div" and len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Div")
+        if not len(node.inputs) > 1 or not isinstance(node.inputs[1], gs.Constant):
+            raise TypeError("Expected second operand of Div to be a `gs.Constant`")
+
+        # x/C -> x * C' where C' = 1/C
+        divisor: gs.Constant = node.inputs[1]
+        if not (reciprocal := self.graph.tensors().get(divisor.name + "_reciprocal")):
+            reciprocal = gs.Constant(
+                name=divisor.name + "_reciprocal",
+                values=np.array(np.float32(1.0) / divisor.values.astype(np.float32)),
+                export_dtype=self.export_dtype,
+            )
+        node.op = "Mul"
+        node.inputs[1] = reciprocal
+
+        self._logger.debug("Replaced Div @ '%s' by constant '%s' with Mul by reciprocal", node.name, divisor.name)
+
+
 class ConstantBroadcastPolicy(Enum):
     """
     Strategy for handling broadcastable constants during graph edits.
@@ -980,6 +1017,9 @@ class CommonGraphEditsMixin:
     def fold_scalar_matmul(self):
         self.apply_edit(FoldScalarMatMul(self._graph, self._graph_name))
         return self
+    
+    def replace_constant_div_with_mul(self):
+        self.apply_edit(ReplaceConstantDivWithMul(self._graph, self._graph_name, self._export_dtype))
 
     def broadcast_op_inputs(self, ops, output_idx=0, inputs_idx=None, constants_policy=ConstantBroadcastPolicy.SKIP):
         self.apply_edit(BroadcastOpInputs(self._graph, self._graph_name, ops, output_idx, inputs_idx, constants_policy))
