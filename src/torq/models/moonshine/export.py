@@ -277,9 +277,23 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
-    def _patch_static_encoder(self, model_path: str | os.PathLike, component: str):
+    def _patch_static_preprocessor(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
+
+        # Decompose large strided Conv1D into im2col + MatMul
+        editor.decompose_strided_conv1d()
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def _patch_static_encoder(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)        # Decompose large strided Conv1D into im2col + MatMul
+
+        # Decompose large strided Conv1D into im2col + MatMul
+        if not self._split_encoder:
+            editor.decompose_strided_conv1d()
 
         # Replace constant Div ops with Mul
         editor.replace_constant_div_with_mul()
@@ -517,8 +531,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         )
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
-        if component == "encoder":
-            self._patch_static_encoder(model_path, component)
+        if component == "preprocessor":
+            self._patch_static_preprocessor(model_path)
+        elif component == "encoder":
+            self._patch_static_encoder(model_path)
         elif "decoder" in component:
             self._patch_static_decoder(model_path, component)
             self._dedup_decoder_embeddings_npy(Path(model_path).parent)
@@ -597,7 +613,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         skip: list[str] | None = None,
     ):
         skip = skip or []
-        skip.append("preprocessor")
         external_data = None if any(m in self._skip_export for m in ("decoder", "decoder_with_past")) else \
         [(self._export_paths["decoder"].parent / "decoder_token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))]
         super().convert_models(
@@ -606,10 +621,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             skip=skip,
             external_data=external_data,
         )
-        for comp, model_path in self._export_paths.items():
-            if comp == "preprocessor":
-                shutil.copy2(model_path, self._convert_dir)
-                break
 
     def export_iree(
         self,
@@ -619,7 +630,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         skip: list[str] | None = None,
     ):
         skip = skip or []
-        skip.append("preprocessor")
         for comp, onnx_path in self._export_paths.items():
             if comp in skip:
                 continue
