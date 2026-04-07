@@ -479,17 +479,17 @@ class ReplacePadWithConcat(OnnxGraphEdit):
 @dataclass
 class DecomposeStridedConv1D(OnnxGraphEdit):
     """
-    Decompose a 1D convolution with kernel_shape = 2*stride - 1 and in_channels = 1
-    into an im2col unfold + MatMul.
+    Decompose strided 1D convolutions into im2col unfold + MatMul.
 
-    Replaces:
-        Unsqueeze -> Conv(kernel=2*s-1, stride=s, in_ch=1) -> [1, out_ch, L_out]
+    Handles two cases:
 
-    With:
-        Reshape -> Slice/Concat (im2col) -> MatMul -> Transpose -> [1, out_ch, L_out]
+    1. Single-channel with Unsqueeze predecessor and kernel = 2*stride - 1:
+       Uses an efficient reshape + slice trick to build sliding windows.
 
-    This avoids the large strided convolution over the full input length which is
-    difficult for compilers to tile efficiently.
+    2. General multi-channel Conv1D:
+       Uses per-kernel-position strided slices to build the im2col matrix.
+
+    Both produce: im2col patches @ weight.T [+ bias] -> Transpose to channel-first.
     """
 
     def match(self, node: gs.Node) -> bool:
@@ -501,22 +501,43 @@ class DecomposeStridedConv1D(OnnxGraphEdit):
         pads = node.attrs.get("pads", [0, 0])
         if len(kernel_shape) != 1 or len(strides) != 1:
             return False
-        k, s = kernel_shape[0], strides[0]
-        if s <= 1 or k != 2 * s - 1:
+        if strides[0] <= 1:
             return False
         if group != 1:
             return False
         if any(p != 0 for p in pads):
             return False
-        # weight shape must be [out_ch, 1, kernel]
         weight = node.inputs[1]
         w_shape = weight.shape
-        if w_shape is None or len(w_shape) != 3 or w_shape[1] != 1:
+        if w_shape is None or len(w_shape) != 3:
+            return False
+        inp = node.inputs[0]
+        if inp.shape is None or not isinstance(inp.shape[-1], (int, np.integer)):
             return False
         return True
 
+    def _is_single_channel_special_case(self, node: gs.Node) -> bool:
+        k = node.attrs["kernel_shape"][0]
+        s = node.attrs["strides"][0]
+        weight = node.inputs[1]
+        if weight.shape[1] != 1 or k != 2 * s - 1:
+            return False
+        conv_input = node.inputs[0]
+        if conv_input.inputs and len(conv_input.inputs) == 1:
+            producer = conv_input.inputs[0]
+            if producer.op == "Unsqueeze":
+                return True
+        return False
+
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Conv")
+        if self._is_single_channel_special_case(node):
+            self._transform_single_channel(node)
+        else:
+            self._transform_general(node)
+
+    def _transform_single_channel(self, node: gs.Node):
+        """Efficient decomposition for single-channel Conv1D with k = 2*stride - 1."""
         k = node.attrs["kernel_shape"][0]
         s = node.attrs["strides"][0]
         weight = node.inputs[1]
@@ -527,34 +548,11 @@ class DecomposeStridedConv1D(OnnxGraphEdit):
         conv_output: gs.Variable = node.outputs[0]
         consumers: list[gs.Node] = list(conv_output.outputs)
 
-        # Find the Unsqueeze feeding this Conv (adds channel dim)
-        unsqueeze_node: gs.Node | None = None
-        raw_input = conv_input
-        if conv_input.inputs and len(conv_input.inputs) == 1:
-            producer = conv_input.inputs[0]
-            if producer.op == "Unsqueeze":
-                unsqueeze_node = producer
-                raw_input = producer.inputs[0]
-
-        if unsqueeze_node is None:
-            self._logger.debug(
-                "Skipping Conv node '%s': no Unsqueeze producer found", node.name
-            )
-            return
+        unsqueeze_node: gs.Node = conv_input.inputs[0]
+        raw_input = unsqueeze_node.inputs[0]
 
         raw_shape = raw_input.shape
-        if raw_shape is None or len(raw_shape) != 2:
-            self._logger.debug(
-                "Skipping Conv node '%s': raw input is not 2D (shape=%s)", node.name, raw_shape
-            )
-            return
-
         batch, n_samples = raw_shape
-        if not isinstance(n_samples, (int, np.integer)):
-            self._logger.debug(
-                "Skipping Conv node '%s': n_samples is dynamic", node.name
-            )
-            return
 
         n_chunks = n_samples // s
         n_windows = n_chunks - 1  # number of output positions
@@ -686,22 +684,182 @@ class DecomposeStridedConv1D(OnnxGraphEdit):
             attrs={"perm": [0, 2, 1]}
         )[0]
 
-        # Rewire consumers of the Conv output to the new output
         rewire_consumers(consumers, conv_output, final)
         for i, graph_out in enumerate(self.graph.outputs):
             if graph_out is conv_output:
                 self.graph.outputs[i] = final
 
-        # Disconnect old nodes
         node.inputs.clear()
         node.outputs.clear()
-        if unsqueeze_node is not None:
-            unsqueeze_node.inputs.clear()
-            unsqueeze_node.outputs.clear()
+        unsqueeze_node.inputs.clear()
+        unsqueeze_node.outputs.clear()
 
         self._logger.debug(
-            "Decomposed Conv1D node '%s' (kernel=%d, stride=%d) into im2col + MatMul",
+            "Decomposed single-channel Conv1D '%s' (kernel=%d, stride=%d) into im2col + MatMul",
             node.name, k, s
+        )
+
+    def _transform_general(self, node: gs.Node):
+        """General decomposition for multi-channel Conv1D using strided slices."""
+        k = node.attrs["kernel_shape"][0]
+        s = node.attrs["strides"][0]
+        weight = node.inputs[1]
+        bias = node.inputs[2] if len(node.inputs) > 2 else None
+        out_ch, c_in = weight.shape[0], weight.shape[1]
+
+        conv_input = node.inputs[0]
+        conv_output = node.outputs[0]
+        consumers = list(conv_output.outputs)
+
+        batch = conv_input.shape[0]
+        l_in = int(conv_input.shape[2])
+        l_out = (l_in - k) // s + 1
+        prefix = node.name or "decomposed_conv1d"
+
+        # im2col via strided slices: for each kernel position j,
+        # extract input[:, :, j : j + l_out*s : s] -> [batch, c_in, l_out]
+        sl_axes = gs.Constant(f"{prefix}_axes_2", np.array([2], dtype=np.int64))
+        sl_steps = gs.Constant(f"{prefix}_steps_{s}", np.array([s], dtype=np.int64))
+        unsq_axes = gs.Constant(f"{prefix}_unsq_axes_3", np.array([3], dtype=np.int64))
+
+        slices = []
+        for j in range(k):
+            sl_start = gs.Constant(f"{prefix}_start_{j}", np.array([j], dtype=np.int64))
+            sl_end = gs.Constant(f"{prefix}_end_{j}", np.array([j + l_out * s], dtype=np.int64))
+            slice_j = self.graph.layer(
+                name=f"{prefix}_slice_pos{j}",
+                op="Slice",
+                inputs=[conv_input, sl_start, sl_end, sl_axes, sl_steps],
+                outputs=[gs.Variable(
+                    f"{prefix}_pos{j}", dtype=conv_input.dtype,
+                    shape=[batch, c_in, l_out]
+                )]
+            )[0]
+            unsq_j = self.graph.layer(
+                name=f"{prefix}_unsq_pos{j}",
+                op="Unsqueeze",
+                inputs=[slice_j, unsq_axes],
+                outputs=[gs.Variable(
+                    f"{prefix}_pos{j}_4d", dtype=conv_input.dtype,
+                    shape=[batch, c_in, l_out, 1]
+                )]
+            )[0]
+            slices.append(unsq_j)
+
+        # Concat along axis=3: [batch, c_in, l_out, k]
+        patches = self.graph.layer(
+            name=f"{prefix}_im2col_concat",
+            op="Concat",
+            inputs=slices,
+            outputs=[gs.Variable(
+                f"{prefix}_patches", dtype=conv_input.dtype,
+                shape=[batch, c_in, l_out, k]
+            )],
+            attrs={"axis": 3}
+        )[0]
+
+        # Transpose to [batch, l_out, c_in, k]
+        patches_t = self.graph.layer(
+            name=f"{prefix}_transpose_patches",
+            op="Transpose",
+            inputs=[patches],
+            outputs=[gs.Variable(
+                f"{prefix}_patches_t", dtype=conv_input.dtype,
+                shape=[batch, l_out, c_in, k]
+            )],
+            attrs={"perm": [0, 2, 1, 3]}
+        )[0]
+
+        # Reshape to [batch, l_out, c_in * k]
+        flat_shape = gs.Constant(
+            f"{prefix}_flat_shape",
+            np.array([batch, l_out, c_in * k], dtype=np.int64)
+        )
+        patches_flat = self.graph.layer(
+            name=f"{prefix}_reshape_patches",
+            op="Reshape",
+            inputs=[patches_t, flat_shape],
+            outputs=[gs.Variable(
+                f"{prefix}_patches_flat", dtype=conv_input.dtype,
+                shape=[batch, l_out, c_in * k]
+            )],
+            attrs={"allowzero": 0}
+        )[0]
+
+        # Reshape weight [out_ch, c_in, k] -> [out_ch, c_in * k]
+        w_flat_shape = gs.Constant(
+            f"{prefix}_w_flat_shape",
+            np.array([out_ch, c_in * k], dtype=np.int64)
+        )
+        w_flat = self.graph.layer(
+            name=f"{prefix}_reshape_weight",
+            op="Reshape",
+            inputs=[weight, w_flat_shape],
+            outputs=[gs.Variable(
+                f"{prefix}_w_flat", dtype=weight.dtype,
+                shape=[out_ch, c_in * k]
+            )],
+            attrs={"allowzero": 0}
+        )[0]
+
+        # Transpose weight [out_ch, c_in*k] -> [c_in*k, out_ch]
+        w_t = self.graph.layer(
+            name=f"{prefix}_transpose_weight",
+            op="Transpose",
+            inputs=[w_flat],
+            outputs=[gs.Variable(
+                f"{prefix}_w_t", dtype=weight.dtype,
+                shape=[c_in * k, out_ch]
+            )],
+            attrs={"perm": [1, 0]}
+        )[0]
+
+        # MatMul [batch, l_out, c_in*k] x [c_in*k, out_ch] -> [batch, l_out, out_ch]
+        mm_out = self.graph.layer(
+            name=f"{prefix}_matmul",
+            op="MatMul",
+            inputs=[patches_flat, w_t],
+            outputs=[gs.Variable(
+                f"{prefix}_mm", dtype=conv_input.dtype,
+                shape=[batch, l_out, out_ch]
+            )]
+        )[0]
+
+        # Add bias if present
+        if bias is not None:
+            mm_out = self.graph.layer(
+                name=f"{prefix}_add_bias",
+                op="Add",
+                inputs=[mm_out, bias],
+                outputs=[gs.Variable(
+                    f"{prefix}_biased", dtype=conv_input.dtype,
+                    shape=[batch, l_out, out_ch]
+                )]
+            )[0]
+
+        # Transpose [batch, l_out, out_ch] -> [batch, out_ch, l_out]
+        final = self.graph.layer(
+            name=f"{prefix}_transpose_out",
+            op="Transpose",
+            inputs=[mm_out],
+            outputs=[gs.Variable(
+                f"{prefix}_out", dtype=conv_output.dtype,
+                shape=[batch, out_ch, l_out]
+            )],
+            attrs={"perm": [0, 2, 1]}
+        )[0]
+
+        rewire_consumers(consumers, conv_output, final)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is conv_output:
+                self.graph.outputs[i] = final
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug(
+            "Decomposed Conv1D '%s' (kernel=%d, stride=%d, in_ch=%d) into im2col + MatMul",
+            node.name, k, s, c_in
         )
 
 
