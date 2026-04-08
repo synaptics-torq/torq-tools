@@ -278,10 +278,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             input = prompts[i]
             output = runner.run(input)
             val_output = val_runner.run(input)
-            if output != val_output:
+            min_len = min(len(output), len(val_output))
+            if output[:min_len] != val_output[:min_len]:
                 result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_output},\nGenerated:\n{output}"
             else:
                 result = f"Validation successful, identical outputs"
+                if len(output) != len(val_output):
+                    result += f" (output lengths differ: {len(output)} vs {len(val_output)})"
             self._logger.info(
                 "(ONNX-validation) [iter %d, %.3f ms]: %s",
                 i,

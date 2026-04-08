@@ -365,6 +365,9 @@ class SmolLM2Static(SmolLM2Base):
             if instruct_model:
                 repo_id += "-Instruct"
         self._combined_kv_io = combined_kv_io
+        self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
+            model.model_path
+        )
         super().__init__(
             model,
             ModelConfig.from_json_config(
@@ -378,7 +381,6 @@ class SmolLM2Static(SmolLM2Base):
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
-        self._token_embeddings: np.ndarray | None = self._find_token_embeddings()
 
     @classmethod
     def from_onnx(
@@ -420,12 +422,13 @@ class SmolLM2Static(SmolLM2Base):
             combined_kv_io=combined_kv_io
         )
 
+    @staticmethod
     def _find_token_embeddings(
-        self,
+        model_path: str | os.PathLike,
         emb_pattern: str = "token_embeddings.npy",
     ) -> np.ndarray | None:
         paths = []
-        paths.extend(Path(self._model.model_path).parent.glob(emb_pattern))
+        paths.extend(Path(model_path).parent.glob(emb_pattern))
         if not paths:
             return None
 
@@ -494,7 +497,7 @@ class SmolLM2Static(SmolLM2Base):
         next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
         gen_tokens = [next_token]
         while not self._stop_decoding(next_token, gen_tokens):
-            if isinstance(self._max_gen_tokens, int) and len(gen_tokens) >= self._max_gen_tokens:
+            if curr_seq_len >= self._max_gen_tokens:
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
             next_token, cache = self._llm_step(next_token, curr_seq_len)
