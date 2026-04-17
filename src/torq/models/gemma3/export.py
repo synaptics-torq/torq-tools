@@ -215,6 +215,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._config.head_dim                                           # D
             ])
 
+        editor.reorder_graph_input("position_ids", 1)
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
