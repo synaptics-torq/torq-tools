@@ -260,6 +260,9 @@ class Gemma3Dynamic(Gemma3Base):
             repo_id: str = "google/gemma-3-270m"
             if instruct_model:
                 repo_id += "-it"
+        self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
+            model.model_path
+        )
         super().__init__(
             model,
             ModelConfig.from_json_config(
@@ -273,6 +276,31 @@ class Gemma3Dynamic(Gemma3Base):
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
+
+    @staticmethod
+    def _find_token_embeddings(
+        model_path: str | os.PathLike,
+        emb_pattern: str = "token_embeddings.npy",
+    ) -> np.ndarray | None:
+        model_dir = Path(model_path).parent
+        # Search the model directory and up to 2 parent levels (covers
+        # source/int4_converted/ -> source/int4/ sibling layout)
+        search_dirs = [model_dir]
+        for parent in [model_dir.parent, model_dir.parent.parent]:
+            search_dirs.extend(parent.glob("*"))
+            search_dirs.append(parent)
+        paths = []
+        for d in search_dirs:
+            if d.is_dir():
+                paths.extend(d.glob(emb_pattern))
+        if not paths:
+            return None
+        paths = list({p.resolve(): p for p in paths}.values())
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+            )
+        return np.load(paths[0])
 
     @classmethod
     def from_onnx(
@@ -327,13 +355,20 @@ class Gemma3Dynamic(Gemma3Base):
         self, token: int, curr_seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
         input_ids = np.array([[token]], dtype=np.int64)
+        if isinstance(self._token_embeddings, np.ndarray):
+            inputs = {
+                "token_embedding": np.expand_dims(self._token_embeddings[token], axis=(0, 1)),
+                "input_ids": input_ids,
+            }
+        else:
+            inputs = {
+                "input_ids": input_ids,
+            }
         attn_mask = np.ones([1, curr_seq_len + 1], dtype=np.int64)
-        pos_ids = np.array([[curr_seq_len]], dtype=np.int64)
-        inputs = {
-            "input_ids": input_ids,
+        inputs.update({
             "attention_mask": attn_mask,
             **self._kv_cache
-        }
+        })
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
