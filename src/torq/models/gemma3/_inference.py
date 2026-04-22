@@ -29,6 +29,29 @@ from ...inference.runners import (
 DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named Gemma. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
 
 
+def _default_repo_id(instruct_model: bool) -> str:
+    repo_id = "google/gemma-3-270m"
+    if instruct_model:
+        repo_id += "-it"
+    return repo_id
+
+
+def _resolve_asset_path(
+    model_path: str | os.PathLike,
+    asset_name: str,
+    repo_id: str | None,
+    instruct_model: bool,
+) -> str:
+    local_path = Path(model_path).parent / asset_name
+    if local_path.exists():
+        return str(local_path)
+    repo_id = repo_id or _default_repo_id(instruct_model)
+    try:
+        return hf_hub_download(repo_id, asset_name, local_files_only=True)
+    except Exception:
+        return hf_hub_download(repo_id, asset_name)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     n_layers: int
@@ -243,20 +266,18 @@ class Gemma3Dynamic(Gemma3Base):
         instruct_model: bool = False,
         repo_id: str | None = None
     ):
-        if repo_id is None:
-            repo_id: str = "google/gemma-3-270m"
-            if instruct_model:
-                repo_id += "-it"
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
@@ -365,24 +386,22 @@ class Gemma3Static(Gemma3Base):
         repo_id: str | None = None,
         combined_kv_io: bool = True
     ):
-        if repo_id is None:
-            repo_id: str = "google/gemma-3-270m"
-            if instruct_model:
-                repo_id += "-it"
         self._combined_kv_io = combined_kv_io
         self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
             model.model_path
         )
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )

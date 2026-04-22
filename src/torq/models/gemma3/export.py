@@ -3,13 +3,18 @@
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
+from collections.abc import Sequence
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 import ml_dtypes
+from huggingface_hub import hf_hub_download
+from onnx import numpy_helper
+from tokenizers import Tokenizer
 from transformers import AutoConfig
 from torq.compile import process_iree_args
 from torq.utils.logging import (
@@ -19,6 +24,16 @@ from torq.utils.logging import (
 from . import add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
+from ._trim_vocab import (
+    TrimmedVocabSpec,
+    build_trimmed_vocab_spec,
+    load_json,
+    rewrite_config_json,
+    rewrite_tokenizer_json,
+    save_json,
+    trim_embedding_rows,
+    trim_logits_projection,
+)
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx
 
@@ -38,6 +53,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
+        trim_vocab: bool = False,
+        trim_vocab_groups: list[str] | None = None,
+        trim_byte_fallback: bool = True,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -45,14 +63,40 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
+        self._trim_vocab = trim_vocab
+        self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct"))
+        self._trim_byte_fallback = trim_byte_fallback
         self._hf_repo = f"google/gemma-3-{model_size}"
         if self._instruct_model:
             self._hf_repo += "-it"
-        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._source_asset_dirs = [
+            path
+            for path in (
+                Path(self._onnx_source_dir) if self._onnx_source_dir else None,
+                Path(models_dir) / self._hf_repo / "source" / "fp32",
+            )
+            if isinstance(path, Path) and path.exists()
+        ]
+        local_config_dir = next(
+            (path for path in self._source_asset_dirs if (path / "config.json").exists()),
+            None,
+        )
+        if local_config_dir is not None:
+            self._config = AutoConfig.from_pretrained(local_config_dir, local_files_only=True)
+        else:
+            try:
+                self._config = AutoConfig.from_pretrained(self._hf_repo, local_files_only=True)
+            except OSError:
+                self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
+        self._trimmed_vocab_spec: TrimmedVocabSpec | None = None
+        self._source_tokenizer_json: dict | None = None
+        self._source_config_json: dict | None = None
+        if self._trim_vocab and not static_models:
+            raise ValueError("`--trim-vocab` is currently supported only for static Gemma exports")
 
         super().__init__(
             "fp32",
@@ -114,6 +158,179 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model = gs.export_onnx(graph)
         model.ir_version = orig_ir
         return {"model": model}
+
+    def _resolve_source_asset_path(self, asset_name: str) -> Path:
+        for asset_dir in self._source_asset_dirs:
+            asset_path = asset_dir / asset_name
+            if asset_path.exists():
+                return asset_path
+        try:
+            return Path(hf_hub_download(self._hf_repo, asset_name, local_files_only=True))
+        except Exception:
+            return Path(hf_hub_download(self._hf_repo, asset_name))
+
+    def _get_trimmed_vocab_spec(self) -> TrimmedVocabSpec:
+        if not self._trim_vocab:
+            raise RuntimeError("Trimmed vocab spec requested when trim-vocab export is disabled")
+        if self._trimmed_vocab_spec is not None:
+            return self._trimmed_vocab_spec
+
+        tokenizer_json_path = self._resolve_source_asset_path("tokenizer.json")
+        config_json_path = self._resolve_source_asset_path("config.json")
+        self._source_tokenizer_json = load_json(tokenizer_json_path)
+        self._source_config_json = load_json(config_json_path)
+        tokenizer = Tokenizer.from_file(str(tokenizer_json_path))
+        self._trimmed_vocab_spec = build_trimmed_vocab_spec(
+            tokenizer=tokenizer,
+            tokenizer_json=self._source_tokenizer_json,
+            config_json=self._source_config_json,
+            selected_groups=self._trim_vocab_groups,
+            byte_fallback=self._trim_byte_fallback,
+        )
+        self._logger.info(
+            "(model) Trimmed vocab enabled: %d -> %d tokens",
+            self._trimmed_vocab_spec.model_vocab_size,
+            self._trimmed_vocab_spec.trimmed_vocab_size,
+        )
+        return self._trimmed_vocab_spec
+
+    @staticmethod
+    def _replace_initializer(
+        model: onnx.ModelProto,
+        initializer_name: str,
+        values: np.ndarray,
+    ) -> None:
+        for idx, initializer in enumerate(model.graph.initializer):
+            if initializer.name == initializer_name:
+                model.graph.initializer[idx].CopyFrom(
+                    numpy_helper.from_array(values, name=initializer_name)
+                )
+                return
+        raise ValueError(f"Initializer '{initializer_name}' not found in ONNX model")
+
+    @staticmethod
+    def _update_value_info_shape(
+        value_info: onnx.ValueInfoProto,
+        shape: Sequence[int | str],
+    ) -> None:
+        dims = value_info.type.tensor_type.shape.dim
+        del dims[:]
+        for dim in shape:
+            new_dim = dims.add()
+            if isinstance(dim, int):
+                new_dim.dim_value = int(dim)
+            else:
+                new_dim.dim_param = str(dim)
+
+    @staticmethod
+    def _update_logits_metadata(
+        model: onnx.ModelProto,
+        trimmed_vocab_size: int,
+    ) -> None:
+        updated = False
+        for value_info in model.graph.output:
+            if value_info.name != "logits":
+                continue
+            Gemma3ModelExporter._update_value_info_shape(value_info, [1, 1, trimmed_vocab_size])
+            updated = True
+        for value_info in model.graph.value_info:
+            if value_info.name != "logits":
+                continue
+            Gemma3ModelExporter._update_value_info_shape(value_info, [1, 1, trimmed_vocab_size])
+            updated = True
+        if not updated:
+            raise ValueError("Could not find logits output metadata for trimmed-vocab export")
+
+    def _emit_trimmed_vocab_bundle(self, dst_dir: str | os.PathLike) -> None:
+        spec = self._get_trimmed_vocab_spec()
+        if self._source_tokenizer_json is None or self._source_config_json is None:
+            raise RuntimeError("Missing source tokenizer/config JSON for trimmed-vocab export")
+        dst_dir = Path(dst_dir)
+        save_json(
+            dst_dir / "tokenizer.json",
+            rewrite_tokenizer_json(self._source_tokenizer_json, spec),
+        )
+        save_json(
+            dst_dir / "config.json",
+            rewrite_config_json(self._source_config_json, spec),
+        )
+
+    def _trim_static_artifacts(self, model_path: str | os.PathLike) -> None:
+        if not self._trim_vocab:
+            return
+
+        spec = self._get_trimmed_vocab_spec()
+        model_path = Path(model_path)
+        model = onnx.load(model_path)
+
+        logits_weight_name = None
+        embedding_weight_name = None
+        for node in model.graph.node:
+            if node.op_type == "MatMul" and "logits" in node.output:
+                logits_weight_name = node.input[1]
+            if (
+                not self._extract_embeddings
+                and node.op_type == "Gather"
+                and len(node.input) >= 2
+                and node.input[1] == "input_ids"
+            ):
+                embedding_weight_name = node.input[0]
+
+        if logits_weight_name is None:
+            raise ValueError("Could not find logits MatMul weight for trimmed-vocab export")
+
+        initializer_arrays = {
+            initializer.name: numpy_helper.to_array(initializer)
+            for initializer in model.graph.initializer
+        }
+        logits_weight = initializer_arrays.get(logits_weight_name)
+        if logits_weight is None:
+            raise ValueError(f"Logits weight initializer '{logits_weight_name}' not found")
+        self._replace_initializer(
+            model,
+            logits_weight_name,
+            trim_logits_projection(logits_weight, spec),
+        )
+        self._update_logits_metadata(model, spec.trimmed_vocab_size)
+
+        embeddings_npy = model_path.parent / "token_embeddings.npy"
+        if self._extract_embeddings:
+            if not embeddings_npy.exists():
+                raise FileNotFoundError(f"Expected extracted token embeddings @ '{embeddings_npy}'")
+            np.save(embeddings_npy, trim_embedding_rows(np.load(embeddings_npy), spec))
+        else:
+            if embedding_weight_name is None:
+                raise ValueError("Could not find embedding Gather weight for trimmed-vocab export")
+            embedding_weight = initializer_arrays.get(embedding_weight_name)
+            if embedding_weight is None:
+                raise ValueError(f"Embedding initializer '{embedding_weight_name}' not found")
+            self._replace_initializer(
+                model,
+                embedding_weight_name,
+                trim_embedding_rows(embedding_weight, spec),
+            )
+
+        onnx.save(model, model_path)
+        self._emit_trimmed_vocab_bundle(model_path.parent)
+
+    def _copy_runtime_assets(
+        self,
+        dst_dir: str | os.PathLike,
+        src_dir: str | os.PathLike | None = None,
+        *,
+        include_embeddings: bool = True,
+    ) -> None:
+        src_dir = Path(src_dir or self._export_paths["model"].parent)
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        asset_names = ["config.json", "tokenizer.json"]
+        if include_embeddings:
+            asset_names.append("token_embeddings.npy")
+        for asset_name in asset_names:
+            src_path = src_dir / asset_name
+            if not src_path.exists():
+                continue
+            shutil.copy2(src_path, dst_dir / asset_name)
 
     def _make_model_static(
         self, model: onnx.ModelProto
@@ -219,6 +436,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
+        self._trim_static_artifacts(model_path)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -303,13 +521,31 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         convert_dir: str | os.PathLike | None = None,
         preserve_io: bool = False,
     ):
-        return super().convert_models(
+        result = super().convert_models(
             convert_dir=convert_dir,
             preserve_io=preserve_io,
             external_data=[
                 (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))
             ]
         )
+        self._copy_runtime_assets(self._convert_dir, self._export_dir, include_embeddings=False)
+        return result
+
+    def export_iree(
+        self,
+        iree_export_dir: str | os.PathLike | None = None,
+        iree_compile_args: list[str] | None = None,
+        use_iree_cli: bool = False,
+        skip: list[str] | None = None,
+    ):
+        result = super().export_iree(
+            iree_export_dir=iree_export_dir,
+            iree_compile_args=iree_compile_args,
+            use_iree_cli=use_iree_cli,
+            skip=skip,
+        )
+        self._copy_runtime_assets(self._iree_dir, self._export_paths["model"].parent)
+        return result
 
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
@@ -324,6 +560,9 @@ def export_gemma3_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
+        trim_vocab=args.trim_vocab,
+        trim_vocab_groups=args.trim_vocab_groups,
+        trim_byte_fallback=args.trim_byte_fallback,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )

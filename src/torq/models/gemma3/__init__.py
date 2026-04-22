@@ -13,6 +13,7 @@ DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
+TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "other"]
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -66,6 +67,27 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         action="store_true",
         default=False,
         help="Skip exporting to IREE"
+    )
+    parser.add_argument(
+        "--trim-vocab",
+        action="store_true",
+        default=False,
+        help="Trim static export vocab to selected token groups plus required safety tokens"
+    )
+    parser.add_argument(
+        "--trim-vocab-groups",
+        type=str,
+        nargs="+",
+        choices=TRIM_VOCAB_GROUPS,
+        default=["latin", "punct"],
+        metavar="GROUP",
+        help="Token groups to retain when --trim-vocab is enabled (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--trim-byte-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain byte fallback tokens when --trim-vocab is enabled (default: %(default)s)",
     )
     parser.add_argument(
         "--replace-int-bf16-cast",
