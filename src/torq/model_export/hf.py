@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import os
+import sys
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
@@ -43,7 +44,7 @@ def optimum_export_onnx(
     ):
         return
     cmd = [
-        "optimum-cli", "export", "onnx",
+        sys.executable, "-m", "optimum.commands.optimum_cli", "export", "onnx",
         str(onnx_dir),
         "--model", hf_repo,
         "--dtype", dtype,

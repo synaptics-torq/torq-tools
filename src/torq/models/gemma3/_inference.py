@@ -93,6 +93,9 @@ class Gemma3Base(ABC):
         self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
         self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
         self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
+        self._start_of_turn: str = self._tokenizer.decode([105], skip_special_tokens=False)
+        self._end_of_turn: str = self._tokenizer.decode([106], skip_special_tokens=False)
+        self._end_of_turn_id: int = 106
         self._logger.info("Loaded model '%s'", str(self._model.model_path))
 
         self._n_tokens_gen: int = 0
@@ -191,13 +194,22 @@ class Gemma3Base(ABC):
     def _tokenize_input(self, input: str, role: str) -> list[int]:
         if not self._instruct_model:
             return self._tokenizer.encode(input).ids
-        if role == "assistant":
-            return self._tokenizer.encode(self._bos_token + role + "\n").ids
-        return self._tokenizer.encode(self._bos_token + role + "\n" + input + self._eos_token + "\n").ids
+        # Gemma3 chat format: <start_of_turn>role\n...content...<end_of_turn>\n
+        # The model generation prompt uses role="model" (not "assistant")
+        # Strip auto-prepended BOS — caller adds it once at conversation start.
+        if role == "model":
+            ids = self._tokenizer.encode(self._start_of_turn + "model\n").ids
+        else:
+            ids = self._tokenizer.encode(self._start_of_turn + role + "\n" + input + self._end_of_turn + "\n").ids
+        if ids and ids[0] == self._bos_token_id:
+            ids = ids[1:]
+        return ids
 
     def run(self, input: str, max_gen_tokens: int | None = None) -> str:
         self._reset_cache()
         inp_tokens = self._tokenize_input(input, "user")
+        if self._instruct_model:
+            inp_tokens += self._tokenize_input("", "model")
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
         output = self._tokenizer.decode(out_tokens)
@@ -209,7 +221,8 @@ class Gemma3Base(ABC):
         if not self._instruct_model:
             self._logger.warning("Not an instruct model, skipping system prompt warm-up")
             return 0
-        sys_tokens = self._tokenize_input(self._sys_prompt, "system")
+        # Gemma3 format: <bos><start_of_turn>system\n{sys_prompt}<end_of_turn>\n<start_of_turn>model\n
+        sys_tokens = [self._bos_token_id] + self._tokenize_input(self._sys_prompt, "system")
         if isinstance(self._max_prompt_tokens, int):
             if len(sys_tokens) > self._max_prompt_tokens:
                 self._logger.warning("Truncating system prompt from %d to %d", len(sys_tokens), self.max_inp_len)
@@ -326,7 +339,7 @@ class Gemma3Dynamic(Gemma3Base):
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
-        if next_token == self._eos_token_id:
+        if next_token == self._eos_token_id or next_token == self._end_of_turn_id:
             return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:
@@ -480,12 +493,15 @@ class Gemma3Static(Gemma3Base):
             "position_ids": pos_ids,
             **self._kv_cache
         })
+        # Provide attention_mask if the model requires it (e.g. model_q4 with attn_bias)
+        if any(i.name == "attention_mask" for i in self._model._sess.get_inputs()):
+            inputs["attention_mask"] = np.ones([1, self._max_gen_tokens], dtype=np.int64)
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
-        if next_token == self._eos_token_id:
+        if next_token == self._eos_token_id or next_token == self._end_of_turn_id:
             return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:

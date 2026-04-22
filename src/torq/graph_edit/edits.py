@@ -37,6 +37,9 @@ __all__ = [
     "EliminateTranspose",
     "CollapseReshapeChain",
     "CollapseGQABroadcast",
+    "ReplaceSimplifiedLayerNorm",
+    "ReplaceMatMulNBits",
+    "ReplaceGroupQueryAttention",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -194,7 +197,7 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
             op="Where",
             inputs=[mask_lte, attn_mask_keep, attn_mask_block],
             outputs=[
-                gs.Variable(node.name + "_where", dtype=node.inputs[0].dtype, shape=mask_shape)
+                gs.Variable(node.name + "_where", dtype=node.inputs[0].dtype or np.float32, shape=mask_shape)
             ],
         )[0]
 
@@ -208,7 +211,7 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
                 op="Add",
                 inputs=[node.inputs[0], mask],
                 outputs=[
-                    gs.Variable(node.name + "_biased", dtype=producer_output.dtype, shape=producer_output.shape)
+                    gs.Variable(node.name + "_biased", dtype=producer_output.dtype or np.float32, shape=producer_output.shape)
                 ],
             )[0]
             rewire_consumers(consumers, producer_output, add_output)
@@ -981,6 +984,935 @@ class ExtractConstantLUT(OnnxGraphEdit):
         )
 
 
+@dataclass
+class ExtractQuantizedEmbedding(OnnxGraphEdit):
+    """
+    Extract token embeddings from GatherBlockQuantized (int4 quantized embedding).
+
+    Dequantizes the int4 packed weights to fp32, saves as .npy, and replaces
+    the GatherBlockQuantized node output with a graph input (like ExtractConstantLUT).
+    """
+
+    hidden_size: int
+    vocab_size: int
+    save_to: os.PathLike | str
+    inp_name: str = "token_embedding"
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "GatherBlockQuantized":
+            return False
+        # Must gather from input_ids (graph input)
+        if len(node.inputs) < 2:
+            return False
+        idx_inp = node.inputs[1]
+        return any(idx_inp is gi for gi in self.graph.inputs)
+
+    def transform(self, node: gs.Node):
+        weight_q = node.inputs[0]   # uint8 packed int4: (vocab, K_packed)
+        scales = node.inputs[2]     # float32: (vocab, n_blocks)
+        zp = node.inputs[3] if len(node.inputs) > 3 else None
+
+        bits = node.attrs.get("bits", 4)
+        block_size = node.attrs.get("block_size", 32)
+
+        w_data = np.asarray(weight_q.values, dtype=np.uint8)
+        s_data = np.asarray(scales.values, dtype=np.float32)
+
+        # Unpack uint8 → two int4 values per byte (low nibble first)
+        low = (w_data & 0x0F).astype(np.float32)
+        high = ((w_data >> 4) & 0x0F).astype(np.float32)
+        unpacked = np.stack([low, high], axis=-1).reshape(w_data.shape[0], -1)
+        # Trim to hidden_size (padding may exist)
+        unpacked = unpacked[:, :self.hidden_size]
+
+        # Unpack zero points
+        if zp is not None and zp.values is not None and zp.values.size > 0:
+            zp_data = np.asarray(zp.values, dtype=np.uint8)
+            zp_low = (zp_data & 0x0F).astype(np.float32)
+            zp_high = ((zp_data >> 4) & 0x0F).astype(np.float32)
+            zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(zp_data.shape[0], -1)
+        else:
+            n_blocks_per_row = s_data.shape[1]
+            zp_unpacked = np.full((w_data.shape[0], n_blocks_per_row), 8.0, dtype=np.float32)
+
+        # Dequantize: for each block of block_size elements along hidden dim
+        n_blocks = s_data.shape[1]
+        result = np.empty((self.vocab_size, self.hidden_size), dtype=np.float32)
+        for b in range(n_blocks):
+            start = b * block_size
+            end = min(start + block_size, self.hidden_size)
+            scale_col = s_data[:self.vocab_size, b:b+1]          # (V, 1)
+            zp_col = zp_unpacked[:self.vocab_size, b:b+1]        # (V, 1)
+            result[:, start:end] = (unpacked[:self.vocab_size, start:end] - zp_col) * scale_col
+
+        # Save
+        save_path = Path(self.save_to)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_path, result)
+
+        # Replace node output with graph input
+        out_var: gs.Variable = node.outputs[0]
+        consumers = list(out_var.outputs)
+        out_dtype = out_var.dtype or np.float32
+        # Use explicit shape: embedding output is (B, S, hidden_size)
+        out_shape = out_var.shape if out_var.shape else [1, 1, self.hidden_size]
+        new_inp = gs.Variable(
+            name=self.inp_name,
+            dtype=out_dtype,
+            shape=out_shape,
+        )
+        rewire_consumers(consumers, out_var, new_inp)
+        self.graph.inputs.append(new_inp)
+        node.outputs.clear()
+        self._logger.debug(
+            "Extracted quantized embedding from '%s' (%d x %d), saved to '%s'",
+            node.name, self.vocab_size, self.hidden_size, self.save_to
+        )
+
+
+@dataclass
+class ReplaceSimplifiedLayerNorm(OnnxGraphEdit):
+    """
+    Replace SimplifiedLayerNormalization (ORT fused RMS norm) with standard ONNX ops.
+
+    Produces: Pow(x,2) -> ReduceMean -> Add(eps) -> Sqrt -> Div(1,sqrt) -> Mul(x,rcp) -> Mul(weight)
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "SimplifiedLayerNormalization"
+
+    def transform(self, node: gs.Node):
+        inp = node.inputs[0]
+        weight = node.inputs[1]
+        epsilon = node.attrs.get("epsilon", 1e-6)
+        out_var = node.outputs[0]
+        prefix = node.name
+
+        pow_out = self.graph.layer(
+            name=f"{prefix}/Pow", op="Pow",
+            inputs=[inp, gs.Constant(f"{prefix}/pow_exp", np.array(2.0, dtype=np.float32))],
+            outputs=[gs.Variable(f"{prefix}/Pow_output_0")],
+        )[0]
+        mean_out = self.graph.layer(
+            name=f"{prefix}/ReduceMean", op="ReduceMean",
+            inputs=[pow_out, gs.Constant(f"{prefix}/reduce_axes", np.array([-1], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/ReduceMean_output_0")],
+        )[0]
+        add_out = self.graph.layer(
+            name=f"{prefix}/Add", op="Add",
+            inputs=[mean_out, gs.Constant(f"{prefix}/epsilon", np.array(epsilon, dtype=np.float32))],
+            outputs=[gs.Variable(f"{prefix}/Add_output_0")],
+        )[0]
+        sqrt_out = self.graph.layer(
+            name=f"{prefix}/Sqrt", op="Sqrt",
+            inputs=[add_out],
+            outputs=[gs.Variable(f"{prefix}/Sqrt_output_0")],
+        )[0]
+        div_out = self.graph.layer(
+            name=f"{prefix}/Div", op="Div",
+            inputs=[gs.Constant(f"{prefix}/one", np.array(1.0, dtype=np.float32)), sqrt_out],
+            outputs=[gs.Variable(f"{prefix}/Div_output_0")],
+        )[0]
+        mul_out = self.graph.layer(
+            name=f"{prefix}/Mul", op="Mul",
+            inputs=[inp, div_out],
+            outputs=[gs.Variable(f"{prefix}/Mul_output_0")],
+        )[0]
+        mul_w_out = self.graph.layer(
+            name=f"{prefix}/Mul_1", op="Mul",
+            inputs=[mul_out, weight],
+            outputs=[gs.Variable(f"{prefix}/Mul_1_output_0")],
+        )[0]
+
+        rewire_consumers(out_var.outputs.copy(), out_var, mul_w_out)
+
+        # Also update graph outputs if needed
+        for i, go in enumerate(self.graph.outputs):
+            if go is out_var:
+                self.graph.outputs[i] = mul_w_out
+
+        node.outputs.clear()
+        self._logger.debug("Replaced SimplifiedLayerNormalization '%s'", node.name)
+
+
+@dataclass
+class ReplaceSkipSimplifiedLayerNorm(OnnxGraphEdit):
+    """
+    Replace SkipSimplifiedLayerNormalization (ORT fused skip-connection + RMS norm)
+    with standard ONNX ops.
+
+    SkipSimplifiedLayerNormalization(input, skip, weight, epsilon):
+        sum = input + skip
+        output[0] = RMSNorm(sum, weight, epsilon)
+        output[3] = sum
+
+    Produces: Add(input, skip) -> [RMS norm chain] -> output; skip sum forwarded.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "SkipSimplifiedLayerNormalization"
+
+    def transform(self, node: gs.Node):
+        inp = node.inputs[0]
+        skip = node.inputs[1]
+        weight = node.inputs[2]
+        epsilon = node.attrs.get("epsilon", 1e-6)
+        prefix = node.name
+
+        # output[0] = RMSNorm result, output[3] = skip sum
+        out_norm = node.outputs[0]
+        out_skip_sum = node.outputs[3] if len(node.outputs) > 3 and node.outputs[3].name else None
+
+        # Step 1: skip sum = input + skip
+        skip_sum = self.graph.layer(
+            name=f"{prefix}/SkipAdd", op="Add",
+            inputs=[inp, skip],
+            outputs=[gs.Variable(f"{prefix}/skip_sum")],
+        )[0]
+
+        # Step 2: RMSNorm on skip_sum
+        pow_out = self.graph.layer(
+            name=f"{prefix}/Pow", op="Pow",
+            inputs=[skip_sum, gs.Constant(f"{prefix}/pow_exp", np.array(2.0, dtype=np.float32))],
+            outputs=[gs.Variable(f"{prefix}/Pow_output_0")],
+        )[0]
+        mean_out = self.graph.layer(
+            name=f"{prefix}/ReduceMean", op="ReduceMean",
+            inputs=[pow_out, gs.Constant(f"{prefix}/reduce_axes", np.array([-1], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/ReduceMean_output_0")],
+        )[0]
+        add_out = self.graph.layer(
+            name=f"{prefix}/Add", op="Add",
+            inputs=[mean_out, gs.Constant(f"{prefix}/epsilon", np.array(epsilon, dtype=np.float32))],
+            outputs=[gs.Variable(f"{prefix}/Add_output_0")],
+        )[0]
+        sqrt_out = self.graph.layer(
+            name=f"{prefix}/Sqrt", op="Sqrt",
+            inputs=[add_out],
+            outputs=[gs.Variable(f"{prefix}/Sqrt_output_0")],
+        )[0]
+        div_out = self.graph.layer(
+            name=f"{prefix}/Div", op="Div",
+            inputs=[gs.Constant(f"{prefix}/one", np.array(1.0, dtype=np.float32)), sqrt_out],
+            outputs=[gs.Variable(f"{prefix}/Div_output_0")],
+        )[0]
+        mul_out = self.graph.layer(
+            name=f"{prefix}/Mul", op="Mul",
+            inputs=[skip_sum, div_out],
+            outputs=[gs.Variable(f"{prefix}/Mul_output_0")],
+        )[0]
+        mul_w_out = self.graph.layer(
+            name=f"{prefix}/Mul_1", op="Mul",
+            inputs=[mul_out, weight],
+            outputs=[gs.Variable(f"{prefix}/Mul_1_output_0")],
+        )[0]
+
+        # Rewire norm output consumers
+        rewire_consumers(out_norm.outputs.copy(), out_norm, mul_w_out)
+        for i, go in enumerate(self.graph.outputs):
+            if go is out_norm:
+                self.graph.outputs[i] = mul_w_out
+
+        # Rewire skip sum output consumers
+        if out_skip_sum is not None:
+            rewire_consumers(out_skip_sum.outputs.copy(), out_skip_sum, skip_sum)
+            for i, go in enumerate(self.graph.outputs):
+                if go is out_skip_sum:
+                    self.graph.outputs[i] = skip_sum
+
+        node.outputs.clear()
+        self._logger.debug("Replaced SkipSimplifiedLayerNormalization '%s'", node.name)
+
+
+def _dequantize_matmulnbits_weights(
+    W_q: np.ndarray,
+    scales: np.ndarray,
+    zero_points: np.ndarray | None,
+    K: int,
+    N: int,
+    bits: int,
+    block_size: int,
+) -> np.ndarray:
+    """
+    Dequantize MatMulNBits int4 packed weights to fp32.
+
+    MatMulNBits weight layout:
+        W_q: (N, n_blocks, blob_size) uint8 — each byte packs two 4-bit values
+        scales: (N, n_blocks) float32
+        zero_points: (N, n_blocks // 2) uint8 — each byte packs two 4-bit zp values (or None)
+
+    Returns:
+        fp32 weight of shape (K, N)
+    """
+    n_blocks = (K + block_size - 1) // block_size
+
+    # Unpack uint8 -> two int4 values per byte (little-endian nibble order)
+    low = (W_q & 0x0F).astype(np.int8)
+    high = ((W_q >> 4) & 0x0F).astype(np.int8)
+    # Interleave: for each byte, low nibble comes first
+    unpacked = np.stack([low, high], axis=-1).reshape(N, n_blocks, block_size)
+
+    # Ensure scales are 2D (N, n_blocks) — may arrive as flat (N * n_blocks,)
+    scales = np.asarray(scales, dtype=np.float32).reshape(N, n_blocks)
+
+    # Unpack zero points
+    if zero_points is not None and zero_points.size > 0:
+        zp_low = (zero_points & 0x0F).astype(np.int8)
+        zp_high = ((zero_points >> 4) & 0x0F).astype(np.int8)
+        zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+    else:
+        zp_unpacked = np.zeros((N, n_blocks), dtype=np.int8)
+
+    # Dequantize: float_val = (int_val - zero_point) * scale
+    W_float = (unpacked.astype(np.float32) - zp_unpacked[:, :, np.newaxis].astype(np.float32)) * scales[:, :, np.newaxis]
+
+    # Reshape to (N, K) and transpose to (K, N) to match standard MatMul convention
+    W_float = W_float.reshape(N, -1)[:, :K]
+    return W_float.T.astype(np.float32)
+
+
+@dataclass
+class ReplaceMatMulNBits(OnnxGraphEdit):
+    """
+    Replace MatMulNBits (ORT 4-bit quantized matmul) with DequantizeLinear + Reshape + MatMul.
+
+    Dequantizes weights at graph-edit time to fp32 and creates a standard MatMul node.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "MatMulNBits"
+
+    def transform(self, node: gs.Node):
+        activation = node.inputs[0]
+        W_q_const: gs.Constant = node.inputs[1]
+        scales_const: gs.Constant = node.inputs[2]
+        zp_const: gs.Constant = node.inputs[3] if len(node.inputs) > 3 else None
+
+        K = node.attrs["K"]
+        N = node.attrs["N"]
+        bits = node.attrs.get("bits", 4)
+        block_size = node.attrs.get("block_size", 32)
+        out_var = node.outputs[0]
+        prefix = node.name.replace("_Quant", "")
+
+        W_float = _dequantize_matmulnbits_weights(
+            W_q_const.values,
+            scales_const.values,
+            zp_const.values if zp_const is not None else None,
+            K, N, bits, block_size,
+        )
+
+        weight_const = gs.Constant(
+            f"{prefix}/weight_dequantized",
+            W_float,
+        )
+
+        matmul_out = self.graph.layer(
+            name=f"{prefix}/MatMul", op="MatMul",
+            inputs=[activation, weight_const],
+            outputs=[gs.Variable(f"{prefix}/MatMul_output_0", dtype=out_var.dtype, shape=out_var.shape)],
+        )[0]
+
+        rewire_consumers(out_var.outputs.copy(), out_var, matmul_out)
+
+        # Also update graph outputs if this node's output was a graph output
+        for i, go in enumerate(self.graph.outputs):
+            if go is out_var:
+                self.graph.outputs[i] = matmul_out
+
+        node.outputs.clear()
+        self._logger.debug(
+            "Replaced MatMulNBits '%s' (K=%d, N=%d) with dequantized MatMul",
+            node.name, K, N
+        )
+
+
+@dataclass
+class ReplaceMatMulNBitsLinear(OnnxGraphEdit):
+    """
+    Replace MatMulNBits with DequantizeLinear + Transpose + MatMul.
+
+    Keeps weights in packed UINT4 form and inserts a standard
+    DequantizeLinear node (opset 21, block_size) to dequantize at runtime.
+
+    Flow per node:
+        DequantizeLinear(x_uint4(N,K), scale(N,n_blocks), zp_uint4(N,n_blocks),
+                         axis=1, block_size) → Transpose(1,0) → MatMul
+
+    After gs.export_onnx(), call ``pack_dq_weights_uint4(model)`` to convert the
+    uint8 placeholder tensors to proper ONNX UINT4 packed format, halving storage.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "MatMulNBits"
+
+    def transform(self, node: gs.Node):
+        activation = node.inputs[0]
+        W_q_const: gs.Constant = node.inputs[1]
+        scales_const: gs.Constant = node.inputs[2]
+        zp_const: gs.Constant = node.inputs[3] if len(node.inputs) > 3 else None
+
+        K = node.attrs["K"]
+        N = node.attrs["N"]
+        bits = node.attrs.get("bits", 4)
+        block_size = node.attrs.get("block_size", 32)
+        out_var = node.outputs[0]
+        prefix = node.name.replace("_Quant", "").replace("_Q4", "")
+
+        n_blocks = (K + block_size - 1) // block_size
+
+        # Unpack int4 packed weights: (N, n_blocks, blob_size) uint8 → (N, K) uint8
+        # Each uint8 in W_q holds 2 int4 values (low nibble first).
+        # After export, pack_dq_weights_uint4() converts these back to UINT4.
+        W_q = W_q_const.values
+        low = (W_q & 0x0F).astype(np.uint8)
+        high = ((W_q >> 4) & 0x0F).astype(np.uint8)
+        x_data = np.stack([low, high], axis=-1).reshape(N, K)
+
+        # Scales: (N*n_blocks,) → (N, n_blocks) for block_size DQ
+        scales_2d = np.asarray(scales_const.values, dtype=np.float32).reshape(N, n_blocks)
+
+        # Zero points: MatMulNBits uses unsigned int4 with default zero_point=8
+        if zp_const is not None and zp_const.values is not None and zp_const.values.size > 0:
+            zp_raw = zp_const.values
+            zp_low = (zp_raw & 0x0F).astype(np.uint8)
+            zp_high = ((zp_raw >> 4) & 0x0F).astype(np.uint8)
+            zp_2d = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+        else:
+            zp_2d = np.full((N, n_blocks), 8, dtype=np.uint8)
+
+        # Pre-transpose weights so DequantizeLinear outputs (K, N) directly,
+        # eliminating the need for a separate Transpose node.
+        # Layout: x(K, N), scale(n_blocks, N), zp(n_blocks, N), axis=0 (blocks along K)
+        x_data_t = np.ascontiguousarray(x_data.T)       # (N, K) → (K, N)
+        scales_t = np.ascontiguousarray(scales_2d.T)     # (N, n_blocks) → (n_blocks, N)
+        zp_t = np.ascontiguousarray(zp_2d.T)             # (N, n_blocks) → (n_blocks, N)
+
+        # DequantizeLinear: x(K, N) uint8→UINT4, scale(n_blocks, N), zp(n_blocks, N)
+        # Naming convention: /dq_weights and /dq_zero_points suffix triggers UINT4 packing
+        dq_out = self.graph.layer(
+            name=f"{prefix}/DequantizeLinear", op="DequantizeLinear",
+            inputs=[
+                gs.Constant(f"{prefix}/dq_weights", x_data_t),
+                gs.Constant(f"{prefix}/dq_scales", scales_t),
+                gs.Constant(f"{prefix}/dq_zero_points", zp_t),
+            ],
+            outputs=[gs.Variable(f"{prefix}/dq_output", dtype=np.float32)],
+            attrs={"axis": 0, "block_size": block_size},
+        )[0]
+
+        # MatMul: activation(B, S, K) @ weight(K, N) → (B, S, N)
+        matmul_out = self.graph.layer(
+            name=f"{prefix}/MatMul", op="MatMul",
+            inputs=[activation, dq_out],
+            outputs=[gs.Variable(f"{prefix}/MatMul_output_0", dtype=out_var.dtype, shape=out_var.shape)],
+        )[0]
+
+        rewire_consumers(out_var.outputs.copy(), out_var, matmul_out)
+
+        for i, go in enumerate(self.graph.outputs):
+            if go is out_var:
+                self.graph.outputs[i] = matmul_out
+
+        node.outputs.clear()
+        self._logger.debug(
+            "Replaced MatMulNBits '%s' (K=%d, N=%d, block_size=%d) with DequantizeLinear+MatMul",
+            node.name, K, N, block_size
+        )
+
+
+def pack_dq_weights_uint4(model):
+    """Convert DequantizeLinear weight/zp initializers from uint8 to ONNX UINT4.
+
+    After ``gs.export_onnx()``, DQ weight and zero-point tensors are stored as
+    uint8 (one value per byte).  This function repacks them into the ONNX UINT4
+    type (two values per byte), halving storage.
+
+    Tensors are identified by the naming convention established in
+    ``ReplaceMatMulNBitsLinear``: names ending with ``/dq_weights`` or
+    ``/dq_zero_points``.
+    """
+    from onnx import TensorProto, numpy_helper
+
+    for init in model.graph.initializer:
+        if not (init.name.endswith("/dq_weights") or init.name.endswith("/dq_zero_points")):
+            continue
+        if init.data_type != TensorProto.UINT8:
+            continue
+        data = numpy_helper.to_array(init).flatten()
+        # Pad to even length if needed
+        if len(data) % 2 != 0:
+            data = np.append(data, np.uint8(0))
+        packed = (data[0::2] & 0x0F) | ((data[1::2] & 0x0F) << 4)
+        init.data_type = TensorProto.UINT4
+        init.raw_data = packed.tobytes()
+        # Clear float/int data fields
+        del init.float_data[:]
+        del init.int32_data[:]
+        del init.int64_data[:]
+
+    return model
+
+
+@dataclass
+class ReplaceGroupQueryAttention(OnnxGraphEdit):
+    """
+    Replace GroupQueryAttention (ORT fused op) with standard ONNX ops.
+
+    Decomposes into: RoPE -> KV concat -> Q*K^T*scale -> mask -> Softmax -> *V
+    Matches the fp32 model's expanded attention structure.
+    """
+
+    num_heads: int
+    kv_num_heads: int
+    head_dim: int
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "GroupQueryAttention"
+
+    def _apply_rope(self, x, cos_cache, sin_cache, seqlen_k, prefix):
+        """Apply rotary position embeddings: x*cos + rotate_half(x)*sin"""
+        # Reshape to (B, num_heads, seq, head_dim)
+        # cos/sin caches are (max_seq, head_dim/2) or (max_seq, head_dim)
+        # Gather cos/sin for positions 0..seqlen_k (only current position matters for single-token)
+
+        # x * cos
+        mul_cos = self.graph.layer(
+            name=f"{prefix}/rope_mul_cos", op="Mul",
+            inputs=[x, cos_cache],
+            outputs=[gs.Variable(f"{prefix}/rope_mul_cos_out")],
+        )[0]
+
+        # rotate_half(x): split x into two halves, negate second, concat
+        half_dim = self.head_dim // 2
+        x_first = self.graph.layer(
+            name=f"{prefix}/rope_slice_first", op="Slice",
+            inputs=[
+                x,
+                gs.Constant(f"{prefix}/rope_start_0", np.array([0], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_end_half", np.array([half_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_axis_neg1", np.array([-1], dtype=np.int64)),
+            ],
+            outputs=[gs.Variable(f"{prefix}/rope_first_half")],
+        )[0]
+        x_second = self.graph.layer(
+            name=f"{prefix}/rope_slice_second", op="Slice",
+            inputs=[
+                x,
+                gs.Constant(f"{prefix}/rope_start_half", np.array([half_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_end_full", np.array([self.head_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_axis_neg1b", np.array([-1], dtype=np.int64)),
+            ],
+            outputs=[gs.Variable(f"{prefix}/rope_second_half")],
+        )[0]
+        neg_second = self.graph.layer(
+            name=f"{prefix}/rope_neg", op="Neg",
+            inputs=[x_second],
+            outputs=[gs.Variable(f"{prefix}/rope_neg_out")],
+        )[0]
+        rotated = self.graph.layer(
+            name=f"{prefix}/rope_concat", op="Concat",
+            inputs=[neg_second, x_first],
+            outputs=[gs.Variable(f"{prefix}/rope_rotated")],
+            attrs={"axis": -1},
+        )[0]
+        mul_sin = self.graph.layer(
+            name=f"{prefix}/rope_mul_sin", op="Mul",
+            inputs=[rotated, sin_cache],
+            outputs=[gs.Variable(f"{prefix}/rope_mul_sin_out")],
+        )[0]
+        result = self.graph.layer(
+            name=f"{prefix}/rope_add", op="Add",
+            inputs=[mul_cos, mul_sin],
+            outputs=[gs.Variable(f"{prefix}/rope_out")],
+        )[0]
+        return result
+
+    def transform(self, node: gs.Node):
+        # GQA inputs:
+        # [0] Q (B, seq, num_heads*head_dim)
+        # [1] K (B, seq, kv_num_heads*head_dim)
+        # [2] V (B, seq, kv_num_heads*head_dim)
+        # [3] past_key (B, kv_num_heads, past_seq, head_dim)
+        # [4] past_value (B, kv_num_heads, past_seq, head_dim)
+        # [5] seqlen_k (B, 1) int32
+        # [6] total_seq_len scalar int32
+        # [7] cos_cache (max_seq, head_dim)
+        # [8] sin_cache (max_seq, head_dim)
+        # [9] (unused)
+        # [10] attn_bias (B, 1, seq, total_seq) float32
+
+        # GQA outputs (may have been partially cleaned up):
+        # Typically [0]=attn_output, [1]=present_key, [2]=present_value
+        # But cleanup can remove unused outputs, so we identify by name
+
+        q_inp = node.inputs[0]
+        k_inp = node.inputs[1]
+        v_inp = node.inputs[2]
+        past_key = node.inputs[3]
+        past_value = node.inputs[4]
+        seqlen_k = node.inputs[5] if (
+            len(node.inputs) > 5
+            and isinstance(node.inputs[5], (gs.Variable, gs.Constant))
+            and node.inputs[5].name
+        ) else None
+        cos_cache = node.inputs[7]
+        sin_cache = node.inputs[8]
+
+        # attn_bias may be absent (empty input) in int4 quantized models
+        attn_bias = node.inputs[10] if (
+            len(node.inputs) > 10
+            and isinstance(node.inputs[10], (gs.Variable, gs.Constant))
+            and node.inputs[10].name
+        ) else None
+
+        # Identify outputs by name pattern rather than fixed index
+        out_attn = None
+        out_present_k = None
+        out_present_v = None
+        for out in node.outputs:
+            if "present" in out.name and "key" in out.name:
+                out_present_k = out
+            elif "present" in out.name and "value" in out.name:
+                out_present_v = out
+            else:
+                out_attn = out
+
+        scale = node.attrs.get("scale", 1.0 / (self.head_dim ** 0.5))
+        prefix = node.name
+
+        # Disconnect the old GQA node immediately so that the original output
+        # variables can be reused without creating duplicate-name warnings.
+        node.inputs.clear()
+        node.outputs.clear()
+
+        # Squeeze seqlen_k from (B, 1) to (B,) if needed — model_q4 uses (B,1)
+        if seqlen_k is not None and getattr(seqlen_k, 'shape', None) and len(seqlen_k.shape) == 2:
+            seqlen_k = self.graph.layer(
+                name=f"{prefix}/seqlen_k_squeeze", op="Squeeze",
+                inputs=[seqlen_k, gs.Constant(f"{prefix}/seqlen_k_squeeze_axes", np.array([1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/seqlen_k_squeezed", dtype=np.int32)],
+            )[0]
+
+        nh = self.num_heads
+        kvh = self.kv_num_heads
+        hd = self.head_dim
+
+        # Reshape Q: (B, S, nh*hd) -> (B, S, nh, hd) -> transpose to (B, nh, S, hd)
+        q_reshaped = self.graph.layer(
+            name=f"{prefix}/q_reshape", op="Reshape",
+            inputs=[q_inp, gs.Constant(f"{prefix}/q_shape", np.array([0, -1, nh, hd], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/q_reshaped")],
+        )[0]
+        q_transposed = self.graph.layer(
+            name=f"{prefix}/q_transpose", op="Transpose",
+            inputs=[q_reshaped],
+            outputs=[gs.Variable(f"{prefix}/q_transposed")],
+            attrs={"perm": [0, 2, 1, 3]},
+        )[0]
+
+        # Reshape K: (B, S, kvh*hd) -> (B, S, kvh, hd) -> transpose to (B, kvh, S, hd)
+        k_reshaped = self.graph.layer(
+            name=f"{prefix}/k_reshape", op="Reshape",
+            inputs=[k_inp, gs.Constant(f"{prefix}/k_shape", np.array([0, -1, kvh, hd], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/k_reshaped")],
+        )[0]
+        k_transposed = self.graph.layer(
+            name=f"{prefix}/k_transpose", op="Transpose",
+            inputs=[k_reshaped],
+            outputs=[gs.Variable(f"{prefix}/k_transposed")],
+            attrs={"perm": [0, 2, 1, 3]},
+        )[0]
+
+        # Reshape V: same as K
+        v_reshaped = self.graph.layer(
+            name=f"{prefix}/v_reshape", op="Reshape",
+            inputs=[v_inp, gs.Constant(f"{prefix}/v_shape", np.array([0, -1, kvh, hd], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/v_reshaped")],
+        )[0]
+        v_transposed = self.graph.layer(
+            name=f"{prefix}/v_transpose", op="Transpose",
+            inputs=[v_reshaped],
+            outputs=[gs.Variable(f"{prefix}/v_transposed")],
+            attrs={"perm": [0, 2, 1, 3]},
+        )[0]
+
+        # Apply RoPE to Q and K using runtime sin/cos computation.
+        # Instead of storing massive cos/sin lookup tables (64MB),
+        # extract inv_freq from the cache and compute cos/sin at runtime.
+        # This matches the fp32 reference model's rotary_emb subgraph pattern.
+
+        # Extract inv_freq from cos/sin caches: inv_freq = atan2(sin[1,:], cos[1,:])
+        if isinstance(cos_cache, gs.Constant) and isinstance(sin_cache, gs.Constant):
+            cos_vals = np.asarray(cos_cache.values, dtype=np.float32)
+            sin_vals = np.asarray(sin_cache.values, dtype=np.float32)
+            inv_freq = np.arctan2(sin_vals[1, :], cos_vals[1, :]).astype(np.float32)
+            # inv_freq shape: (head_dim//2,) → reshape to (1, head_dim//2, 1) for MatMul
+            inv_freq_const = gs.Constant(
+                f"{prefix}/inv_freq",
+                inv_freq.reshape(1, hd // 2, 1)
+            )
+        else:
+            inv_freq_const = None
+
+        if inv_freq_const is not None and seqlen_k is not None:
+            # Runtime RoPE computation: cos(position * inv_freq), sin(position * inv_freq)
+            # Cast position (int32 scalar) to float32 and reshape to (1, 1, 1) for MatMul
+            pos_float = self.graph.layer(
+                name=f"{prefix}/pos_cast", op="Cast",
+                inputs=[seqlen_k],
+                outputs=[gs.Variable(f"{prefix}/pos_float")],
+                attrs={"to": int(onnx.TensorProto.FLOAT)},
+            )[0]
+            pos_3d = self.graph.layer(
+                name=f"{prefix}/pos_reshape", op="Reshape",
+                inputs=[pos_float, gs.Constant(f"{prefix}/pos_shape", np.array([1, 1, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/pos_3d")],
+            )[0]
+            # MatMul: inv_freq(1, hd//2, 1) @ position(1, 1, 1) → (1, hd//2, 1)
+            angles = self.graph.layer(
+                name=f"{prefix}/rope_angles", op="MatMul",
+                inputs=[inv_freq_const, pos_3d],
+                outputs=[gs.Variable(f"{prefix}/rope_angles_out")],
+            )[0]
+            # Transpose: (1, hd//2, 1) → (1, 1, hd//2)
+            angles_t = self.graph.layer(
+                name=f"{prefix}/rope_angles_t", op="Transpose",
+                inputs=[angles],
+                outputs=[gs.Variable(f"{prefix}/rope_angles_transposed")],
+                attrs={"perm": [0, 2, 1]},
+            )[0]
+            # Duplicate: Concat(angles, angles) → (1, 1, hd)
+            angles_full = self.graph.layer(
+                name=f"{prefix}/rope_angles_dup", op="Concat",
+                inputs=[angles_t, angles_t],
+                outputs=[gs.Variable(f"{prefix}/rope_angles_full")],
+                attrs={"axis": -1},
+            )[0]
+            # Cos / Sin
+            cos_val = self.graph.layer(
+                name=f"{prefix}/rope_cos", op="Cos",
+                inputs=[angles_full],
+                outputs=[gs.Variable(f"{prefix}/rope_cos_out")],
+            )[0]
+            sin_val = self.graph.layer(
+                name=f"{prefix}/rope_sin", op="Sin",
+                inputs=[angles_full],
+                outputs=[gs.Variable(f"{prefix}/rope_sin_out")],
+            )[0]
+            # Unsqueeze to (1, 1, 1, hd) for broadcast with (B, nh, S=1, hd)
+            cos_unsq = self.graph.layer(
+                name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+                inputs=[cos_val, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+            )[0]
+            sin_unsq = self.graph.layer(
+                name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+                inputs=[sin_val, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+            )[0]
+        elif seqlen_k is not None:
+            # Fallback: use original cos/sin cache with Gather
+            cos_full = self.graph.layer(
+                name=f"{prefix}/cos_dup", op="Concat",
+                inputs=[cos_cache, cos_cache],
+                outputs=[gs.Variable(f"{prefix}/cos_full")],
+                attrs={"axis": -1},
+            )[0]
+            sin_full = self.graph.layer(
+                name=f"{prefix}/sin_dup", op="Concat",
+                inputs=[sin_cache, sin_cache],
+                outputs=[gs.Variable(f"{prefix}/sin_full")],
+                attrs={"axis": -1},
+            )[0]
+            cos_pos = self.graph.layer(
+                name=f"{prefix}/cos_gather", op="Gather",
+                inputs=[cos_full, seqlen_k],
+                outputs=[gs.Variable(f"{prefix}/cos_at_pos")],
+                attrs={"axis": 0},
+            )[0]
+            sin_pos = self.graph.layer(
+                name=f"{prefix}/sin_gather", op="Gather",
+                inputs=[sin_full, seqlen_k],
+                outputs=[gs.Variable(f"{prefix}/sin_at_pos")],
+                attrs={"axis": 0},
+            )[0]
+            cos_unsq = self.graph.layer(
+                name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+                inputs=[cos_pos, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+            )[0]
+            sin_unsq = self.graph.layer(
+                name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+                inputs=[sin_pos, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+            )[0]
+        else:
+            # No seqlen_k: use full cos/sin cache directly (e.g. multi-token prefill)
+            cos_full = self.graph.layer(
+                name=f"{prefix}/cos_dup", op="Concat",
+                inputs=[cos_cache, cos_cache],
+                outputs=[gs.Variable(f"{prefix}/cos_full")],
+                attrs={"axis": -1},
+            )[0]
+            sin_full = self.graph.layer(
+                name=f"{prefix}/sin_dup", op="Concat",
+                inputs=[sin_cache, sin_cache],
+                outputs=[gs.Variable(f"{prefix}/sin_full")],
+                attrs={"axis": -1},
+            )[0]
+            cos_unsq = self.graph.layer(
+                name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+                inputs=[cos_full, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+            )[0]
+            sin_unsq = self.graph.layer(
+                name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+                inputs=[sin_full, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+            )[0]
+
+        q_rope = self._apply_rope(q_transposed, cos_unsq, sin_unsq, None, f"{prefix}/q")
+        k_rope = self._apply_rope(k_transposed, cos_unsq, sin_unsq, None, f"{prefix}/k")
+
+        # KV cache concat: concat past with new along sequence dim (axis=2)
+        # Reuse original output variables directly to avoid duplicate-name warnings
+        if out_present_k is not None:
+            # Disconnect from old producer, reuse as Concat output
+            out_present_k.inputs.clear()
+            present_k_var = out_present_k
+        else:
+            present_k_var = gs.Variable(f"{prefix}/present_key", dtype=np.float32)
+        if out_present_v is not None:
+            out_present_v.inputs.clear()
+            present_v_var = out_present_v
+        else:
+            present_v_var = gs.Variable(f"{prefix}/present_value", dtype=np.float32)
+
+        present_k = self.graph.layer(
+            name=f"{prefix}/k_concat", op="Concat",
+            inputs=[past_key, k_rope],
+            outputs=[present_k_var],
+            attrs={"axis": -2},
+        )[0]
+        present_v = self.graph.layer(
+            name=f"{prefix}/v_concat", op="Concat",
+            inputs=[past_value, v_transposed],
+            outputs=[present_v_var],
+            attrs={"axis": -2},
+        )[0]
+
+        # GQA broadcast: if num_heads > kv_num_heads, expand K,V heads
+        if nh != kvh:
+            repeat_factor = nh // kvh
+            # Unsqueeze K to (B, kvh, 1, S, hd) then Expand to (B, kvh, repeat, S, hd)
+            k_for_attn = self.graph.layer(
+                name=f"{prefix}/k_unsq_expand", op="Unsqueeze",
+                inputs=[present_k, gs.Constant(f"{prefix}/k_unsq_ax", np.array([2], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/k_unsqueezed")],
+            )[0]
+            k_expanded = self.graph.layer(
+                name=f"{prefix}/k_expand", op="Expand",
+                inputs=[k_for_attn, gs.Constant(f"{prefix}/k_expand_shape", np.array([1, 1, repeat_factor, 1, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/k_expanded")],
+            )[0]
+            k_for_attn = self.graph.layer(
+                name=f"{prefix}/k_reshape_expanded", op="Reshape",
+                inputs=[k_expanded, gs.Constant(f"{prefix}/k_exp_shape", np.array([0, nh, -1, hd], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/k_attn_ready")],
+            )[0]
+
+            v_for_attn = self.graph.layer(
+                name=f"{prefix}/v_unsq_expand", op="Unsqueeze",
+                inputs=[present_v, gs.Constant(f"{prefix}/v_unsq_ax", np.array([2], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/v_unsqueezed")],
+            )[0]
+            v_expanded = self.graph.layer(
+                name=f"{prefix}/v_expand", op="Expand",
+                inputs=[v_for_attn, gs.Constant(f"{prefix}/v_expand_shape", np.array([1, 1, repeat_factor, 1, 1], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/v_expanded")],
+            )[0]
+            v_for_attn = self.graph.layer(
+                name=f"{prefix}/v_reshape_expanded", op="Reshape",
+                inputs=[v_expanded, gs.Constant(f"{prefix}/v_exp_shape", np.array([0, nh, -1, hd], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/v_attn_ready")],
+            )[0]
+        else:
+            k_for_attn = present_k
+            v_for_attn = present_v
+
+        # Q * K^T: transpose K last two dims, then matmul
+        k_t = self.graph.layer(
+            name=f"{prefix}/k_transpose_attn", op="Transpose",
+            inputs=[k_for_attn],
+            outputs=[gs.Variable(f"{prefix}/k_transposed_attn")],
+            attrs={"perm": [0, 1, 3, 2]},
+        )[0]
+
+        # Scale Q
+        q_scaled = self.graph.layer(
+            name=f"{prefix}/q_scale", op="Mul",
+            inputs=[q_rope, gs.Constant(f"{prefix}/scale", np.array(scale, dtype=np.float32))],
+            outputs=[gs.Variable(f"{prefix}/q_scaled")],
+        )[0]
+
+        # Attention scores: Q_scaled @ K^T
+        attn_scores = self.graph.layer(
+            name=f"{prefix}/attn_matmul", op="MatMul",
+            inputs=[q_scaled, k_t],
+            outputs=[gs.Variable(f"{prefix}/attn_scores", dtype=np.float32)],
+        )[0]
+
+        # Add attention bias (causal mask) if present; otherwise Softmax sees raw scores
+        # and the causal mask is applied later by mask_future_attn_scores
+        if attn_bias is not None:
+            softmax_input = self.graph.layer(
+                name=f"{prefix}/attn_add_bias", op="Add",
+                inputs=[attn_scores, attn_bias],
+                outputs=[gs.Variable(f"{prefix}/attn_masked")],
+            )[0]
+        else:
+            softmax_input = attn_scores
+
+        # Softmax — name must end with "self_attn/Softmax" so
+        # MaskFutureAttentionScores can find it later.
+        softmax_name = prefix.rsplit("/", 1)[0] + "/self_attn/Softmax"
+        attn_weights = self.graph.layer(
+            name=softmax_name, op="Softmax",
+            inputs=[softmax_input],
+            outputs=[gs.Variable(f"{prefix}/attn_weights")],
+            attrs={"axis": -1},
+        )[0]
+
+        # Attention output: weights @ V
+        attn_output = self.graph.layer(
+            name=f"{prefix}/attn_v_matmul", op="MatMul",
+            inputs=[attn_weights, v_for_attn],
+            outputs=[gs.Variable(f"{prefix}/attn_output")],
+        )[0]
+
+        # Transpose back: (B, nh, S, hd) -> (B, S, nh, hd) -> reshape to (B, S, nh*hd)
+        attn_transposed = self.graph.layer(
+            name=f"{prefix}/attn_transpose", op="Transpose",
+            inputs=[attn_output],
+            outputs=[gs.Variable(f"{prefix}/attn_transposed")],
+            attrs={"perm": [0, 2, 1, 3]},
+        )[0]
+        attn_reshaped = self.graph.layer(
+            name=f"{prefix}/attn_reshape", op="Reshape",
+            inputs=[attn_transposed, gs.Constant(f"{prefix}/attn_out_shape", np.array([0, -1, nh * hd], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/attn_reshaped")],
+        )[0]
+
+        # Rewire outputs
+        if out_attn is not None:
+            rewire_consumers(out_attn.outputs.copy(), out_attn, attn_reshaped)
+        # present_k/v variables are reused directly as Concat outputs,
+        # so no rewiring or graph output update is needed for them.
+
+        self._logger.debug("Replaced GroupQueryAttention '%s'", node.name)
+
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
@@ -1012,7 +1944,7 @@ class CombineKVCacheMixin:
             for io in io_coll:
                 if not isinstance(io, gs.Variable):
                     raise TypeError(f"Expected gs.Variable, got {type(io)}")
-                if list(io.shape) != kv_tensor_shape:
+                if io.shape is None or list(io.shape) != kv_tensor_shape:
                     continue
                 if not io.name.startswith(prefix):
                     continue
@@ -1264,6 +2196,10 @@ class CommonGraphEditsMixin:
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
         return self
 
+    def extract_quantized_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
+        self.apply_edit(ExtractQuantizedEmbedding(self._graph, self._graph_name, hidden_size, vocab_size, save_to, inp_name))
+        return self
+
     def eliminate_transposes(self):
         self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
         return self
@@ -1274,4 +2210,24 @@ class CommonGraphEditsMixin:
 
     def collapse_gqa_broadcast(self):
         self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
+        return self
+
+    def replace_simplified_layer_norm(self):
+        self.apply_edit(ReplaceSimplifiedLayerNorm(self._graph, self._graph_name))
+        return self
+
+    def replace_skip_simplified_layer_norm(self):
+        self.apply_edit(ReplaceSkipSimplifiedLayerNorm(self._graph, self._graph_name))
+        return self
+
+    def replace_matmul_nbits(self):
+        self.apply_edit(ReplaceMatMulNBits(self._graph, self._graph_name))
+        return self
+
+    def replace_matmul_nbits_linear(self):
+        self.apply_edit(ReplaceMatMulNBitsLinear(self._graph, self._graph_name))
+        return self
+
+    def replace_group_query_attention(self, num_heads, kv_num_heads, head_dim):
+        self.apply_edit(ReplaceGroupQueryAttention(self._graph, self._graph_name, num_heads, kv_num_heads, head_dim))
         return self

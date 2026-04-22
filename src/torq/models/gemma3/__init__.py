@@ -13,6 +13,7 @@ DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
+MODEL_DTYPES: Final[list[str]] = ["fp32", "int4"]
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -36,6 +37,13 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         action="store_true",
         default=False,
         help="Export instruct model variant"
+    )
+    parser.add_argument(
+        "--model-dtype",
+        type=str,
+        choices=MODEL_DTYPES,
+        default="fp32",
+        help="Model data type / quantization (default: %(default)s)",
     )
     add_onnx_args(
         parser,
@@ -86,6 +94,18 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         nargs="*",
         default=None,
         help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
+    )
+    parser.add_argument(
+        "--dequantize-weights",
+        action="store_true",
+        default=False,
+        help="Dequantize int4 MatMulNBits weights to fp32 MatMul (int4 only, default: keep quantized)",
+    )
+    parser.add_argument(
+        "--dequantize-weights-linear",
+        action="store_true",
+        default=False,
+        help="Replace MatMulNBits with DequantizeLinear+Reshape+MatMul (int4 only, runtime dequantization)",
     )
     add_logging_args(parser)
     add_iree_args(parser)
