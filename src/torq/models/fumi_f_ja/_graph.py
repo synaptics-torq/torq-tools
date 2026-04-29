@@ -1019,15 +1019,12 @@ class FumiOnnxGraphEditor(OnnxGraphEditor):
             export_dtype
         )
 
-    def fix_fumi_io(self, text_len: int, audio_u0: int, audio_u3: int | None = None):
-        if audio_u3 is None:
-            audio_u3 = audio_u0 
+    def fix_fumi_io(self, text_len: int, audio_u0: int | None = None):
 
         # freeze the *symbols* (not "300*u0")
         self.fix_io_dims([
             FixedDimMapping("s26", DimMatchType.EXACT, int(text_len)),
             FixedDimMapping("u0",  DimMatchType.EXACT, int(audio_u0)),
-            FixedDimMapping("u3",  DimMatchType.EXACT, int(audio_u3)),
         ])
         return self
 

@@ -86,6 +86,13 @@ def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int],
         if shape is None:
             return
         
+        unknown_dim_map = {
+            "unk__1": "s26",
+            "unk__2": "s26",
+            "unk__3": "u0",
+            "unk__4": "u0",
+        }
+        
         # Iterate over current tensor dimensions (dim_param and dim_value)
         for d in shape.dim:
             if not d.dim_param:
@@ -118,10 +125,10 @@ def force_all_dim_params_to_values(model: onnx.ModelProto, vars: dict[str, int],
                     d.ClearField("dim_param")
                     continue
 
-                # Rest of tensors expects the output value (u0).
                 if unknown == True:
-                    d.dim_value = int(vars['u0'])
-                    d.ClearField("dim_param")
+                    if s in unknown_dim_map:
+                        d.dim_value = int(vars[unknown_dim_map[s]])
+                        d.ClearField("dim_param")
 
             except Exception:
                 # leave it if we can't resolve it
@@ -244,7 +251,7 @@ class FumiModelExporter:
         editor = FumiOnnxGraphEditor.from_onnx(model, "model", self._onnx_export_dtype)
 
         # Convert I/O to static
-        editor.fix_fumi_io(self._text_len, self._audio_u0, self._audio_u3)
+        editor.fix_fumi_io(self._text_len, self._audio_u0)
         static_model = editor.to_onnx(override_ir=model.ir_version)
 
         # Populate value_info as much as possible before rewriting
@@ -254,17 +261,15 @@ class FumiModelExporter:
         static_model = force_all_dim_params_to_values(static_model, {
             "s26": self._text_len,
             "u0": self._audio_u0,
-            "u3": self._audio_u3,
         }, unknown = False)
 
-        # Infer unknown shapes (unk__) after setting a value to variables (s26, u0, u3)
+        # Infer unknown shapes (unk__) after setting a value to variables (s26, u0)
         static_model = onnx.shape_inference.infer_shapes(static_model, check_type=True, strict_mode=False, data_prop=True)
 
         # Set a value to remaining unknown shapes (unk__)
         static_model = force_all_dim_params_to_values(static_model, {
             "s26": self._text_len,
             "u0": self._audio_u0,
-            "u3": self._audio_u3,
         }, unknown = True)
 
         return static_model
