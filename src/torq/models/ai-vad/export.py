@@ -187,9 +187,7 @@ class AiVadModelExporter(OnnxModelExporterBase):
         # output hidden state: Concathidden_state_dim_1
         editor.fix_encoder_io(1,1,16)
         static_model = editor.to_onnx(override_ir=model.ir_version)
-
         static_model = onnx.shape_inference.infer_shapes(static_model)
-
 
         graph = gs.import_onnx(static_model) 
         graph.name = "main"
@@ -198,12 +196,8 @@ class AiVadModelExporter(OnnxModelExporterBase):
         ).toposort()
         new_encoder = gs.export_onnx(graph)
 
-        '''static_model = force_all_dim_params_to_values(new_encoder, {
-
-        }, unknown = False)'''
-
-        #new_encoder.ir_version = model.ir_version
-        return static_model
+        new_encoder.ir_version = model.ir_version
+        return new_encoder
 
     def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
