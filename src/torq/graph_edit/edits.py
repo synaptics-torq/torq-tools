@@ -1018,22 +1018,32 @@ class ExtractQuantizedEmbedding(OnnxGraphEdit):
         w_data = np.asarray(weight_q.values, dtype=np.uint8)
         s_data = np.asarray(scales.values, dtype=np.float32)
 
-        # Unpack uint8 → two int4 values per byte (low nibble first)
-        low = (w_data & 0x0F).astype(np.float32)
-        high = ((w_data >> 4) & 0x0F).astype(np.float32)
-        unpacked = np.stack([low, high], axis=-1).reshape(w_data.shape[0], -1)
+        if bits == 4:
+            # Unpack uint8 → two int4 values per byte (low nibble first)
+            low = (w_data & 0x0F).astype(np.float32)
+            high = ((w_data >> 4) & 0x0F).astype(np.float32)
+            unpacked = np.stack([low, high], axis=-1).reshape(w_data.shape[0], -1)
+        elif bits == 8:
+            # int8: each byte is one quantized value
+            unpacked = w_data.astype(np.float32).reshape(w_data.shape[0], -1)
+        else:
+            raise ValueError(f"Unsupported GatherBlockQuantized bit width: {bits}")
         # Trim to hidden_size (padding may exist)
         unpacked = unpacked[:, :self.hidden_size]
 
         # Unpack zero points
         if zp is not None and zp.values is not None and zp.values.size > 0:
             zp_data = np.asarray(zp.values, dtype=np.uint8)
-            zp_low = (zp_data & 0x0F).astype(np.float32)
-            zp_high = ((zp_data >> 4) & 0x0F).astype(np.float32)
-            zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(zp_data.shape[0], -1)
+            if bits == 4:
+                zp_low = (zp_data & 0x0F).astype(np.float32)
+                zp_high = ((zp_data >> 4) & 0x0F).astype(np.float32)
+                zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(zp_data.shape[0], -1)
+            else:
+                zp_unpacked = zp_data.astype(np.float32).reshape(zp_data.shape[0], -1)
         else:
             n_blocks_per_row = s_data.shape[1]
-            zp_unpacked = np.full((w_data.shape[0], n_blocks_per_row), 8.0, dtype=np.float32)
+            default_zp = 8.0 if bits == 4 else 128.0
+            zp_unpacked = np.full((w_data.shape[0], n_blocks_per_row), default_zp, dtype=np.float32)
 
         # Dequantize: for each block of block_size elements along hidden dim
         n_blocks = s_data.shape[1]
@@ -1234,34 +1244,49 @@ def _dequantize_matmulnbits_weights(
     block_size: int,
 ) -> np.ndarray:
     """
-    Dequantize MatMulNBits int4 packed weights to fp32.
+    Dequantize MatMulNBits int4/int8 packed weights to fp32.
 
-    MatMulNBits weight layout:
+    MatMulNBits weight layout (4-bit):
         W_q: (N, n_blocks, blob_size) uint8 — each byte packs two 4-bit values
         scales: (N, n_blocks) float32
         zero_points: (N, n_blocks // 2) uint8 — each byte packs two 4-bit zp values (or None)
+
+    MatMulNBits weight layout (8-bit):
+        W_q: (N, n_blocks, block_size) uint8 — each byte is one 8-bit value
+        scales: (N, n_blocks) float32
+        zero_points: (N, n_blocks) uint8 (or None)
 
     Returns:
         fp32 weight of shape (K, N)
     """
     n_blocks = (K + block_size - 1) // block_size
 
-    # Unpack uint8 -> two int4 values per byte (little-endian nibble order)
-    low = (W_q & 0x0F).astype(np.int8)
-    high = ((W_q >> 4) & 0x0F).astype(np.int8)
-    # Interleave: for each byte, low nibble comes first
-    unpacked = np.stack([low, high], axis=-1).reshape(N, n_blocks, block_size)
+    if bits == 4:
+        # Unpack uint8 -> two int4 values per byte (little-endian nibble order)
+        low = (W_q & 0x0F).astype(np.int8)
+        high = ((W_q >> 4) & 0x0F).astype(np.int8)
+        # Interleave: for each byte, low nibble comes first
+        unpacked = np.stack([low, high], axis=-1).reshape(N, n_blocks, block_size)
+    elif bits == 8:
+        # int8: each byte is a single quantized value, already shaped (N, n_blocks, block_size)
+        # Keep as uint8 — values 0-255 with zero_point subtracted in float space
+        unpacked = W_q.reshape(N, n_blocks, block_size)
+    else:
+        raise ValueError(f"Unsupported MatMulNBits bit width: {bits}")
 
     # Ensure scales are 2D (N, n_blocks) — may arrive as flat (N * n_blocks,)
     scales = np.asarray(scales, dtype=np.float32).reshape(N, n_blocks)
 
     # Unpack zero points
     if zero_points is not None and zero_points.size > 0:
-        zp_low = (zero_points & 0x0F).astype(np.int8)
-        zp_high = ((zero_points >> 4) & 0x0F).astype(np.int8)
-        zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+        if bits == 4:
+            zp_low = (zero_points & 0x0F).astype(np.int8)
+            zp_high = ((zero_points >> 4) & 0x0F).astype(np.int8)
+            zp_unpacked = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+        else:
+            zp_unpacked = zero_points.reshape(N, n_blocks)
     else:
-        zp_unpacked = np.zeros((N, n_blocks), dtype=np.int8)
+        zp_unpacked = np.zeros((N, n_blocks), dtype=np.uint8)
 
     # Dequantize: float_val = (int_val - zero_point) * scale
     W_float = (unpacked.astype(np.float32) - zp_unpacked[:, :, np.newaxis].astype(np.float32)) * scales[:, :, np.newaxis]

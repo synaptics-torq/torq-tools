@@ -54,6 +54,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._dequantize_weights = edit_args.get("dequantize_weights", False)
         self._dequantize_weights_linear = edit_args.get("dequantize_weights_linear", False)
+        self._simulate_bf16 = edit_args.get("simulate_bf16", False)
 
         super().__init__(
             "fp32",
@@ -417,11 +418,92 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, _):
         self._patch_static_model(model_path)
+        if self._simulate_bf16:
+            self._logger.info("(model) Creating bf16-simulated copy...")
+            sim_dir = Path(model_path).parent.parent / "int4_bf16_sim" / "static"
+            sim_dir.mkdir(parents=True, exist_ok=True)
+            sim_path = sim_dir / Path(model_path).name
+            import shutil
+            shutil.copy2(model_path, sim_path)
+            # Copy token_embeddings.npy if present
+            emb_src = Path(model_path).parent / "token_embeddings.npy"
+            if emb_src.exists():
+                shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
+            self._simulate_bf16_precision(sim_path)
 
     def _skip_static_shape_check(self) -> bool:
         # int4 models have cos/sin constant cache dims that leak into
         # intermediate shape inference, causing false dynamic-shape reports
         return self._is_int4
+
+    def _simulate_bf16_precision(self, model_path: str | os.PathLike):
+        """Simulate bf16 precision loss on both weights and activations.
+
+        Weights: round-trip fp32 constant data through bf16 in-place.
+        Activations: for each non-Cast node output insert
+            output → Cast(bf16) → Cast(fp32)
+        then rewire all downstream consumers to the fp32 copy.
+        I/O stays fp32 so onnxruntime can run the model normally.
+        """
+        import ml_dtypes
+
+        model = onnx.load(model_path)
+        graph = gs.import_onnx(model)
+
+        # --- 1. Quantize weights: round-trip fp32 constants through bf16 ---
+        n_weights = 0
+        for tensor in graph.tensors().values():
+            if isinstance(tensor, gs.Constant) and tensor.values is not None:
+                if tensor.values.dtype == np.float32:
+                    tensor.values = tensor.values.astype(ml_dtypes.bfloat16).astype(np.float32)
+                    n_weights += 1
+
+        # --- 2. Quantize activations: Cast sandwich on node outputs ---
+        targets: list[tuple[gs.Node, gs.Variable]] = []
+        for node in graph.nodes:
+            if node.op == "Cast":
+                continue
+            for out_var in node.outputs:
+                if out_var.name and out_var.dtype in (np.float32, np.float64):
+                    targets.append((node, out_var))
+
+        n_casts = 0
+        for orig_node, out_var in targets:
+            bf16_var = gs.Variable(f"{out_var.name}__bf16")
+            fp32_var = gs.Variable(f"{out_var.name}__fp32", dtype=np.float32)
+
+            cast_to_bf16 = gs.Node(
+                op="Cast",
+                name=f"{out_var.name}__cast_bf16",
+                inputs=[out_var],
+                outputs=[bf16_var],
+                attrs={"to": onnx.TensorProto.BFLOAT16},
+            )
+            cast_to_fp32 = gs.Node(
+                op="Cast",
+                name=f"{out_var.name}__cast_fp32",
+                inputs=[bf16_var],
+                outputs=[fp32_var],
+                attrs={"to": onnx.TensorProto.FLOAT},
+            )
+            graph.nodes.append(cast_to_bf16)
+            graph.nodes.append(cast_to_fp32)
+
+            for consumer in list(out_var.outputs):
+                if consumer is cast_to_bf16:
+                    continue
+                for idx, inp in enumerate(consumer.inputs):
+                    if inp is out_var:
+                        consumer.inputs[idx] = fp32_var
+            n_casts += 1
+
+        graph.cleanup().toposort()
+        model = gs.export_onnx(graph)
+        onnx.save(model, model_path)
+        self._logger.info(
+            "Saved bf16-simulated model to '%s' (%d weights quantized, %d activation Cast pairs)",
+            model_path, n_weights, n_casts,
+        )
 
     def validate_onnx(self, n_iters: int = 5):
         # simple dataset to test functional equivalence
@@ -526,7 +608,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops,
         dequantize_weights=args.dequantize_weights,
-        dequantize_weights_linear=args.dequantize_weights_linear
+        dequantize_weights_linear=args.dequantize_weights_linear,
+        simulate_bf16=args.simulate_bf16
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:

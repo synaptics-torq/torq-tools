@@ -107,6 +107,12 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=False,
         help="Replace MatMulNBits with DequantizeLinear+Reshape+MatMul (int4 only, runtime dequantization)",
     )
+    parser.add_argument(
+        "--simulate-bf16",
+        action="store_true",
+        default=False,
+        help="Simulate bf16 inference by sandwiching each op with fp32→bf16→fp32 casts (for measuring quantization impact)",
+    )
     add_logging_args(parser)
     add_iree_args(parser)
 
