@@ -43,7 +43,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
-        self._is_int4 = model_dtype == "int4"
+        self._is_quantized = model_dtype in ("int4", "int8")
+        self._model_quant_dtype = model_dtype  # "int4", "int8", or "fp32"
         self._hf_repo = f"google/gemma-3-{model_size}"
         if self._instruct_model:
             self._hf_repo += "-it"
@@ -63,7 +64,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
-            opt_configs={} if self._is_int4 else {"model": ORTOptimizerConfig(
+            opt_configs={} if self._is_quantized else {"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
                 hidden_size=self._config.hidden_size
             )}
@@ -83,17 +84,17 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                         f"Source directory not found: '{onnx_source_dir}'"
                     )
             onnx_dir = onnx_source_dir
-        elif not self._is_int4:
+        elif self._is_quantized:
+            onnx_dir = self._models_dir / "source" / self._model_quant_dtype
+            if not onnx_dir.exists():
+                self._download_from_hf(onnx_dir, variant=self._model_quant_dtype)
+        else:
             onnx_dir = self._models_dir / "source" / self._model_dtype
             onnx_dir.mkdir(parents=True, exist_ok=True)
             optimum_export_onnx(
                 onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"], opt_level=None
             )
-        else:
-            onnx_dir = self._models_dir / "source" / "int4"
-            if not onnx_dir.exists():
-                self._download_from_hf(onnx_dir, variant="int4")
-        dtype_tag = "int4" if self._is_int4 else self._model_dtype
+        dtype_tag = self._model_quant_dtype if self._is_quantized else self._model_dtype
         export_dir = (
             self._models_dir / 
             "export" / 
@@ -101,18 +102,20 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             dtype_tag / 
             ("static" if self._static_models else "dynamic")
         )
+        # converted dir: "converted" for int4/fp32, "int8_converted" for int8
+        convert_tag = "int8_converted" if self._model_quant_dtype == "int8" else "converted"
         convert_dir = (
             self._models_dir 
             / "export"
             / "onnx"
-            / "converted"
+            / convert_tag
             / ("static" if self._static_models else "dynamic")
         )
         iree_dir = (
             self._models_dir
             / "export"
             / "iree"
-            / ("converted" if self._convert_dtypes else self._model_dtype)
+            / (convert_tag if self._convert_dtypes else dtype_tag)
             / ("static" if self._static_models else "dynamic")
         )
         return onnx_dir, export_dir, convert_dir, iree_dir
@@ -158,8 +161,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._logger.info("Download complete: %s", target_dir)
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
-        if self._is_int4:
-            return self._load_onnx_int4()
+        if self._is_quantized:
+            return self._load_onnx_quantized()
         model_path = self._onnx_dir /  "model.onnx"
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
@@ -175,14 +178,21 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model.ir_version = orig_ir
         return {"model": model}
 
-    def _load_onnx_int4(self) -> dict[str, onnx.ModelProto]:
-        # Prefer model_q4.onnx (smaller, quantized embedding) over model.onnx
-        model_path = self._onnx_dir / "model_q4.onnx"
-        if not model_path.exists():
-            model_path = self._onnx_dir / "model.onnx"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Expected model_q4.onnx or model.onnx @ '{self._onnx_dir}'")
-        self._logger.info("Loading int4 quantized model from '%s'", model_path)
+    def _load_onnx_quantized(self) -> dict[str, onnx.ModelProto]:
+        # Search for quantized model file in order of preference
+        candidates = ["model_q4.onnx", "model_quantized.onnx", "model.onnx"]
+        model_path = None
+        for name in candidates:
+            p = self._onnx_dir / name
+            if p.exists():
+                model_path = p
+                break
+        if model_path is None:
+            raise FileNotFoundError(
+                f"No quantized model found in '{self._onnx_dir}'. "
+                f"Expected one of: {candidates}"
+            )
+        self._logger.info("Loading quantized model from '%s'", model_path)
         model = onnx.load(model_path)
         orig_ir = model.ir_version
         graph = gs.import_onnx(model)
@@ -306,7 +316,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         editor = Gemma3OnnxGraphEditor(graph, self._onnx_export_dtype)
         # int4 GQA replacement produces "total_sequence_length" on present KV outputs
         extra_dims = None
-        if self._is_int4:
+        if self._is_quantized:
             from ...graph_edit import DimMatchType, FixedDimMapping
             extra_dims = [FixedDimMapping("total_sequence_length", DimMatchType.EXACT, self._max_gen_tokens)]
         editor.fix_io(self._max_gen_tokens, dims=extra_dims)
@@ -335,7 +345,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         # The GQA replacement uses seqlen_k for cos/sin position indexing.
         # In the static model, position_ids (cur_len) provides the same value,
         # so we rewire all consumers and let cleanup remove the attention_mask input.
-        if self._is_int4:
+        if self._is_quantized:
             from ...graph_edit.onnx import rewire_consumers
             # Try both seqlen_k variable names (model.onnx vs model_q4.onnx)
             seqlen_k_candidates = [
@@ -374,7 +384,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             .convert_to_static_index()
         )
 
-        new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=not self._is_int4)
+        new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=not self._is_quantized)
         return new_model
 
     def _patch_static_model(self, model_path: str | os.PathLike):
@@ -398,7 +408,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
             embeddings_inp = "token_embedding"
-            if self._is_int4:
+            if self._is_quantized:
                 # GatherBlockQuantized was already extracted during dynamic conversion;
                 # copy the .npy to the static export directory.
                 src_npy = self._onnx_dir / "token_embeddings.npy"
@@ -424,9 +434,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
         editor.reorder_graph_input("position_ids", 1)
 
-        new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=not self._is_int4)
+        new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=not self._is_quantized)
         # Re-run shape inference with stale value_info cleared to fill all shapes
-        if self._is_int4:
+        if self._is_quantized:
             del new_model.graph.value_info[:]
             new_model = onnx.shape_inference.infer_shapes(
                 new_model, check_type=True, strict_mode=False, data_prop=True
@@ -438,8 +448,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         # nodes with shape [] in value_info but actual rank-1 tensor data). Relax
         # strict_mode so shape inference overwrites stale annotations instead of
         # raising InferenceError.
-        strict = not self._is_int4
-        if self._is_int4:
+        strict = not self._is_quantized
+        if self._is_quantized:
             # Clear all stale value_info entries — the int4 model has many shape
             # annotations that become invalid after graph transformations (GQA
             # replacement, seqlen_k → position_ids rewiring, etc.).  Shape
@@ -459,7 +469,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
     def make_static(self):
         self._logger.info("(model) Making graph static...")
         self._components["model"] = self.check_model(
-            self._components["model"], skip_data_prop=self._is_int4
+            self._components["model"], skip_data_prop=self._is_quantized
         )
         self._components["model"] = self._make_model_static(self._components["model"])
 
@@ -481,7 +491,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
     def _skip_static_shape_check(self) -> bool:
         # int4 models have cos/sin constant cache dims that leak into
         # intermediate shape inference, causing false dynamic-shape reports
-        return self._is_int4
+        return self._is_quantized
 
     def _simulate_bf16_precision(self, model_path: str | os.PathLike):
         """Simulate bf16 precision loss on both weights and activations.

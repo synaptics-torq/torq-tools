@@ -13,7 +13,7 @@ DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
-MODEL_DTYPES: Final[list[str]] = ["fp32", "int4"]
+MODEL_DTYPES: Final[list[str]] = ["fp32", "int4", "int8"]
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):

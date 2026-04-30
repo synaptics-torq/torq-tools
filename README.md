@@ -218,19 +218,16 @@ The int4 source model is downloaded automatically from HuggingFace on first run.
 ### Export int8 model
 
 ```bash
-# Download int8 source and export
 PYTHONPATH=src python -m torq.models.gemma3.export \
-    --model-dtype int4 \
+    --model-dtype int8 \
     --instruct-model \
     --extract-embeddings \
     --dequantize-weights \
-    --convert-dtypes \
-    --skip-iree \
-    --onnx-source-dir models/google/gemma-3-270m-it/source/int8
+    --convert-dtypes
 ```
 
-> **Note:** `--model-dtype int4` is reused because the pipeline handles both int4 and int8
-> (MatMulNBits with `bits=4` or `bits=8`). Use `--onnx-source-dir` to point to the int8 source.
+The int8 source model is downloaded automatically from HuggingFace on first run.
+Output: `models/google/gemma-3-270m-it/export/onnx/int8_converted/static/model.onnx`
 
 ### bf16 Scale Dequantization
 
@@ -269,11 +266,11 @@ source ../venv/bin/activate
 
 | Flag | Description |
 |------|-------------|
-| `--model-dtype int4` | Use int4/int8 quantized source |
+| `--model-dtype int4\|int8` | Quantization type (auto-downloads source from HuggingFace) |
 | `--instruct-model` | Use the instruct-tuned (-it) variant |
 | `--extract-embeddings` | Extract token embeddings to `.npy` (input becomes embedding vector) |
-| `--dequantize-weights` | Dequantize MatMulNBits → fp32 MatMul |
+| `--dequantize-weights` | Dequantize MatMulNBits → fp32 MatMul (bf16 scales by default) |
 | `--convert-dtypes` | Convert fp32 → bf16 for IREE compile |
 | `--skip-iree` | Skip VMFB compilation step |
-| `--onnx-source-dir DIR` | Override source model directory |
+| `--onnx-source-dir DIR` | Override source model directory (skips auto-download) |
 | `--max-gen-tokens N` | Max sequence length (default: 256) |
