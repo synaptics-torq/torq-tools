@@ -85,6 +85,45 @@ def dequantize_matmulnbits_bf16_scales(
     return W_float.T.astype(np.float32)
 
 
+def download_source_if_needed(source_dir: Path, variant: str):
+    """Download quantized source model from HuggingFace if not present."""
+    from huggingface_hub import hf_hub_download
+
+    HF_REPO = "onnx-community/gemma-3-270m-it-ONNX"
+    files_map = {
+        "int4": ["model_q4.onnx", "model_q4.onnx_data"],
+        "int8": ["model_quantized.onnx", "model_quantized.onnx_data"],
+    }
+    files = files_map.get(variant, [])
+    if not files:
+        return
+
+    # Check if any expected file already exists
+    if any((source_dir / f).exists() for f in files):
+        return
+
+    # Also check for model.onnx (some int8 dirs use this name)
+    if (source_dir / "model.onnx").exists():
+        return
+
+    print(f"  Downloading {variant} source from {HF_REPO}...")
+    source_dir.mkdir(parents=True, exist_ok=True)
+    for filename in files:
+        print(f"    {filename}")
+        hf_hub_download(
+            repo_id=HF_REPO,
+            filename=f"onnx/{filename}",
+            local_dir=str(source_dir),
+            local_dir_use_symlinks=False,
+        )
+        downloaded = source_dir / "onnx" / filename
+        if downloaded.exists():
+            downloaded.rename(source_dir / filename)
+    onnx_subdir = source_dir / "onnx"
+    if onnx_subdir.exists() and not any(onnx_subdir.iterdir()):
+        onnx_subdir.rmdir()
+
+
 def dequantize_source_model(source_dir: Path, bits_expected: int) -> dict[str, np.ndarray]:
     """
     Load source ONNX model with MatMulNBits ops and dequantize all weights
@@ -269,6 +308,8 @@ def process_variant(source_type: str, output_name: str):
     t0 = time.time()
 
     source_dir = BASE / "source" / source_type
+    # Download source from HuggingFace if not present
+    download_source_if_needed(source_dir, source_type)
     # Use the already-converted bf16 model as the base (has correct types, graph structure)
     converted_dir = BASE / "export" / "onnx" / (
         "converted" if source_type == "int4" else "int8_converted"

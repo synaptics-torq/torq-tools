@@ -71,7 +71,17 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
+        if self._onnx_source_dir:
+            onnx_source_dir = Path(self._onnx_source_dir)
+            if not onnx_source_dir.exists():
+                # Auto-download from HuggingFace based on directory name
+                variant = onnx_source_dir.name  # e.g. "int4" or "int8"
+                if variant in ("int4", "int8"):
+                    self._download_from_hf(onnx_source_dir, variant=variant)
+                else:
+                    raise FileNotFoundError(
+                        f"Source directory not found: '{onnx_source_dir}'"
+                    )
             onnx_dir = onnx_source_dir
         elif not self._is_int4:
             onnx_dir = self._models_dir / "source" / self._model_dtype
@@ -82,10 +92,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         else:
             onnx_dir = self._models_dir / "source" / "int4"
             if not onnx_dir.exists():
-                raise FileNotFoundError(
-                    f"int4 quantized model not found at '{onnx_dir}'. "
-                    "Provide --onnx-source-dir pointing to directory containing model.onnx"
-                )
+                self._download_from_hf(onnx_dir, variant="int4")
         dtype_tag = "int4" if self._is_int4 else self._model_dtype
         export_dir = (
             self._models_dir / 
@@ -109,6 +116,46 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             / ("static" if self._static_models else "dynamic")
         )
         return onnx_dir, export_dir, convert_dir, iree_dir
+
+    # HuggingFace repo containing pre-quantized ONNX models
+    HF_ONNX_REPO = "onnx-community/gemma-3-270m-it-ONNX"
+
+    def _download_from_hf(self, target_dir: Path, variant: str = "int4"):
+        """Download quantized ONNX model from HuggingFace."""
+        from huggingface_hub import hf_hub_download
+
+        files_map = {
+            "int4": ["model_q4.onnx", "model_q4.onnx_data"],
+            "int8": ["model_quantized.onnx", "model_quantized.onnx_data"],
+            "fp32": ["model.onnx", "model.onnx_data"],
+        }
+        if variant not in files_map:
+            raise ValueError(f"Unknown variant '{variant}', expected one of {list(files_map.keys())}")
+
+        files = files_map[variant]
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._logger.info("Downloading %s model from '%s'...", variant, self.HF_ONNX_REPO)
+        for filename in files:
+            dest = target_dir / filename
+            if dest.exists():
+                self._logger.info("  Already exists: %s", dest)
+                continue
+            self._logger.info("  Downloading: %s", filename)
+            hf_hub_download(
+                repo_id=self.HF_ONNX_REPO,
+                filename=f"onnx/{filename}",
+                local_dir=str(target_dir),
+                local_dir_use_symlinks=False,
+            )
+            # hf_hub_download places files in subdirs; move to target
+            downloaded = target_dir / "onnx" / filename
+            if downloaded.exists():
+                downloaded.rename(dest)
+        # Clean up empty onnx/ subdir if created
+        onnx_subdir = target_dir / "onnx"
+        if onnx_subdir.exists() and not any(onnx_subdir.iterdir()):
+            onnx_subdir.rmdir()
+        self._logger.info("Download complete: %s", target_dir)
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         if self._is_int4:

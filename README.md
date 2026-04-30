@@ -167,3 +167,113 @@ You can import and use the same tools programmatically through the torq namespac
 >>> exporter.export_onnx()
 >>> convert_model(...)
 ```
+
+---
+
+## Gemma-3 270M-IT LLM Export
+
+Export pipeline for the [gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) model, converting quantized ONNX models to static bf16 VMFBs for the Torq board.
+
+### Source Models
+
+Pre-quantized ONNX models are downloaded automatically from:
+[onnx-community/gemma-3-270m-it-ONNX](https://huggingface.co/onnx-community/gemma-3-270m-it-ONNX/tree/main/onnx)
+
+| File | Description | Size |
+|------|-------------|------|
+| `model_q4.onnx` + `_data` | int4 quantized (MatMulNBits, bits=4, block_size=32) | ~323 MB |
+| `model_quantized.onnx` + `_data` | int8 quantized (MatMulNBits, bits=8, block_size=32) | ~545 MB |
+| `model.onnx` + `_data` | fp32 original | ~1.14 GB |
+
+### Pipeline Overview
+
+```
+Source (HuggingFace quantized ONNX)
+  → Dequantize weights (MatMulNBits → fp32 MatMul, using bf16-precision scales)
+  → Make static (fixed KV cache, seq_len=256)
+  → Post-static patches (fuse ops, merge KV I/O)
+  → Convert to bf16
+  → Compile to VMFB (IREE + Torq backend)
+```
+
+> **Note:** Quantization scales are rounded to bf16 precision *before* dequantization by default.
+> This ensures the scale precision matches the final bf16 compute precision, producing
+> consistent weights without precision mismatch artifacts.
+
+### Quick Start: Export int4 model
+
+```bash
+cd torq-tools-dev
+source .venv/bin/activate
+PYTHONPATH=src python -m torq.models.gemma3.export \
+    --model-dtype int4 \
+    --instruct-model \
+    --extract-embeddings \
+    --dequantize-weights \
+    --convert-dtypes
+```
+
+The int4 source model is downloaded automatically from HuggingFace on first run.
+
+### Export int8 model
+
+```bash
+# Download int8 source and export
+PYTHONPATH=src python -m torq.models.gemma3.export \
+    --model-dtype int4 \
+    --instruct-model \
+    --extract-embeddings \
+    --dequantize-weights \
+    --convert-dtypes \
+    --skip-iree \
+    --onnx-source-dir models/google/gemma-3-270m-it/source/int8
+```
+
+> **Note:** `--model-dtype int4` is reused because the pipeline handles both int4 and int8
+> (MatMulNBits with `bits=4` or `bits=8`). Use `--onnx-source-dir` to point to the int8 source.
+
+### bf16 Scale Dequantization
+
+The export pipeline uses bf16-precision scales by default during weight dequantization.
+This is integrated into the `--dequantize-weights` flag — no separate step is needed.
+
+The standalone `convert_bf16_scales.py` script can regenerate bf16-scale models from
+existing static models if needed:
+
+```bash
+# Regenerate int8_converted_bf16_scales and int4_converted_bf16_scales from source
+PYTHONPATH=src python convert_bf16_scales.py --source-type both
+```
+
+### Layer Sensitivity Analysis (layer_sensitivity.py)
+
+Runs teacher-forced perplexity analysis to determine which layers benefit most from int8:
+
+```bash
+PYTHONPATH=src python layer_sensitivity.py --n-prompts 10 --n-tokens 30
+```
+
+Creates a mixed int8/int4 model keeping only the most sensitive layers at int8 precision.
+
+### Compile to VMFB
+
+```bash
+cd /path/to/torq-compiler-dev
+source ../venv/bin/activate
+./compile_v1.5.sh ../torq-tools-dev/models/google/gemma-3-270m-it/export/onnx/converted/static/model.onnx \
+    --torq-enable-transpose-optimization \
+    --torq-enable-torq-hl-tiling
+```
+
+### Key Export Flags
+
+| Flag | Description |
+|------|-------------|
+| `--model-dtype int4` | Use int4/int8 quantized source |
+| `--instruct-model` | Use the instruct-tuned (-it) variant |
+| `--extract-embeddings` | Extract token embeddings to `.npy` (input becomes embedding vector) |
+| `--dequantize-weights` | Dequantize MatMulNBits → fp32 MatMul |
+| `--convert-dtypes` | Convert fp32 → bf16 for IREE compile |
+| `--skip-iree` | Skip VMFB compilation step |
+| `--onnx-source-dir DIR` | Override source model directory |
+| `--max-gen-tokens N` | Max sequence length (default: 256) |

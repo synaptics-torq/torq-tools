@@ -1242,6 +1242,7 @@ def _dequantize_matmulnbits_weights(
     N: int,
     bits: int,
     block_size: int,
+    bf16_scales: bool = True,
 ) -> np.ndarray:
     """
     Dequantize MatMulNBits int4/int8 packed weights to fp32.
@@ -1255,6 +1256,11 @@ def _dequantize_matmulnbits_weights(
         W_q: (N, n_blocks, block_size) uint8 — each byte is one 8-bit value
         scales: (N, n_blocks) float32
         zero_points: (N, n_blocks) uint8 (or None)
+
+    Args:
+        bf16_scales: If True, round scales to bf16 precision before dequantization.
+            This matches the final compute precision and avoids precision mismatch
+            when the model is later converted to bf16.
 
     Returns:
         fp32 weight of shape (K, N)
@@ -1276,6 +1282,11 @@ def _dequantize_matmulnbits_weights(
 
     # Ensure scales are 2D (N, n_blocks) — may arrive as flat (N * n_blocks,)
     scales = np.asarray(scales, dtype=np.float32).reshape(N, n_blocks)
+
+    # Round scales to bf16 precision before dequantization
+    if bf16_scales:
+        as_int = scales.view(np.uint32)
+        scales = (as_int & np.uint32(0xFFFF0000)).view(np.float32)
 
     # Unpack zero points
     if zero_points is not None and zero_points.size > 0:
