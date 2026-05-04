@@ -14,6 +14,7 @@ from torq.models.gemma3._trim_vocab import (
     load_json,
     rewrite_config_json,
     rewrite_tokenizer_json,
+    trim_tokenizer_json_file,
     trim_embedding_rows,
     trim_logits_projection,
 )
@@ -144,6 +145,31 @@ class Gemma3TrimVocabTests(unittest.TestCase):
         self.assertTrue(np.array_equal(trimmed_embeddings[-1], np.zeros(3, dtype=np.float32)))
         self.assertTrue(np.array_equal(trimmed_logits[:, -2], logits[:, 8]))
         self.assertTrue(np.array_equal(trimmed_logits[:, -1], np.zeros(2, dtype=np.float32)))
+
+    def test_trim_tokenizer_json_file_writes_trimmed_tokenizer_without_config(self):
+        temp_dir, tokenizer_path, _, _, _ = self._build_test_assets()
+        self.addCleanup(temp_dir.cleanup)
+
+        output_path, spec = trim_tokenizer_json_file(
+            tokenizer_path,
+            Path(temp_dir.name) / "trimmed" / "tokenizer.json",
+            selected_groups=["latin", "punct"],
+            byte_fallback=True,
+        )
+
+        self.assertTrue(output_path.exists())
+        trimmed_tokenizer_json = load_json(output_path)
+        dense_model_ids = sorted(trimmed_tokenizer_json["model"]["vocab"].values())
+
+        self.assertEqual(dense_model_ids, list(range(len(dense_model_ids))))
+        self.assertEqual(
+            next(
+                entry["content"]
+                for entry in trimmed_tokenizer_json["added_tokens"]
+                if entry["id"] == spec.old_to_new[max(spec.extra_token_ids)]
+            ),
+            "<image_soft_token>",
+        )
 
     def test_update_logits_metadata_rewrites_output_shape(self):
         logits_info = onnx.helper.make_tensor_value_info(
