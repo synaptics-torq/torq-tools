@@ -933,7 +933,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
     def match(self, node: gs.Node) -> bool:
         if node.op != "Gather" or len(node.inputs) < 2:
             return False
-        if node.attrs.get("axis", None) != 0:
+        if node.attrs.get("axis", 0) != 0:
             return False
         lut = node.inputs[0]
         if not isinstance(lut, gs.Constant):
@@ -946,7 +946,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
     def transform(self, node: gs.Node):
         if not (node.op == "Gather" and len(node.inputs) >= 2 and isinstance((lut := node.inputs[0]), gs.Constant)):
             raise ValueError(f"Gather node '{node.name}' does not have a constant data input")
-        if (axis := node.attrs.get("axis", None)) != 0:
+        if (axis := node.attrs.get("axis", 0)) != 0:
             raise ValueError(f"Only support axis = 0 for LUT, found axis = {axis} for Gather node '{node.name}'")
         
         lut_data = lut.values
