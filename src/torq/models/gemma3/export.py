@@ -35,7 +35,7 @@ from ._trim_vocab import (
     trim_logits_projection,
 )
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
-from ...model_export.hf import optimum_export_onnx
+from ...model_export.hf import optimum_export_onnx, hf_download_source_model
 
 
 class Gemma3ModelExporter(OnnxModelExporterBase):
@@ -48,6 +48,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
+        hf_repo: str | None = None,
+        hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -66,9 +68,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._trim_vocab = trim_vocab
         self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct"))
         self._trim_byte_fallback = trim_byte_fallback
-        self._hf_repo = f"google/gemma-3-{model_size}"
-        if self._instruct_model:
-            self._hf_repo += "-it"
+        self._hf_repo_subdir = hf_repo_subdir
+        if hf_repo:
+            self._hf_repo = hf_repo
+        else:
+            self._hf_repo = f"google/gemma-3-{model_size}"
+            if self._instruct_model:
+                self._hf_repo += "-it"
         self._source_asset_dirs = [
             path
             for path in (
@@ -118,9 +124,31 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         else:
             onnx_dir = self._models_dir / "source" / self._model_dtype
             onnx_dir.mkdir(parents=True, exist_ok=True)
-            optimum_export_onnx(
-                onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"], opt_level=None
-            )
+            try:
+                hf_download_source_model(
+                    self._hf_repo,
+                    "model.onnx",
+                    onnx_dir,
+                    subfolder=self._hf_repo_subdir,
+                    peripheral_files=[
+                        "config.json",
+                        "generation_config.json",
+                        "special_tokens_map.json",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                    ],
+                )
+                self._logger.info("Downloaded model.onnx and peripheral files from %s", self._hf_repo)
+            except (FileNotFoundError, Exception):
+                optimum_export_onnx(
+                    onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"], opt_level=None
+                )
+                self._logger.info("Exported %s to ONNX @ '%s' via optimum-cli", self._hf_repo, onnx_dir)
+            if self._hf_repo_subdir:
+                onnx_dir /= Path(self._hf_repo_subdir)
+                self._config = AutoConfig.from_pretrained(onnx_dir / "config.json")
+                self._hidden_size = int(self._config.hidden_size)
+                self._vocab_size = int(self._config.vocab_size)
         export_dir = (
             self._models_dir / 
             "export" / 
@@ -555,6 +583,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
         args.extract_embeddings,
         args.keep_individual_kv_io,
         not args.dynamic_models,
+        hf_repo=args.hf_repo,
+        hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,

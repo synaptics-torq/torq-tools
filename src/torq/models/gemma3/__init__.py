@@ -38,6 +38,17 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=False,
         help="Export instruct model variant"
     )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        help="Custom Gemma3 HuggingFace repository"
+    )
+    parser.add_argument(
+        "--hf-repo-subdir",
+        type=str,
+        metavar="DIR",
+        help="Sub-directory within the HuggingFace repository containing the model files"
+    )
     add_onnx_args(
         parser,
         convert_dtypes=["bf16", "fp16"],
