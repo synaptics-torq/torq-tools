@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import re
 import unicodedata
@@ -63,16 +62,10 @@ class TrimmedVocabSpec:
     kept_model_ids: tuple[int, ...]
     extra_token_ids: tuple[int, ...]
     byte_token_ids: tuple[int, ...]
-    old_to_new: dict[int, int]
-    new_to_old: tuple[int, ...]
 
     @property
     def trimmed_vocab_size(self) -> int:
-        return len(self.new_to_old)
-
-    @property
-    def kept_token_ids(self) -> tuple[int, ...]:
-        return self.new_to_old
+        return len(self.kept_model_ids) + len(self.extra_token_ids)
 
     @property
     def kept_model_id_set(self) -> set[int]:
@@ -192,10 +185,6 @@ def build_trimmed_vocab_spec(
     kept_model_ids_sorted = tuple(sorted(kept_model_ids))
     extra_token_ids = tuple(sorted(token_id for token_id in kept_special_ids if token_id >= model_vocab_size))
 
-    old_to_new: dict[int, int] = {
-        token_id: new_id for new_id, token_id in enumerate((*kept_model_ids_sorted, *extra_token_ids))
-    }
-
     return TrimmedVocabSpec(
         selected_groups=selected_groups,
         byte_fallback=byte_fallback,
@@ -203,221 +192,4 @@ def build_trimmed_vocab_spec(
         kept_model_ids=kept_model_ids_sorted,
         extra_token_ids=extra_token_ids,
         byte_token_ids=tuple(base_groups["byte"]),
-        old_to_new=old_to_new,
-        new_to_old=tuple(old_to_new.keys()),
-    )
-
-
-def rewrite_tokenizer_json(
-    tokenizer_json: dict[str, Any],
-    spec: TrimmedVocabSpec,
-) -> dict[str, Any]:
-    old_to_new = spec.old_to_new
-    kept_model_id_set = spec.kept_model_id_set
-    trimmed = {
-        key: copy.deepcopy(value)
-        for key, value in tokenizer_json.items()
-        if key not in {"model", "added_tokens", "post_processor"}
-    }
-    old_model = tokenizer_json["model"]
-    old_vocab = old_model["vocab"]
-    new_vocab = {
-        token: old_to_new[token_id]
-        for token, token_id in old_vocab.items()
-        if token_id in kept_model_id_set
-    }
-    model = {
-        key: copy.deepcopy(value)
-        for key, value in old_model.items()
-        if key not in {"vocab", "merges"}
-    }
-    model["vocab"] = new_vocab
-
-    kept_tokens = set(new_vocab)
-    filtered_merges = []
-    for merge in old_model.get("merges", []):
-        if isinstance(merge, str):
-            parts = merge.split()
-        else:
-            parts = list(merge)
-        if len(parts) != 2:
-            continue
-        left, right = parts
-        if left in kept_tokens and right in kept_tokens and f"{left}{right}" in kept_tokens:
-            filtered_merges.append(merge)
-    model["merges"] = filtered_merges
-    trimmed["model"] = model
-
-    remapped_added_tokens = []
-    for entry in tokenizer_json.get("added_tokens", []):
-        token_id = entry.get("id")
-        if token_id not in old_to_new:
-            continue
-        new_entry = copy.deepcopy(entry)
-        new_entry["id"] = old_to_new[token_id]
-        remapped_added_tokens.append(new_entry)
-    trimmed["added_tokens"] = sorted(remapped_added_tokens, key=lambda entry: entry["id"])
-
-    post_processor = copy.deepcopy(tokenizer_json.get("post_processor"))
-    if isinstance(post_processor, dict):
-        for token_info in post_processor.get("special_tokens", {}).values():
-            ids = token_info.get("ids")
-            if isinstance(ids, list):
-                token_info["ids"] = [old_to_new[token_id] for token_id in ids]
-    trimmed["post_processor"] = post_processor
-
-    return trimmed
-
-
-def rewrite_config_json(config_json: dict[str, Any], spec: TrimmedVocabSpec) -> dict[str, Any]:
-    trimmed = copy.deepcopy(config_json)
-
-    def _walk(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            remapped = {}
-            for key, value in obj.items():
-                if (
-                    isinstance(value, int)
-                    and not isinstance(value, bool)
-                    and key.endswith(("_token_id", "_token_index"))
-                    and value in spec.old_to_new
-                ):
-                    remapped[key] = spec.old_to_new[value]
-                else:
-                    remapped[key] = _walk(value)
-            return remapped
-        if isinstance(obj, list):
-            return [_walk(item) for item in obj]
-        return obj
-
-    trimmed = _walk(trimmed)
-    trimmed["vocab_size"] = spec.trimmed_vocab_size
-    trimmed["torq_trimmed_vocab"] = {
-        "enabled": True,
-        "selected_groups": list(spec.selected_groups),
-        "byte_fallback": spec.byte_fallback,
-        "original_vocab_size": spec.model_vocab_size,
-        "trimmed_vocab_size": spec.trimmed_vocab_size,
-    }
-    return trimmed
-
-
-def write_trimmed_vocab_bundle(
-    dst_dir: str | Path,
-    tokenizer_json: dict[str, Any],
-    config_json: dict[str, Any],
-    spec: TrimmedVocabSpec,
-    *,
-    debug_spec_json: dict[str, Any] | None = None,
-) -> dict[str, Path]:
-    dst_dir = Path(dst_dir)
-    written_paths = {
-        "tokenizer.json": dst_dir / "tokenizer.json",
-        "config.json": dst_dir / "config.json",
-    }
-    save_json(written_paths["tokenizer.json"], rewrite_tokenizer_json(tokenizer_json, spec))
-    save_json(written_paths["config.json"], rewrite_config_json(config_json, spec))
-    if debug_spec_json is not None:
-        written_paths["trimmed_vocab_spec.json"] = dst_dir / "trimmed_vocab_spec.json"
-        save_json(written_paths["trimmed_vocab_spec.json"], debug_spec_json)
-    return written_paths
-
-
-def trim_embedding_rows(embeddings: np.ndarray, spec: TrimmedVocabSpec) -> np.ndarray:
-    if embeddings.ndim != 2 or embeddings.shape[0] != spec.model_vocab_size:
-        raise ValueError(
-            f"Expected embedding table shape ({spec.model_vocab_size}, hidden), got {embeddings.shape}"
-        )
-    trimmed = np.take(embeddings, spec.kept_model_ids, axis=0)
-    if spec.extra_token_ids:
-        extra = np.zeros((len(spec.extra_token_ids), embeddings.shape[1]), dtype=embeddings.dtype)
-        trimmed = np.concatenate([trimmed, extra], axis=0)
-    return trimmed
-
-
-def trim_logits_projection(weight: np.ndarray, spec: TrimmedVocabSpec) -> np.ndarray:
-    if weight.ndim != 2:
-        raise ValueError(f"Expected 2D logits projection weight, got {weight.shape}")
-    if weight.shape[0] == spec.model_vocab_size:
-        trimmed = np.take(weight, spec.kept_model_ids, axis=0)
-        if spec.extra_token_ids:
-            extra = np.zeros((len(spec.extra_token_ids), weight.shape[1]), dtype=weight.dtype)
-            trimmed = np.concatenate([trimmed, extra], axis=0)
-        return trimmed
-    if weight.shape[1] == spec.model_vocab_size:
-        trimmed = np.take(weight, spec.kept_model_ids, axis=1)
-        if spec.extra_token_ids:
-            extra = np.zeros((weight.shape[0], len(spec.extra_token_ids)), dtype=weight.dtype)
-            trimmed = np.concatenate([trimmed, extra], axis=1)
-        return trimmed
-    raise ValueError(
-        f"Expected logits projection with vocab axis {spec.model_vocab_size}, got {weight.shape}"
-    )
-
-
-def trim_tokenizer_json_file(
-    tokenizer_json_path: str | Path,
-    output_path: str | Path,
-    *,
-    selected_groups: Iterable[str],
-    byte_fallback: bool,
-) -> tuple[Path, TrimmedVocabSpec]:
-    tokenizer_json_path = Path(tokenizer_json_path)
-    output_path = Path(output_path)
-    tokenizer_json = load_json(tokenizer_json_path)
-    spec = build_trimmed_vocab_spec(
-        tokenizer=Tokenizer.from_file(str(tokenizer_json_path)),
-        tokenizer_json=tokenizer_json,
-        config_json=None,
-        selected_groups=selected_groups,
-        byte_fallback=byte_fallback,
-    )
-    save_json(output_path, rewrite_tokenizer_json(tokenizer_json, spec))
-    return output_path, spec
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Generate a trimmed tokenizer.json from an existing tokenizer.json",
-    )
-    parser.add_argument(
-        "tokenizer_json",
-        type=Path,
-        help="Path to the source tokenizer.json",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        required=True,
-        help="Path to write the trimmed tokenizer.json",
-    )
-    parser.add_argument(
-        "--trim-vocab-groups",
-        type=str,
-        nargs="+",
-        choices=TRIM_GROUP_CHOICES,
-        default=["latin", "punct"],
-        metavar="GROUP",
-        help="Token groups to retain (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--trim-byte-fallback",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Retain byte fallback tokens (default: %(default)s)",
-    )
-    args = parser.parse_args()
-
-    output_path, spec = trim_tokenizer_json_file(
-        args.tokenizer_json,
-        args.output,
-        selected_groups=args.trim_vocab_groups,
-        byte_fallback=args.trim_byte_fallback,
-    )
-    print(
-        f"Wrote trimmed tokenizer.json to {output_path} "
-        f"({spec.model_vocab_size} -> {spec.trimmed_vocab_size} tokens)"
     )

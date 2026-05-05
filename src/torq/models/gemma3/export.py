@@ -28,11 +28,6 @@ from ._trim_vocab import (
     TrimmedVocabSpec,
     build_trimmed_vocab_spec,
     load_json,
-    rewrite_config_json,
-    rewrite_tokenizer_json,
-    save_json,
-    trim_embedding_rows,
-    trim_logits_projection,
 )
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
@@ -269,91 +264,19 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if not updated:
             raise ValueError("Could not find logits output metadata for trimmed-vocab export")
 
-    def _emit_trimmed_vocab_bundle(self, dst_dir: str | os.PathLike) -> None:
-        spec = self._get_trimmed_vocab_spec()
-        if self._source_tokenizer_json is None or self._source_config_json is None:
-            raise RuntimeError("Missing source tokenizer/config JSON for trimmed-vocab export")
-        dst_dir = Path(dst_dir)
-        save_json(
-            dst_dir / "tokenizer.json",
-            rewrite_tokenizer_json(self._source_tokenizer_json, spec),
-        )
-        save_json(
-            dst_dir / "config.json",
-            rewrite_config_json(self._source_config_json, spec),
-        )
-
-    def _trim_static_artifacts(self, model_path: str | os.PathLike) -> None:
-        if not self._trim_vocab:
-            return
-
-        spec = self._get_trimmed_vocab_spec()
-        model_path = Path(model_path)
-        model = onnx.load(model_path)
-
-        logits_weight_name = None
-        embedding_weight_name = None
-        for node in model.graph.node:
-            if node.op_type == "MatMul" and "logits" in node.output:
-                logits_weight_name = node.input[1]
-            if (
-                not self._extract_embeddings
-                and node.op_type == "Gather"
-                and len(node.input) >= 2
-                and node.input[1] == "input_ids"
-            ):
-                embedding_weight_name = node.input[0]
-
-        if logits_weight_name is None:
-            raise ValueError("Could not find logits MatMul weight for trimmed-vocab export")
-
-        initializer_arrays = {
-            initializer.name: numpy_helper.to_array(initializer)
-            for initializer in model.graph.initializer
-        }
-        logits_weight = initializer_arrays.get(logits_weight_name)
-        if logits_weight is None:
-            raise ValueError(f"Logits weight initializer '{logits_weight_name}' not found")
-        self._replace_initializer(
-            model,
-            logits_weight_name,
-            trim_logits_projection(logits_weight, spec),
-        )
-        self._update_logits_metadata(model, spec.trimmed_vocab_size)
-
-        embeddings_npy = model_path.parent / "token_embeddings.npy"
-        if self._extract_embeddings:
-            if not embeddings_npy.exists():
-                raise FileNotFoundError(f"Expected extracted token embeddings @ '{embeddings_npy}'")
-            np.save(embeddings_npy, trim_embedding_rows(np.load(embeddings_npy), spec))
-        else:
-            if embedding_weight_name is None:
-                raise ValueError("Could not find embedding Gather weight for trimmed-vocab export")
-            embedding_weight = initializer_arrays.get(embedding_weight_name)
-            if embedding_weight is None:
-                raise ValueError(f"Embedding initializer '{embedding_weight_name}' not found")
-            self._replace_initializer(
-                model,
-                embedding_weight_name,
-                trim_embedding_rows(embedding_weight, spec),
-            )
-
-        onnx.save(model, model_path)
-        self._emit_trimmed_vocab_bundle(model_path.parent)
-
     def _copy_runtime_assets(
         self,
         dst_dir: str | os.PathLike,
         src_dir: str | os.PathLike | None = None,
         *,
-        include_embeddings: bool = True,
+        include_npy_data: bool = True,
     ) -> None:
         src_dir = Path(src_dir or self._export_paths["model"].parent)
         dst_dir = Path(dst_dir)
         dst_dir.mkdir(parents=True, exist_ok=True)
         asset_names = ["config.json", "tokenizer.json"]
-        if include_embeddings:
-            asset_names.append("token_embeddings.npy")
+        if include_npy_data:
+            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
         for asset_name in asset_names:
             src_path = src_dir / asset_name
             if not src_path.exists():
@@ -460,11 +383,18 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._config.head_dim                                           # D
             ])
 
+        if self._trim_vocab:
+            spec = self._get_trimmed_vocab_spec()
+            token_id_lut_path = Path(model_path).parent / "token_id_lut.npy"
+            editor.trim_lm_head_vocab(
+                kept_token_ids=np.array(spec.kept_model_ids, dtype=np.int64),
+                save_lut=token_id_lut_path,
+            )
+
         editor.reorder_graph_input("position_ids", 1)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
-        self._trim_static_artifacts(model_path)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -553,10 +483,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             convert_dir=convert_dir,
             preserve_io=preserve_io,
             external_data=[
-                (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))
+                (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16)),
+                (self._export_paths["model"].parent / "token_id_lut.npy", np.dtype(np.int32)),
             ]
         )
-        self._copy_runtime_assets(self._convert_dir, self._export_dir, include_embeddings=False)
+        self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
         return result
 
     def export_iree(
