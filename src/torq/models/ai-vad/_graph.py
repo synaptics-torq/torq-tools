@@ -476,6 +476,201 @@ class ReplacePadWithConcat(OnnxGraphEdit):
         self._logger.debug("Replaced Pad node '%s' with Concat ops", node.name)
 
 
+@dataclass
+class WidenSmallStridedDepthwiseConv(OnnxGraphEdit):
+    """
+    Right-pad the trailing spatial input of a *narrow*, strided depthwise Conv
+    so that its output dimension grows past the Torq compiler's DEDR
+    scatter-gather (SIMD G-tag) selection threshold, then slice the conv output
+    back to its original shape.
+
+    Why
+    ---
+    For depthwise Conv with ``stride[-1] > 1`` and a small last spatial output
+    dim, the Torq compiler picks a DEDR ``G(L)[sgGroups>1]`` SIMD scatter-gather
+    descriptor. The current precompiled NSS CModel hangs while executing that
+    descriptor (depthwise stride-2 + ``sgGroups=4`` codegen path), which makes
+    pytest cases like ``test_onnx_model.py -k cleaned_bf16_layer_conv_13`` time
+    out under the simulator. The DEDR codegen condition is roughly::
+
+        sg fires iff   out_w * sgGroups <= bus_width_items
+
+    where ``bus_width_items = bus_width_bytes / element_size`` and ``sgGroups``
+    ranges over 1..``sg_groups_max``. Pushing ``out_w`` just past
+    ``bus_width_items // sg_groups_max`` (e.g. ``> 9`` for bf16) makes the
+    compiler fall back to the dense ``V(H)`` outerGroups path, which the
+    CModel executes correctly.
+
+    Transform
+    ---------
+    The trailing ``pads`` entry on the matched Conv is bumped by
+    ``extra * stride[-1]`` so the conv naturally produces ``extra`` extra
+    output positions with zero-padding (numerically equivalent to extending
+    the input with zeros). A ``Slice`` node is then inserted after the conv
+    that crops back to the original output width, so all downstream consumers
+    see a bit-identical tensor.
+
+    Parameters
+    ----------
+    bus_width_bytes:
+        DEDR bus width in bytes (Torq HW: ``iram_seg_width = 72``).
+    sg_groups_max:
+        Maximum SIMD scatter-gather group count for DEDR (Torq HW: ``4``).
+    """
+
+    bus_width_bytes: int = 72
+    sg_groups_max: int = 4
+
+    @staticmethod
+    def _element_size_bytes(dtype) -> int | None:
+        if isinstance(dtype, np.dtype):
+            return dtype.itemsize
+        if isinstance(dtype, int):
+            sizes = {
+                onnx.TensorProto.FLOAT: 4,
+                onnx.TensorProto.UINT8: 1,
+                onnx.TensorProto.INT8: 1,
+                onnx.TensorProto.UINT16: 2,
+                onnx.TensorProto.INT16: 2,
+                onnx.TensorProto.INT32: 4,
+                onnx.TensorProto.INT64: 8,
+                onnx.TensorProto.UINT32: 4,
+                onnx.TensorProto.UINT64: 8,
+                onnx.TensorProto.FLOAT16: 2,
+                onnx.TensorProto.BFLOAT16: 2,
+                onnx.TensorProto.DOUBLE: 8,
+                onnx.TensorProto.BOOL: 1,
+            }
+            return sizes.get(int(dtype))
+        return None
+
+    def _threshold(self, dtype) -> int | None:
+        elem = self._element_size_bytes(dtype)
+        if not elem or self.sg_groups_max <= 0:
+            return None
+        return (self.bus_width_bytes // elem) // self.sg_groups_max
+
+    @staticmethod
+    def _is_static_shape(shape) -> bool:
+        return shape is not None and all(
+            isinstance(d, (int, np.integer)) for d in shape
+        )
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Conv" or len(node.inputs) < 2 or not node.outputs:
+            return False
+        x, w = node.inputs[0], node.inputs[1]
+        out = node.outputs[0]
+        if not (
+            self._is_static_shape(x.shape)
+            and self._is_static_shape(w.shape)
+            and self._is_static_shape(out.shape)
+        ):
+            return False
+        if len(x.shape) < 3 or len(w.shape) != len(x.shape):
+            return False
+
+        # Depthwise: group == in_channels and weight C/group dim == 1.
+        in_channels = int(x.shape[1])
+        group = int(node.attrs.get("group", 1))
+        if group != in_channels or int(w.shape[1]) != 1:
+            return False
+
+        rank = len(x.shape) - 2
+        strides = list(node.attrs.get("strides", [1] * rank))
+        if len(strides) != rank or int(strides[-1]) <= 1:
+            return False
+
+        threshold = self._threshold(out.dtype)
+        if threshold is None or threshold <= 0:
+            return False
+        return int(out.shape[-1]) <= threshold
+
+    def transform(self, node: gs.Node):
+        x = node.inputs[0]
+        out = node.outputs[0]
+        rank = len(x.shape) - 2
+
+        threshold = self._threshold(out.dtype)
+        cur_out_w = int(out.shape[-1])
+        target_out_w = threshold + 1
+        extra = target_out_w - cur_out_w
+
+        strides = list(node.attrs.get("strides", [1] * rank))
+        s_w = int(strides[-1])
+        extra_pad = extra * s_w
+
+        pads = list(node.attrs.get("pads", [0] * (2 * rank)))
+        if len(pads) != 2 * rank:
+            raise ValueError(
+                f"Conv '{node.name}' has unexpected 'pads' length {len(pads)} "
+                f"(expected {2 * rank})"
+            )
+
+        # ONNX Conv pads layout: [x1_begin, x2_begin, ..., x1_end, x2_end, ...].
+        pads[2 * rank - 1] = int(pads[2 * rank - 1]) + extra_pad
+        node.attrs["pads"] = pads
+        # `auto_pad` would override an explicit `pads` list.
+        node.attrs["auto_pad"] = "NOTSET"
+
+        new_out_shape = list(out.shape)
+        new_out_shape[-1] = target_out_w
+
+        widened = gs.Variable(
+            name=out.name + "_widened",
+            dtype=out.dtype,
+            shape=new_out_shape,
+        )
+
+        consumers = list(out.outputs)
+        graph_output_indices = [
+            i for i, g_out in enumerate(self.graph.outputs) if g_out is out
+        ]
+
+        node.outputs[0] = widened
+
+        last_axis = len(new_out_shape) - 1
+        starts = gs.Constant(
+            f"{node.name}_widen_slice_starts",
+            np.array([0], dtype=np.int64),
+        )
+        ends = gs.Constant(
+            f"{node.name}_widen_slice_ends",
+            np.array([cur_out_w], dtype=np.int64),
+        )
+        axes = gs.Constant(
+            f"{node.name}_widen_slice_axes",
+            np.array([last_axis], dtype=np.int64),
+        )
+        steps = gs.Constant(
+            f"{node.name}_widen_slice_steps",
+            np.array([1], dtype=np.int64),
+        )
+        # Preserve the original output name on the slice so downstream tensor
+        # references stay stable; `out` becomes orphaned and is dropped by cleanup.
+        sliced = gs.Variable(
+            name=out.name,
+            dtype=out.dtype,
+            shape=list(out.shape),
+        )
+        slice_node = gs.Node(
+            op="Slice",
+            name=f"{node.name}_widen_slice",
+            inputs=[widened, starts, ends, axes, steps],
+            outputs=[sliced],
+        )
+        self.graph.nodes.append(slice_node)
+
+        rewire_consumers(consumers, out, sliced)
+        for i in graph_output_indices:
+            self.graph.outputs[i] = sliced
+
+        self._logger.debug(
+            "Widened depthwise Conv '%s': out_w %d -> %d (pad+%d on axis %d, slice [:%d])",
+            node.name, cur_out_w, target_out_w, extra_pad, last_axis, cur_out_w,
+        )
+
+
 class AiVadOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
 
     def __init__(
@@ -538,4 +733,24 @@ class AiVadOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCach
         self,
     ):
         self.apply_edit(ReplacePadWithConcat(self._graph, self._graph_name))
+        return self
+
+    def widen_small_strided_depthwise_conv(
+        self,
+        bus_width_bytes: int = 72,
+        sg_groups_max: int = 4,
+    ):
+        """Widen narrow strided-depthwise Convs to dodge the Torq DEDR
+        scatter-gather codegen path that hangs the simulator's CModel.
+
+        See :class:`WidenSmallStridedDepthwiseConv` for the full rationale.
+        """
+        self.apply_edit(
+            WidenSmallStridedDepthwiseConv(
+                self._graph,
+                self._graph_name,
+                bus_width_bytes=bus_width_bytes,
+                sg_groups_max=sg_groups_max,
+            )
+        )
         return self

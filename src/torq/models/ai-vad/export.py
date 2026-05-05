@@ -186,6 +186,10 @@ class AiVadModelExporter(OnnxModelExporterBase):
         # output vad: Reshapevad_dim_0, Reshapevad_dim_1
         # output hidden state: Concathidden_state_dim_1
         editor.fix_encoder_io(1,1,16)
+        # Widen narrow strided-depthwise Convs so the Torq compiler does not
+        # pick the DEDR scatter-gather (G(L)[>1]) path that hangs the
+        # precompiled CModel simulator. See WidenSmallStridedDepthwiseConv.
+        editor.widen_small_strided_depthwise_conv()
         static_model = editor.to_onnx(override_ir=model.ir_version)
         static_model = onnx.shape_inference.infer_shapes(static_model)
 
