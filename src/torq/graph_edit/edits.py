@@ -37,6 +37,7 @@ __all__ = [
     "EliminateTranspose",
     "CollapseReshapeChain",
     "CollapseGQABroadcast",
+    "TrimLMHeadVocab",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -981,6 +982,117 @@ class ExtractConstantLUT(OnnxGraphEdit):
         )
 
 
+@dataclass
+class TrimLMHeadVocab(OnnxGraphEdit):
+    """
+    Trim LM head weight matrix to a subset of tokens.
+
+    The weight matrix is sliced from [hidden, vocab] to [hidden, kept_count].
+    If include_argmax is True, an ArgMax is appended to output the compact index.
+    Otherwise the output is the trimmed logits tensor [1, 1, kept_count].
+
+    The caller is responsible for mapping compact_idx -> original token ID via
+    kept_token_ids[compact_idx].
+
+    Args:
+        kept_token_ids (np.ndarray): 1-D array of original token IDs to keep, in the
+            order they should appear in the trimmed weight (sorted recommended).
+        output_name (str): Name of the MatMul output to match (default: "logits").
+        save_lut (Path | str | None): If provided, save kept_token_ids to this .npy path.
+        include_argmax (bool): If True, append ArgMax to the graph (default: False).
+    """
+
+    kept_token_ids: np.ndarray
+    output_name: str = "logits"
+    save_lut: Path | str | None = None
+    include_argmax: bool = False
+
+    def __post_init__(self):
+        self.kept_token_ids = np.asarray(self.kept_token_ids, dtype=np.int64)
+        if self.kept_token_ids.ndim != 1 or len(self.kept_token_ids) == 0:
+            raise ValueError("kept_token_ids must be a non-empty 1-D array")
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "MatMul" or not node.outputs:
+            return False
+        return node.outputs[0].name == self.output_name
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        weight_inp = node.inputs[1]
+        if not isinstance(weight_inp, gs.Constant):
+            raise ValueError(
+                f"Expected constant weight for LM head MatMul, got {type(weight_inp).__name__}"
+            )
+
+        W = weight_inp.values
+        if W.ndim != 2:
+            raise ValueError(f"Expected 2-D weight matrix, got shape {W.shape}")
+
+        hidden_size, vocab_size = W.shape
+        if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
+            raise ValueError(
+                f"kept_token_ids contains values outside [0, {vocab_size})"
+            )
+        kept_count = len(self.kept_token_ids)
+
+        W_trimmed = W[:, self.kept_token_ids]
+        trimmed_weight = gs.Constant(
+            name=weight_inp.name + "_trimmed",
+            values=W_trimmed,
+            export_dtype=getattr(weight_inp, "export_dtype", None),
+        )
+
+        node.inputs[1] = trimmed_weight
+
+        logits_out = node.outputs[0]
+        old_shape = list(logits_out.shape) if logits_out.shape else None
+        if old_shape and len(old_shape) >= 1:
+            new_logits_shape = old_shape[:-1] + [kept_count]
+        else:
+            new_logits_shape = [1, 1, kept_count]
+
+        trimmed_logits = gs.Variable(
+            name="trimmed_logits",
+            dtype=logits_out.dtype,
+            shape=new_logits_shape,
+        )
+        consumers = list(logits_out.outputs)
+        node.outputs[0] = trimmed_logits
+
+        if self.include_argmax:
+            final_out = self.graph.layer(
+                name="lm_head_argmax",
+                op="ArgMax",
+                attrs={"axis": -1, "keepdims": 0},
+                inputs=[trimmed_logits],
+                outputs=[gs.Variable(
+                    name="compact_token_idx",
+                    dtype=np.int64,
+                    shape=new_logits_shape[:-1],
+                )],
+            )[0]
+        else:
+            final_out = trimmed_logits
+
+        rewire_consumers(consumers, logits_out, final_out)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is logits_out:
+                self.graph.outputs[i] = final_out
+
+        if self.save_lut is not None:
+            lut_path = Path(self.save_lut)
+            lut_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(lut_path, self.kept_token_ids)
+            self._logger.debug("Saved token ID LUT to '%s'", lut_path)
+
+        self._logger.debug(
+            "Trimmed LM head vocab: %d -> %d tokens (argmax=%s)",
+            vocab_size, kept_count, self.include_argmax,
+        )
+
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
@@ -1274,4 +1386,8 @@ class CommonGraphEditsMixin:
 
     def collapse_gqa_broadcast(self):
         self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
+        return self
+
+    def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):
+        self.apply_edit(TrimLMHeadVocab(self._graph, self._graph_name, kept_token_ids, output_name, save_lut, include_argmax))
         return self
