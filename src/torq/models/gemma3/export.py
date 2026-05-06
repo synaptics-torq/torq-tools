@@ -362,6 +362,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             editor.broadcast_op_inputs(
                 ops=self._broadcast_ops,
             )
+        else:
+            # Eliminate explicit Expand ops
+            editor.eliminate_expands([
+                # supports kernel broadcast in Torq-compiler
+                "Mul", "MatMul", "Where",
+                # produced by collapse_gqa_broadcast()
+                "Transpose",
+            ])
 
         if self._extract_embeddings:
             # Extract token embeddings LUT

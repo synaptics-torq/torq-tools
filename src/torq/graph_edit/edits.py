@@ -502,6 +502,74 @@ class FoldScalarMatMul(OnnxGraphEdit):
 
 
 @dataclass
+class EliminateExpand(OnnxGraphEdit):
+    """
+    Eliminate Expand ops at inputs for specific ops and let the compiler handle implicit broadcasting.
+    """
+
+    ops: list[str]
+
+    @staticmethod
+    def _iter_producers(node):
+        for tensor in node.inputs or []:
+            if tensor is None:
+                continue
+            for producer in getattr(tensor, "inputs", []) or []:
+                if producer is not None:
+                    yield producer
+
+    @staticmethod
+    def _clear_downstream_shapes(node: gs.Node, graph_output_ids: set[int]):
+        """BFS forward from node, clearing .shape on all intermediate variables."""
+        queue = [node]
+        visited = set()
+        while queue:
+            n = queue.pop(0)
+            if id(n) in visited:
+                continue
+            visited.add(id(n))
+            for out in n.outputs:
+                if not isinstance(out, gs.Variable):
+                    continue
+                if id(out) not in graph_output_ids:
+                    out.shape = None
+                for consumer in out.outputs:
+                    if id(consumer) not in visited:
+                        queue.append(consumer)
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op not in self.ops:
+            return False
+        return any(
+            producer.op == "Expand"
+            for producer in self._iter_producers(node)
+        )
+
+    def transform(self, node: gs.Node):
+        if node.op not in self.ops:
+            raise ValueError(
+                f"Expected node op in {self.ops} for Expand elimination, got '{node.op}'"
+            )
+        graph_output_ids = {id(o) for o in self.graph.outputs}
+        for prod in self._iter_producers(node):
+            if prod.op != "Expand":
+                continue
+            inp_tensor = prod.inputs[0]
+            expand_out = prod.outputs[0]
+            rewire_consumers([node], expand_out, inp_tensor)
+            # Clear stale shape metadata on all downstream variables so ONNX
+            # shape inference can recompute them from the pre-expand input.
+            self._clear_downstream_shapes(node, graph_output_ids)
+            if not expand_out.outputs and not any(id(out) == id(expand_out) for out in self.graph.outputs):
+                prod.inputs.clear()
+                prod.outputs.clear()
+            self._logger.debug(
+                "Eliminated Expand '%s' feeding %s node '%s'",
+                prod.name, node.op, node.name
+            )
+
+
+@dataclass
 class EliminateTranspose(OnnxGraphEdit):
     """
     Eliminate Transpose ops that don't rearrange data in memory.
@@ -1374,6 +1442,10 @@ class CommonGraphEditsMixin:
 
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def eliminate_expands(self, ops: list[str]):
+        self.apply_edit(EliminateExpand(self._graph, self._graph_name, ops))
         return self
 
     def eliminate_transposes(self):
