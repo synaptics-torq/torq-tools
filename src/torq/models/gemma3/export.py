@@ -144,9 +144,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._config = AutoConfig.from_pretrained(onnx_dir / "config.json")
                 self._hidden_size = int(self._config.hidden_size)
                 self._vocab_size = int(self._config.vocab_size)
+        model_type = "trim" if self._trim_vocab else "full"
         export_dir = (
             self._models_dir / 
             "export" / 
+            model_type /
             "onnx" / 
             self._model_dtype / 
             ("static" if self._static_models else "dynamic")
@@ -154,6 +156,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         convert_dir = (
             self._models_dir 
             / "export"
+            / model_type
             / "onnx"
             / "converted"
             / ("static" if self._static_models else "dynamic")
@@ -161,6 +164,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         iree_dir = (
             self._models_dir
             / "export"
+            / model_type
             / "iree"
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
@@ -487,13 +491,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         convert_dir: str | os.PathLike | None = None,
         preserve_io: bool = False,
     ):
+        external_data = [
+            (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16)),
+        ]
+        if self._trim_vocab:
+            external_data.append((self._export_paths["model"].parent / "token_id_lut.npy", np.dtype(np.int32)))
         result = super().convert_models(
             convert_dir=convert_dir,
             preserve_io=preserve_io,
-            external_data=[
-                (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16)),
-                (self._export_paths["model"].parent / "token_id_lut.npy", np.dtype(np.int32)),
-            ]
+            external_data=external_data
         )
         self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
         return result
