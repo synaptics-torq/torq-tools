@@ -86,6 +86,12 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         help="Trim static export vocab to selected token groups plus required safety tokens"
     )
     parser.add_argument(
+        "--split-lm-head",
+        action="store_true",
+        default=False,
+        help="Split the final LM head into lm_head.onnx and export hidden states from model.onnx"
+    )
+    parser.add_argument(
         "--trim-vocab-groups",
         type=str,
         nargs="+",

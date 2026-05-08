@@ -38,6 +38,7 @@ __all__ = [
     "CollapseReshapeChain",
     "CollapseGQABroadcast",
     "TrimLMHeadVocab",
+    "SplitLMHead",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -1126,7 +1127,7 @@ class TrimLMHeadVocab(OnnxGraphEdit):
             new_logits_shape = [1, 1, kept_count]
 
         trimmed_logits = gs.Variable(
-            name="trimmed_logits",
+            name="logits",
             dtype=logits_out.dtype,
             shape=new_logits_shape,
         )
@@ -1163,6 +1164,109 @@ class TrimLMHeadVocab(OnnxGraphEdit):
             "Trimmed LM head vocab: %d -> %d tokens (argmax=%s)",
             vocab_size, kept_count, self.include_argmax,
         )
+
+
+@dataclass
+class SplitLMHead(OnnxGraphEdit):
+    """
+    Extract the final LM head into a standalone graph.
+
+    The main graph output is replaced with the non-constant MatMul input, named
+    ``hidden_states_name``. The extracted LM head graph accepts that tensor as
+    its only input, preserves the original LM head output, and is saved to
+    ``save_to``.
+    """
+
+    save_to: Path | str
+    output_name: str = "logits"
+    hidden_states_name: str = "last_hidden_states"
+
+    def _find_lm_head_matmul(self) -> gs.Node:
+        for node in self.graph.nodes:
+            if node.op != "MatMul" or not node.outputs:
+                continue
+            output = node.outputs[0]
+            if output.name != self.output_name:
+                continue
+            if any(graph_output is output for graph_output in self.graph.outputs):
+                return node
+        raise ValueError(f"Could not find final LM head MatMul feeding graph output '{self.output_name}'")
+
+    @staticmethod
+    def _select_hidden_states(node: gs.Node) -> gs.Variable:
+        if len(node.inputs) != 2:
+            raise ValueError(f"LM head MatMul '{node.name}' must have 2 inputs, found {len(node.inputs)}")
+        if all(isinstance(inp, gs.Constant) for inp in node.inputs):
+            raise ValueError(f"LM head MatMul '{node.name}' is invalid because both inputs are constant")
+        hidden_states = next(
+            (inp for inp in node.inputs if not isinstance(inp, gs.Constant)),
+            None
+        )
+        if not isinstance(hidden_states, gs.Variable):
+            raise ValueError(
+                f"Expected LM head hidden states to be a graph variable, got {type(hidden_states).__name__}"
+            )
+        return hidden_states
+
+    def _extract_lm_head_graph(self) -> gs.Graph:
+        lm_head = self._find_lm_head_matmul()
+        lm_head_logits = lm_head.outputs[0]
+        hidden_states = self._select_hidden_states(lm_head)
+        lm_head_input = gs.Variable(
+            name=self.hidden_states_name,
+            dtype=hidden_states.dtype,
+            shape=hidden_states.shape,
+        )
+        for idx, inp in enumerate(lm_head.inputs):
+            if inp is hidden_states:
+                lm_head.inputs[idx] = lm_head_input
+                break
+        lm_head_graph = gs.Graph(
+            name="main",
+            nodes=[lm_head],
+            inputs=[lm_head_input],
+            outputs=[lm_head_logits],
+        )
+        return lm_head_graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True,
+        ).toposort()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "MatMul" or not node.outputs:
+            return False
+        output = node.outputs[0]
+        if output.name != self.output_name:
+            return False
+        return any(graph_output is output for graph_output in self.graph.outputs)
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        hidden_states = self._select_hidden_states(node)
+        lm_head_graph = self._extract_lm_head_graph()
+        lm_head_model = onnx.shape_inference.infer_shapes(
+            gs.export_onnx(lm_head_graph),
+            True, True, True
+        )
+        save_to = Path(self.save_to)
+        save_to.parent.mkdir(parents=True, exist_ok=True)
+        onnx.save(lm_head_model, save_to)
+
+        logits = node.outputs[0]
+        hidden_states.name = self.hidden_states_name
+        for idx, graph_output in enumerate(self.graph.outputs):
+            if graph_output is logits:
+                self.graph.outputs[idx] = hidden_states
+
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.debug(
+            "Split LM head MatMul '%s'; graph output '%s' now exposes '%s'",
+            node.name,
+            logits.name,
+            hidden_states.name,
+        )
+        self._logger.debug("Saved split LM head to '%s'", save_to)
 
 
 class CombineKVCacheMixin:
@@ -1466,4 +1570,8 @@ class CommonGraphEditsMixin:
 
     def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):
         self.apply_edit(TrimLMHeadVocab(self._graph, self._graph_name, kept_token_ids, output_name, save_lut, include_argmax))
+        return self
+
+    def split_lm_head(self, save_to, output_name="logits", hidden_states_name="last_hidden_states"):
+        self.apply_edit(SplitLMHead(self._graph, self._graph_name, save_to, output_name, hidden_states_name))
         return self

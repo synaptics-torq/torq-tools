@@ -51,6 +51,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         show_model_info: bool = False,
         convert_dtypes: bool = False,
         trim_vocab: bool = False,
+        split_lm_head: bool = False,
         trim_vocab_groups: list[str] | None = None,
         trim_byte_fallback: bool = True,
         **edit_args
@@ -61,6 +62,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._trim_vocab = trim_vocab
+        self._split_lm_head = split_lm_head
         self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct"))
         self._trim_byte_fallback = trim_byte_fallback
         self._hf_repo_subdir = hf_repo_subdir
@@ -98,6 +100,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._source_config_json: dict | None = None
         if self._trim_vocab and not static_models:
             raise ValueError("`--trim-vocab` is currently supported only for static Gemma exports")
+        if self._split_lm_head and not static_models:
+            raise ValueError("`--split-lm-head` is currently supported only for static Gemma exports")
 
         super().__init__(
             "fp32",
@@ -145,10 +149,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._hidden_size = int(self._config.hidden_size)
                 self._vocab_size = int(self._config.vocab_size)
         model_type = "trim" if self._trim_vocab else "full"
+        model_topology = "split_lm_head" if self._split_lm_head else "unified"
         export_dir = (
             self._models_dir / 
             "export" / 
             model_type /
+            model_topology /
             "onnx" / 
             self._model_dtype / 
             ("static" if self._static_models else "dynamic")
@@ -157,6 +163,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._models_dir 
             / "export"
             / model_type
+            / model_topology
             / "onnx"
             / "converted"
             / ("static" if self._static_models else "dynamic")
@@ -165,6 +172,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._models_dir
             / "export"
             / model_type
+            / model_topology
             / "iree"
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
@@ -405,6 +413,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
         editor.reorder_graph_input("position_ids", 1)
 
+        if self._split_lm_head:
+            lm_head_path = Path(model_path).parent / "lm_head.onnx"
+            editor.split_lm_head(lm_head_path)
+            lm_head_model = onnx.load(lm_head_path)
+            lm_head_model.ir_version = model.ir_version
+            onnx.save(self.check_model(lm_head_model), lm_head_path)
+            self._export_paths["lm_head"] = lm_head_path
+            self._logger.info("(lm_head) Saved split LM head to '%s'", str(lm_head_path))
+
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
@@ -536,6 +553,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
         trim_vocab=args.trim_vocab,
+        split_lm_head=args.split_lm_head,
         trim_vocab_groups=args.trim_vocab_groups,
         trim_byte_fallback=args.trim_byte_fallback,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
