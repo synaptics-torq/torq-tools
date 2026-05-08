@@ -509,6 +509,10 @@ class EliminateExpand(OnnxGraphEdit):
 
     ops: list[str]
 
+    def __post_init__(self):
+        self.requires_shape_inference = True
+        return super().__post_init__()
+
     @staticmethod
     def _iter_producers(node):
         for tensor in node.inputs or []:
