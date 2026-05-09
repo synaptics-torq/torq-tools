@@ -51,7 +51,7 @@ COMMON_ES_EN_PUNCT = {
     "_",
 }
 BYTE_TOKEN_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
-TRIM_GROUP_CHOICES = ("latin", "punct", "other")
+TRIM_GROUP_CHOICES = ("latin", "punct", "digits", "digits-non-latin", "other")
 
 
 @dataclass(frozen=True)
@@ -101,6 +101,26 @@ def _is_common_punctuation(ch: str) -> bool:
     return unicodedata.category(ch).startswith("P")
 
 
+def _is_latin_digit(ch: str) -> bool:
+    return ch in "0123456789"
+
+
+def _is_latin_digit_text(text: str) -> bool:
+    if not text:
+        return False
+    return all(_is_latin_digit(ch) or ch.isspace() for ch in text) and any(_is_latin_digit(ch) for ch in text)
+
+
+def _is_nonlatin_digit_text(text: str) -> bool:
+    if not text:
+        return False
+    return (
+        all(ch.isdigit() or ch.isspace() for ch in text)
+        and any(ch.isdigit() for ch in text)
+        and not any(_is_latin_digit(ch) for ch in text)
+    )
+
+
 def _is_punctuation_only_text(text: str) -> bool:
     if not text:
         return False
@@ -108,7 +128,7 @@ def _is_punctuation_only_text(text: str) -> bool:
 
 
 def build_token_groups(tokenizer: Tokenizer, vocab_size: int) -> dict[str, list[int]]:
-    groups = {"latin": [], "punct": [], "other": [], "byte": []}
+    groups = {"latin": [], "punct": [], "digits": [], "digits-non-latin": [], "other": [], "byte": []}
     for token_id in range(vocab_size):
         raw_token = tokenizer.id_to_token(token_id) or ""
         decoded = tokenizer.decode([token_id], skip_special_tokens=False)
@@ -116,6 +136,10 @@ def build_token_groups(tokenizer: Tokenizer, vocab_size: int) -> dict[str, list[
             groups["byte"].append(token_id)
         if any(_is_latin_char(ch) for ch in decoded):
             groups["latin"].append(token_id)
+        elif _is_latin_digit_text(decoded):
+            groups["digits"].append(token_id)
+        elif _is_nonlatin_digit_text(decoded):
+            groups["digits-non-latin"].append(token_id)
         elif _is_punctuation_only_text(decoded):
             groups["punct"].append(token_id)
         else:

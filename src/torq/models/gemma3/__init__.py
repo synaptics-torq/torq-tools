@@ -13,7 +13,7 @@ DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
-TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "other"]
+TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "digits", "digits-non-latin", "other"]
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -96,7 +96,7 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         type=str,
         nargs="+",
         choices=TRIM_VOCAB_GROUPS,
-        default=["latin", "punct"],
+        default=["latin", "punct", "digits"],
         metavar="GROUP",
         help="Token groups to retain when --trim-vocab is enabled (default: %(default)s)",
     )

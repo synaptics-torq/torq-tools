@@ -63,7 +63,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._onnx_source_dir = onnx_source_dir
         self._trim_vocab = trim_vocab
         self._split_lm_head = split_lm_head
-        self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct"))
+        self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct", "digits"))
         self._trim_byte_fallback = trim_byte_fallback
         self._hf_repo_subdir = hf_repo_subdir
         if hf_repo:
