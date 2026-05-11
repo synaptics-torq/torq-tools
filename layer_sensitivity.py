@@ -342,14 +342,28 @@ def main():
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
     ref_init_map = {init.name: init for init in ref_model_proto.graph.initializer}
+
+    # Build test model weight map by node name (handles naming differences like _bf16 suffix)
+    test_node_weight_map = {}
+    for node in test_model_proto.graph.node:
+        if node.op_type in ("MatMul", "Gemm"):
+            for inp in node.input:
+                if inp in test_init_map:
+                    test_node_weight_map[node.name] = inp
+                    break
+
     matmul_layers = []
     for i, node in enumerate(ref_model_proto.graph.node):
         if node.op_type not in ("MatMul", "Gemm"):
             continue
         wt_name = node.input[1]
-        if wt_name not in ref_init_map or wt_name not in test_init_map:
+        if wt_name not in ref_init_map:
             continue
-        matmul_layers.append({"node_index": i, "weight_name": wt_name, "shape": list(ref_init_map[wt_name].dims)})
+        # Match by node name, not weight name
+        test_wt_name = test_node_weight_map.get(node.name)
+        if test_wt_name is None or test_wt_name not in test_init_map:
+            continue
+        matmul_layers.append({"node_index": i, "weight_name": wt_name, "test_weight_name": test_wt_name, "shape": list(ref_init_map[wt_name].dims)})
 
     print(f"  Found {len(matmul_layers)} MatMul layers to evaluate\n")
 
@@ -382,7 +396,7 @@ def main():
         orig_dtype = orig_init.data_type
         orig_dims = list(orig_init.dims)
 
-        test_init = test_init_map[wt_name]
+        test_init = test_init_map[layer_info.get("test_weight_name", wt_name)]
         if test_init.data_type == TensorProto.BFLOAT16:
             dims = list(test_init.dims)
             n_elems = 1

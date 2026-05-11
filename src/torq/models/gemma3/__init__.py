@@ -113,6 +113,18 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=False,
         help="Simulate bf16 inference by sandwiching each op with fp32→bf16→fp32 casts (for measuring quantization impact)",
     )
+    parser.add_argument(
+        "--fp8-e5m2",
+        action="store_true",
+        default=False,
+        help="Quantize fp32 weights to fp8-e5m2 (then dequantize back to fp32) before export",
+    )
+    parser.add_argument(
+        "--fp8-e4m3",
+        action="store_true",
+        default=False,
+        help="Quantize fp32 weights to fp8-e4m3fn (then dequantize back to fp32) before export",
+    )
     add_logging_args(parser)
     add_iree_args(parser)
 

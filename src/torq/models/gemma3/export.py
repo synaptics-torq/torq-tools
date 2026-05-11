@@ -56,6 +56,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._dequantize_weights = edit_args.get("dequantize_weights", False)
         self._dequantize_weights_linear = edit_args.get("dequantize_weights_linear", False)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
+        self._fp8_e5m2 = edit_args.get("fp8_e5m2", False)
+        self._fp8_e4m3 = edit_args.get("fp8_e4m3", False)
 
         super().__init__(
             "fp32",
@@ -95,11 +97,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"], opt_level=None
             )
         dtype_tag = self._model_quant_dtype if self._is_quantized else self._model_dtype
+        # Append "_dql" suffix for DequantizeLinear (runtime dequant) exports
+        dql_suffix = "_dql" if self._dequantize_weights_linear else ""
         export_dir = (
             self._models_dir / 
             "export" / 
             "onnx" / 
-            dtype_tag / 
+            (dtype_tag + dql_suffix) / 
             ("static" if self._static_models else "dynamic")
         )
         # converted dir: "converted" for int4/fp32, "int8_converted" for int8
@@ -108,14 +112,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._models_dir 
             / "export"
             / "onnx"
-            / convert_tag
+            / (convert_tag + dql_suffix)
             / ("static" if self._static_models else "dynamic")
         )
         iree_dir = (
             self._models_dir
             / "export"
             / "iree"
-            / (convert_tag if self._convert_dtypes else dtype_tag)
+            / ((convert_tag if self._convert_dtypes else dtype_tag) + dql_suffix)
             / ("static" if self._static_models else "dynamic")
         )
         return onnx_dir, export_dir, convert_dir, iree_dir
@@ -238,13 +242,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model = gs.export_onnx(editor.graph)
         model.ir_version = orig_ir
 
-        # DequantizeLinear with block_size requires opset 21; pack uint8 → UINT4
+        # DequantizeLinear with block_size requires opset 21; pack uint8 → UINT4 for 4-bit only
         if self._dequantize_weights_linear:
             for opset in model.opset_import:
                 if opset.domain == "" and opset.version < 21:
                     opset.version = 21
-            from torq.graph_edit.edits import pack_dq_weights_uint4
-            pack_dq_weights_uint4(model)
+            if self._model_quant_dtype != "int8":
+                from torq.graph_edit.edits import pack_dq_weights_uint4
+                pack_dq_weights_uint4(model)
 
         has_ms_ops = any(n.domain == "com.microsoft" for n in model.graph.node)
         if not has_ms_ops:
@@ -666,7 +671,9 @@ def export_gemma3_from_args(args: argparse.Namespace):
         broadcast_ops=args.broadcast_ops,
         dequantize_weights=args.dequantize_weights,
         dequantize_weights_linear=args.dequantize_weights_linear,
-        simulate_bf16=args.simulate_bf16
+        simulate_bf16=args.simulate_bf16,
+        fp8_e5m2=args.fp8_e5m2,
+        fp8_e4m3=args.fp8_e4m3
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:

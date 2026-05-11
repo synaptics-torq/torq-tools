@@ -155,6 +155,56 @@ PYTHONPATH=src python -m torq.models.gemma3.export \
 | `--broadcast-ops [OP...]` | Broadcast op inputs to match output shape |
 | `--keep-individual-kv-io` | Keep separate K,V I/O instead of merged |
 
+## Custom Block Int8 Quantization Pipeline (`quantize_bf16_to_block_int8.py`)
+
+Standalone script for block-quantizing fp32 weights to int8 along axis=1 (N/embed dim).
+
+### IMPORTANT: Full pipeline for compilable VMFB
+
+The source model with DequantizeLinear+int8 weights (e.g. `source/fp32_xenova_block_int8_1/model.onnx`)
+**cannot be compiled directly**. It must go through the full Gemma3 export pipeline first:
+
+1. **Source**: `source/fp32_xenova_block_int8_1/model.onnx` (int8 DQL + MatMul, with SimplifiedLayerNorm + GQA)
+2. **Export pipeline** (Stage 1-3): Replaces custom ops → makes static → patches graph
+   - The pipeline needs `model.onnx` with pre-dequantized fp32 weights (not DQL nodes)
+   - `--dequantize-weights` only handles `MatMulNBits`, NOT `DequantizeLinear`
+   - `--extract-embeddings` only handles `GatherBlockQuantized`, NOT regular `Gather`
+3. **Convert dtypes** (Stage 5): fp32 → bf16 + int64 → int32
+4. **Compile**: ONNX → MLIR → VMFB
+
+### Correct workflow for custom block int8
+```bash
+# Step 1: Quantize fp32_xenova source to int8 DQL model
+python quantize_bf16_to_block_int8.py
+# Input:  source/fp32_xenova/model.onnx
+# Output: source/fp32_xenova_block_int8_1/model.onnx (DQL + MatMul)
+
+# Step 2: Run export pipeline with --onnx-source-dir
+# CRITICAL: The pipeline source must be a model with fp32 MatMul weights (not DQL)
+# Either pre-dequantize the DQL nodes first, or use the export pipeline on
+# the original source and replace weights afterward.
+PYTHONPATH=src python -m torq.models.gemma3.export \
+    --model-dtype int4 --instruct-model --extract-embeddings \
+    --dequantize-weights --convert-dtypes --skip-iree --skip-validation \
+    --onnx-source-dir models/google/gemma-3-270m-it/source/fp32_xenova_block_int8_1
+
+# Step 3: Copy output to target directory
+mkdir -p models/google/gemma-3-270m-it/export/onnx/int8_bf16_scales_blocks_along_embed_dim_1/static
+cp models/google/gemma-3-270m-it/export/onnx/converted/static/model.onnx \
+   models/google/gemma-3-270m-it/export/onnx/int8_bf16_scales_blocks_along_embed_dim_1/static/
+
+# Step 4: Compile
+cd /home/kshanmug/synpu_compiler/torq-compiler-dev
+./compile_v1.5.sh ../torq-tools-dev/models/google/gemma-3-270m-it/export/onnx/int8_bf16_scales_blocks_along_embed_dim_1/static/model.onnx \
+    --torq-enable-transpose-optimization --torq-enable-torq-hl-tiling
+```
+
+### Gotchas
+- **Cannot skip bf16 conversion**: The compiler requires bf16 weights + int32 integers. Raw int8/fp32 models will fail with LRAM allocation or dtype errors.
+- **Cannot compile DQL models directly**: The torq compiler does not support `DequantizeLinear` with `block_size`. Weights must be pre-dequantized to bf16.
+- **Embedding extraction**: If the source has a regular `Gather` (not `GatherBlockQuantized`), the pipeline won't extract embeddings. The lm_head also shares the embedding weight via Transpose. Both must be handled manually or the pipeline needs a model where `model.onnx` has pre-dequantized fp32 weights so the pipeline's `--dequantize-weights` and `--extract-embeddings` work properly.
+- **I/O dtypes**: The compiled model must have bf16 I/O and int32 position_ids. The `--convert-dtypes` flag handles this.
+
 ## Compile & Deploy
 
 ### Compile ONNX → VMFB

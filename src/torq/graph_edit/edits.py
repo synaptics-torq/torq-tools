@@ -1397,51 +1397,85 @@ class ReplaceMatMulNBitsLinear(OnnxGraphEdit):
 
         n_blocks = (K + block_size - 1) // block_size
 
-        # Unpack int4 packed weights: (N, n_blocks, blob_size) uint8 → (N, K) uint8
-        # Each uint8 in W_q holds 2 int4 values (low nibble first).
-        # After export, pack_dq_weights_uint4() converts these back to UINT4.
+        # Unpack weights based on bit width
         W_q = W_q_const.values
-        low = (W_q & 0x0F).astype(np.uint8)
-        high = ((W_q >> 4) & 0x0F).astype(np.uint8)
-        x_data = np.stack([low, high], axis=-1).reshape(N, K)
+        if bits == 4:
+            # Each uint8 in W_q holds 2 uint4 values (low nibble first).
+            low = (W_q & 0x0F).astype(np.uint8)
+            high = ((W_q >> 4) & 0x0F).astype(np.uint8)
+            x_data_unsigned = np.stack([low, high], axis=-1).reshape(N, K)
+        elif bits == 8:
+            # Each uint8 is one weight value directly
+            x_data_unsigned = W_q.reshape(N, K)
+        else:
+            raise ValueError(f"Unsupported MatMulNBits bits={bits}")
 
         # Scales: (N*n_blocks,) → (N, n_blocks) for block_size DQ
         scales_2d = np.asarray(scales_const.values, dtype=np.float32).reshape(N, n_blocks)
 
-        # Zero points: MatMulNBits uses unsigned int4 with default zero_point=8
+        # Zero points (unsigned)
         if zp_const is not None and zp_const.values is not None and zp_const.values.size > 0:
             zp_raw = zp_const.values
-            zp_low = (zp_raw & 0x0F).astype(np.uint8)
-            zp_high = ((zp_raw >> 4) & 0x0F).astype(np.uint8)
-            zp_2d = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+            if bits == 4:
+                zp_low = (zp_raw & 0x0F).astype(np.uint8)
+                zp_high = ((zp_raw >> 4) & 0x0F).astype(np.uint8)
+                zp_2d_unsigned = np.stack([zp_low, zp_high], axis=-1).reshape(N, n_blocks)
+            else:
+                zp_2d_unsigned = zp_raw.reshape(N, n_blocks)
         else:
-            zp_2d = np.full((N, n_blocks), 8, dtype=np.uint8)
+            default_zp = 8 if bits == 4 else 128
+            zp_2d_unsigned = np.full((N, n_blocks), default_zp, dtype=np.uint8)
 
-        # Pre-transpose weights so DequantizeLinear outputs (K, N) directly,
-        # eliminating the need for a separate Transpose node.
-        # Layout: x(K, N), scale(n_blocks, N), zp(n_blocks, N), axis=0 (blocks along K)
-        x_data_t = np.ascontiguousarray(x_data.T)       # (N, K) → (K, N)
-        scales_t = np.ascontiguousarray(scales_2d.T)     # (N, n_blocks) → (n_blocks, N)
-        zp_t = np.ascontiguousarray(zp_2d.T)             # (N, n_blocks) → (n_blocks, N)
+        # Convert from unsigned to signed:
+        # DQL: output = (x - zp) * scale  (same result whether unsigned or signed)
+        # uint4 [0,15] → int4 [-8,7]: subtract 8
+        # uint8 [0,255] → int8 [-128,127]: subtract 128
+        offset = 8 if bits == 4 else 128
+        x_data = (x_data_unsigned.astype(np.int16) - offset).astype(np.int8)
+        zp_2d = (zp_2d_unsigned.astype(np.int16) - offset).astype(np.int8)
 
-        # DequantizeLinear: x(K, N) uint8→UINT4, scale(n_blocks, N), zp(n_blocks, N)
+        # Keep weights as (N, K) with block dequantization along axis=1 (the K dimension).
+        # Layout: x(N, K), scale(N, n_blocks), zp(N, n_blocks), axis=1
+        # DQL output is (N, K). Instead of transposing weights, we transpose the
+        # input activation and swap operand order:
+        #   1. Transpose input: (1,1,K) → (1,K,1)
+        #   2. MatMul: DQL_output(N,K) @ transposed_input(1,K,1) → (1,N,1)
+        #   3. Transpose output: (1,N,1) → (1,1,N)
+
+        # DequantizeLinear: x(N, K), scale(N, n_blocks), zp(N, n_blocks), axis=1
         # Naming convention: /dq_weights and /dq_zero_points suffix triggers UINT4 packing
         dq_out = self.graph.layer(
             name=f"{prefix}/DequantizeLinear", op="DequantizeLinear",
             inputs=[
-                gs.Constant(f"{prefix}/dq_weights", x_data_t),
-                gs.Constant(f"{prefix}/dq_scales", scales_t),
-                gs.Constant(f"{prefix}/dq_zero_points", zp_t),
+                gs.Constant(f"{prefix}/dq_weights", np.ascontiguousarray(x_data)),
+                gs.Constant(f"{prefix}/dq_scales", np.ascontiguousarray(scales_2d)),
+                gs.Constant(f"{prefix}/dq_zero_points", np.ascontiguousarray(zp_2d)),
             ],
             outputs=[gs.Variable(f"{prefix}/dq_output", dtype=np.float32)],
-            attrs={"axis": 0, "block_size": block_size},
+            attrs={"axis": 1, "block_size": block_size},
         )[0]
 
-        # MatMul: activation(B, S, K) @ weight(K, N) → (B, S, N)
-        matmul_out = self.graph.layer(
+        # Transpose input: (B, S, K) → (B, K, S) i.e. (1,1,K) → (1,K,1)
+        input_t = self.graph.layer(
+            name=f"{prefix}/TransposeInput", op="Transpose",
+            inputs=[activation],
+            outputs=[gs.Variable(f"{prefix}/input_transposed", dtype=np.float32)],
+            attrs={"perm": [0, 2, 1]},
+        )[0]
+
+        # MatMul: weight(N,K) @ input_t(1,K,1) → (1,N,1) via broadcasting
+        matmul_raw = self.graph.layer(
             name=f"{prefix}/MatMul", op="MatMul",
-            inputs=[activation, dq_out],
+            inputs=[dq_out, input_t],
+            outputs=[gs.Variable(f"{prefix}/MatMul_output_raw", dtype=np.float32)],
+        )[0]
+
+        # Transpose output: (1,N,1) → (1,1,N)
+        matmul_out = self.graph.layer(
+            name=f"{prefix}/TransposeOutput", op="Transpose",
+            inputs=[matmul_raw],
             outputs=[gs.Variable(f"{prefix}/MatMul_output_0", dtype=out_var.dtype, shape=out_var.shape)],
+            attrs={"perm": [0, 2, 1]},
         )[0]
 
         rewire_consumers(out_var.outputs.copy(), out_var, matmul_out)
@@ -1458,10 +1492,10 @@ class ReplaceMatMulNBitsLinear(OnnxGraphEdit):
 
 
 def pack_dq_weights_uint4(model):
-    """Convert DequantizeLinear weight/zp initializers from uint8 to ONNX UINT4.
+    """Convert DequantizeLinear weight/zp initializers from int8 to ONNX INT4.
 
     After ``gs.export_onnx()``, DQ weight and zero-point tensors are stored as
-    uint8 (one value per byte).  This function repacks them into the ONNX UINT4
+    int8 (one value per byte).  This function repacks them into the ONNX INT4
     type (two values per byte), halving storage.
 
     Tensors are identified by the naming convention established in
@@ -1473,14 +1507,15 @@ def pack_dq_weights_uint4(model):
     for init in model.graph.initializer:
         if not (init.name.endswith("/dq_weights") or init.name.endswith("/dq_zero_points")):
             continue
-        if init.data_type != TensorProto.UINT8:
+        if init.data_type != TensorProto.INT8:
             continue
-        data = numpy_helper.to_array(init).flatten()
+        data = numpy_helper.to_array(init).flatten().astype(np.int8)
         # Pad to even length if needed
         if len(data) % 2 != 0:
-            data = np.append(data, np.uint8(0))
-        packed = (data[0::2] & 0x0F) | ((data[1::2] & 0x0F) << 4)
-        init.data_type = TensorProto.UINT4
+            data = np.append(data, np.int8(0))
+        # Pack two int4 values per byte (low nibble first)
+        packed = (data[0::2].view(np.uint8) & 0x0F) | ((data[1::2].view(np.uint8) & 0x0F) << 4)
+        init.data_type = TensorProto.INT4
         init.raw_data = packed.tobytes()
         # Clear float/int data fields
         del init.float_data[:]
