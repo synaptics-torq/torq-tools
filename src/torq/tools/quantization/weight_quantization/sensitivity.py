@@ -64,6 +64,7 @@ class LayerSensitivityAnalyzer:
         model_path: str | Path,
         embeddings_path: str | Path,
         tokenizer_path: str | Path | None = None,
+        token_lut_path: str | Path | None = None,
         calibration_prompts: list[str] | None = None,
         num_tokens: int = 5,
         num_layers: int = 18,
@@ -72,11 +73,14 @@ class LayerSensitivityAnalyzer:
         self.model_path = Path(model_path)
         self.embeddings_path = Path(embeddings_path)
         self.tokenizer_path = Path(tokenizer_path) if tokenizer_path else None
+        self.token_lut_path = Path(token_lut_path) if token_lut_path else None
         self.prompts = calibration_prompts or _DEFAULT_PROMPTS
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.skip_layers = skip_layers or []
         self._embeddings: np.ndarray | None = None
+        self._token_lut: np.ndarray | None = None  # reduced_idx → full_vocab_id
+        self._reverse_lut: dict[int, int] | None = None  # full_vocab_id → reduced_idx
         self._tokenizer = None
 
     # --- public API ----------------------------------------------------------
@@ -114,6 +118,16 @@ class LayerSensitivityAnalyzer:
             fp32.view(np.uint32)[...] = u16.astype(np.uint32) << 16
             emb = fp32
         self._embeddings = emb
+
+        # Load token LUT for reduced-vocab models
+        if self.token_lut_path and self.token_lut_path.exists():
+            self._token_lut = np.load(str(self.token_lut_path)).astype(np.int64)
+            self._reverse_lut = {
+                int(full_id): idx for idx, full_id in enumerate(self._token_lut)
+            }
+            logger.info(
+                "Loaded token LUT: %d reduced vocab entries", len(self._token_lut)
+            )
 
         # Tokenize prompts
         token_sequences = self._tokenize_prompts()
@@ -349,6 +363,18 @@ class LayerSensitivityAnalyzer:
             return tok.decode(token_ids)
         return str(token_ids)
 
+    def _reduced_to_full(self, reduced_idx: int) -> int:
+        """Map reduced-vocab index to full-vocab token ID."""
+        if self._token_lut is not None:
+            return int(self._token_lut[reduced_idx])
+        return reduced_idx
+
+    def _full_to_reduced(self, full_id: int) -> int | None:
+        """Map full-vocab token ID to reduced-vocab index (None if not in vocab)."""
+        if self._reverse_lut is not None:
+            return self._reverse_lut.get(full_id)
+        return full_id
+
     def _collect_logits(
         self,
         sess,
@@ -356,15 +382,15 @@ class LayerSensitivityAnalyzer:
         n_gen: int,
         ref_tokens: list[int] | None = None,
     ) -> list[tuple[int, np.ndarray]]:
-        """Run autoregressive inference, returning (token_id, logits) per step.
+        """Run autoregressive inference, returning (full_token_id, logits) per step.
 
         Parameters
         ----------
         sess : ORT session
-        prompt_ids : tokenized prompt
+        prompt_ids : tokenized prompt (full-vocab token IDs)
         n_gen : number of tokens to generate after prompt
-        ref_tokens : if provided, feed these tokens instead of model predictions
-                     (teacher forcing)
+        ref_tokens : if provided, feed these full-vocab token IDs instead of
+                     model predictions (teacher forcing)
         """
         emb = self._embeddings
         kv = {
@@ -378,25 +404,28 @@ class LayerSensitivityAnalyzer:
         pos = 0
         logits = None
 
-        # Process prompt tokens
+        # Process prompt tokens (full-vocab IDs → embedding lookup)
         for tok in prompt_ids:
             logits = self._step(sess, emb, kv, tok, pos, out_names)
             pos += 1
 
         # Generate tokens
         results = []
-        next_tok = int(logits.argmax())
-        results.append((next_tok, logits.copy()))
+        # logits are over reduced vocab; argmax gives reduced index
+        reduced_idx = int(logits.argmax())
+        full_tok = self._reduced_to_full(reduced_idx)
+        results.append((full_tok, logits.copy()))
 
         for i in range(n_gen - 1):
-            # Teacher forcing: use reference token if available
-            feed_tok = ref_tokens[i] if ref_tokens and i < len(ref_tokens) else next_tok
+            # Teacher forcing: ref_tokens are full-vocab IDs
+            feed_tok = ref_tokens[i] if ref_tokens and i < len(ref_tokens) else full_tok
             if feed_tok in (_EOS_ID, _END_TURN_ID):
                 break
             logits = self._step(sess, emb, kv, feed_tok, pos, out_names)
             pos += 1
-            next_tok = int(logits.argmax())
-            results.append((next_tok, logits.copy()))
+            reduced_idx = int(logits.argmax())
+            full_tok = self._reduced_to_full(reduced_idx)
+            results.append((full_tok, logits.copy()))
 
         return results
 

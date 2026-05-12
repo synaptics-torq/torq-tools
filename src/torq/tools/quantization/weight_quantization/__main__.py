@@ -164,6 +164,12 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         help="Path to token_embeddings.npy for embedding lookup (required)",
     )
     parser.add_argument(
+        "--token-lut",
+        type=str,
+        default=None,
+        help="Path to token_id_lut.npy for reduced-vocab models (maps reduced index → full vocab ID)",
+    )
+    parser.add_argument(
         "--num-layers",
         type=int,
         default=18,
@@ -227,6 +233,7 @@ def _run_analyze(args: argparse.Namespace) -> None:
         model_path=args.input,
         embeddings_path=args.embeddings,
         tokenizer_path=args.tokenizer,
+        token_lut_path=args.token_lut,
         calibration_prompts=prompts,
         num_tokens=args.num_tokens,
         num_layers=args.num_layers,
