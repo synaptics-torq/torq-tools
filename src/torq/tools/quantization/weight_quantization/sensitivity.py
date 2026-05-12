@@ -406,7 +406,7 @@ class LayerSensitivityAnalyzer:
         e = emb[token_id].astype(np.float32).reshape(1, 1, -1)
         feeds = {
             "token_embedding": e,
-            "position_ids": np.array([[pos]], dtype=np.int32),
+            "position_ids": np.array([[pos]], dtype=np.int64),
         }
         feeds.update(kv)
         outs = sess.run(None, feeds)
@@ -447,14 +447,6 @@ class LayerSensitivityAnalyzer:
                 new_inputs.append(
                     helper.make_tensor_value_info(inp.name, TensorProto.FLOAT, shape)
                 )
-            elif t.elem_type == TensorProto.INT64:
-                shape = [
-                    d.dim_value if d.HasField("dim_value") else d.dim_param
-                    for d in t.shape.dim
-                ]
-                new_inputs.append(
-                    helper.make_tensor_value_info(inp.name, TensorProto.INT32, shape)
-                )
             else:
                 new_inputs.append(inp)
 
@@ -484,12 +476,6 @@ class LayerSensitivityAnalyzer:
                         new_attr.name = "to"
                         new_attr.type = onnx.AttributeProto.INT
                         new_attr.i = TensorProto.FLOAT
-                        new_attrs.append(new_attr)
-                    elif attr.name == "to" and attr.i == TensorProto.INT64:
-                        new_attr = onnx.AttributeProto()
-                        new_attr.name = "to"
-                        new_attr.type = onnx.AttributeProto.INT
-                        new_attr.i = TensorProto.INT32
                         new_attrs.append(new_attr)
                     else:
                         new_attrs.append(attr)
