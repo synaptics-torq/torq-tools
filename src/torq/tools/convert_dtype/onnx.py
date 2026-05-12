@@ -147,21 +147,14 @@ class OnnxDtypeConverterBase(ABC):
         elif isinstance(tensor, gs.Constant):
             new_const_name: str = tensor.name + f"_{self._export_dtype_str}"
             if not (new_const := graph.tensors().get(new_const_name)):
-                if self._original_onnx_dtype == onnx.TensorProto.FLOAT and self._export_onnx_dtype == onnx.TensorProto.BFLOAT16:
-                    new_const = gs.Constant(
-                        new_const_name,
-                        tensor.values,
-                        export_dtype=self._export_onnx_dtype
-                    )
-                else:
-                    try:
-                        np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
-                    except (TypeError, ValueError, KeyError):
-                        raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
-                    new_const = gs.Constant(
-                        new_const_name,
-                        tensor.values.astype(np_type)
-                    )
+                try:
+                    np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+                except (TypeError, ValueError, KeyError):
+                    raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+                new_const = gs.Constant(
+                    new_const_name,
+                    tensor.values.astype(np_type)
+                )
             logger.debug("Add %s initializer '%s'", self._export_dtype_str, new_const.name)
             try:
                 if is_attr:
