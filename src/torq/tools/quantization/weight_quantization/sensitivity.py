@@ -24,6 +24,15 @@ from onnx import TensorProto, helper, numpy_helper
 from .config import SensitivityResult, SensitivityResults
 from .quantize import dequantize_weight, quantize_weight
 
+
+def _bf16_roundtrip(weight: np.ndarray) -> np.ndarray:
+    """Truncate fp32 weight to bf16 precision and back to fp32."""
+    u32 = weight.view(np.uint32)
+    u16 = ((u32 + 0x8000) >> 16).astype(np.uint16)  # round to nearest bf16
+    fp32 = np.zeros(weight.shape, dtype=np.float32)
+    fp32.view(np.uint32)[:] = u16.astype(np.uint32) << 16
+    return fp32
+
 logger = logging.getLogger(__name__)
 
 # Gemma-3 defaults
@@ -124,7 +133,7 @@ class LayerSensitivityAnalyzer:
         -------
         SensitivityResults with per-layer metrics
         """
-        bits_options = bits_options or [4, 8]
+        bits_options = bits_options or [4, 8, 16]
         import onnxruntime as ort
 
         # Load embeddings
@@ -226,8 +235,11 @@ class LayerSensitivityAnalyzer:
                 )
 
                 # Quantize → dequantize this layer
-                qw = quantize_weight(fp32_w, bits)
-                deq_w = dequantize_weight(qw)
+                if bits == 16:
+                    deq_w = _bf16_roundtrip(fp32_w)
+                else:
+                    qw = quantize_weight(fp32_w, bits)
+                    deq_w = dequantize_weight(qw)
 
                 # Replace weight in model
                 new_init = numpy_helper.from_array(deq_w, name=weight_name)

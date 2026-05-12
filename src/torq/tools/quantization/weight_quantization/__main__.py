@@ -179,8 +179,8 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         "--bits",
         type=int,
         nargs="+",
-        default=[4, 8],
-        help="Bit-widths to test (default: 4 8)",
+        default=[4, 8, 16],
+        help="Bit-widths to test (default: 4 8 16)",
     )
     parser.add_argument(
         "--num-tokens",
