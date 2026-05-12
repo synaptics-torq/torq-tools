@@ -184,7 +184,10 @@ class LayerSensitivityAnalyzer:
             original_data = original_init.raw_data
             fp32_w = numpy_helper.to_array(original_init).astype(np.float32)
 
-            best_result = None
+            layer_kl = {}
+            layer_cos = {}
+            layer_top1 = {}
+
             for bits in bits_options:
                 logger.info(
                     "[%d/%d] Testing %s at %d-bit",
@@ -229,19 +232,18 @@ class LayerSensitivityAnalyzer:
                 del mod_sess
 
                 mean_kl = float(np.mean(kl_divs)) if kl_divs else float("inf")
-                result = SensitivityResult(
-                    layer_name=node_name,
-                    kl_divergence=mean_kl,
-                    cosine_similarity=float(np.mean(cos_sims)) if cos_sims else 0.0,
-                    top1_match=float(np.mean(top1_matches)) if top1_matches else 0.0,
-                    top5_match=0.0,
-                    mse=0.0,
-                    bits_tested=bits,
-                    classification=_classify(mean_kl),
-                )
+                mean_cos = float(np.mean(cos_sims)) if cos_sims else 0.0
+                mean_top1 = float(np.mean(top1_matches)) if top1_matches else 0.0
 
-                if best_result is None or result.kl_divergence < best_result.kl_divergence:
-                    best_result = result
+                layer_kl[bits] = mean_kl
+                layer_cos[bits] = mean_cos
+                layer_top1[bits] = mean_top1
+
+                sev = _classify(mean_kl)
+                logger.info(
+                    "  %d-bit: KL=%.6f cos=%.6f top1=%.2f [%s]",
+                    bits, mean_kl, mean_cos, mean_top1, sev,
+                )
 
                 # Restore original weight
                 original_init_restored = onnx.TensorProto()
@@ -253,16 +255,22 @@ class LayerSensitivityAnalyzer:
                     original_init_restored
                 )
 
-            if best_result is not None:
-                results.layers.append(best_result)
-                logger.info(
-                    "  → %s KL=%.6f cos=%.6f top1=%.2f [%s]",
-                    best_result.layer_name,
-                    best_result.kl_divergence,
-                    best_result.cosine_similarity,
-                    best_result.top1_match,
-                    best_result.classification,
-                )
+            # Classify by worst-case (int4) KL
+            worst_kl = max(layer_kl.values()) if layer_kl else 0.0
+            result = SensitivityResult(
+                layer_name=node_name,
+                kl_divergence=layer_kl,
+                cosine_similarity=layer_cos,
+                top1_match=layer_top1,
+                classification=_classify(worst_kl),
+            )
+            results.layers.append(result)
+
+            # Summary line
+            parts = [f"{b}bit={layer_kl[b]:.6f}" for b in sorted(layer_kl)]
+            logger.info(
+                "  → %s: %s [%s]", node_name, ", ".join(parts), result.classification,
+            )
 
         # Cleanup
         os.unlink(base_tmp.name)

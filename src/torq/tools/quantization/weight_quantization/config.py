@@ -76,15 +76,16 @@ class QuantizationConfig:
 
 @dataclass
 class SensitivityResult:
-    """Per-layer sensitivity metrics from analysis."""
+    """Per-layer sensitivity metrics from analysis.
+
+    Stores KL divergence for each tested bit-width so that ``to_config``
+    can pick the most aggressive quantization whose KL is below threshold.
+    """
 
     layer_name: str
-    kl_divergence: float = 0.0
-    cosine_similarity: float = 1.0
-    top1_match: float = 1.0
-    top5_match: float = 1.0
-    mse: float = 0.0
-    bits_tested: int = 4
+    kl_divergence: dict[int, float] = field(default_factory=dict)  # {bits: kl}
+    cosine_similarity: dict[int, float] = field(default_factory=dict)
+    top1_match: dict[int, float] = field(default_factory=dict)
     classification: str = "LOW"  # LOW / MEDIUM / HIGH / CRITICAL
 
 
@@ -103,7 +104,14 @@ class SensitivityResults:
     @classmethod
     def load(cls, path: str | Path) -> SensitivityResults:
         data = json.loads(Path(path).read_text())
-        return cls(layers=[SensitivityResult(**d) for d in data])
+        layers = []
+        for d in data:
+            # JSON keys are strings — convert back to int
+            for field_name in ("kl_divergence", "cosine_similarity", "top1_match"):
+                if field_name in d and isinstance(d[field_name], dict):
+                    d[field_name] = {int(k): v for k, v in d[field_name].items()}
+            layers.append(SensitivityResult(**d))
+        return cls(layers=layers)
 
     def to_config(
         self,
@@ -113,17 +121,25 @@ class SensitivityResults:
     ) -> QuantizationConfig:
         """Convert sensitivity results to a quantization config.
 
-        Layers with KL divergence above *bf16_threshold* are kept in bf16,
-        those above *int8_threshold* use int8, and the rest use int4.
+        For each layer, pick the most aggressive quantization (int4 first,
+        then int8) whose KL divergence is below the relevant threshold.
+        If none qualifies, assign bf16.
         """
         layers: dict[str, LayerQuantConfig] = {}
         for r in self.layers:
-            if r.kl_divergence > bf16_threshold:
-                layers[r.layer_name] = LayerQuantConfig(bits=16, block_size=block_size)
-            elif r.kl_divergence > int8_threshold:
+            # Try int4 first (most aggressive)
+            kl_4 = r.kl_divergence.get(4, float("inf"))
+            kl_8 = r.kl_divergence.get(8, float("inf"))
+
+            if kl_4 <= int8_threshold:
+                # int4 KL is low enough → use int4
+                layers[r.layer_name] = LayerQuantConfig(bits=4, block_size=block_size)
+            elif kl_8 <= bf16_threshold:
+                # int8 KL is acceptable → use int8
                 layers[r.layer_name] = LayerQuantConfig(bits=8, block_size=block_size)
             else:
-                layers[r.layer_name] = LayerQuantConfig(bits=4, block_size=block_size)
+                # Both too sensitive → bf16
+                layers[r.layer_name] = LayerQuantConfig(bits=16, block_size=block_size)
         return QuantizationConfig(
             default=LayerQuantConfig(bits=4, block_size=block_size),
             layers=layers,
