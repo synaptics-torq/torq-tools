@@ -444,6 +444,9 @@ class WeightQuantizer:
             counts["bf16"],
         )
 
+        # Convert remaining fp32 initializers and I/O to bf16, int64 to int32
+        self._convert_non_weight_to_bf16(model)
+
     def _quantize_dequantize_bf16(
         self,
         model: onnx.ModelProto,
@@ -535,6 +538,64 @@ class WeightQuantizer:
                             attr.i = TensorProto.INT32
 
         logger.info("Converted model to bf16 + int32")
+
+    def _convert_non_weight_to_bf16(self, model: onnx.ModelProto) -> None:
+        """Convert non-quantized parts of the model to bf16/int32.
+
+        Skips initializers that are already int8/uint8/bf16 (quantized weights,
+        scales, zero points).  Converts remaining fp32 initializers, I/O types,
+        value_info, and Cast attributes.
+        """
+        skip_dtypes = {
+            TensorProto.INT8,
+            TensorProto.UINT8,
+            TensorProto.BFLOAT16,
+        }
+
+        for init in model.graph.initializer:
+            if init.data_type in skip_dtypes:
+                continue
+            if init.data_type == TensorProto.FLOAT:
+                fp32 = numpy_helper.to_array(init)
+                new_init = TensorProto()
+                new_init.name = init.name
+                new_init.dims[:] = list(fp32.shape)
+                new_init.data_type = TensorProto.BFLOAT16
+                new_init.raw_data = _fp32_to_bf16_raw(fp32)
+                init.CopyFrom(new_init)
+            elif init.data_type == TensorProto.INT64:
+                i64 = numpy_helper.to_array(init)
+                new_init = numpy_helper.from_array(
+                    i64.astype(np.int32), name=init.name
+                )
+                init.CopyFrom(new_init)
+
+        # Update graph I/O types
+        for container in (model.graph.input, model.graph.output):
+            for io in container:
+                if io.type.tensor_type.elem_type == TensorProto.FLOAT:
+                    io.type.tensor_type.elem_type = TensorProto.BFLOAT16
+                elif io.type.tensor_type.elem_type == TensorProto.INT64:
+                    io.type.tensor_type.elem_type = TensorProto.INT32
+
+        # Update value_info
+        for vi in model.graph.value_info:
+            if vi.type.tensor_type.elem_type == TensorProto.FLOAT:
+                vi.type.tensor_type.elem_type = TensorProto.BFLOAT16
+            elif vi.type.tensor_type.elem_type == TensorProto.INT64:
+                vi.type.tensor_type.elem_type = TensorProto.INT32
+
+        # Update Cast node 'to' attributes
+        for node in model.graph.node:
+            if node.op_type == "Cast":
+                for attr in node.attribute:
+                    if attr.name == "to":
+                        if attr.i == TensorProto.FLOAT:
+                            attr.i = TensorProto.BFLOAT16
+                        elif attr.i == TensorProto.INT64:
+                            attr.i = TensorProto.INT32
+
+        logger.info("Converted non-weight tensors and I/O to bf16 + int32")
 
 
 # ---------------------------------------------------------------------------
