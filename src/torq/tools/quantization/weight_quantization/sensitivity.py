@@ -284,7 +284,7 @@ class LayerSensitivityAnalyzer:
 
                 sev = _classify(mean_kl)
                 logger.info(
-                    "  %d-bit: KL=%.6f cos=%.6f top1=%.2f [%s]",
+                    "  %d-bit: KL=%.10f cos=%.6f top1=%.2f [%s]",
                     bits, mean_kl, mean_cos, mean_top1, sev,
                 )
 
@@ -310,7 +310,7 @@ class LayerSensitivityAnalyzer:
             results.layers.append(result)
 
             # Summary line
-            parts = [f"{b}bit={layer_kl[b]:.6f}" for b in sorted(layer_kl)]
+            parts = [f"{b}bit={layer_kl[b]:.10f}" for b in sorted(layer_kl)]
             logger.info(
                 "  → %s: %s [%s]", node_name, ", ".join(parts), result.classification,
             )
