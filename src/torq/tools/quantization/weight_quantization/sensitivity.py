@@ -92,6 +92,7 @@ class LayerSensitivityAnalyzer:
         tokenizer_path: str | Path | None = None,
         token_lut_path: str | Path | None = None,
         calibration_prompts: list[str] | None = None,
+        system_prompt: str | None = None,
         num_tokens: int = 20,
         num_layers: int = 18,
         skip_layers: list[str] | None = None,
@@ -101,6 +102,7 @@ class LayerSensitivityAnalyzer:
         self.tokenizer_path = Path(tokenizer_path) if tokenizer_path else None
         self.token_lut_path = Path(token_lut_path) if token_lut_path else None
         self.prompts = calibration_prompts or _DEFAULT_PROMPTS
+        self.system_prompt = system_prompt or _SYS_PROMPT
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.skip_layers = skip_layers or []
@@ -379,7 +381,7 @@ class LayerSensitivityAnalyzer:
         for prompt in self.prompts:
             ids = (
                 [_BOS_ID]
-                + encode_turn(_SYS_PROMPT, "system")
+                + encode_turn(self.system_prompt, "system")
                 + encode_turn(prompt, "user")
                 + encode_turn("", "model")
             )

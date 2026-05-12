@@ -220,6 +220,12 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         help="Layer name substrings to skip (e.g. lm_head)",
     )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="System prompt for chat template (default: Gemma-3 assistant prompt)",
+    )
 
 
 def _run_analyze(args: argparse.Namespace) -> None:
@@ -235,6 +241,7 @@ def _run_analyze(args: argparse.Namespace) -> None:
         tokenizer_path=args.tokenizer,
         token_lut_path=args.token_lut,
         calibration_prompts=prompts,
+        system_prompt=args.system_prompt,
         num_tokens=args.num_tokens,
         num_layers=args.num_layers,
         skip_layers=args.skip_layers,
