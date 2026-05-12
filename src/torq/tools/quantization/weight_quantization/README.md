@@ -22,9 +22,12 @@ python -m torq.tools.quantization.weight_quantization quantize \
 python -m torq.tools.quantization.weight_quantization quantize \
   -i model_fp32.onnx -o model_bf16.onnx --bits 16
 
-# --- Dequantized bf16 output (ready for IREE compilation) ---
+# --- Dequantized bf16 output (ready for Torq compilation) ---
 
-# Quantize to int8, then dequantize back and convert entire model to bf16
+# Quantize to int8, then dequantize back and convert entire model to bf16.
+# Scales are truncated to bf16 precision BEFORE dequantization so that the
+# output matches what the hardware computes at runtime (bf16 scale × int8 weight).
+# The final weights are: bf16( (q - zp) * bf16(scale) )
 python -m torq.tools.quantization.weight_quantization quantize \
   -i model_fp32.onnx -o model_bf16.onnx --bits 8 --dequantize-weights
 
