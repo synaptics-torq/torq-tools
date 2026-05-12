@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
-"""Per-layer quantization sensitivity analysis.
+"""Per-layer quantization sensitivity analysis (model-agnostic).
 
 Uses teacher-forced autoregressive evaluation: for each MatMul weight layer,
 the weight is quantised → dequantised at a given bit-width, the model is
 run step-by-step feeding baseline tokens, and output logit divergence is
 measured against the fp32 baseline.
+
+Auto-detects model architecture (KV cache shape, input names, number of
+layers) from the ONNX graph.  Chat template is configurable via a format
+string with ``{system}`` and ``{user}`` placeholders.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -24,24 +30,33 @@ from onnx import TensorProto, helper, numpy_helper
 from .config import SensitivityResult, SensitivityResults
 from .quantize import dequantize_weight, quantize_weight
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 
 def _bf16_roundtrip(weight: np.ndarray) -> np.ndarray:
     """Truncate fp32 weight to bf16 precision and back to fp32."""
     u32 = weight.view(np.uint32)
-    u16 = ((u32 + 0x8000) >> 16).astype(np.uint16)  # round to nearest bf16
+    u16 = ((u32 + 0x8000) >> 16).astype(np.uint16)
     fp32 = np.zeros(weight.shape, dtype=np.float32)
     fp32.view(np.uint32)[:] = u16.astype(np.uint32) << 16
     return fp32
 
-logger = logging.getLogger(__name__)
 
-# Gemma-3 defaults
-_BOS_ID = 2
-_EOS_ID = 1
-_END_TURN_ID = 106
-_HEAD_DIM = 256
-_MAX_SEQ = 256
-_SYS_PROMPT = "You are a helpful AI assistant named Gemma. Answer in 1-2 sentences."
+# Default chat template (Gemma-3 format).
+# Use {system} and {user} placeholders.
+_DEFAULT_CHAT_TEMPLATE = (
+    "<start_of_turn>system\n{system}<end_of_turn>\n"
+    "<start_of_turn>user\n{user}<end_of_turn>\n"
+    "<start_of_turn>model\n"
+)
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant. Answer in 1-2 sentences."
+)
 
 _DEFAULT_PROMPTS = [
     "What is the capital of France?",
@@ -67,22 +82,118 @@ _DEFAULT_PROMPTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Model architecture auto-detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_model_arch(sess) -> dict:
+    """Auto-detect model architecture from an ORT session.
+
+    Returns a dict with:
+        embedding_input : name of the embedding/token input
+        position_input  : name of the position_ids input (or None)
+        kv_inputs       : dict mapping kv input name → shape
+        kv_output_map   : dict mapping kv output name → kv input name
+        num_layers      : number of transformer layers
+        eos_token_ids   : list of token IDs that stop generation
+    """
+    inputs = {i.name: i for i in sess.get_inputs()}
+    outputs = {o.name: o for o in sess.get_outputs()}
+
+    # Find embedding input (float, 3D: [batch, seq, hidden])
+    embedding_input = None
+    position_input = None
+    kv_inputs = {}
+
+    for name, inp in inputs.items():
+        shape = [d if isinstance(d, int) else 1 for d in inp.shape]
+        dtype_str = inp.type.replace("tensor(", "").replace(")", "")
+
+        if any(k in name.lower() for k in ("embed", "token_embed", "input_embed")):
+            embedding_input = name
+        elif "position" in name.lower():
+            position_input = name
+        elif any(k in name.lower() for k in ("past", "cache", "kv")):
+            kv_inputs[name] = shape
+
+    # If no explicit embedding input found, look for a 3D float input
+    if embedding_input is None:
+        for name, inp in inputs.items():
+            shape = inp.shape
+            dtype_str = inp.type.replace("tensor(", "").replace(")", "")
+            if len(shape) == 3 and dtype_str in ("float", "float16", "bfloat16"):
+                if name not in kv_inputs:
+                    embedding_input = name
+                    break
+
+    # Map KV outputs back to inputs
+    # Common patterns: "present.0.key_value" → "past_key_values.0.key_value"
+    kv_output_map = {}
+    for out_name in outputs:
+        out_lower = out_name.lower()
+        if not any(k in out_lower for k in ("present", "cache", "kv", "past")):
+            continue
+        # Try common renaming patterns
+        for pattern, replacement in [
+            ("present.", "past_key_values."),
+            ("present_", "past_"),
+            ("new_", ""),
+        ]:
+            candidate = out_name.replace(pattern, replacement)
+            if candidate in kv_inputs:
+                kv_output_map[out_name] = candidate
+                break
+        else:
+            # Try matching by layer index
+            m = re.search(r"(\d+)", out_name)
+            if m:
+                idx = m.group(1)
+                for kv_name in kv_inputs:
+                    if idx in kv_name and kv_name not in kv_output_map.values():
+                        kv_output_map[out_name] = kv_name
+                        break
+
+    num_layers = len(kv_inputs)
+
+    logger.info(
+        "Auto-detected model: embedding=%s, position=%s, %d KV layers",
+        embedding_input, position_input, num_layers,
+    )
+
+    return {
+        "embedding_input": embedding_input,
+        "position_input": position_input,
+        "kv_inputs": kv_inputs,
+        "kv_output_map": kv_output_map,
+        "num_layers": num_layers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main analyzer
+# ---------------------------------------------------------------------------
+
+
 class LayerSensitivityAnalyzer:
     """Analyse per-layer quantization sensitivity of an ONNX model.
 
-    Uses teacher-forced autoregressive evaluation: process prompt tokens
-    one-by-one with KV cache, generate N tokens, and compare logits against
-    the unmodified baseline using KL divergence.
+    Model-agnostic: auto-detects architecture from ONNX graph.
 
     Parameters
     ----------
     model_path : path to the fp32/bf16 ONNX model
     embeddings_path : path to token_embeddings.npy
-    tokenizer_path : path to tokenizer.json (Gemma-3 / SentencePiece)
+    tokenizer_path : path to tokenizer.json
+    token_lut_path : path to token_id_lut.npy (for reduced-vocab models)
     calibration_prompts : list of text prompts; ``None`` → use defaults
+    pre_tokenized_file : path to JSON file with pre-tokenized token ID lists
+                         (skips tokenization entirely)
+    chat_template : format string with {system} and {user} placeholders
+    system_prompt : system prompt text
+    eos_token_ids : list of token IDs that stop generation
     num_tokens : number of generation tokens to evaluate per prompt
-    num_layers : number of transformer layers (for KV cache init)
-    skip_layers : layer-name substrings to skip (e.g. ``["lm_head"]``)
+    skip_layers : layer-name substrings to skip
     """
 
     def __init__(
@@ -92,9 +203,11 @@ class LayerSensitivityAnalyzer:
         tokenizer_path: str | Path | None = None,
         token_lut_path: str | Path | None = None,
         calibration_prompts: list[str] | None = None,
+        pre_tokenized_file: str | Path | None = None,
+        chat_template: str | None = None,
         system_prompt: str | None = None,
+        eos_token_ids: list[int] | None = None,
         num_tokens: int = 20,
-        num_layers: int = 18,
         skip_layers: list[str] | None = None,
     ):
         self.model_path = Path(model_path)
@@ -102,14 +215,21 @@ class LayerSensitivityAnalyzer:
         self.tokenizer_path = Path(tokenizer_path) if tokenizer_path else None
         self.token_lut_path = Path(token_lut_path) if token_lut_path else None
         self.prompts = calibration_prompts or _DEFAULT_PROMPTS
-        self.system_prompt = system_prompt or _SYS_PROMPT
+        self.pre_tokenized_file = (
+            Path(pre_tokenized_file) if pre_tokenized_file else None
+        )
+        self.chat_template = chat_template or _DEFAULT_CHAT_TEMPLATE
+        self.system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        self.eos_token_ids = set(eos_token_ids) if eos_token_ids else None
         self.num_tokens = num_tokens
-        self.num_layers = num_layers
         self.skip_layers = skip_layers or []
+
         self._embeddings: np.ndarray | None = None
-        self._token_lut: np.ndarray | None = None  # reduced_idx → full_vocab_id
-        self._reverse_lut: dict[int, int] | None = None  # full_vocab_id → reduced_idx
+        self._token_lut: np.ndarray | None = None
+        self._reverse_lut: dict[int, int] | None = None
         self._tokenizer = None
+        self._arch: dict | None = None
+        self._detected_eos: set[int] | None = None
 
     # --- public API ----------------------------------------------------------
 
@@ -121,20 +241,7 @@ class LayerSensitivityAnalyzer:
         bf16_threshold: float = 0.1,
         int8_threshold: float = 0.01,
     ) -> SensitivityResults:
-        """Run sensitivity analysis.
-
-        Parameters
-        ----------
-        bits_options : list of bit-widths to test (default ``[4, 8]``)
-        output_path : save detailed results JSON here
-        config_output_path : save quantization config JSON here
-        bf16_threshold : KL threshold above which layers stay bf16
-        int8_threshold : KL threshold above which layers use int8
-
-        Returns
-        -------
-        SensitivityResults with per-layer metrics
-        """
+        """Run sensitivity analysis."""
         bits_options = bits_options or [4, 8, 16]
         import onnxruntime as ort
 
@@ -179,6 +286,16 @@ class LayerSensitivityAnalyzer:
             base_tmp.name, opts, providers=["CPUExecutionProvider"]
         )
 
+        # Auto-detect model architecture
+        self._arch = _detect_model_arch(base_sess)
+
+        # Detect EOS tokens from tokenizer if not provided
+        if self.eos_token_ids is not None:
+            self._detected_eos = self.eos_token_ids
+        else:
+            self._detected_eos = self._detect_eos_tokens()
+            logger.info("EOS token IDs: %s", self._detected_eos)
+
         # Collect baseline logits (teacher-forced)
         logger.info("Collecting baseline logits...")
         baseline_all = []
@@ -188,7 +305,7 @@ class LayerSensitivityAnalyzer:
             elapsed = (time.time() - t0) * 1000
             tokens_text = self._decode_tokens([t for t, _ in bl])
             logger.info(
-                "  Prompt %d: %.0fms, %d tokens: \"%s\"",
+                '  Prompt %d: %.0fms, %d tokens: "%s"',
                 i + 1, elapsed, len(bl), tokens_text[:60],
             )
             baseline_all.append(bl)
@@ -212,9 +329,7 @@ class LayerSensitivityAnalyzer:
                 if inp in init_map:
                     init = init_map[inp]
                     if len(init.dims) == 2:
-                        layers.append(
-                            (node.name, inp, fp32_init_idx[inp])
-                        )
+                        layers.append((node.name, inp, fp32_init_idx[inp]))
                         break
 
         logger.info("Found %d MatMul layers to test", len(layers))
@@ -236,24 +351,20 @@ class LayerSensitivityAnalyzer:
                     layer_idx + 1, len(layers), node_name, bits,
                 )
 
-                # Quantize → dequantize this layer
                 if bits == 16:
                     deq_w = _bf16_roundtrip(fp32_w)
                 else:
                     qw = quantize_weight(fp32_w, bits)
                     deq_w = dequantize_weight(qw)
 
-                # Replace weight in model
                 new_init = numpy_helper.from_array(deq_w, name=weight_name)
                 fp32_model.graph.initializer[init_idx].CopyFrom(new_init)
 
-                # Save modified model and create session
                 onnx.save(fp32_model, base_tmp.name)
                 mod_sess = ort.InferenceSession(
                     base_tmp.name, opts, providers=["CPUExecutionProvider"]
                 )
 
-                # Collect logits with teacher forcing (using baseline tokens)
                 kl_divs = []
                 cos_sims = []
                 top1_matches = []
@@ -263,7 +374,6 @@ class LayerSensitivityAnalyzer:
                         mod_sess, ids, self.num_tokens, ref_tokens=ref_tokens,
                     )
 
-                    # Compare per-step logits
                     bl_results = baseline_all[prompt_idx]
                     for step_idx in range(min(len(bl_results), len(mod_results))):
                         bl_logits = bl_results[step_idx][1]
@@ -271,7 +381,9 @@ class LayerSensitivityAnalyzer:
                         kl_divs.append(_kl_divergence(bl_logits, mod_logits))
                         cos_sims.append(_cosine_similarity(bl_logits, mod_logits))
                         top1_matches.append(
-                            1.0 if bl_logits.argmax() == mod_logits.argmax() else 0.0
+                            1.0
+                            if bl_logits.argmax() == mod_logits.argmax()
+                            else 0.0
                         )
 
                 del mod_sess
@@ -300,7 +412,6 @@ class LayerSensitivityAnalyzer:
                     original_init_restored
                 )
 
-            # Classify by worst-case (int4) KL
             worst_kl = max(layer_kl.values()) if layer_kl else 0.0
             result = SensitivityResult(
                 layer_name=node_name,
@@ -311,10 +422,10 @@ class LayerSensitivityAnalyzer:
             )
             results.layers.append(result)
 
-            # Summary line
             parts = [f"{b}bit={layer_kl[b]:.10f}" for b in sorted(layer_kl)]
             logger.info(
-                "  → %s: %s [%s]", node_name, ", ".join(parts), result.classification,
+                "  → %s: %s [%s]",
+                node_name, ", ".join(parts), result.classification,
             )
 
         # Cleanup
@@ -328,7 +439,6 @@ class LayerSensitivityAnalyzer:
             )
         logger.info("Sensitivity summary: %s", classifications)
 
-        # Save results
         if output_path:
             results.save(output_path)
         if config_output_path:
@@ -349,43 +459,75 @@ class LayerSensitivityAnalyzer:
         if self.tokenizer_path and self.tokenizer_path.exists():
             try:
                 from tokenizers import Tokenizer
+
                 self._tokenizer = Tokenizer.from_file(str(self.tokenizer_path))
                 return self._tokenizer
             except ImportError:
                 logger.warning("tokenizers not installed")
         return None
 
+    def _detect_eos_tokens(self) -> set[int]:
+        """Auto-detect EOS/stop token IDs from the tokenizer."""
+        tok = self._load_tokenizer()
+        eos_ids = set()
+        if tok is None:
+            return {1, 2}  # common defaults
+
+        # Check tokenizer special tokens
+        model_json = tok.to_str()
+        model_data = json.loads(model_json)
+
+        # Look for added_tokens with special=true that look like EOS/end
+        added = model_data.get("added_tokens", [])
+        for t in added:
+            if not t.get("special", False):
+                continue
+            content = t.get("content", "").lower()
+            tid = t.get("id")
+            if tid is not None and any(
+                k in content
+                for k in ("</s>", "<eos>", "end_of_turn", "<|end|>", "<|eot_id|>")
+            ):
+                eos_ids.add(tid)
+
+        if not eos_ids:
+            eos_ids = {1}  # fallback: common EOS
+
+        return eos_ids
+
     def _tokenize_prompts(self) -> list[list[int]]:
-        """Tokenise calibration prompts using Gemma chat template."""
+        """Tokenise calibration prompts.
+
+        Supports:
+        1. Pre-tokenized file (JSON list of int lists) — skips tokenization
+        2. Chat template with {system}/{user} placeholders
+        3. Plain text tokenization (no template)
+        """
+        # Option 1: Pre-tokenized file
+        if self.pre_tokenized_file and self.pre_tokenized_file.exists():
+            data = json.loads(self.pre_tokenized_file.read_text())
+            logger.info("Loaded %d pre-tokenized sequences", len(data))
+            return data
+
+        # Need tokenizer for options 2 and 3
         tok = self._load_tokenizer()
         if tok is None:
             raise RuntimeError(
                 "Tokenizer is required for sensitivity analysis. "
-                "Provide --tokenizer path/to/tokenizer.json"
+                "Provide --tokenizer or --pre-tokenized-file"
             )
-
-        def encode_turn(content, role):
-            """Encode a single turn in Gemma chat format."""
-            start_turn = tok.decode([105], skip_special_tokens=False)
-            end_turn = tok.decode([106], skip_special_tokens=False)
-            if role == "model":
-                text = start_turn + "model\n"
-            else:
-                text = start_turn + role + "\n" + content + end_turn + "\n"
-            ids = tok.encode(text).ids
-            if ids and ids[0] == _BOS_ID:
-                ids = ids[1:]
-            return ids
 
         all_ids = []
         for prompt in self.prompts:
-            ids = (
-                [_BOS_ID]
-                + encode_turn(self.system_prompt, "system")
-                + encode_turn(prompt, "user")
-                + encode_turn("", "model")
+            # Apply chat template
+            text = self.chat_template.format(
+                system=self.system_prompt,
+                user=prompt,
             )
+            ids = tok.encode(text).ids
             all_ids.append(ids)
+            logger.debug("Prompt tokenized: %d tokens", len(ids))
+
         return all_ids
 
     def _decode_tokens(self, token_ids: list[int]) -> str:
@@ -400,12 +542,6 @@ class LayerSensitivityAnalyzer:
             return int(self._token_lut[reduced_idx])
         return reduced_idx
 
-    def _full_to_reduced(self, full_id: int) -> int | None:
-        """Map full-vocab token ID to reduced-vocab index (None if not in vocab)."""
-        if self._reverse_lut is not None:
-            return self._reverse_lut.get(full_id)
-        return full_id
-
     def _collect_logits(
         self,
         sess,
@@ -413,46 +549,39 @@ class LayerSensitivityAnalyzer:
         n_gen: int,
         ref_tokens: list[int] | None = None,
     ) -> list[tuple[int, np.ndarray]]:
-        """Run autoregressive inference, returning (full_token_id, logits) per step.
-
-        Parameters
-        ----------
-        sess : ORT session
-        prompt_ids : tokenized prompt (full-vocab token IDs)
-        n_gen : number of tokens to generate after prompt
-        ref_tokens : if provided, feed these full-vocab token IDs instead of
-                     model predictions (teacher forcing)
-        """
+        """Run autoregressive inference, returning (full_token_id, logits) per step."""
+        arch = self._arch
         emb = self._embeddings
-        kv = {
-            f"past_key_values.{i}.key_value": np.zeros(
-                (1, 2, _MAX_SEQ, _HEAD_DIM), dtype=np.float32
-            )
-            for i in range(self.num_layers)
-        }
+        eos_ids = self._detected_eos or set()
+
+        # Initialize KV cache from model inputs
+        kv = {}
+        for name, shape in arch["kv_inputs"].items():
+            kv[name] = np.zeros(shape, dtype=np.float32)
+
         out_names = [o.name for o in sess.get_outputs()]
 
         pos = 0
         logits = None
 
-        # Process prompt tokens (full-vocab IDs → embedding lookup)
+        # Process prompt tokens
         for tok in prompt_ids:
-            logits = self._step(sess, emb, kv, tok, pos, out_names)
+            logits = self._step(sess, emb, kv, tok, pos, out_names, arch)
             pos += 1
 
         # Generate tokens
         results = []
-        # logits are over reduced vocab; argmax gives reduced index
         reduced_idx = int(logits.argmax())
         full_tok = self._reduced_to_full(reduced_idx)
         results.append((full_tok, logits.copy()))
 
         for i in range(n_gen - 1):
-            # Teacher forcing: ref_tokens are full-vocab IDs
-            feed_tok = ref_tokens[i] if ref_tokens and i < len(ref_tokens) else full_tok
-            if feed_tok in (_EOS_ID, _END_TURN_ID):
+            feed_tok = (
+                ref_tokens[i] if ref_tokens and i < len(ref_tokens) else full_tok
+            )
+            if feed_tok in eos_ids:
                 break
-            logits = self._step(sess, emb, kv, feed_tok, pos, out_names)
+            logits = self._step(sess, emb, kv, feed_tok, pos, out_names, arch)
             pos += 1
             reduced_idx = int(logits.argmax())
             full_tok = self._reduced_to_full(reduced_idx)
@@ -461,18 +590,39 @@ class LayerSensitivityAnalyzer:
         return results
 
     @staticmethod
-    def _step(sess, emb, kv, token_id, pos, out_names):
+    def _step(sess, emb, kv, token_id, pos, out_names, arch):
         """Run a single autoregressive step."""
         e = emb[token_id].astype(np.float32).reshape(1, 1, -1)
-        feeds = {
-            "token_embedding": e,
-            "position_ids": np.array([[pos]], dtype=np.int64),
-        }
+        feeds = {}
+
+        # Embedding input
+        emb_name = arch["embedding_input"]
+        feeds[emb_name] = e
+
+        # Position input (if present)
+        if arch["position_input"]:
+            pos_name = arch["position_input"]
+            # Detect dtype from session inputs
+            for inp in sess.get_inputs():
+                if inp.name == pos_name:
+                    dtype_str = inp.type.replace("tensor(", "").replace(")", "")
+                    if dtype_str == "int32":
+                        feeds[pos_name] = np.array([[pos]], dtype=np.int32)
+                    else:
+                        feeds[pos_name] = np.array([[pos]], dtype=np.int64)
+                    break
+
+        # KV cache inputs
         feeds.update(kv)
+
         outs = sess.run(None, feeds)
-        # Update KV cache
-        for i, name in enumerate(out_names[1:], 1):
-            kv[name.replace("present.", "past_key_values.")] = outs[i]
+
+        # Update KV cache using output→input mapping
+        kv_map = arch["kv_output_map"]
+        for i, name in enumerate(out_names):
+            if name in kv_map:
+                kv[kv_map[name]] = outs[i]
+
         return outs[0][0, -1]  # logits for last position
 
     @staticmethod
@@ -505,7 +655,9 @@ class LayerSensitivityAnalyzer:
                     for d in t.shape.dim
                 ]
                 new_inputs.append(
-                    helper.make_tensor_value_info(inp.name, TensorProto.FLOAT, shape)
+                    helper.make_tensor_value_info(
+                        inp.name, TensorProto.FLOAT, shape
+                    )
                 )
             else:
                 new_inputs.append(inp)
@@ -519,7 +671,9 @@ class LayerSensitivityAnalyzer:
                     for d in t.shape.dim
                 ]
                 new_outputs.append(
-                    helper.make_tensor_value_info(out.name, TensorProto.FLOAT, shape)
+                    helper.make_tensor_value_info(
+                        out.name, TensorProto.FLOAT, shape
+                    )
                 )
             else:
                 new_outputs.append(out)
@@ -530,7 +684,8 @@ class LayerSensitivityAnalyzer:
                 new_attrs = []
                 for attr in node.attribute:
                     if attr.name == "to" and attr.i in (
-                        TensorProto.BFLOAT16, TensorProto.FLOAT16
+                        TensorProto.BFLOAT16,
+                        TensorProto.FLOAT16,
                     ):
                         new_attr = onnx.AttributeProto()
                         new_attr.name = "to"
@@ -540,7 +695,10 @@ class LayerSensitivityAnalyzer:
                     else:
                         new_attrs.append(attr)
                 nn = helper.make_node(
-                    node.op_type, list(node.input), list(node.output), name=node.name
+                    node.op_type,
+                    list(node.input),
+                    list(node.output),
+                    name=node.name,
                 )
                 nn.attribute.extend(new_attrs)
                 new_nodes.append(nn)

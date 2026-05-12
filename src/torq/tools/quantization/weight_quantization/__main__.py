@@ -154,8 +154,8 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tokenizer",
         type=str,
-        required=True,
-        help="Path to tokenizer.json for prompt tokenization (required)",
+        default=None,
+        help="Path to tokenizer.json for prompt tokenization",
     )
     parser.add_argument(
         "--embeddings",
@@ -168,12 +168,6 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="Path to token_id_lut.npy for reduced-vocab models (maps reduced index → full vocab ID)",
-    )
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=18,
-        help="Number of transformer layers for KV cache init (default: %(default)s)",
     )
     parser.add_argument(
         "--bits",
@@ -202,6 +196,31 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         help="JSON file with list of calibration prompt strings",
     )
     parser.add_argument(
+        "--pre-tokenized-file",
+        type=str,
+        default=None,
+        help="JSON file with pre-tokenized token ID lists (skips tokenization)",
+    )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help="Chat template format string with {system} and {user} placeholders",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="System prompt text for chat template",
+    )
+    parser.add_argument(
+        "--eos-token-ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Token IDs that stop generation (auto-detected from tokenizer if omitted)",
+    )
+    parser.add_argument(
         "--bf16-threshold",
         type=float,
         default=0.1,
@@ -220,12 +239,6 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         help="Layer name substrings to skip (e.g. lm_head)",
     )
-    parser.add_argument(
-        "--system-prompt",
-        type=str,
-        default=None,
-        help="System prompt for chat template (default: Gemma-3 assistant prompt)",
-    )
 
 
 def _run_analyze(args: argparse.Namespace) -> None:
@@ -241,9 +254,11 @@ def _run_analyze(args: argparse.Namespace) -> None:
         tokenizer_path=args.tokenizer,
         token_lut_path=args.token_lut,
         calibration_prompts=prompts,
+        pre_tokenized_file=args.pre_tokenized_file,
+        chat_template=args.chat_template,
         system_prompt=args.system_prompt,
+        eos_token_ids=args.eos_token_ids,
         num_tokens=args.num_tokens,
-        num_layers=args.num_layers,
         skip_layers=args.skip_layers,
     )
     analyzer.analyze(
