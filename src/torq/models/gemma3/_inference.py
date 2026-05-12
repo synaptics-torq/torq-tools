@@ -26,7 +26,10 @@ from ...inference.runners import (
     TFLiteInferenceRunner
 )
 
-DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named Gemma. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
+DEFAULT_SYS_PROMPT: Final[str] = (
+    "You are a helpful AI assistant named Gemma. "
+    "Answer in 1-2 sentences. No lists, no bullet points, no repetition."
+)
 
 
 def _default_repo_id(instruct_model: bool) -> str:
@@ -116,6 +119,7 @@ class Gemma3Base(ABC):
         self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
         self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
         self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
+        self._end_of_turn_id: int = self._tokenizer.token_to_id("<end_of_turn>")
         self._logger.info("Loaded model '%s'", str(self._model.model_path))
 
         self._n_tokens_gen: int = 0
@@ -211,16 +215,26 @@ class Gemma3Base(ABC):
             num_tokens_gen += 1
         return next_token, num_tokens_gen
     
-    def _tokenize_input(self, input: str, role: str) -> list[int]:
-        if not self._instruct_model:
+    def _tokenize_input(self, input: str, role: str | None = None) -> list[int]:
+        if not self._instruct_model or role is None:
             return self._tokenizer.encode(input).ids
-        if role == "assistant":
-            return self._tokenizer.encode(self._bos_token + role + "\n").ids
-        return self._tokenizer.encode(self._bos_token + role + "\n" + input + self._eos_token + "\n").ids
+        # Gemma 3 chat format: <start_of_turn>role\ntext<end_of_turn>\n
+        # BOS is added once at warmup start; strip auto-prepended BOS here.
+        if role == "model":
+            ids = self._tokenizer.encode("<start_of_turn>model\n").ids
+        else:
+            ids = self._tokenizer.encode(
+                "<start_of_turn>" + role + "\n" + input + "<end_of_turn>\n"
+            ).ids
+        if ids and ids[0] == self._bos_token_id:
+            ids = ids[1:]
+        return ids
 
     def run(self, input: str, max_gen_tokens: int | None = None) -> str:
         self._reset_cache()
         inp_tokens = self._tokenize_input(input, "user")
+        if self._instruct_model:
+            inp_tokens += self._tokenize_input("", "model")
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
         output = self._tokenizer.decode(out_tokens)
@@ -232,7 +246,7 @@ class Gemma3Base(ABC):
         if not self._instruct_model:
             self._logger.warning("Not an instruct model, skipping system prompt warm-up")
             return 0
-        sys_tokens = self._tokenize_input(self._sys_prompt, "system")
+        sys_tokens = [self._bos_token_id] + self._tokenize_input(self._sys_prompt, "system")
         if isinstance(self._max_prompt_tokens, int):
             if len(sys_tokens) > self._max_prompt_tokens:
                 self._logger.warning("Truncating system prompt from %d to %d", len(sys_tokens), self.max_inp_len)
@@ -349,10 +363,13 @@ class Gemma3Dynamic(Gemma3Base):
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
+            return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:
                 return True
             return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,
@@ -506,10 +523,13 @@ class Gemma3Static(Gemma3Base):
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
+            return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:
                 return True
             return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,
