@@ -185,7 +185,7 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=5,
+        default=20,
         help="Number of output tokens to evaluate per prompt (default: %(default)s)",
     )
     parser.add_argument(

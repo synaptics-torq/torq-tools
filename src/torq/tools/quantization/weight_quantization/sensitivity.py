@@ -38,6 +38,23 @@ _DEFAULT_PROMPTS = [
     "What is the capital of France?",
     "Explain how photosynthesis works.",
     "The speed of light is approximately",
+    "Who wrote Romeo and Juliet?",
+    "What is the largest planet in our solar system?",
+    "How does a computer processor work?",
+    "What causes earthquakes?",
+    "Describe the water cycle in nature.",
+    "What is the theory of relativity?",
+    "How do vaccines work to prevent disease?",
+    "What is machine learning?",
+    "Explain the concept of supply and demand.",
+    "What are the main layers of the Earth?",
+    "How does electricity flow through a circuit?",
+    "What is DNA and why is it important?",
+    "Describe how airplanes generate lift.",
+    "What is the greenhouse effect?",
+    "How does the human immune system work?",
+    "What are prime numbers?",
+    "Explain how a neural network learns.",
 ]
 
 
@@ -66,7 +83,7 @@ class LayerSensitivityAnalyzer:
         tokenizer_path: str | Path | None = None,
         token_lut_path: str | Path | None = None,
         calibration_prompts: list[str] | None = None,
-        num_tokens: int = 5,
+        num_tokens: int = 20,
         num_layers: int = 18,
         skip_layers: list[str] | None = None,
     ):
