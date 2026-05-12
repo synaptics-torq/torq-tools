@@ -230,6 +230,34 @@ def _bf16_raw_to_fp32(raw: bytes, shape: tuple[int, ...]) -> np.ndarray:
     return fp32
 
 
+def _pack_int4(values: np.ndarray) -> bytes:
+    """Pack int4 values (range [-8, 7]) into bytes, 2 values per byte.
+
+    ONNX INT4 packing: low nibble first, high nibble second.
+    Values are stored as unsigned nibbles: ``(val & 0xF)``.
+    """
+    flat = values.flatten().astype(np.int8)
+    # Pad to even length
+    if len(flat) % 2 != 0:
+        flat = np.append(flat, np.int8(0))
+    low = flat[0::2].astype(np.uint8) & 0x0F
+    high = flat[1::2].astype(np.uint8) & 0x0F
+    packed = low | (high << 4)
+    return packed.tobytes()
+
+
+def _make_int4_initializer(
+    name: str, values: np.ndarray, shape: tuple[int, ...]
+) -> TensorProto:
+    """Create an ONNX TensorProto with INT4 dtype from int8 values [-8, 7]."""
+    init = TensorProto()
+    init.name = name
+    init.dims[:] = list(shape)
+    init.data_type = TensorProto.INT4
+    init.raw_data = _pack_int4(values)
+    return init
+
+
 # ---------------------------------------------------------------------------
 # WeightQuantizer — operates on an ONNX model
 # ---------------------------------------------------------------------------
@@ -393,7 +421,10 @@ class WeightQuantizer:
             zp_name = f"{weight_name}_zero_points"
 
             # Quantized weight initializer
-            q_init = numpy_helper.from_array(qw.quantized, name=q_name)
+            if layer_cfg.bits == 4:
+                q_init = _make_int4_initializer(q_name, qw.quantized, qw.quantized.shape)
+            else:
+                q_init = numpy_helper.from_array(qw.quantized, name=q_name)
 
             # Scales as bf16
             s_init = TensorProto()
@@ -403,7 +434,10 @@ class WeightQuantizer:
             s_init.raw_data = _fp32_to_bf16_raw(qw.scales)
 
             # Zero points
-            zp_init = numpy_helper.from_array(qw.zero_points, name=zp_name)
+            if layer_cfg.bits == 4:
+                zp_init = _make_int4_initializer(zp_name, qw.zero_points, qw.zero_points.shape)
+            else:
+                zp_init = numpy_helper.from_array(qw.zero_points, name=zp_name)
 
             # Remove old weight initializer
             if weight_name in init_map:
@@ -549,6 +583,8 @@ class WeightQuantizer:
         skip_dtypes = {
             TensorProto.INT8,
             TensorProto.UINT8,
+            TensorProto.INT4,
+            TensorProto.UINT4,
             TensorProto.BFLOAT16,
         }
 
