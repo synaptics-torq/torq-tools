@@ -62,7 +62,7 @@ def quantize_int8_asymmetric(
 
     Returns
     -------
-    QuantizedWeight with uint8 quantized values, fp32 scales, uint8 zero points.
+    QuantizedWeight with int8 quantized values, fp32 scales, int8 zero points.
     """
     weight = weight.astype(np.float32)
     K, N = weight.shape
@@ -80,15 +80,20 @@ def quantize_int8_asymmetric(
 
     scale = (w_max - w_min) / 255.0
     scale = np.maximum(scale, 1e-10)
-    zp = np.round(-w_min / scale).clip(0, 255).astype(np.uint8)
-    q = np.round(w_blocked / scale + zp.astype(np.float32)).clip(0, 255).astype(
+    # Compute in uint8 space then convert to int8 (subtract 128)
+    zp_u8 = np.round(-w_min / scale).clip(0, 255).astype(np.uint8)
+    q_u8 = np.round(w_blocked / scale + zp_u8.astype(np.float32)).clip(0, 255).astype(
         np.uint8
     )
+    # Convert to int8: int8 = uint8 - 128
+    # (int8_q - int8_zp) * scale = (uint8_q - uint8_zp) * scale
+    q = (q_u8.astype(np.int16) - 128).astype(np.int8)
+    zp = (zp_u8.astype(np.int16) - 128).astype(np.int8)
 
     # Reshape back to (K, N) storage layout for DequantizeLinear axis=0
-    q_kn = q.reshape(N, n_blocks * block_size)[:, :K].T.copy()  # (K, N) uint8
+    q_kn = q.reshape(N, n_blocks * block_size)[:, :K].T.copy()  # (K, N) int8
     s_kn = scale.reshape(N, n_blocks).T.copy()  # (n_blocks, N) fp32
-    zp_kn = zp.reshape(N, n_blocks).T.copy()  # (n_blocks, N) uint8
+    zp_kn = zp.reshape(N, n_blocks).T.copy()  # (n_blocks, N) int8
 
     return QuantizedWeight(
         quantized=q_kn,
