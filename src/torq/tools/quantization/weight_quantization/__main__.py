@@ -154,8 +154,20 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tokenizer",
         type=str,
-        default=None,
-        help="Path to tokenizer.json for calibration prompt tokenization",
+        required=True,
+        help="Path to tokenizer.json for prompt tokenization (required)",
+    )
+    parser.add_argument(
+        "--embeddings",
+        type=str,
+        required=True,
+        help="Path to token_embeddings.npy for embedding lookup (required)",
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=18,
+        help="Number of transformer layers for KV cache init (default: %(default)s)",
     )
     parser.add_argument(
         "--bits",
@@ -213,9 +225,11 @@ def _run_analyze(args: argparse.Namespace) -> None:
 
     analyzer = LayerSensitivityAnalyzer(
         model_path=args.input,
+        embeddings_path=args.embeddings,
         tokenizer_path=args.tokenizer,
         calibration_prompts=prompts,
         num_tokens=args.num_tokens,
+        num_layers=args.num_layers,
         skip_layers=args.skip_layers,
     )
     analyzer.analyze(
