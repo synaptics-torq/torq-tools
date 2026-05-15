@@ -407,6 +407,9 @@ class Gemma3Static(Gemma3Base):
         self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
             model.model_path
         )
+        self._token_id_lut: np.ndarray | None = self._find_token_id_lut(
+            model.model_path
+        )
         config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
         tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
@@ -422,6 +425,11 @@ class Gemma3Static(Gemma3Base):
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
+        if self._token_id_lut is not None:
+            self._logger.info(
+                "Loaded token ID LUT (%d entries) for trimmed vocab remap",
+                len(self._token_id_lut),
+            )
 
     @classmethod
     def from_onnx(
@@ -464,21 +472,41 @@ class Gemma3Static(Gemma3Base):
         )
 
     @staticmethod
-    def _find_token_embeddings(
+    def _find_data_file(
         model_path: str | os.PathLike,
-        emb_pattern: str = "token_embeddings.npy",
-    ) -> np.ndarray | None:
-        paths = []
-        paths.extend(Path(model_path).parent.glob(emb_pattern))
+        pattern: str,
+        description: str,
+    ) -> Path | None:
+        paths = list(Path(model_path).parent.glob(pattern))
         if not paths:
             return None
 
         paths = list({p.resolve(): p for p in paths}.values())
         if len(paths) > 1:
             raise RuntimeError(
-                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+                f"Expected a single {description} file, found {len(paths)}: {paths}"
             )
-        return np.load(paths[0])
+        return paths[0]
+
+    @staticmethod
+    def _find_token_embeddings(
+        model_path: str | os.PathLike,
+        emb_pattern: str = "token_embeddings.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, emb_pattern, "token embedding")
+        if path is None:
+            return None
+        return np.load(path)
+
+    @staticmethod
+    def _find_token_id_lut(
+        model_path: str | os.PathLike,
+        lut_pattern: str = "token_id_lut.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, lut_pattern, "token ID LUT")
+        if path is None:
+            return None
+        return np.load(path)
 
     def _init_cache(self) -> dict[str, np.ndarray]:
         if self._combined_kv_io:
@@ -518,6 +546,13 @@ class Gemma3Static(Gemma3Base):
         })
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
+        if self._token_id_lut is not None:
+            if next_token >= len(self._token_id_lut):
+                raise RuntimeError(
+                    f"Sampled compact token index {next_token} outside token ID LUT "
+                    f"with {len(self._token_id_lut)} entries"
+                )
+            next_token = int(self._token_id_lut[next_token])
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
