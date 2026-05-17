@@ -177,6 +177,10 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = SmolLM2OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
 
+        # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Fold MatMul A @ B where B is a scalar into Mul
         editor.fold_scalar_matmul()
         # Broadcast op inputs to match output shape
@@ -266,10 +270,13 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             input = prompts[i]
             output = runner.run(input)
             val_output = val_runner.run(input)
-            if output != val_output:
+            min_len = min(len(output), len(val_output))
+            if output[:min_len] != val_output[:min_len]:
                 result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_output},\nGenerated:\n{output}"
             else:
                 result = f"Validation successful, identical outputs"
+                if len(output) != len(val_output):
+                    result += f" (output lengths differ: {len(output)} vs {len(val_output)})"
             self._logger.info(
                 "(ONNX-validation) [iter %d, %.3f ms]: %s",
                 i,

@@ -297,6 +297,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
         # Replace constant Div ops with Mul
         editor.replace_constant_div_with_mul()
+        # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Broadcast op inputs to match output shape
         if self._broadcast_ops is not None:
             editor.broadcast_op_inputs(
@@ -309,7 +313,12 @@ class MoonshineModelExporter(OnnxModelExporterBase):
     def _patch_static_decoder(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+        with_past = "with_past" in component
 
+        # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
+        editor.eliminate_transposes()
+        # Collapse consecutive Reshape chains
+        editor.collapse_reshape_chains()
         # Fold MatMul A @ B where B is a scalar into Mul
         editor.fold_scalar_matmul()
         # Manually dequantize projection scores
@@ -342,7 +351,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         if not self._keep_individual_kv_io:
             n_kv_heads = self._config.decoder_num_attention_heads
             head_dim = self._hidden_size // n_kv_heads
-            with_past = "with_past" in component
             dec_seq_len = self._max_tokens if with_past else 1
             # Combine decoder (self-attn) key+value into single tensor per layer
             editor.combine_kv_io_tensors(
@@ -356,6 +364,9 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                 kv_layer_re=r"\.(\d+)\.encoder\.(key|value)$",
                 combined_name_fmt="{prefix}.{layer}.encoder"
             )
+        
+        if with_past:
+            editor.reorder_graph_input("current_len", 1)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)

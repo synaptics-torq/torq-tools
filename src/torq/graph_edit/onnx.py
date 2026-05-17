@@ -3,7 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from collections.abc import Iterable, Mapping, Sequence
 
@@ -44,6 +44,7 @@ class FixedDimMapping:
 class OnnxGraphEdit(ABC):
     graph: gs.Graph
     graph_name: str
+    requires_shape_inference: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self._logger = logging.getLogger(f"{self.name}[{self.graph_name}]")
@@ -162,20 +163,28 @@ class OnnxGraphEditor:
             self.register_edit(edit, name)
 
     def apply_edit(self, edit: OnnxGraphEdit | str):
+        if isinstance(edit, str):
+            edit = self._edits[edit]
         for node in self._graph.nodes:
-            if isinstance(edit, str):
-                edit = self._edits[edit]
             edit(node)
         self._graph = self._graph.cleanup(
             remove_unused_graph_inputs=True,
             remove_unused_node_outputs=True
         ).toposort()
+        if edit.requires_shape_inference:
+            self._infer_shapes()
         return self
 
     def apply_edits(self, edits: Sequence[OnnxGraphEdit | str]):
         for edit in edits:
             self.apply_edit(edit)
         return self
+
+    def _infer_shapes(self):
+        model = onnx.shape_inference.infer_shapes(
+            gs.export_onnx(self._graph), check_type=True, strict_mode=True, data_prop=True
+        )
+        self._graph = gs.import_onnx(model)
 
     def fix_io_dims(self, to_fix: list[FixedDimMapping] | None = None):
         to_fix = tuple(to_fix or [])

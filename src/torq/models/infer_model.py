@@ -5,6 +5,7 @@ import argparse
 
 from .moonshine import add_moonshine_infer_args
 from .smollm2 import add_smollm2_infer_args
+from .gemma3 import add_gemma3_infer_args
 
 
 def main():
@@ -17,6 +18,9 @@ def main():
     smollm2 = model.add_parser("smollm2", help="Run SmolLM2 inference")
     add_smollm2_infer_args(smollm2)
 
+    gemma3 = model.add_parser("gemma3", help="Run Gemma3 inference")
+    add_gemma3_infer_args(gemma3)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -25,6 +29,9 @@ def main():
     elif args.model_name == "smollm2":
         from .smollm2.infer import infer_smollm2
         infer_smollm2(args)
+    elif args.model_name == "gemma3":
+        from .gemma3.infer import infer_gemma3
+        infer_gemma3(args)
 
 
 if __name__ == "__main__":

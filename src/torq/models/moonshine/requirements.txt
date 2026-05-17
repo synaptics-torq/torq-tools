@@ -6,3 +6,5 @@ torchcodec
 whisper-openai
 jiwer
 openpyxl
+pandas
+tqdm

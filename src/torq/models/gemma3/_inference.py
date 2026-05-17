@@ -26,7 +26,33 @@ from ...inference.runners import (
     TFLiteInferenceRunner
 )
 
-DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named SmolLM. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
+DEFAULT_SYS_PROMPT: Final[str] = (
+    "You are a helpful AI assistant named Gemma. "
+    "Answer in 1-2 sentences. No lists, no bullet points, no repetition."
+)
+
+
+def _default_repo_id(instruct_model: bool) -> str:
+    repo_id = "google/gemma-3-270m"
+    if instruct_model:
+        repo_id += "-it"
+    return repo_id
+
+
+def _resolve_asset_path(
+    model_path: str | os.PathLike,
+    asset_name: str,
+    repo_id: str | None,
+    instruct_model: bool,
+) -> str:
+    local_path = Path(model_path).parent / asset_name
+    if local_path.exists():
+        return str(local_path)
+    repo_id = repo_id or _default_repo_id(instruct_model)
+    try:
+        return hf_hub_download(repo_id, asset_name, local_files_only=True)
+    except Exception:
+        return hf_hub_download(repo_id, asset_name)
 
 
 @dataclass(frozen=True)
@@ -47,7 +73,7 @@ class ModelConfig:
             return cls(
                 config["num_hidden_layers"],
                 config["num_key_value_heads"],
-                config["hidden_size"] // config["num_attention_heads"],
+                config["head_dim"],
                 config["bos_token_id"],
                 config["eos_token_id"],
                 config.get("pad_token_id"),
@@ -57,7 +83,7 @@ class ModelConfig:
             raise ValueError(f"Model config missing required metadata: {e}")
 
 
-class SmolLM2Base(ABC):
+class Gemma3Base(ABC):
 
     def __init__(
         self,
@@ -89,9 +115,11 @@ class SmolLM2Base(ABC):
         self._bos_token_id: int = config.bos_token_id
         self._eos_token_id: int = config.eos_token_id
         self._pad_token_id: int = config.pad_token_id or 0
-        self._nl_token_id: int = self._tokenizer.encode("\n").ids[0]
+        self._nl_token_id: int = self._tokenizer.encode("\n").ids[-1]
+        self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
         self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
         self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
+        self._end_of_turn_id: int = self._tokenizer.token_to_id("<end_of_turn>")
         self._logger.info("Loaded model '%s'", str(self._model.model_path))
 
         self._n_tokens_gen: int = 0
@@ -187,16 +215,26 @@ class SmolLM2Base(ABC):
             num_tokens_gen += 1
         return next_token, num_tokens_gen
     
-    def _tokenize_input(self, input: str, role: str) -> list[int]:
-        if not self._instruct_model:
+    def _tokenize_input(self, input: str, role: str | None = None) -> list[int]:
+        if not self._instruct_model or role is None:
             return self._tokenizer.encode(input).ids
-        if role == "assistant":
-            return self._tokenizer.encode(self._bos_token + role + "\n").ids
-        return self._tokenizer.encode(self._bos_token + role + "\n" + input + self._eos_token + "\n").ids
+        # Gemma 3 chat format: <start_of_turn>role\ntext<end_of_turn>\n
+        # BOS is added once at warmup start; strip auto-prepended BOS here.
+        if role == "model":
+            ids = self._tokenizer.encode("<start_of_turn>model\n").ids
+        else:
+            ids = self._tokenizer.encode(
+                "<start_of_turn>" + role + "\n" + input + "<end_of_turn>\n"
+            ).ids
+        if ids and ids[0] == self._bos_token_id:
+            ids = ids[1:]
+        return ids
 
     def run(self, input: str, max_gen_tokens: int | None = None) -> str:
         self._reset_cache()
         inp_tokens = self._tokenize_input(input, "user")
+        if self._instruct_model:
+            inp_tokens += self._tokenize_input("", "model")
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
         output = self._tokenizer.decode(out_tokens)
@@ -208,7 +246,7 @@ class SmolLM2Base(ABC):
         if not self._instruct_model:
             self._logger.warning("Not an instruct model, skipping system prompt warm-up")
             return 0
-        sys_tokens = self._tokenize_input(self._sys_prompt, "system")
+        sys_tokens = [self._bos_token_id] + self._tokenize_input(self._sys_prompt, "system")
         if isinstance(self._max_prompt_tokens, int):
             if len(sys_tokens) > self._max_prompt_tokens:
                 self._logger.warning("Truncating system prompt from %d to %d", len(sys_tokens), self.max_inp_len)
@@ -232,7 +270,7 @@ class SmolLM2Base(ABC):
         return warmup_len
 
 
-class SmolLM2Dynamic(SmolLM2Base):
+class Gemma3Dynamic(Gemma3Base):
 
     def __init__(
         self,
@@ -242,20 +280,18 @@ class SmolLM2Dynamic(SmolLM2Base):
         instruct_model: bool = False,
         repo_id: str | None = None
     ):
-        if repo_id is None:
-            repo_id: str = "HuggingFaceTB/SmolLM2-135M"
-            if instruct_model:
-                repo_id += "-Instruct"
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
@@ -265,13 +301,15 @@ class SmolLM2Dynamic(SmolLM2Base):
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
+        max_gen_tokens: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None
-    ) -> "SmolLM2Dynamic":
+    ) -> "Gemma3Dynamic":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id
         )
@@ -281,13 +319,15 @@ class SmolLM2Dynamic(SmolLM2Base):
         cls,
         model_path: str | os.PathLike,
         max_inp_len: int | None = None,
+        max_gen_tokens: int | None = None,
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None
-    ) -> "SmolLM2Dynamic":
+    ) -> "Gemma3Dynamic":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id
         )
@@ -314,7 +354,6 @@ class SmolLM2Dynamic(SmolLM2Base):
         inputs = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
-            "position_ids": pos_ids,
             **self._kv_cache
         }
         logits, *cache = self._model.infer(inputs)
@@ -324,9 +363,13 @@ class SmolLM2Dynamic(SmolLM2Base):
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
-        if not self._instruct_model:
-            # WARNING: relying on "\n\n" is fragile but is the best we have right now
-            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
+            return True
+        if not self._instruct_model and len(gen_tokens) > 2:
+            if next_token == self._double_nl_token_id:
+                return True
+            return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,
@@ -349,7 +392,7 @@ class SmolLM2Dynamic(SmolLM2Base):
         return gen_tokens
 
 
-class SmolLM2Static(SmolLM2Base):
+class Gemma3Static(Gemma3Base):
 
     def __init__(
         self,
@@ -360,27 +403,33 @@ class SmolLM2Static(SmolLM2Base):
         repo_id: str | None = None,
         combined_kv_io: bool = True
     ):
-        if repo_id is None:
-            repo_id: str = "HuggingFaceTB/SmolLM2-135M"
-            if instruct_model:
-                repo_id += "-Instruct"
         self._combined_kv_io = combined_kv_io
         self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
             model.model_path
         )
+        self._token_id_lut: np.ndarray | None = self._find_token_id_lut(
+            model.model_path
+        )
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
+        if self._token_id_lut is not None:
+            self._logger.info(
+                "Loaded token ID LUT (%d entries) for trimmed vocab remap",
+                len(self._token_id_lut),
+            )
 
     @classmethod
     def from_onnx(
@@ -392,7 +441,7 @@ class SmolLM2Static(SmolLM2Base):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True
-    ) -> "SmolLM2Static": 
+    ) -> "Gemma3Static": 
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -412,7 +461,7 @@ class SmolLM2Static(SmolLM2Base):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True
-    ) -> "SmolLM2Static":
+    ) -> "Gemma3Static":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -423,21 +472,41 @@ class SmolLM2Static(SmolLM2Base):
         )
 
     @staticmethod
-    def _find_token_embeddings(
+    def _find_data_file(
         model_path: str | os.PathLike,
-        emb_pattern: str = "token_embeddings.npy",
-    ) -> np.ndarray | None:
-        paths = []
-        paths.extend(Path(model_path).parent.glob(emb_pattern))
+        pattern: str,
+        description: str,
+    ) -> Path | None:
+        paths = list(Path(model_path).parent.glob(pattern))
         if not paths:
             return None
 
         paths = list({p.resolve(): p for p in paths}.values())
         if len(paths) > 1:
             raise RuntimeError(
-                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+                f"Expected a single {description} file, found {len(paths)}: {paths}"
             )
-        return np.load(paths[0])
+        return paths[0]
+
+    @staticmethod
+    def _find_token_embeddings(
+        model_path: str | os.PathLike,
+        emb_pattern: str = "token_embeddings.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, emb_pattern, "token embedding")
+        if path is None:
+            return None
+        return np.load(path)
+
+    @staticmethod
+    def _find_token_id_lut(
+        model_path: str | os.PathLike,
+        lut_pattern: str = "token_id_lut.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, lut_pattern, "token ID LUT")
+        if path is None:
+            return None
+        return np.load(path)
 
     def _init_cache(self) -> dict[str, np.ndarray]:
         if self._combined_kv_io:
@@ -477,14 +546,25 @@ class SmolLM2Static(SmolLM2Base):
         })
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
+        if self._token_id_lut is not None:
+            if next_token >= len(self._token_id_lut):
+                raise RuntimeError(
+                    f"Sampled compact token index {next_token} outside token ID LUT "
+                    f"with {len(self._token_id_lut)} entries"
+                )
+            next_token = int(self._token_id_lut[next_token])
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
             return True
-        if not self._instruct_model:
-            # WARNING: relying on "\n\n" is fragile but is the best we have right now
-            return len(gen_tokens) > 2 and all(t == self._nl_token_id for t in gen_tokens[-2:])
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
+            return True
+        if not self._instruct_model and len(gen_tokens) > 2:
+            if next_token == self._double_nl_token_id:
+                return True
+            return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,

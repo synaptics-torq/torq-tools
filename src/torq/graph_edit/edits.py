@@ -34,6 +34,11 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "EliminateTranspose",
+    "CollapseReshapeChain",
+    "CollapseGQABroadcast",
+    "TrimLMHeadVocab",
+    "SplitLMHead",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -312,8 +317,8 @@ class DequantizeProjectionsMatMul(OnnxGraphEdit):
     Manually dequantize projection scores MatMul producer to prevent MLIR warnings.
 
     Args:
-        hidden_size (int): SmolLM2 hidden KV dims size
-        vocab_size (int): SmolLM2 vocabulary size
+        hidden_size (int): Model hidden KV dims size
+        vocab_size (int): Model vocabulary size
         export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
 
     Raises:
@@ -495,6 +500,310 @@ class FoldScalarMatMul(OnnxGraphEdit):
         node.outputs.clear()
 
         self._logger.debug("Folded scalar MatMul node '%s' into Mul", node.name)
+
+
+@dataclass
+class EliminateExpand(OnnxGraphEdit):
+    """
+    Eliminate Expand ops at inputs for specific ops and let the compiler handle implicit broadcasting.
+    """
+
+    ops: list[str]
+
+    def __post_init__(self):
+        self.requires_shape_inference = True
+        return super().__post_init__()
+
+    @staticmethod
+    def _iter_producers(node):
+        for tensor in node.inputs or []:
+            if tensor is None:
+                continue
+            for producer in getattr(tensor, "inputs", []) or []:
+                if producer is not None:
+                    yield producer
+
+    @staticmethod
+    def _clear_downstream_shapes(node: gs.Node, graph_output_ids: set[int]):
+        """BFS forward from node, clearing .shape on all intermediate variables."""
+        queue = [node]
+        visited = set()
+        while queue:
+            n = queue.pop(0)
+            if id(n) in visited:
+                continue
+            visited.add(id(n))
+            for out in n.outputs:
+                if not isinstance(out, gs.Variable):
+                    continue
+                if id(out) not in graph_output_ids:
+                    out.shape = None
+                for consumer in out.outputs:
+                    if id(consumer) not in visited:
+                        queue.append(consumer)
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op not in self.ops:
+            return False
+        return any(
+            producer.op == "Expand"
+            for producer in self._iter_producers(node)
+        )
+
+    def transform(self, node: gs.Node):
+        if node.op not in self.ops:
+            raise ValueError(
+                f"Expected node op in {self.ops} for Expand elimination, got '{node.op}'"
+            )
+        graph_output_ids = {id(o) for o in self.graph.outputs}
+        for prod in self._iter_producers(node):
+            if prod.op != "Expand":
+                continue
+            inp_tensor = prod.inputs[0]
+            expand_out = prod.outputs[0]
+            rewire_consumers([node], expand_out, inp_tensor)
+            # Clear stale shape metadata on all downstream variables so ONNX
+            # shape inference can recompute them from the pre-expand input.
+            self._clear_downstream_shapes(node, graph_output_ids)
+            if not expand_out.outputs and not any(id(out) == id(expand_out) for out in self.graph.outputs):
+                prod.inputs.clear()
+                prod.outputs.clear()
+            self._logger.debug(
+                "Eliminated Expand '%s' feeding %s node '%s'",
+                prod.name, node.op, node.name
+            )
+
+
+@dataclass
+class EliminateTranspose(OnnxGraphEdit):
+    """
+    Eliminate Transpose ops that don't rearrange data in memory.
+
+    Handles two cases:
+    1. No-op: permuted shape equals input shape (e.g., transposing two dims of equal size).
+       The Transpose is bypassed entirely.
+    2. Data-preserving: permutation only swaps dims where at most one per cycle has size > 1
+       (e.g., ``[1,1,H,D]`` with ``perm=[0,2,1,3]`` → ``[1,H,1,D]`` when seq_len dim is 1).
+       The Transpose is replaced with an equivalent Reshape.
+    """
+
+    @staticmethod
+    def _is_data_preserving_perm(perm: list[int], shape: list[int]) -> bool:
+        visited = [False] * len(perm)
+        for i in range(len(perm)):
+            if visited[i] or perm[i] == i:
+                visited[i] = True
+                continue
+            cycle_dims: list[int] = []
+            j = i
+            while not visited[j]:
+                visited[j] = True
+                cycle_dims.append(shape[j])
+                j = perm[j]
+            if sum(1 for d in cycle_dims if d > 1) > 1:
+                return False
+        return True
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Transpose" or not node.inputs or not node.outputs:
+            return False
+        perm = node.attrs.get("perm", None)
+        if perm is None:
+            return False
+        inp_shape = getattr(node.inputs[0], "shape", None)
+        if inp_shape is None or not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+            return False
+
+        perm = [int(p) for p in perm]
+        shape = [int(d) for d in inp_shape]
+
+        return self._is_data_preserving_perm(perm, shape)
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Transpose")
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        inp_shape = [int(d) for d in inp.shape]
+        out_shape = [int(d) for d in out.shape]
+        consumers: list[gs.Node] = list(out.outputs)
+
+        if inp_shape == out_shape:
+            rewire_consumers(consumers, out, inp)
+            for i, graph_out in enumerate(self.graph.outputs):
+                if graph_out is out:
+                    self.graph.outputs[i] = inp
+        else:
+            shape_const = gs.Constant(
+                name=node.name + "_fold_shape",
+                values=np.array(out_shape, dtype=np.int64)
+            )
+            reshape_out: gs.Variable = self.graph.layer(
+                name=node.name + "_fold_reshape",
+                op="Reshape",
+                inputs=[inp, shape_const],
+                outputs=[gs.Variable(
+                    name=out.name + "_reshaped",
+                    dtype=out.dtype,
+                    shape=out_shape
+                )]
+            )[0]
+            rewire_consumers(consumers, out, reshape_out)
+            for i, graph_out in enumerate(self.graph.outputs):
+                if graph_out is out:
+                    self.graph.outputs[i] = reshape_out
+
+        node.inputs.clear()
+        node.outputs.clear()
+        if inp_shape == out_shape:
+            self._logger.debug(
+                "Eliminated Transpose '%s': %s -> %s", node.name, inp_shape, out_shape
+            )
+        else:
+            self._logger.debug(
+                "Folded Transpose '%s' into Reshape '%s'", node.name, node.name + "_fold_reshape"
+            )
+
+
+@dataclass
+class CollapseReshapeChain(OnnxGraphEdit):
+    """
+    Collapse consecutive Reshape ops into a single Reshape.
+
+    Matches a Reshape node whose only consumer is another Reshape,
+    and replaces the chain with a single Reshape from the first input
+    to the last output shape.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Reshape" or not node.inputs or not node.outputs:
+            return False
+        out = node.outputs[0]
+        if len(out.outputs) != 1:
+            return False
+        consumer: gs.Node = out.outputs[0]
+        return consumer.op == "Reshape"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Reshape")
+        data_inp = node.inputs[0]
+
+        # walk forward through all consecutive Reshapes
+        current = node
+        collapsed: list[str] = [node.name]
+        while True:
+            out = current.outputs[0]
+            if len(out.outputs) != 1 or out.outputs[0].op != "Reshape":
+                break
+            next_node: gs.Node = out.outputs[0]
+            current.inputs.clear()
+            current.outputs.clear()
+            collapsed.append(next_node.name)
+            current = next_node
+
+        # wire original data input into the final Reshape
+        current.inputs[0] = data_inp
+        self._logger.debug(
+            "Collapsed %d Reshapes into '%s'", len(collapsed), current.name
+        )
+
+
+@dataclass
+class CollapseGQABroadcast(OnnxGraphEdit):
+    """
+    Collapse Unsqueeze → Expand → Reshape GQA head broadcast into a single Expand.
+
+    In GQA attention, KV tensors ``[B, H_kv, S, D]`` are broadcast to match Q heads
+    via ``Unsqueeze(axis) → Expand → Reshape → [B, H_q, S, D]``.  When ``H_kv == 1``
+    the chain is equivalent to a single ``Expand`` because the head dim can be
+    broadcast directly.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Unsqueeze" or not node.inputs or not node.outputs:
+            return False
+        unsqueeze_out = node.outputs[0]
+        if len(unsqueeze_out.outputs) != 1:
+            return False
+        expand_node: gs.Node = unsqueeze_out.outputs[0]
+        if expand_node.op != "Expand" or not expand_node.outputs:
+            return False
+        expand_out = expand_node.outputs[0]
+        if len(expand_out.outputs) != 1:
+            return False
+        reshape_node: gs.Node = expand_out.outputs[0]
+        if reshape_node.op != "Reshape" or not reshape_node.outputs:
+            return False
+
+        inp_shape = getattr(node.inputs[0], "shape", None)
+        final_shape = getattr(reshape_node.outputs[0], "shape", None)
+        if inp_shape is None or final_shape is None:
+            return False
+        if not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+            return False
+        if not all(isinstance(d, (int, np.integer)) for d in final_shape):
+            return False
+
+        inp_shape = [int(d) for d in inp_shape]
+        final_shape = [int(d) for d in final_shape]
+
+        if len(inp_shape) != len(final_shape):
+            return False
+
+        axes = None
+        if len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+            axes = node.inputs[1].values.flatten().tolist()
+        elif "axes" in node.attrs:
+            axes = list(node.attrs["axes"])
+        if axes is None or len(axes) != 1:
+            return False
+        axis = int(axes[0])
+        ndim_after = len(inp_shape) + 1
+        if axis < 0:
+            axis = ndim_after + axis
+
+        # Collapsible when the dim adjacent to the insertion point is 1,
+        # meaning a direct Expand on the input can replace the full chain.
+        return 0 < axis <= len(inp_shape) and inp_shape[axis - 1] == 1
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Unsqueeze")
+        expand_node: gs.Node = node.outputs[0].outputs[0]
+        reshape_node: gs.Node = expand_node.outputs[0].outputs[0]
+
+        inp = node.inputs[0]
+        final_out = reshape_node.outputs[0]
+        final_shape = [int(d) for d in final_out.shape]
+        consumers: list[gs.Node] = list(final_out.outputs)
+
+        expand_shape_const = gs.Constant(
+            name=node.name + "_gqa_expand_shape",
+            values=np.array(final_shape, dtype=np.int64)
+        )
+        new_expand_out: gs.Variable = self.graph.layer(
+            name=node.name + "_gqa_expand",
+            op="Expand",
+            inputs=[inp, expand_shape_const],
+            outputs=[gs.Variable(
+                name=final_out.name + "_expanded",
+                dtype=final_out.dtype,
+                shape=final_shape
+            )]
+        )[0]
+        rewire_consumers(consumers, final_out, new_expand_out)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is final_out:
+                self.graph.outputs[i] = new_expand_out
+
+        node.inputs.clear()
+        node.outputs.clear()
+        expand_node.inputs.clear()
+        expand_node.outputs.clear()
+        reshape_node.inputs.clear()
+        reshape_node.outputs.clear()
+        self._logger.debug(
+            "Collapsed GQA broadcast at '%s' into single Expand -> %s",
+            node.name, final_shape
+        )
 
 
 @dataclass
@@ -698,7 +1007,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
     def match(self, node: gs.Node) -> bool:
         if node.op != "Gather" or len(node.inputs) < 2:
             return False
-        if node.attrs.get("axis", None) != 0:
+        if node.attrs.get("axis", 0) != 0:
             return False
         lut = node.inputs[0]
         if not isinstance(lut, gs.Constant):
@@ -711,7 +1020,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
     def transform(self, node: gs.Node):
         if not (node.op == "Gather" and len(node.inputs) >= 2 and isinstance((lut := node.inputs[0]), gs.Constant)):
             raise ValueError(f"Gather node '{node.name}' does not have a constant data input")
-        if (axis := node.attrs.get("axis", None)) != 0:
+        if (axis := node.attrs.get("axis", 0)) != 0:
             raise ValueError(f"Only support axis = 0 for LUT, found axis = {axis} for Gather node '{node.name}'")
         
         lut_data = lut.values
@@ -744,6 +1053,220 @@ class ExtractConstantLUT(OnnxGraphEdit):
             "Extracted LUT from '%s', consumers redirected to graph input '%s'",
             node.name, self.inp_name
         )
+
+
+@dataclass
+class TrimLMHeadVocab(OnnxGraphEdit):
+    """
+    Trim LM head weight matrix to a subset of tokens.
+
+    The weight matrix is sliced from [hidden, vocab] to [hidden, kept_count].
+    If include_argmax is True, an ArgMax is appended to output the compact index.
+    Otherwise the output is the trimmed logits tensor [1, 1, kept_count].
+
+    The caller is responsible for mapping compact_idx -> original token ID via
+    kept_token_ids[compact_idx].
+
+    Args:
+        kept_token_ids (np.ndarray): 1-D array of original token IDs to keep, in the
+            order they should appear in the trimmed weight (sorted recommended).
+        output_name (str): Name of the MatMul output to match (default: "logits").
+        save_lut (Path | str | None): If provided, save kept_token_ids to this .npy path.
+        include_argmax (bool): If True, append ArgMax to the graph (default: False).
+    """
+
+    kept_token_ids: np.ndarray
+    output_name: str = "logits"
+    save_lut: Path | str | None = None
+    include_argmax: bool = False
+
+    def __post_init__(self):
+        self.kept_token_ids = np.asarray(self.kept_token_ids, dtype=np.int64)
+        if self.kept_token_ids.ndim != 1 or len(self.kept_token_ids) == 0:
+            raise ValueError("kept_token_ids must be a non-empty 1-D array")
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "MatMul" or not node.outputs:
+            return False
+        return node.outputs[0].name == self.output_name
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        weight_inp = node.inputs[1]
+        if not isinstance(weight_inp, gs.Constant):
+            raise ValueError(
+                f"Expected constant weight for LM head MatMul, got {type(weight_inp).__name__}"
+            )
+
+        W = weight_inp.values
+        if W.ndim != 2:
+            raise ValueError(f"Expected 2-D weight matrix, got shape {W.shape}")
+
+        hidden_size, vocab_size = W.shape
+        if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
+            raise ValueError(
+                f"kept_token_ids contains values outside [0, {vocab_size})"
+            )
+        kept_count = len(self.kept_token_ids)
+
+        W_trimmed = W[:, self.kept_token_ids]
+        trimmed_weight = gs.Constant(
+            name=weight_inp.name + "_trimmed",
+            values=W_trimmed,
+            export_dtype=getattr(weight_inp, "export_dtype", None),
+        )
+
+        node.inputs[1] = trimmed_weight
+
+        logits_out = node.outputs[0]
+        old_shape = list(logits_out.shape) if logits_out.shape else None
+        if old_shape and len(old_shape) >= 1:
+            new_logits_shape = old_shape[:-1] + [kept_count]
+        else:
+            new_logits_shape = [1, 1, kept_count]
+
+        trimmed_logits = gs.Variable(
+            name="logits",
+            dtype=logits_out.dtype,
+            shape=new_logits_shape,
+        )
+        consumers = list(logits_out.outputs)
+        node.outputs[0] = trimmed_logits
+
+        if self.include_argmax:
+            final_out = self.graph.layer(
+                name="lm_head_argmax",
+                op="ArgMax",
+                attrs={"axis": -1, "keepdims": 0},
+                inputs=[trimmed_logits],
+                outputs=[gs.Variable(
+                    name="compact_token_idx",
+                    dtype=np.int64,
+                    shape=new_logits_shape[:-1],
+                )],
+            )[0]
+        else:
+            final_out = trimmed_logits
+
+        rewire_consumers(consumers, logits_out, final_out)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is logits_out:
+                self.graph.outputs[i] = final_out
+
+        if self.save_lut is not None:
+            lut_path = Path(self.save_lut)
+            lut_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(lut_path, self.kept_token_ids)
+            self._logger.debug("Saved token ID LUT to '%s'", lut_path)
+
+        self._logger.debug(
+            "Trimmed LM head vocab: %d -> %d tokens (argmax=%s)",
+            vocab_size, kept_count, self.include_argmax,
+        )
+
+
+@dataclass
+class SplitLMHead(OnnxGraphEdit):
+    """
+    Extract the final LM head into a standalone graph.
+
+    The main graph output is replaced with the non-constant MatMul input, named
+    ``hidden_states_name``. The extracted LM head graph accepts that tensor as
+    its only input, preserves the original LM head output, and is saved to
+    ``save_to``.
+    """
+
+    save_to: Path | str
+    output_name: str = "logits"
+    hidden_states_name: str = "last_hidden_states"
+
+    def _find_lm_head_matmul(self) -> gs.Node:
+        for node in self.graph.nodes:
+            if node.op != "MatMul" or not node.outputs:
+                continue
+            output = node.outputs[0]
+            if output.name != self.output_name:
+                continue
+            if any(graph_output is output for graph_output in self.graph.outputs):
+                return node
+        raise ValueError(f"Could not find final LM head MatMul feeding graph output '{self.output_name}'")
+
+    @staticmethod
+    def _select_hidden_states(node: gs.Node) -> gs.Variable:
+        if len(node.inputs) != 2:
+            raise ValueError(f"LM head MatMul '{node.name}' must have 2 inputs, found {len(node.inputs)}")
+        if all(isinstance(inp, gs.Constant) for inp in node.inputs):
+            raise ValueError(f"LM head MatMul '{node.name}' is invalid because both inputs are constant")
+        hidden_states = next(
+            (inp for inp in node.inputs if not isinstance(inp, gs.Constant)),
+            None
+        )
+        if not isinstance(hidden_states, gs.Variable):
+            raise ValueError(
+                f"Expected LM head hidden states to be a graph variable, got {type(hidden_states).__name__}"
+            )
+        return hidden_states
+
+    def _extract_lm_head_graph(self) -> gs.Graph:
+        lm_head = self._find_lm_head_matmul()
+        lm_head_logits = lm_head.outputs[0]
+        hidden_states = self._select_hidden_states(lm_head)
+        lm_head_input = gs.Variable(
+            name=self.hidden_states_name,
+            dtype=hidden_states.dtype,
+            shape=hidden_states.shape,
+        )
+        for idx, inp in enumerate(lm_head.inputs):
+            if inp is hidden_states:
+                lm_head.inputs[idx] = lm_head_input
+                break
+        lm_head_graph = gs.Graph(
+            name="main",
+            nodes=[lm_head],
+            inputs=[lm_head_input],
+            outputs=[lm_head_logits],
+        )
+        return lm_head_graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True,
+        ).toposort()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "MatMul" or not node.outputs:
+            return False
+        output = node.outputs[0]
+        if output.name != self.output_name:
+            return False
+        return any(graph_output is output for graph_output in self.graph.outputs)
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        hidden_states = self._select_hidden_states(node)
+        lm_head_graph = self._extract_lm_head_graph()
+        lm_head_model = onnx.shape_inference.infer_shapes(
+            gs.export_onnx(lm_head_graph),
+            True, True, True
+        )
+        save_to = Path(self.save_to)
+        save_to.parent.mkdir(parents=True, exist_ok=True)
+        onnx.save(lm_head_model, save_to)
+
+        logits = node.outputs[0]
+        hidden_states.name = self.hidden_states_name
+        for idx, graph_output in enumerate(self.graph.outputs):
+            if graph_output is logits:
+                self.graph.outputs[idx] = hidden_states
+
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.debug(
+            "Split LM head MatMul '%s'; graph output '%s' now exposes '%s'",
+            node.name,
+            logits.name,
+            hidden_states.name,
+        )
+        self._logger.debug("Saved split LM head to '%s'", save_to)
 
 
 class CombineKVCacheMixin:
@@ -1027,4 +1550,28 @@ class CommonGraphEditsMixin:
 
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def eliminate_expands(self, ops: list[str]):
+        self.apply_edit(EliminateExpand(self._graph, self._graph_name, ops))
+        return self
+
+    def eliminate_transposes(self):
+        self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
+        return self
+
+    def collapse_reshape_chains(self):
+        self.apply_edit(CollapseReshapeChain(self._graph, self._graph_name))
+        return self
+
+    def collapse_gqa_broadcast(self):
+        self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
+        return self
+
+    def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):
+        self.apply_edit(TrimLMHeadVocab(self._graph, self._graph_name, kept_token_ids, output_name, save_lut, include_argmax))
+        return self
+
+    def split_lm_head(self, save_to, output_name="logits", hidden_states_name="last_hidden_states"):
+        self.apply_edit(SplitLMHead(self._graph, self._graph_name, save_to, output_name, hidden_states_name))
         return self

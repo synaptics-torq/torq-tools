@@ -49,5 +49,7 @@ moonshine = [
     "whisper-openai",
     "jiwer",
     "openpyxl",
+    "pandas",
+    "tqdm",
 ]
 all = ["torq-tools[moonshine]"]
