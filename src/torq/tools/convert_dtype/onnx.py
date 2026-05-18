@@ -12,11 +12,22 @@ from typing import Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+from onnx_graphsurgeon.exporters import onnx_exporter as _gs_onnx_exporter
 from torq.utils.logging import add_logging_args, configure_logging
 
 from ...utils.onnx import is_same_dtype, upgrade_model
 
 logger = logging.getLogger("ONNX-Dtype-Converter")
+
+
+def _fp32_to_bf16(arr: np.ndarray) -> np.ndarray:
+    """Convert a float32 numpy array to bfloat16 by truncating the lower 16 mantissa bits."""
+    return arr.view(np.uint32).__rshift__(16).astype(np.uint16)
+
+
+# Register bf16 export support in onnx-graphsurgeon (not natively supported)
+if onnx.TensorProto.BFLOAT16 not in _gs_onnx_exporter._NUMPY_ARRAY_CONVERTERS:
+    _gs_onnx_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = _fp32_to_bf16
 
 _ONNX_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
     "fp32": onnx.TensorProto.FLOAT,
