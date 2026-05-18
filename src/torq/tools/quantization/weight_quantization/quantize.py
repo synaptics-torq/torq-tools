@@ -525,112 +525,56 @@ class WeightQuantizer:
         self._convert_to_bf16(model)
 
     def _convert_to_bf16(self, model: onnx.ModelProto) -> None:
-        """Convert fp32 model to bf16 inline.
+        """Convert fp32 model to bf16 inline using the proper dtype converter.
 
-        Converts all fp32 initializers to bf16 and int64 initializers to int32.
-        Does NOT use onnx_graphsurgeon to avoid version compatibility issues.
+        Delegates to :mod:`torq.tools.convert_dtype.onnx` which uses
+        onnx-graphsurgeon with shape inference and proper handling of
+        Slice/Reshape/etc. inputs (kept as int64 per ONNX spec).
         """
-        for init in model.graph.initializer:
-            if init.data_type == TensorProto.FLOAT:
-                fp32 = numpy_helper.to_array(init)
-                new_init = TensorProto()
-                new_init.name = init.name
-                new_init.dims[:] = list(fp32.shape)
-                new_init.data_type = TensorProto.BFLOAT16
-                new_init.raw_data = _fp32_to_bf16_raw(fp32)
-                init.CopyFrom(new_init)
-            elif init.data_type == TensorProto.INT64:
-                i64 = numpy_helper.to_array(init)
-                new_init = numpy_helper.from_array(
-                    i64.astype(np.int32), name=init.name
-                )
-                init.CopyFrom(new_init)
+        from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
+        from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
 
-        # Update graph I/O types: fp32 → bf16, int64 → int32
-        for container in (model.graph.input, model.graph.output):
-            for io in container:
-                if io.type.tensor_type.elem_type == TensorProto.FLOAT:
-                    io.type.tensor_type.elem_type = TensorProto.BFLOAT16
-                elif io.type.tensor_type.elem_type == TensorProto.INT64:
-                    io.type.tensor_type.elem_type = TensorProto.INT32
+        # Register bf16 export support in onnx-graphsurgeon (not natively supported)
+        if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
+            _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
+                lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
+            )
 
-        # Update value_info
-        for vi in model.graph.value_info:
-            if vi.type.tensor_type.elem_type == TensorProto.FLOAT:
-                vi.type.tensor_type.elem_type = TensorProto.BFLOAT16
-            elif vi.type.tensor_type.elem_type == TensorProto.INT64:
-                vi.type.tensor_type.elem_type = TensorProto.INT32
+        fp32_conv = FP32Converter("bf16", convert_io=True)
+        converted = fp32_conv.convert_model(model)
 
-        # Update Cast node 'to' attributes
-        for node in model.graph.node:
-            if node.op_type == "Cast":
-                for attr in node.attribute:
-                    if attr.name == "to":
-                        if attr.i == TensorProto.FLOAT:
-                            attr.i = TensorProto.BFLOAT16
-                        elif attr.i == TensorProto.INT64:
-                            attr.i = TensorProto.INT32
+        int64_conv = Int64Converter("int32", convert_io=True)
+        converted = int64_conv.convert_model(converted)
 
+        model.CopyFrom(converted)
         logger.info("Converted model to bf16 + int32")
 
     def _convert_non_weight_to_bf16(self, model: onnx.ModelProto) -> None:
         """Convert non-quantized parts of the model to bf16/int32.
 
-        Skips initializers that are already int8/uint8/bf16 (quantized weights,
-        scales, zero points).  Converts remaining fp32 initializers, I/O types,
-        value_info, and Cast attributes.
+        Delegates to :mod:`torq.tools.convert_dtype.onnx` which uses
+        onnx-graphsurgeon with shape inference and proper handling of
+        Slice/Reshape/etc. inputs (kept as int64 per ONNX spec).
+        Initializers that are already int8/uint8/int4/bf16 (quantized weights,
+        scales, zero points) are preserved by the converter since they don't
+        match the fp32 source dtype.
         """
-        skip_dtypes = {
-            TensorProto.INT8,
-            TensorProto.UINT8,
-            TensorProto.INT4,
-            TensorProto.UINT4,
-            TensorProto.BFLOAT16,
-        }
+        from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
+        from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
 
-        for init in model.graph.initializer:
-            if init.data_type in skip_dtypes:
-                continue
-            if init.data_type == TensorProto.FLOAT:
-                fp32 = numpy_helper.to_array(init)
-                new_init = TensorProto()
-                new_init.name = init.name
-                new_init.dims[:] = list(fp32.shape)
-                new_init.data_type = TensorProto.BFLOAT16
-                new_init.raw_data = _fp32_to_bf16_raw(fp32)
-                init.CopyFrom(new_init)
-            elif init.data_type == TensorProto.INT64:
-                i64 = numpy_helper.to_array(init)
-                new_init = numpy_helper.from_array(
-                    i64.astype(np.int32), name=init.name
-                )
-                init.CopyFrom(new_init)
+        # Register bf16 export support in onnx-graphsurgeon (not natively supported)
+        if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
+            _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
+                lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
+            )
 
-        # Update graph I/O types
-        for container in (model.graph.input, model.graph.output):
-            for io in container:
-                if io.type.tensor_type.elem_type == TensorProto.FLOAT:
-                    io.type.tensor_type.elem_type = TensorProto.BFLOAT16
-                elif io.type.tensor_type.elem_type == TensorProto.INT64:
-                    io.type.tensor_type.elem_type = TensorProto.INT32
+        fp32_conv = FP32Converter("bf16", convert_io=True)
+        converted = fp32_conv.convert_model(model)
 
-        # Update value_info
-        for vi in model.graph.value_info:
-            if vi.type.tensor_type.elem_type == TensorProto.FLOAT:
-                vi.type.tensor_type.elem_type = TensorProto.BFLOAT16
-            elif vi.type.tensor_type.elem_type == TensorProto.INT64:
-                vi.type.tensor_type.elem_type = TensorProto.INT32
+        int64_conv = Int64Converter("int32", convert_io=True)
+        converted = int64_conv.convert_model(converted)
 
-        # Update Cast node 'to' attributes
-        for node in model.graph.node:
-            if node.op_type == "Cast":
-                for attr in node.attribute:
-                    if attr.name == "to":
-                        if attr.i == TensorProto.FLOAT:
-                            attr.i = TensorProto.BFLOAT16
-                        elif attr.i == TensorProto.INT64:
-                            attr.i = TensorProto.INT32
-
+        model.CopyFrom(converted)
         logger.info("Converted non-weight tensors and I/O to bf16 + int32")
 
 
