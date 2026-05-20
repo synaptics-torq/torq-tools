@@ -99,7 +99,7 @@ python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.on
 > Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64. 
 > Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
 
-#### Export supported models to static graphs
+#### Export onnx supported models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
@@ -109,6 +109,15 @@ For example, to export a static bf16 Moonshine model:
 ```bash
 python3 -m src.torq.models.moonshine.export --convert-dtype bf16
 ``` 
+
+#### Export tflite models to static graphs
+Exports dynamic TFLite models as static graphs using the model’s default tensor shapes by removing dynamic shapeSignature metadata. This works for most dynamic models, though some may still require custom static export flows.
+```bash
+python3 -m src.torq.tools.convert_static tflite \
+  -i path/model.tflite \
+  -o path/model_static.tflite
+```
+
 
 #### Compile models
 A helper utility is provided for compiling ONNX or MLIR models into VMFB binaries.
