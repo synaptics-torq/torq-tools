@@ -2,8 +2,7 @@
 *.tflite
 *.vmfb
 *.mlir
-models/
-!src/torq/models/
+/models/
 .venv/
 .torq/
 venv/

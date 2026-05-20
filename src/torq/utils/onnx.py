@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
+import copy
 import hashlib
 import logging
 import os
@@ -15,6 +16,7 @@ from typing import Union
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
+from onnx import shape_inference
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ __all__ = [
 
     # Transformations
     "upgrade_model",
+    "finalize_torq_ready_onnx",
 ]
 
 
@@ -353,6 +356,61 @@ def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
 # -----------------------------------------------------------------------------
 # Transformations
 # -----------------------------------------------------------------------------
+
+def finalize_torq_ready_onnx(
+    model: onnx.ModelProto,
+    *,
+    max_ir_version: int = 11,
+    symbolic_shape_infer: bool = True,
+) -> onnx.ModelProto:
+    """Post-process ONNX for Torq import and layer extraction.
+
+    - Optionally runs ONNX Runtime symbolic shape inference so ``unk__`` dims
+      become static where ORT can derive them.
+    - Drops ``graph.value_info`` entries whose names duplicate ``graph.output``
+      (avoids rank mismatches in torch-onnx import for isolated subgraphs).
+    - Caps ``ir_version`` for broader onnxruntime / tooling compatibility.
+    - Refreshes standard ONNX shape inference when possible.
+
+    Requires ``onnxruntime`` with ``tools.symbolic_shape_infer`` for the first
+    step; if unavailable or it fails, subsequent steps still run.
+    """
+    work = copy.deepcopy(model)
+    if symbolic_shape_infer:
+        try:
+            from onnxruntime.tools.symbolic_shape_infer import (
+                SymbolicShapeInference,
+            )
+
+            work = SymbolicShapeInference.infer_shapes(
+                work,
+                auto_merge=True,
+                guess_output_rank=True,
+                verbose=0,
+            )
+        except Exception as exc:
+            logger.debug("Symbolic shape inference skipped: %s", exc)
+
+    work.ir_version = min(int(work.ir_version), max_ir_version)
+
+    graph = work.graph
+    out_names = {o.name for o in graph.output}
+    kept = [vi for vi in graph.value_info if vi.name not in out_names]
+    del graph.value_info[:]
+    graph.value_info.extend(kept)
+
+    try:
+        work = shape_inference.infer_shapes(work)
+    except Exception as exc:
+        logger.debug("shape_inference.infer_shapes after finalize skipped: %s", exc)
+
+    try:
+        onnx.checker.check_model(work, full_check=False)
+    except Exception as exc:
+        logger.warning("ONNX checker warning after finalize_torq_ready_onnx: %s", exc)
+
+    return work
+
 
 def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
     if (curr_opset := get_model_opset(model)) >= target_opset:

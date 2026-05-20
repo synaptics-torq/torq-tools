@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 from . import (
+    gemma3,
     moonshine,
     smollm2,
-    gemma3,
+    synaptics_audio,
 )
 
-all = [
+__all__ = [
+    "gemma3",
     "moonshine",
     "smollm2",
-    "gemma3",
+    "synaptics_audio",
 ]
