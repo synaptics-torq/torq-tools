@@ -703,7 +703,7 @@ def convert_model(
     convert_io: bool = False,
     max_float: float = 1e9,
     target_opset: int = 22,
-    skip_torq_onnx_finalize: bool = False,
+    torq_onnx_finalize: bool = False,
     preserve_unused_node_outputs: bool = False,
 ):
     if use_modelopt:
@@ -724,7 +724,7 @@ def convert_model(
 
     export_dir = Path(output_model).parent
     export_dir.mkdir(parents=True, exist_ok=True)
-    if not skip_torq_onnx_finalize:
+    if torq_onnx_finalize:
         converted_model = finalize_torq_ready_onnx(converted_model)
     onnx.save(converted_model, output_model)
     logger.info("Saved converted model to '%s'", str(output_model))
@@ -776,11 +776,11 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         help="Use TensorRT modelopt for dtype conversion"
     )
     parser.add_argument(
-        "--skip-torq-onnx-finalize",
+        "--torq-onnx-finalize",
         action="store_true",
         default=False,
         help=(
-            "Skip Torq-oriented ONNX post-process (ORT symbolic shapes, IR cap, "
+            "Run Torq-oriented ONNX post-process (ORT symbolic shapes, IR cap, "
             "value_info cleanup)"
         ),
     )
@@ -799,7 +799,7 @@ def onnx_dtype_convert_from_args(args: argparse.Namespace):
         args.convert_io,
         args.max_float,
         args.opset,
-        skip_torq_onnx_finalize=args.skip_torq_onnx_finalize,
+        torq_onnx_finalize=args.torq_onnx_finalize,
     )
 
 

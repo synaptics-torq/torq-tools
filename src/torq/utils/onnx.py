@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
-import copy
 import hashlib
 import logging
 import os
@@ -41,6 +40,7 @@ __all__ = [
     "is_same_dtype",
 
     # Transformations
+    "drop_empty_name_value_info",
     "upgrade_model",
     "finalize_torq_ready_onnx",
 ]
@@ -357,6 +357,20 @@ def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
 # Transformations
 # -----------------------------------------------------------------------------
 
+def drop_empty_name_value_info(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Remove ``graph.value_info`` entries with an empty name.
+
+    Rare leftover when an RNN optional output still uses ``""``; fails ONNX
+    validation: ``Field 'name' of 'value_info' is required to be non-empty``.
+    """
+    graph = model.graph
+    kept = [vi for vi in graph.value_info if vi.name]
+    if len(kept) != len(graph.value_info):
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return model
+
+
 def finalize_torq_ready_onnx(
     model: onnx.ModelProto,
     *,
@@ -372,10 +386,11 @@ def finalize_torq_ready_onnx(
     - Caps ``ir_version`` for broader onnxruntime / tooling compatibility.
     - Refreshes standard ONNX shape inference when possible.
 
-    Requires ``onnxruntime`` with ``tools.symbolic_shape_infer`` for the first
-    step; if unavailable or it fails, subsequent steps still run.
+    Mutates ``model`` unless a shape-inference step returns a replacement
+    model. Requires ``onnxruntime`` with ``tools.symbolic_shape_infer`` for the
+    first step; if unavailable or it fails, subsequent steps still run.
     """
-    work = copy.deepcopy(model)
+    work = model
     if symbolic_shape_infer:
         try:
             from onnxruntime.tools.symbolic_shape_infer import (
@@ -393,9 +408,11 @@ def finalize_torq_ready_onnx(
 
     work.ir_version = min(int(work.ir_version), max_ir_version)
 
+    work = drop_empty_name_value_info(work)
+
     graph = work.graph
     out_names = {o.name for o in graph.output}
-    kept = [vi for vi in graph.value_info if vi.name not in out_names]
+    kept = [vi for vi in graph.value_info if vi.name and vi.name not in out_names]
     del graph.value_info[:]
     graph.value_info.extend(kept)
 

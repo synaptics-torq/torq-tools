@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
-"""FP32-vs-FP32 equivalence check between source and simplified ONNX.
-
-This is the safety net for the simplification pipeline: every pass in
-:data:`passes.PIPELINE` must be value-preserving, so running the source FP32
-model and the simplified FP32 model on the same random inputs must produce
-near-identical outputs (FP32 tolerance, not BF16 tolerance -- BF16 numeric
-loss is a separate concern handled by :mod:`torq.tools.convert_dtype.onnx`).
-"""
+"""ONNX model verification helpers."""
 
 from __future__ import annotations
 
@@ -18,9 +11,9 @@ from typing import Mapping, Sequence
 import numpy as np
 import onnx
 
-from ._ort import make_cpu_session
+from .ort import make_cpu_session
 
-logger = logging.getLogger("synaptics-audio.verify")
+logger = logging.getLogger(__name__)
 
 
 def _run(
@@ -40,12 +33,7 @@ def verify_equivalence(
     atol: float = 1e-5,
     rtol: float = 1e-4,
 ) -> None:
-    """Assert ``source`` and ``simplified`` produce equivalent outputs on random FP32 inputs.
-
-    Both models must be FP32. Tolerances are tight; a failure means a pass
-    in the pipeline is not value-preserving and must be fixed.
-    Raises :class:`AssertionError` on any output-set or numeric mismatch.
-    """
+    """Assert that two FP32 ONNX models produce equivalent random-input outputs."""
     rng = np.random.default_rng(seed)
     feeds = {
         name: rng.standard_normal(tuple(shape)).astype(np.float32)

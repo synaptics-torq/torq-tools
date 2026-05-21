@@ -69,7 +69,13 @@ def fetch_sources(
     cache_dir: Path | str | None = None,
 ) -> list[Path]:
     """Download every source ONNX declared by ``recipe``."""
+    source_filenames = recipe.source_filenames()
+    if not source_filenames:
+        raise ValueError(
+            f"recipe {recipe.key!r} has no source_filename; cannot auto-fetch from HF. "
+            f"Either set source_filename in the recipe or provide an explicit src path."
+        )
     return [
         fetch_source(recipe, source_filename=source, cache_dir=cache_dir)
-        for source in recipe.source_filenames()
+        for source in source_filenames
     ]

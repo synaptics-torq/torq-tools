@@ -13,10 +13,10 @@ pipeline:
 FP32 ONNX  ->  simplified FP32 ONNX  ->  (verify equivalence)  ->  BF16 ONNX
 ```
 
-There is one entry point (`prepare`), one fixed list of value-preserving
-rewrites (`passes.PIPELINE`), and one declarative description per recipe
-(`recipes.*`). Recipes may declare multiple HF source filenames, but the
-preparation pipeline stays the same.
+There is one entry point (`prepare`), one fixed sequence of value-preserving
+rewrites built on top of `torq.graph_edit.OnnxGraphEditor`, and one declarative
+description per recipe (`recipes.*`). Recipes may declare multiple HF source
+filenames, but the preparation pipeline stays the same.
 
 ## Quickstart
 
@@ -56,36 +56,36 @@ are derived by `shape_inference` once inputs are fixed. The recipe declares
 only the recipe identity (HF `repo_id`, source filenames inside the repo) plus
 an optional dynamic-input safety hatch.
 
-## Pipeline (`passes.PIPELINE`)
+## Pipeline
 
-Passes are applied in this order. Each pass is **idempotent** and
-**self-skipping** -- if its pattern doesn't appear in the model, it returns the
-input unchanged:
+The simplification sequence lives in
+`prepare._SynapticsAudioGraphEditor.run_audio_pipeline`. Every step is
+**idempotent** and **self-skipping** -- if its pattern doesn't appear in the
+model, it leaves the graph unchanged:
 
-| # | Pass                            | Purpose                                                                                                           |
-|--:|---------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| 1 | `ApplyFixedShapes`              | Stamp explicit `Recipe.input_shape_overrides` onto `graph.input` (no-op when overrides are empty -- the common case). |
-| 2 | `FreezeShapeSeeds`              | Constant-fold shape-computation subgraphs that feed `Reshape` / `Expand` / `Slice` controls.                      |
-| 3 | `EliminateDegenerateTranspose`  | Remove `Transpose` nodes that only reorder singleton static dimensions.                                           |
-| 4 | `ReplacePadInputsWithConstants` | Constant-fold dynamic `pads` / `constant_value` inputs of `Pad` into static initializers.                         |
-| 5 | `DecomposeBidirectionalRnn`     | Split bidirectional `GRU` / `LSTM` / `RNN` into two unidirectional forward layers (works around torch-mlir).      |
-| 6 | `EliminateRank0Gather`          | Rewrite `Gather` ops producing rank-0 scalars + `Unsqueeze[0]` into a rank-1 path (works around an IREE codegen bug). |
-| 7 | `RewriteNegativePads`           | Rewrite `Pad` ops with negative (crop) paddings into `Pad(positive) + Slice`.                                     |
-| 8 | `AbsorbPadding`                 | Fuse non-negative `Pad` layers into the following `Conv`'s `pads` attribute.                                      |
-| 9 | `EliminateSingletonGatherUnsqueeze` | Remove singleton-axis `Gather -> unary -> Unsqueeze` rank shims.                                             |
-| 10 | `WidenStridedDepthwiseConv`    | Widen narrow strided-depthwise `Conv`s so the Torq compiler avoids the DEDR scatter-gather codegen path.          |
-| 11 | `FinalizeTorqReady`            | Symbolic shape inference, `value_info` cleanup, IR-version cap.                                                   |
+| # | Step | Source | Purpose |
+|--:|------|--------|---------|
+| 1 | `apply_fixed_input_shapes`              | `OnnxGraphEditor`            | Stamp explicit `Recipe.input_shape_overrides` onto `graph.input` (no-op when overrides are empty -- the common case). |
+| 2 | `freeze_shape_seeds`                    | `OnnxGraphEditor`            | Constant-fold shape-computation subgraphs feeding `Reshape` / `Expand` / `Slice` / `Pad` controls. |
+| 3 | `EliminateTranspose`                    | `graph_edit.edits`           | Remove `Transpose` nodes that don't physically rearrange data (handles singleton-axis Transposes). |
+| 4 | `DecomposeBidirectionalRnn`             | `graph_edit.edits`           | Split bidirectional `GRU` / `LSTM` / `RNN` into two unidirectional forward layers (works around torch-mlir). |
+| 5 | `EliminateRank0Gather`                  | `graph_edit.edits`           | Rewrite `Gather` ops producing rank-0 scalars + `Unsqueeze[0]` into a rank-1 path (works around an IREE codegen bug). |
+| 6 | `RewriteNegativePads`                   | `graph_edit.edits`           | Rewrite `Pad` ops with negative (crop) paddings into `Pad(positive) + Slice`. |
+| 7 | `AbsorbPadding`                         | `graph_edit.edits`           | Fuse non-negative `Pad` layers into the following `Conv`'s `pads` attribute. |
+| 8 | `EliminateSingletonGatherUnsqueeze`     | `graph_edit.edits`           | Remove singleton-axis `Gather -> unary -> Unsqueeze` rank shims. |
+| 9 | `WidenStridedDepthwiseConv`             | `graph_edit.edits`           | Widen narrow strided-depthwise `Conv`s so the Torq compiler avoids the DEDR scatter-gather codegen path. |
+| 10 | `finalize_torq_ready_onnx`             | `torq.utils.onnx`            | Symbolic shape inference, `value_info` cleanup, IR-version cap (run after the editor exports). |
 
-Order matters: shape-resolving passes first (1-4), graph rewrites in the middle
-(5-10), finalization last (11). The runner has no per-model branching --
-self-skipping passes are how recipe-specific behavior is achieved.
+Order matters: shape-resolving steps first (1-2), shape-aware rewrites in the
+middle (3-9), finalization last (10). The runner has no per-model branching --
+self-skipping rewrites are how recipe-specific behavior is achieved.
 
 ## Verification
 
-After all passes have run, `verify.verify_equivalence` runs both the source
-FP32 model and the simplified FP32 model on the same random inputs (seeded,
-shapes from the recipe) via `onnxruntime` CPU and asserts the outputs match
-within tight FP32 tolerances (`atol=1e-5`, `rtol=1e-4`).
+After all passes have run, `torq.utils.onnx_verify.verify_equivalence` runs
+both the source FP32 model and the simplified FP32 model on the same random
+inputs (seeded, shapes from the recipe) via `onnxruntime` CPU and asserts the
+outputs match within tight FP32 tolerances (`atol=1e-5`, `rtol=1e-4`).
 
 This is the **safety net** that catches any pass that is not value-preserving.
 BF16 numeric loss is a separate concern and is **not** verified here -- it is
@@ -191,23 +191,18 @@ The checked-in recipe fixes it to `feats=(1, 100, 40)`, producing
 `embs=[1, 256]`. Change that override if the runtime uses a different fixed
 feature-frame count.
 
-### Adding a new pass
+### Adding a new rewrite
 
-Drop a new `passes/<pass_name>.py` whose class matches `passes.base.OnnxPass`:
+If the rewrite is generic (could plausibly be useful to another exporter), add
+it as an `OnnxGraphEdit` subclass in `torq.graph_edit.edits` -- the existing
+audio rewrites (`EliminateRank0Gather`, `RewriteNegativePads`, etc.) live there
+alongside the LLM-oriented ones. Then call it from `run_audio_pipeline` at the
+appropriate position (shape-resolving first, structural rewrites in the
+middle).
 
-```python
-class MyPass:
-    name = "my_pass"
-
-    def __call__(self, model, ctx):
-        if not _matches(model):  # self-skip when not applicable
-            return model
-        # ... rewrite ...
-        return new_model
-```
-
-Then import it in `passes/__init__.py` and insert it into `PIPELINE` at the
-appropriate position (shape-resolving first, finalize last).
+If the rewrite is whole-graph (not a per-node pattern -- e.g. a constant-fold
+that needs an ORT round-trip), add it as a method on `OnnxGraphEditor` next to
+`apply_fixed_input_shapes` / `freeze_shape_seeds`.
 
 ## Layout
 
@@ -217,29 +212,8 @@ synaptics_audio/
 ├── __main__.py            # CLI entry point
 ├── prepare.py             # source fetch, simplify, verify, BF16 conversion
 ├── fetch.py               # HuggingFace Hub source-ONNX downloader
-├── verify.py              # FP32-vs-FP32 equivalence check
-├── passes/
-│   ├── __init__.py        # PIPELINE (fixed order)
-│   ├── base.py            # OnnxPass protocol + PassContext
-│   └── *.py               # one pass per file
 └── recipes/
     ├── __init__.py        # ALL / BY_KEY
     ├── base.py            # Recipe dataclass
     └── *.py               # one recipe per file
 ```
-
-## Design notes / what was deliberately left out
-
-* **No `optimum` / PyTorch -> ONNX export.** The flow starts from an existing
-  FP32 ONNX. This package does graph refinement, not source export. The
-  upstream artifact is expected to come from the model owner (training repo,
-  release tarball, manual `optimum` invocation, etc.). HF auto-download is
-  for the *already-exported* source ONNX, not for re-running export.
-* **No IREE compilation step.** Use `torq.compile` / the standard Torq tooling
-  on the resulting BF16 ONNX.
-* **No HuggingFace dataset validation.** `verify` is FP32-vs-FP32 on random
-  inputs only; that is sufficient because every pass is required to be
-  value-preserving in FP32.
-* **No per-model arg surface.** All recipe-specific behavior lives in `Recipe`
-  fields and self-skipping passes. There is no `--broadcast-ops`,
-  `--skip-export`, `--use-optimum`, etc.

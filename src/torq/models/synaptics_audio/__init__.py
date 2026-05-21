@@ -8,8 +8,10 @@ Public surface is intentionally tiny:
 * :data:`recipes.ALL` / :data:`recipes.BY_KEY` -- the registry of audio recipes.
 * :func:`prepare.prepare` -- the one and only entry point.
 * :func:`fetch.fetch_sources` -- download a recipe's source ONNX files from HF Hub.
-* :data:`passes.PIPELINE` -- the fixed list of value-preserving rewrites
-  applied in order.
+
+The simplification pipeline runs through :class:`torq.graph_edit.OnnxGraphEditor`
+plus the per-node ``OnnxGraphEdit`` rewrites in :mod:`torq.graph_edit.edits`;
+the audio-specific ordering lives in :func:`prepare._SynapticsAudioGraphEditor.run_audio_pipeline`.
 
 CLI: ``python -m torq.models.synaptics_audio <recipe-key> <dst> [--src <src.onnx>]``
 """
