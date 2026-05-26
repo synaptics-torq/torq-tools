@@ -6,7 +6,7 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 from torq.models.tsuki._graph import TsukiOnnxGraphEditor
-from .common import maybe_load_onnx_model
+from ..common import maybe_load_onnx_model
 
 
 def decompose_norm(input_path: str) -> onnx.ModelProto:

@@ -13,6 +13,9 @@
 python3 -m src.torq.tools.decompose_norm -i ../models/tsuki/tsuki_static_float32.onnx -o model.onnx
 ```
 ### 2. Constant Folding
+```
+python3 -m src.torq.tools.fold_constants -i <model_in>.onnx -o <model_out>.onnx
+```
 ### 3. Convert 1x1 Conv to GEMM
 ### 4. More Normalization Conversions
 #### 4.1. ONNX Tiling for ReduceSum and ReduceMean
