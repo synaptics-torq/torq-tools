@@ -44,17 +44,28 @@ python -m torq.tools.quantization.weight_quantization quantize \
 
 python -m torq.tools.quantization.weight_quantization analyze \
   -i model_fp32.onnx -o sensitivity_results.json \
-  --config-output quant_config.json
+  --config-output quant_config.json \
+  --embeddings token_embeddings.npy
 
 # Custom thresholds and tokenizer
 python -m torq.tools.quantization.weight_quantization analyze \
   -i model_fp32.onnx -o results.json \
   --config-output config.json \
+  --embeddings token_embeddings.npy \
   --tokenizer tokenizer.json \
   --bits 4 8 \
   --bf16-threshold 0.1 \
   --int8-threshold 0.01 \
   --num-tokens 10
+
+# Reduced-vocab models (pass token ID LUT for correct index mapping)
+python -m torq.tools.quantization.weight_quantization analyze \
+  -i model_reduced_vocab.onnx -o results.json \
+  --config-output config.json \
+  --embeddings token_embeddings.npy \
+  --tokenizer tokenizer.json \
+  --token-lut token_id_lut.npy \
+  --bits 4 8
 ```
 
 ## Quantization Config JSON
@@ -116,3 +127,12 @@ Output: sensitivity results JSON + quantization config JSON.
 - Format: int8 values [-8, 7] (15 quantization levels)
 - Block size: 32 (configurable)
 - Formula: `scale = (max - min) / 15`, `zp = round(-8 - min / scale)`, `q = round(w / scale + zp)`
+
+## IREE Compatibility
+
+The `quantize` subcommand automatically fixes ONNX graph issues that prevent IREE import:
+
+- **Slice INT64_MAX ends**: ONNX allows `ends=[INT64_MAX]` to mean "to the end," but IREE requires concrete bounds. The tool resolves these via shape inference before int64→int32 conversion.
+- **Mixed-type DQL validation**: DQL models with bf16 scales produce `InferenceError` during `check_model`. This is caught and handled gracefully.
+
+Both DQL and dequantized-bf16 outputs are directly importable by `iree.compiler.tools.import_onnx`.
