@@ -41,7 +41,7 @@ torq-convert-dtype = "torq.tools.convert_dtype.__main__:main"
 torq-compile-model = "torq.compile:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
-torq-quantize      = "torq.tools.quantization.weight_quantization.__main__:main"
+torq-quantize-model = "torq.tools.quantization.weight_quantization.__main__:main"
 
 [project.optional-dependencies]
 moonshine = [

@@ -179,9 +179,9 @@ If `torq-tools` was installed as a Python package, all major tools are also expo
 torq-convert-dtype onnx -d bf16 -i model_fp32.onnx -o model_bf16.onnx
 
 # quantize weights
-torq-quantize analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
-torq-quantize quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
-torq-quantize quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
+torq-quantize-model analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
+torq-quantize-model quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
+torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
