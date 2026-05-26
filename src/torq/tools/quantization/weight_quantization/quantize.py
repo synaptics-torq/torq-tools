@@ -607,17 +607,10 @@ class WeightQuantizer:
         onnx-graphsurgeon with shape inference and proper handling of
         Slice/Reshape/etc. inputs (kept as int64 per ONNX spec).
         """
-        from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
         from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
 
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)
-
-        # Register bf16 export support for older onnx-graphsurgeon versions
-        if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
-            _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
-                lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
-            )
 
         fp32_conv = FP32Converter("bf16", convert_io=True)
         converted = fp32_conv.convert_model(model)
@@ -638,17 +631,10 @@ class WeightQuantizer:
         scales, zero points) are preserved by the converter since they don't
         match the fp32 source dtype.
         """
-        from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
         from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
 
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)
-
-        # Register bf16 export support for older onnx-graphsurgeon versions
-        if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
-            _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
-                lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
-            )
 
         fp32_conv = FP32Converter("bf16", convert_io=True)
         converted = fp32_conv.convert_model(model)
