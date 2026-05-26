@@ -118,7 +118,7 @@ def _simplify(
     """Run the fixed audio simplification pipeline on ``fp32`` and return a new model."""
     graph = gs.import_onnx(fp32)
     graph.name = graph.name or "main"
-    with _SynapticsAudioGraphEditor(graph, name) as editor:
+    with _SynapticsAudioGraphEditor(graph, name, is_rnn=True) as editor:
         editor.run_audio_pipeline(input_shapes)
         simplified = editor.to_onnx()
     return finalize_torq_ready_onnx(simplified)

@@ -91,7 +91,8 @@ class OnnxGraphEditor:
         graph: gs.Graph,
         graph_name: str,
         edits: Iterable[OnnxGraphEdit] | None = None,
-        export_dtype: onnx.TensorProto.DataType | None = None
+        export_dtype: onnx.TensorProto.DataType | None = None,
+        is_rnn: bool = False,
     ):
         self._export_dtype = export_dtype
         self._graph = graph
@@ -99,6 +100,10 @@ class OnnxGraphEditor:
         self._graph_bak = self._graph.copy()
         self._logger = logging.getLogger(str(self))
         self._edits: dict[str, OnnxGraphEdit] = {}
+        # Restoring omitted RNN outputs is only relevant for graphs that
+        # actually contain RNN/GRU/LSTM nodes; opt-in via ``is_rnn`` so we
+        # don't run the post-pass on every unrelated graph.
+        self._is_rnn = bool(is_rnn)
         if isinstance(edits, Iterable):
             self.register_edits(edits)
 
@@ -142,7 +147,8 @@ class OnnxGraphEditor:
             remove_unused_graph_inputs=True,
             remove_unused_node_outputs=True
         ).toposort()
-        self.restore_rnn_output_arity(self._graph)
+        if self._is_rnn:
+            self.restore_rnn_output_arity(self._graph)
         onnx_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(self._graph),
             check_type=check_type,
@@ -187,7 +193,8 @@ class OnnxGraphEditor:
             remove_unused_graph_inputs=True,
             remove_unused_node_outputs=True
         ).toposort()
-        self.restore_rnn_output_arity(self._graph)
+        if self._is_rnn:
+            self.restore_rnn_output_arity(self._graph)
         if edit.requires_shape_inference:
             self._infer_shapes()
         return self

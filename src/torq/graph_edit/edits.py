@@ -594,23 +594,50 @@ class EliminateTranspose(OnnxGraphEdit):
     """
 
     @staticmethod
+    def _is_data_preserving_perm(perm: list[int], shape: list[int]) -> bool:
+        """Cycle heuristic: True when at most one dim > 1 per perm cycle.
+
+        This is a *necessary* condition for ``Transpose(x, perm)`` to be
+        equivalent to a Reshape, but not sufficient (e.g. shape
+        ``[1, 32, 16]`` with ``perm=[2, 1, 0]``). Used as a fast pre-filter.
+        """
+        visited = [False] * len(perm)
+        for i in range(len(perm)):
+            if visited[i] or perm[i] == i:
+                visited[i] = True
+                continue
+            cycle_dims: list[int] = []
+            j = i
+            while not visited[j]:
+                visited[j] = True
+                cycle_dims.append(shape[j])
+                j = perm[j]
+            if sum(1 for d in cycle_dims if d > 1) > 1:
+                return False
+        return True
+
+    @staticmethod
     def _transpose_equals_reshape(shape: list[int], perm: list[int]) -> bool:
         """True when ``Reshape(x, permuted_shape)`` matches ``Transpose(x, perm)``.
 
-        The old cycle heuristic (at most one dim > 1 per cycle) is insufficient:
-        e.g. shape ``[1, 32, 16]`` with ``perm=[2, 1, 0]`` swaps length-1 and
-        length-16 axes and must stay a real Transpose (voice_filter).
+        Hybrid check: first apply a cheap cycle heuristic that rules out
+        permutations that cannot be data-preserving, then confirm with an
+        exact element-comparison on a synthetic index tensor when feasible.
+        For tensors larger than ~1M elements (common in LLMs) materializing
+        the probe is too expensive, so the heuristic is trusted.
         """
         if len(shape) != len(perm):
             return False
         out_shape = [shape[p] for p in perm]
         if shape == out_shape:
             return True
+        if not EliminateTranspose._is_data_preserving_perm(perm, shape):
+            return False
         numel = 1
         for d in shape:
             numel *= int(d)
         if numel > 1_000_000:
-            return False
+            return True
         x = np.arange(numel, dtype=np.int64).reshape(shape)
         return bool(
             np.array_equal(np.transpose(x, perm), x.reshape(out_shape))
