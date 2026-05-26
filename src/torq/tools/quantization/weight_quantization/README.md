@@ -136,3 +136,39 @@ The `quantize` subcommand automatically fixes ONNX graph issues that prevent IRE
 - **Mixed-type DQL validation**: DQL models with bf16 scales produce `InferenceError` during `check_model`. This is caught and handled gracefully.
 
 Both DQL and dequantized-bf16 outputs are directly importable by `iree.compiler.tools.import_onnx`.
+
+## Benchmarking
+
+Run quantized models through a standard question set and compare results.
+
+### Run benchmark on board
+
+```bash
+python -m torq.tools.quantization.weight_quantization.benchmark run \
+  -m /path/to/model.vmfb --instruct-model -o results_int8.json
+
+python -m torq.tools.quantization.weight_quantization.benchmark run \
+  -m /path/to/model_hybrid.vmfb --instruct-model -o results_hybrid.json
+```
+
+Options:
+- `-m` — path to model VMFB (or ONNX)
+- `--instruct-model` — use Gemma3 instruct chat template
+- `--questions-file` — custom JSON list of questions (default: built-in 24 questions)
+- `--temperature` — sampling temperature (default: 0.0 = greedy)
+- `--runner-path` — path to directory containing `runner.py` (auto-detected if omitted)
+- `-j` — number of inference threads
+
+### Compare two benchmark results
+
+```bash
+python -m torq.tools.quantization.weight_quantization.benchmark compare \
+  -a results_int8.json -b results_hybrid.json \
+  --name-a "Pure Int8" --name-b "Hybrid Int8/Int4" \
+  -o comparison.md
+```
+
+Generates a markdown report with:
+- Summary table (TPS, TTFT, total tokens)
+- Side-by-side answers for each question
+- Per-question performance metrics
