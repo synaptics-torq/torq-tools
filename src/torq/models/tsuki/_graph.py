@@ -14,7 +14,7 @@ from ...graph_edit import (
 from ...graph_edit.edits import *
 from ...graph_edit.tsuki_edits import *
 
-class TsukiOnnxGraphEditor(OnnxGraphEditor, NormalizationPatches):
+class TsukiOnnxGraphEditor(OnnxGraphEditor, NormalizationPatches, MiscTsukiPatches):
     def __init__(
         self,
         graph: gs.Graph,

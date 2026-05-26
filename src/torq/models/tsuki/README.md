@@ -10,13 +10,16 @@
 ## Making the Model Compatible
 ### 1. Layer/Instance Normalization Decomposition
 ```
-python3 -m src.torq.tools.decompose_norm -i ../models/tsuki/tsuki_static_float32.onnx -o model.onnx
+python3 -m src.torq.tools.decompose_norm -i <model_in>.onnx -o <model_out>.onnx
 ```
 ### 2. Constant Folding
 ```
 python3 -m src.torq.tools.fold_constants -i <model_in>.onnx -o <model_out>.onnx
 ```
 ### 3. Convert 1x1 Conv to GEMM
+```
+python3 -m src.torq.tools.optimize_conv1d -i <model_in>.onnx -o <model_out>.onnx
+```
 ### 4. More Normalization Conversions
 #### 4.1. ONNX Tiling for ReduceSum and ReduceMean
 #### 4.2. Transpose -> ReduceMean(last axis) -> Tranpose back

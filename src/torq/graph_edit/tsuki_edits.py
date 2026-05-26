@@ -348,6 +348,59 @@ class DecomposeInstanceNorm(OnnxGraphEdit):
             node.name, epsilon, self.dynamic,
         )
 
+@dataclass
+class Convert1x1Conv1DToGEMM(OnnxGraphEdit):
+    """
+    Replace onnx.InstanceNormalization with its primitive op decomposition.
+
+    Decomposes ``Conv1D where (kernel=1, stride=1, dilation=1, groups=1 with GEMM``
+
+    Notes:
+        
+    """
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Conv" \
+            and node.attrs["strides"][0]==1 \
+            and len(node.attrs["strides"]) == 1 \
+            and node.inputs[1].shape[-1] == 1 \
+            and len(node.inputs[1].shape) == 3:
+
+            if hasattr(node.attrs, "dilations"):
+                if node.attrs["dilations"][0]==1 and len(node.attrs["dilations"]) == 1:
+                    return False
+            if hasattr(node.attrs, "group"):
+                if node.attrs["group"][0]==1:
+                    return False
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        input_node = node.inputs[0]
+        output_node = node.outputs[0]
+        weights = node.inputs[1]
+        bias = node.inputs[2]
+        if not isinstance(weights, gs.Constant) or not isinstance(bias, gs.Constant):
+            raise ValueError(f"Cannot convert non constant weight: {node.name}\nPlease see: python3 -m src.torq.tools.fold_constants -i <in_model.onnx> -o <out_model.onnx>")
+
+        prefix = f"_conv1d_converted_to_gemm_{output_node.name}_"
+        weights.values = weights.values.squeeze(-1).T
+
+        self.graph.layer(
+            name=prefix + "gemm",
+            op="Gemm",
+            inputs=[input_node, weights, bias],
+            outputs=[output_node],
+        )
+
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug(
+            "Replaced Conv '%s' with GEMM",
+            node.name,
+        )
+
 
 class NormalizationPatches:
     def decompose_layer_norm(self):
@@ -357,3 +410,7 @@ class NormalizationPatches:
     def decompose_instance_norm(self, N: gs.Variable | None = None, dynamic: bool | None = None):
         self.apply_edit(DecomposeInstanceNorm(self._graph, self._graph_name, N=N, dynamic=dynamic))
         return self
+    
+class MiscTsukiPatches:
+    def convert_1x1_conv1d_to_gemm(self):
+        self.apply_edit(Convert1x1Conv1DToGEMM(self._graph, self._graph_name))
