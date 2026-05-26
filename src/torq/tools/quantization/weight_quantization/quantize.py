@@ -613,7 +613,7 @@ class WeightQuantizer:
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)
 
-        # Register bf16 export support in onnx-graphsurgeon (not natively supported)
+        # Register bf16 export support for older onnx-graphsurgeon versions
         if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
             _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
                 lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
@@ -644,7 +644,7 @@ class WeightQuantizer:
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)
 
-        # Register bf16 export support in onnx-graphsurgeon (not natively supported)
+        # Register bf16 export support for older onnx-graphsurgeon versions
         if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
             _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = (
                 lambda arr: arr.view(np.uint32).__rshift__(16).astype(np.uint16)
