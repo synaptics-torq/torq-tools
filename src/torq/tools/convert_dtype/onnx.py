@@ -12,7 +12,6 @@ from typing import Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
-from torq.utils.logging import add_logging_args, configure_logging
 
 from ...utils.onnx import is_same_dtype, upgrade_model
 
@@ -744,10 +743,12 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         default=False,
         help="Use TensorRT modelopt for dtype conversion"
     )
+    from torq.utils.logging import add_logging_args
     add_logging_args(parser)
 
 
 def onnx_dtype_convert_from_args(args: argparse.Namespace):
+    from torq.utils.logging import configure_logging
     configure_logging(args.logging)
     convert_model(
         args.input,
