@@ -88,6 +88,10 @@ Layers not listed in `layers` use the `default` settings.
 
 ## Sensitivity Analysis
 
+> **Note:** The `analyze` subcommand only supports autoregressive decoder models
+> (e.g. Gemma, SmolLM, LLaMA). It requires a static ONNX graph with KV cache I/O
+> and token embedding inputs. Encoder or encoder-decoder models are not supported.
+
 The `analyze` subcommand measures per-layer quantization impact:
 
 1. For each MatMul layer, quantize its weight independently

@@ -85,6 +85,11 @@ _DEFAULT_PROMPTS = [
 # ---------------------------------------------------------------------------
 # Model architecture auto-detection
 # ---------------------------------------------------------------------------
+# NOTE: The inference loop below intentionally does NOT reuse the model-specific
+# runners (e.g. SmolLM2Base, Gemma3Static). Those require model config files and
+# are tied to a specific architecture. The sensitivity analyzer must work with
+# *any* static decoder ONNX model using only the session I/O metadata.
+# ---------------------------------------------------------------------------
 
 
 def _detect_model_arch(sess) -> dict:
