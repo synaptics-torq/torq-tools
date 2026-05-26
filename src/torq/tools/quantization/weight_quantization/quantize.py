@@ -524,6 +524,82 @@ class WeightQuantizer:
         # Convert entire model fp32 → bf16 and int64 → int32
         self._convert_to_bf16(model)
 
+    @staticmethod
+    def _fix_slice_int64max(model: onnx.ModelProto) -> int:
+        """Replace INT64_MAX in Slice 'ends' with actual dimension sizes.
+
+        ONNX allows ``ends=[INT64_MAX]`` to mean "to the end of the axis",
+        but IREE's ONNX importer cannot handle unbounded slice bounds.
+        This pass resolves them to concrete values via shape inference.
+
+        Must be called **before** int64→int32 conversion (INT64_MAX truncated
+        to int32 produces garbage values).
+
+        Returns the number of Slice nodes fixed.
+        """
+        from onnx import shape_inference
+
+        INT64_MAX = 9223372036854775807
+
+        model_inferred = shape_inference.infer_shapes(model)
+
+        # Build shape map from inferred model
+        shapes: dict[str, list[int]] = {}
+        for v in (
+            list(model_inferred.graph.value_info)
+            + list(model_inferred.graph.input)
+            + list(model_inferred.graph.output)
+        ):
+            if v.type.tensor_type.shape.dim:
+                shapes[v.name] = [
+                    d.dim_value for d in v.type.tensor_type.shape.dim
+                ]
+
+        init_map = {i.name: idx for idx, i in enumerate(model.graph.initializer)}
+
+        fixed = 0
+        for node in model.graph.node:
+            if node.op_type != "Slice":
+                continue
+            inputs = list(node.input)
+            if len(inputs) < 4:
+                continue
+
+            ends_name = inputs[2]
+            axes_name = inputs[3]
+            data_name = inputs[0]
+
+            if ends_name not in init_map or axes_name not in init_map:
+                continue
+
+            ends_arr = numpy_helper.to_array(
+                model.graph.initializer[init_map[ends_name]]
+            )
+            axes_arr = numpy_helper.to_array(
+                model.graph.initializer[init_map[axes_name]]
+            )
+
+            new_ends = ends_arr.copy()
+            needs_fix = False
+            for i, (end_val, axis_val) in enumerate(zip(ends_arr, axes_arr)):
+                if end_val == INT64_MAX:
+                    shape = shapes.get(data_name)
+                    if shape and len(shape) > axis_val and shape[axis_val] > 0:
+                        new_ends[i] = shape[axis_val]
+                        needs_fix = True
+
+            if needs_fix:
+                new_tensor = numpy_helper.from_array(new_ends, name=ends_name)
+                model.graph.initializer[init_map[ends_name]].CopyFrom(new_tensor)
+                fixed += 1
+
+        if fixed:
+            logger.info(
+                "Fixed %d Slice node(s): replaced INT64_MAX ends with actual dims",
+                fixed,
+            )
+        return fixed
+
     def _convert_to_bf16(self, model: onnx.ModelProto) -> None:
         """Convert fp32 model to bf16 inline using the proper dtype converter.
 
@@ -533,6 +609,9 @@ class WeightQuantizer:
         """
         from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
         from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
+
+        # Fix INT64_MAX in Slice ends before int64→int32 conversion
+        self._fix_slice_int64max(model)
 
         # Register bf16 export support in onnx-graphsurgeon (not natively supported)
         if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
@@ -561,6 +640,9 @@ class WeightQuantizer:
         """
         from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
         from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
+
+        # Fix INT64_MAX in Slice ends before int64→int32 conversion
+        self._fix_slice_int64max(model)
 
         # Register bf16 export support in onnx-graphsurgeon (not natively supported)
         if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:

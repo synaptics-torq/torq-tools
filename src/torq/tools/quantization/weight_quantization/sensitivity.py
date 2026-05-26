@@ -542,6 +542,16 @@ class LayerSensitivityAnalyzer:
             return int(self._token_lut[reduced_idx])
         return reduced_idx
 
+    def _full_to_reduced(self, full_id: int) -> int:
+        """Map full-vocab token ID to reduced-vocab index."""
+        if self._reverse_lut is not None:
+            if full_id in self._reverse_lut:
+                return self._reverse_lut[full_id]
+            # Token not in reduced vocab — fall back to UNK (index 0)
+            logger.debug("Token ID %d not in reduced vocab, using index 0", full_id)
+            return 0
+        return full_id
+
     def _collect_logits(
         self,
         sess,
@@ -566,7 +576,9 @@ class LayerSensitivityAnalyzer:
 
         # Process prompt tokens
         for tok in prompt_ids:
-            logits = self._step(sess, emb, kv, tok, pos, out_names, arch)
+            # Map full vocab ID to reduced vocab index for embedding lookup
+            reduced_tok = self._full_to_reduced(tok)
+            logits = self._step(sess, emb, kv, reduced_tok, pos, out_names, arch)
             pos += 1
 
         # Generate tokens
@@ -581,7 +593,9 @@ class LayerSensitivityAnalyzer:
             )
             if feed_tok in eos_ids:
                 break
-            logits = self._step(sess, emb, kv, feed_tok, pos, out_names, arch)
+            # Map full vocab ID to reduced index for embedding lookup
+            reduced_feed = self._full_to_reduced(feed_tok)
+            logits = self._step(sess, emb, kv, reduced_feed, pos, out_names, arch)
             pos += 1
             reduced_idx = int(logits.argmax())
             full_tok = self._reduced_to_full(reduced_idx)
