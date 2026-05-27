@@ -22,9 +22,15 @@ def _create_norm_subgraph(graph: gs.Graph, node: gs.Node, axis: int = -1, epsilo
     prefix = f"_norm_decomp_{y.name}_"
 
     x_dtype = getattr(x, "dtype", None)
+    x_shape = getattr(x, "shape", None)
+    reduced_shape = None
+    if x_shape is not None:
+        norm_axis = axis if axis >= 0 else len(x_shape) + axis
+        reduced_shape = list(x_shape)
+        reduced_shape[norm_axis] = 1
 
-    def _var(name: str) -> gs.Variable:
-        return gs.Variable(name=prefix + name, dtype=x_dtype, shape=None)
+    def _var(name: str, shape=x_shape) -> gs.Variable:
+        return gs.Variable(name=prefix + name, dtype=x_dtype, shape=shape)
 
     axes_const = gs.Constant(
         name=prefix + "axes",
@@ -40,7 +46,7 @@ def _create_norm_subgraph(graph: gs.Graph, node: gs.Node, axis: int = -1, epsilo
         op="ReduceMean",
         inputs=[x, axes_const],
         attrs={"keepdims": 1},
-        outputs=[_var("mean_out")],
+        outputs=[_var("mean_out", shape=reduced_shape)],
     )[0]
     diff = graph.layer(
         name=prefix + "diff",
@@ -59,25 +65,25 @@ def _create_norm_subgraph(graph: gs.Graph, node: gs.Node, axis: int = -1, epsilo
         op="ReduceMean",
         inputs=[diff_sq, axes_const],
         attrs={"keepdims": 1},
-        outputs=[_var("var_out")],
+        outputs=[_var("var_out", shape=reduced_shape)],
     )[0]
     var_eps = graph.layer(
         name=prefix + "var_eps",
         op="Add",
         inputs=[var, eps_const],
-        outputs=[_var("var_eps_out")],
+        outputs=[_var("var_eps_out", shape=reduced_shape)],
     )[0]
     std = graph.layer(
         name=prefix + "std",
         op="Sqrt",
         inputs=[var_eps],
-        outputs=[_var("std_out")],
+        outputs=[_var("std_out", shape=reduced_shape)],
     )[0]
     inv_std = graph.layer(
         name=prefix + "inv_std",
         op="Reciprocal",
         inputs=[std],
-        outputs=[_var("inv_std_out")],
+        outputs=[_var("inv_std_out", shape=reduced_shape)],
     )[0]
     norm = graph.layer(
         name=prefix + "norm",
@@ -141,9 +147,11 @@ def _create_instance_norm_subgraph(
         )
     spatial_axes = list(range(2, rank))
     unsqueeze_axes = [0] + spatial_axes
+    reduced_shape = [x_shape[0], x_shape[1]] + [1] * len(spatial_axes)
+    channel_shape = [1, x_shape[1]] + [1] * len(spatial_axes)
 
-    def _var(name: str) -> gs.Variable:
-        return gs.Variable(name=prefix + name, dtype=x_dtype, shape=None)
+    def _var(name: str, shape=x_shape) -> gs.Variable:
+        return gs.Variable(name=prefix + name, dtype=x_dtype, shape=shape)
 
     axes_const = gs.Constant(
         name=prefix + "axes",
@@ -166,14 +174,14 @@ def _create_instance_norm_subgraph(
             op=reduce_op,
             inputs=[in_tensor, axes_const],
             attrs={"keepdims": 1},
-            outputs=[_var(label + "_out")],
+            outputs=[_var(label + "_out", shape=reduced_shape)],
         )[0]
         if N is not None:
             reduced = graph.layer(
                 name=prefix + label + "_div_n",
                 op="Div",
                 inputs=[reduced, N],
-                outputs=[_var(label + "_mean")],
+                outputs=[_var(label + "_mean", shape=reduced_shape)],
             )[0]
         return reduced
 
@@ -195,19 +203,19 @@ def _create_instance_norm_subgraph(
         name=prefix + "var_eps",
         op="Add",
         inputs=[var, eps_const],
-        outputs=[_var("var_eps_out")],
+        outputs=[_var("var_eps_out", shape=reduced_shape)],
     )[0]
     std = graph.layer(
         name=prefix + "std",
         op="Sqrt",
         inputs=[var_eps],
-        outputs=[_var("std_out")],
+        outputs=[_var("std_out", shape=reduced_shape)],
     )[0]
     inv_std = graph.layer(
         name=prefix + "inv_std",
         op="Reciprocal",
         inputs=[std],
-        outputs=[_var("inv_std_out")],
+        outputs=[_var("inv_std_out", shape=reduced_shape)],
     )[0]
     norm = graph.layer(
         name=prefix + "norm",
@@ -220,7 +228,7 @@ def _create_instance_norm_subgraph(
         name=prefix + "scale_unsqueeze",
         op="Unsqueeze",
         inputs=[scale, unsqueeze_axes_const],
-        outputs=[_var("scale_reshaped")],
+        outputs=[_var("scale_reshaped", shape=channel_shape)],
     )[0]
 
     if bias is not None:
@@ -234,7 +242,7 @@ def _create_instance_norm_subgraph(
             name=prefix + "bias_unsqueeze",
             op="Unsqueeze",
             inputs=[bias, unsqueeze_axes_const],
-            outputs=[_var("bias_reshaped")],
+            outputs=[_var("bias_reshaped", shape=channel_shape)],
         )[0]
         graph.layer(
             name=prefix + "biased",
@@ -355,7 +363,7 @@ class Convert1x1Conv1DToGEMM(OnnxGraphEdit):
 
     Decomposes ``Conv1D where (kernel=1, stride=1, dilation=1, groups=1 with GEMM``
 
-    Notes:
+    Notes: Requires constant weights
         
     """
     def match(self, node: gs.Node) -> bool:
@@ -401,6 +409,57 @@ class Convert1x1Conv1DToGEMM(OnnxGraphEdit):
             node.name,
         )
 
+@dataclass
+class ConvertReduceSumToConvertMean(OnnxGraphEdit):
+    """
+    Converts ReduceSum(x) into ReduceMean(x) * len(x)
+
+    Notes:
+        
+    """
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "ReduceSum"
+
+    def transform(self, node: gs.Node):
+        input_node = node.inputs[0]
+        output_node = node.outputs[0]
+        prefix = f"_reducesum_as_reducemean_{output_node.name}_"
+        axis = node.inputs[1]
+        attrs = node.attrs
+        input_node_dtype = getattr(input_node, "dtype", None)
+        axis_lens = [input_node.shape[int(axis.values[i])] for i in range(len(axis.values))]
+        axis_len = np.cumprod(axis_lens)[-1]
+
+        def _var(name: str) -> gs.Variable:
+            return gs.Variable(name=prefix + name, dtype=input_node_dtype, shape=output_node.shape)
+
+        axis_len_const = gs.Constant(
+            name=prefix + "axis_len",
+            values=np.array([axis_len], dtype=np.float32),
+        )
+
+        mean = self.graph.layer(
+            name=prefix + "reducemean",
+            op="ReduceMean",
+            inputs=[input_node, axis],
+            outputs=[_var("mean_out")],
+            attrs=attrs,
+        )[0]
+
+        self.graph.layer(
+            name=prefix + "mul",
+            op="Mul",
+            inputs=[mean, axis_len_const],
+            outputs=[output_node]
+        )
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug(
+            "Replaced ReduceSum(x) '%s' with ReduceMean(x) * len(x)",
+            node.name,
+        )
 
 class NormalizationPatches:
     def decompose_layer_norm(self):
@@ -410,6 +469,11 @@ class NormalizationPatches:
     def decompose_instance_norm(self, N: gs.Variable | None = None, dynamic: bool | None = None):
         self.apply_edit(DecomposeInstanceNorm(self._graph, self._graph_name, N=N, dynamic=dynamic))
         return self
+    
+    def convert_reduce_sum(self):
+        self.apply_edit(ConvertReduceSumToConvertMean(self._graph, self._graph_name))
+    #def tile_reduce_operators(self):
+
     
 class MiscTsukiPatches:
     def convert_1x1_conv1d_to_gemm(self):

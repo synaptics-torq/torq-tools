@@ -17,6 +17,7 @@ def decompose_norm(input_path: str) -> onnx.ModelProto:
     N = gs.Variable(name="N", dtype=np.float32, shape=())
     graph_editor.graph.inputs.append(N)
     graph_editor.decompose_instance_norm(N=N, dynamic=False)
+    graph_editor.convert_reduce_sum()
     return gs.export_onnx(graph)
 
 def main():

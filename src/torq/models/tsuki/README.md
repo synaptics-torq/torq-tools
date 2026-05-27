@@ -12,6 +12,8 @@
 ```
 python3 -m src.torq.tools.decompose_norm -i <model_in>.onnx -o <model_out>.onnx
 ```
+#### 1.1. Decomposes Layer Norm/Instance Norm
+#### 1.2. Converts ReduceSum(x) INTO ReduceMean(x) * len(x)
 ### 2. Constant Folding
 ```
 python3 -m src.torq.tools.fold_constants -i <model_in>.onnx -o <model_out>.onnx
@@ -32,6 +34,5 @@ python3 -m src.torq.tools.optimize_conv1d -i <model_in>.onnx -o <model_out>.onnx
 ### 6. Tile large matmul/softmax across attention head axis
 ### 7. Further tiling of large softmax/attention head across k dimension
 ### 8. Decompose ConvTranspose using im2col
-### 9. Convert ReduceSum(x) INTO ReduceMean(x) * len(x)
 
 ## Compiliation Instructions
