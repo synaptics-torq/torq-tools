@@ -586,11 +586,15 @@ class EliminateTranspose(OnnxGraphEdit):
     Eliminate Transpose ops that don't rearrange data in memory.
 
     Handles two cases:
-    1. No-op: permuted shape equals input shape (e.g., transposing two dims of equal size).
-       The Transpose is bypassed entirely.
-    2. Data-preserving: permutation only swaps dims where at most one per cycle has size > 1
-       (e.g., ``[1,1,H,D]`` with ``perm=[0,2,1,3]`` → ``[1,H,1,D]`` when seq_len dim is 1).
-       The Transpose is replaced with an equivalent Reshape.
+    1. Identity: ``perm == [0, 1, ..., n-1]``. The Transpose is bypassed entirely.
+    2. Data-preserving: the flat element order produced by ``Transpose(x, perm)``
+       equals that of ``Reshape(x, permuted_shape)`` (e.g. ``[1,1,H,D]`` with
+       ``perm=[0,2,1,3]`` when one of the swapped dims is 1). The Transpose is
+       replaced with an equivalent Reshape.
+
+    Note: ``input_shape == permuted_shape`` is *not* sufficient on its own --
+    e.g. ``shape=[2,2] perm=[1,0]`` has equal in/out shapes but really
+    rearranges data.
     """
 
     @staticmethod
@@ -622,14 +626,18 @@ class EliminateTranspose(OnnxGraphEdit):
 
         Hybrid check: first apply a cheap cycle heuristic that rules out
         permutations that cannot be data-preserving, then confirm with an
-        exact element-comparison on a synthetic index tensor when feasible.
-        For tensors larger than ~1M elements (common in LLMs) materializing
-        the probe is too expensive, so the heuristic is trusted.
+        exact element-comparison on a synthetic index tensor. The heuristic
+        alone admits false positives (e.g. ``shape=[1, 4, N] perm=[2, 1, 0]``
+        passes the cycle test but is a real transpose), so for tensors too
+        large to materialize the probe (numel > ~1M) we conservatively return
+        False -- a missed elimination is only a speed loss, whereas an
+        incorrect elimination can silently miscompile.
         """
         if len(shape) != len(perm):
             return False
-        out_shape = [shape[p] for p in perm]
-        if shape == out_shape:
+        # True identity is always safe regardless of tensor size; equal in/out
+        # shapes alone are not (e.g. [2,2] perm=[1,0] really swaps data).
+        if all(perm[i] == i for i in range(len(perm))):
             return True
         if not EliminateTranspose._is_data_preserving_perm(perm, shape):
             return False
@@ -637,7 +645,8 @@ class EliminateTranspose(OnnxGraphEdit):
         for d in shape:
             numel *= int(d)
         if numel > 1_000_000:
-            return True
+            return False
+        out_shape = [shape[p] for p in perm]
         x = np.arange(numel, dtype=np.int64).reshape(shape)
         return bool(
             np.array_equal(np.transpose(x, perm), x.reshape(out_shape))
