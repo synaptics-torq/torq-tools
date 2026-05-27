@@ -5,10 +5,12 @@ from . import (
     moonshine,
     smollm2,
     gemma3,
+    liquid,
 )
 
 all = [
     "moonshine",
     "smollm2",
     "gemma3",
+    "liquid",
 ]

@@ -6,6 +6,7 @@ import argparse
 from .moonshine import add_moonshine_infer_args
 from .smollm2 import add_smollm2_infer_args
 from .gemma3 import add_gemma3_infer_args
+from .liquid import add_liquid_infer_args
 
 
 def main():
@@ -21,6 +22,9 @@ def main():
     gemma3 = model.add_parser("gemma3", help="Run Gemma3 inference")
     add_gemma3_infer_args(gemma3)
 
+    liquid = model.add_parser("liquid", help="Run LFM2.5 (Liquid) inference")
+    add_liquid_infer_args(liquid)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -32,6 +36,9 @@ def main():
     elif args.model_name == "gemma3":
         from .gemma3.infer import infer_gemma3
         infer_gemma3(args)
+    elif args.model_name == "liquid":
+        from .liquid.infer import infer_liquid
+        infer_liquid(args)
 
 
 if __name__ == "__main__":

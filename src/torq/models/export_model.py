@@ -6,6 +6,7 @@ import argparse
 from .moonshine import add_moonshine_export_args
 from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
+from .liquid import add_liquid_export_args
 
 
 def main():
@@ -21,6 +22,9 @@ def main():
     gemma3 = model.add_parser("gemma3", help="Export Gemma3 to Torq")
     add_gemma3_export_args(gemma3)
 
+    liquid = model.add_parser("liquid", help="Export LFM2.5 (Liquid) to Torq")
+    add_liquid_export_args(liquid)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -32,6 +36,9 @@ def main():
     elif args.model_name == "gemma3":
         from .gemma3.export import export_gemma3_from_args
         export_gemma3_from_args(args)
+    elif args.model_name == "liquid":
+        from .liquid.export import export_liquid_from_args
+        export_liquid_from_args(args)
 
 
 if __name__ == "__main__":
