@@ -113,7 +113,6 @@ def _create_norm_subgraph(graph: gs.Graph, node: gs.Node, axis: int = -1, epsilo
             outputs=[y],
         )
 
-
 def _create_instance_norm_subgraph(
     graph: gs.Graph,
     node: gs.Node,
@@ -258,7 +257,6 @@ def _create_instance_norm_subgraph(
             outputs=[y],
         )
 
-
 @dataclass
 class DecomposeLayerNorm(OnnxGraphEdit):
     """
@@ -291,7 +289,6 @@ class DecomposeLayerNorm(OnnxGraphEdit):
             "Decomposed LayerNormalization '%s' (axis=%s, epsilon=%s)",
             node.name, axis, epsilon,
         )
-
 
 @dataclass
 class DecomposeInstanceNorm(OnnxGraphEdit):
@@ -461,6 +458,46 @@ class ConvertReduceSumToConvertMean(OnnxGraphEdit):
             node.name,
         )
 
+
+@dataclass
+class ConvertReciprocalMulToDiv(OnnxGraphEdit):
+    """
+    Converts Reciprocal -> Mul INTO Div
+
+    Notes:
+        
+    """
+    def match(self, node: gs.Node) -> bool:
+        #TODO: needs to be tightened for 
+        return node.op == "Reciprocal" and node.o().op=="Mul"
+
+    def transform(self, node: gs.Node):
+        reciprocal_node = node
+        mul_node = node.o()
+        input_nodes = reciprocal_node.inputs + mul_node.inputs[1:]
+        output_nodes = mul_node.outputs
+
+        prefix = f"_reducesum_as_reducemean_{output_nodes[0].name}_"
+
+        self.graph.layer(
+            name=prefix + "div",
+            op="Div",
+            inputs=input_nodes,
+            outputs=output_nodes
+        )
+
+        reciprocal_node.inputs.clear()
+        reciprocal_node.outputs.clear()
+
+        mul_node.inputs.clear()
+        mul_node.outputs.clear()
+
+        self._logger.debug(
+            "Replaced Reciprocal -> Mul '%s' with Div",
+            node.name,
+        )
+
+
 class NormalizationPatches:
     def decompose_layer_norm(self):
         self.apply_edit(DecomposeLayerNorm(self._graph, self._graph_name))
@@ -472,6 +509,9 @@ class NormalizationPatches:
     
     def convert_reduce_sum(self):
         self.apply_edit(ConvertReduceSumToConvertMean(self._graph, self._graph_name))
+
+    def convert_reciprocal_mul(self):
+        self.apply_edit(ConvertReciprocalMulToDiv(self._graph, self._graph_name))
     #def tile_reduce_operators(self):
 
     
