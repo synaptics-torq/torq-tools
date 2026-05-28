@@ -15,6 +15,7 @@ To compile the exported ONNX to VMFB for on-device deployment, see
 | File | Purpose |
 |---|---|
 | [export.py](export.py) | PyTorch → 4 dynamic ONNX models → static-shape ONNX. Wired into `torq-export-model moonshine-streaming`. |
+| [export_lite.py](export_lite.py) | Lightweight dynamic-only ONNX export. Single-file script with minimal dependencies; no `torq` package install required. |
 | [_wrappers.py](_wrappers.py) | `nn.Module` wrappers that split the HF model into `Preprocessor` / `TransformerEncoder` / `Decoder` / `DecoderWithPast` for ONNX export. |
 | [_graph.py](_graph.py) | `MoonshineStreamingOnnxGraphEditor` — graph surgery for the dynamo output (Softmax renaming, KV-cache resize, causal mask injection). |
 | [__init__.py](__init__.py) | Argparse helper shared with the top-level CLI dispatcher. |
@@ -54,6 +55,10 @@ pip install --upgrade pip
 pip install -e .
 ```
 
+This is the recommended install. It registers the `torq-export-model` CLI
+and pulls in every dependency used by the exporter, the validation tests,
+and the mic demo.
+
 The mic demo additionally requires `sounddevice`:
 
 ```bash
@@ -62,6 +67,27 @@ pip install sounddevice
 
 On Linux, `sounddevice` needs the system PortAudio library
 (`apt install portaudio19-dev` on Debian/Ubuntu).
+
+### Lightweight install (export + inference, no `torq` package)
+
+The dynamic ONNX export ([export_lite.py](export_lite.py)) and the inference
+/ validation scripts ([infer_test.py](infer_test.py),
+[test_chunk_size.py](test_chunk_size.py),
+[test_incremental_static.py](test_incremental_static.py)) do not import the
+`torq` package and run with a minimal dependency set:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install numpy onnx onnxruntime torch transformers huggingface_hub tokenizers
+pip install sounddevice           # only for infer_test.py
+```
+
+Scripts are invoked by file path rather than via `python -m torq.…`. The
+static-shape conversion (`models/.../static/`) and the `torq-export-model`
+CLI are unavailable in this mode; use the recommended install above when
+those are needed.
 
 ## Quick start
 
@@ -80,6 +106,20 @@ models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/
 ├── dynamic/    # variable shapes — used for validation and the mic demo
 └── static/     # fixed shapes for downstream compilation
 ```
+
+### Lightweight export (dynamic ONNX only)
+
+For environments without the `torq` package install, use the standalone
+script:
+
+```bash
+python src/torq/models/moonshine_streaming/export_lite.py -s tiny
+```
+
+Produces the same dynamic ONNX models as `torq-export-model …` in
+`models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/dynamic/`,
+which are sufficient for the mic demo and the HF validation tests. The
+static-shape conversion is not run.
 
 ### Mic demo
 
@@ -245,10 +285,10 @@ by `current_len`.
 
 ## Notes
 
-- The standalone scripts ([infer_test.py](infer_test.py),
-  [test_chunk_size.py](test_chunk_size.py),
+- The standalone scripts ([export_lite.py](export_lite.py),
+  [infer_test.py](infer_test.py), [test_chunk_size.py](test_chunk_size.py),
   [test_incremental_static.py](test_incremental_static.py)) are invoked as
-  files. `python -m torq.models.moonshine_streaming.infer_test` works once
+  files. `python -m torq.models.moonshine_streaming.<name>` also works once
   the package is installed.
 - The validation script in [test_incremental_static.py](test_incremental_static.py)
   uses `MoonshineStreamingForConditionalGeneration.generate(...)` as the
