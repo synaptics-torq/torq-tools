@@ -6,8 +6,7 @@ from pathlib import Path
 import flatbuffers
 import os
 
-from tensorflow.lite.python import schema_py_generated as schema_fb
-
+from . import schema_py_generated as schema_fb
 
 def convert_model(
     input_model: str | os.PathLike,

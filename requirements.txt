@@ -15,4 +15,3 @@ polygraphy
 tokenizers
 transformers
 flatbuffers
-tensorflow
