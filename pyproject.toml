@@ -42,6 +42,7 @@ torq-compile-model = "torq.compile:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
 torq-quantize-model = "torq.tools.quantization.weight_quantization.__main__:main"
+torq-synaptics-audio = "torq.models.synaptics_audio.__main__:main"
 
 [project.optional-dependencies]
 moonshine = [

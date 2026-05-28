@@ -13,7 +13,7 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
-from ...utils.onnx import is_same_dtype, upgrade_model
+from ...utils.onnx import finalize_torq_ready_onnx, is_same_dtype, upgrade_model
 
 logger = logging.getLogger("ONNX-Dtype-Converter")
 
@@ -40,6 +40,7 @@ class OnnxDtypeConverterBase(ABC):
         export_dtype: str,
         convert_io: bool = False,
         direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
     ):
         if export_dtype not in self.allowed_dtypes():
             raise ValueError(
@@ -53,6 +54,7 @@ class OnnxDtypeConverterBase(ABC):
         self._original_onnx_dtype = self._validate_dtype(original_dtype)
         self._export_onnx_dtype = self._validate_dtype(export_dtype)
         self._convert_exceptions: dict[str, str] = {}
+        self._remove_unused_node_outputs = not preserve_unused_node_outputs
 
     @staticmethod
     def _validate_dtype(dtype: str) -> onnx.TensorProto.DataType:
@@ -270,7 +272,7 @@ class OnnxDtypeConverterBase(ABC):
             )
         graph = graph.cleanup(
             remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
+            remove_unused_node_outputs=self._remove_unused_node_outputs,
         ).toposort()
 
     def _check_tensor_dtypes(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
@@ -296,7 +298,7 @@ class OnnxDtypeConverterBase(ABC):
     def _check_conversion(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
         graph.cleanup(
             remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
+            remove_unused_node_outputs=self._remove_unused_node_outputs,
         ).toposort()
         return self._check_tensor_dtypes(graph)
 
@@ -385,9 +387,16 @@ class FP32Converter(OnnxDtypeConverterBase):
         self,
         export_dtype: str,
         convert_io: bool = False,
-        direct_cast: bool = True
+        direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
     ):
-        super().__init__("fp32", export_dtype, convert_io, direct_cast)
+        super().__init__(
+            "fp32",
+            export_dtype,
+            convert_io,
+            direct_cast,
+            preserve_unused_node_outputs,
+        )
 
     @classmethod
     def allowed_dtypes(cls) -> tuple[str, ...]:
@@ -476,9 +485,16 @@ class Int64Converter(OnnxDtypeConverterBase):
         self,
         export_dtype: str = "int32",
         convert_io: bool = False,
-        direct_cast: bool = True
+        direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
     ):
-        super().__init__("int64", export_dtype, convert_io, direct_cast)
+        super().__init__(
+            "int64",
+            export_dtype,
+            convert_io,
+            direct_cast,
+            preserve_unused_node_outputs,
+        )
 
         self._original_sdtype_str  = self._original_dtype_str
         self._original_udtype_str  = "u" + self._original_dtype_str
@@ -651,16 +667,27 @@ def _convert_internal(
     convert_dtype: str,
     convert_io: bool,
     target_opset: int,
+    preserve_unused_node_outputs: bool,
 ):
     model = onnx.load(input_model)
     model = upgrade_model(model, target_opset)
 
     if convert_dtype in FP32Converter.allowed_dtypes():
-        converter = FP32Converter(convert_dtype, convert_io=convert_io)
+        converter = FP32Converter(
+            convert_dtype,
+            convert_io=convert_io,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
+        )
     elif convert_dtype in Int64Converter.allowed_dtypes():
-        converter = Int64Converter(convert_dtype, convert_io=convert_io)
+        converter = Int64Converter(
+            convert_dtype,
+            convert_io=convert_io,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
+        )
     else:
-        allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(Int64Converter.allowed_dtypes())
+        allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(
+            Int64Converter.allowed_dtypes()
+        )
         raise ValueError(
             f"Invalid convert dtype '{convert_dtype}', choose from {allowed_dtypes}"
         )
@@ -676,6 +703,8 @@ def convert_model(
     convert_io: bool = False,
     max_float: float = 1e9,
     target_opset: int = 22,
+    torq_onnx_finalize: bool = False,
+    preserve_unused_node_outputs: bool = False,
 ):
     if use_modelopt:
         converted_model = _convert_modelopt(
@@ -690,10 +719,13 @@ def convert_model(
             convert_dtype=convert_dtype,
             convert_io=convert_io,
             target_opset=target_opset,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
         )
 
     export_dir = Path(output_model).parent
     export_dir.mkdir(parents=True, exist_ok=True)
+    if torq_onnx_finalize:
+        converted_model = finalize_torq_ready_onnx(converted_model)
     onnx.save(converted_model, output_model)
     logger.info("Saved converted model to '%s'", str(output_model))
 
@@ -743,6 +775,15 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         default=False,
         help="Use TensorRT modelopt for dtype conversion"
     )
+    parser.add_argument(
+        "--torq-onnx-finalize",
+        action="store_true",
+        default=False,
+        help=(
+            "Run Torq-oriented ONNX post-process (ORT symbolic shapes, IR cap, "
+            "value_info cleanup)"
+        ),
+    )
     from torq.utils.logging import add_logging_args
     add_logging_args(parser)
 
@@ -757,7 +798,8 @@ def onnx_dtype_convert_from_args(args: argparse.Namespace):
         args.modelopt,
         args.convert_io,
         args.max_float,
-        args.opset
+        args.opset,
+        torq_onnx_finalize=args.torq_onnx_finalize,
     )
 
 
