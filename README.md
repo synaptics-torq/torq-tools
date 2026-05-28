@@ -98,8 +98,40 @@ python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.on
 > [!WARNING]
 > Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64. 
 > Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
+#### Quantize ONNX model weights
+Quantize MatMul weights in fp32 ONNX models to int4/int8 with optional per-layer sensitivity analysis.
+Supports two output modes: DequantizeLinear (DQL) nodes for runtime dequantization, or pre-dequantized bf16 for direct IREE compilation.
 
-#### Export onnx supported models to static graphs
+**Sensitivity analysis** — determines optimal per-layer bit-width:
+```bash
+python3 -m torq.tools.quantization.weight_quantization analyze \
+    -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json \
+    --embeddings token_embeddings.npy --tokenizer tokenizer.json \
+    --bits 4 8 --num-tokens 15
+```
+
+**Quantize with per-layer config** (DQL output for sharing/further compilation):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_int8_int4_dql.onnx --config quant_config.json
+```
+
+**Quantize with pre-dequantized bf16** (ready for IREE compilation):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_bf16.onnx --config quant_config.json --dequantize-weights
+```
+
+**Uniform quantization** (all layers same bit-width):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_int8.onnx --bits 8
+```
+
+> [!NOTE]
+> For reduced-vocab models, pass `--token-lut token_id_lut.npy` to the analyze command
+> to map reduced vocab indices back to full vocab IDs during evaluation.
+#### Export supported models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
@@ -154,6 +186,11 @@ If `torq-tools` was installed as a Python package, all major tools are also expo
 ```bash
 # convert to bf16
 torq-convert-dtype onnx -d bf16 -i model_fp32.onnx -o model_bf16.onnx
+
+# quantize weights
+torq-quantize-model analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
+torq-quantize-model quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
+torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
