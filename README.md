@@ -131,7 +131,7 @@ python3 -m torq.tools.quantization.weight_quantization quantize \
 > [!NOTE]
 > For reduced-vocab models, pass `--token-lut token_id_lut.npy` to the analyze command
 > to map reduced vocab indices back to full vocab IDs during evaluation.
-#### Export supported models to static graphs
+#### Export supported ONNX models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
@@ -142,14 +142,17 @@ For example, to export a static bf16 Moonshine model:
 python3 -m src.torq.models.moonshine.export --convert-dtype bf16
 ``` 
 
-#### Export tflite models to static graphs
-Exports dynamic TFLite models as static graphs using the model’s default tensor shapes by removing dynamic shapeSignature metadata. This works for most dynamic models, though some may still require custom static export flows.
+#### Convert TFLite models to static shapes
+Converts dynamic TFLite models to static by removing `shapeSignature` metadata from tensors, forcing the runtime to use the concrete dimensions already present in the `shape` field. This works for most dynamic models whose default shapes are valid.
 ```bash
 python3 -m src.torq.tools.convert_static tflite \
   -i path/model.tflite \
   -o path/model_static.tflite
 ```
 
+> [!WARNING]
+> This tool assumes the model's default `shape` values are valid and mutually consistent. If any tensor has an invalid
+> default shape (e.g., `0` or `-1`), the exported model will have incorrect static shapes.
 
 #### Compile models
 A helper utility is provided for compiling ONNX or MLIR models into VMFB binaries.
