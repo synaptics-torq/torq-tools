@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
 import argparse
 from pathlib import Path
 import flatbuffers
@@ -12,6 +15,16 @@ def convert_model(
 ):
     input_path = Path(input_model)
     output_path = Path(output_model)
+
+    # Validate file exists
+    if not input_path.exists():
+        raise FileNotFoundError(f"Model file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"Path is not a file: {input_path}")
+
+    # Validate it's a .tflite file by extension
+    if input_path.suffix.lower() != ".tflite":
+        raise ValueError(f"Expected a .tflite file, got: {input_path.suffix}")
 
     buf = input_path.read_bytes()
 
