@@ -8,6 +8,8 @@ import numpy as np
 
 from .onnx import OnnxGraphEdit
 
+def _create_var(name: str, shape=None, prefix="", dtype="") -> gs.Variable:
+        return gs.Variable(name=prefix + name, dtype=dtype, shape=shape)
 
 def _create_norm_subgraph(graph: gs.Graph, node: gs.Node, axis: int = -1, epsilon: float = 1e-5):
     """Build the LayerNormalization decomposition into `graph`.
@@ -419,7 +421,9 @@ class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
     def match(self, node: gs.Node) -> bool:
         if node.op == "MatMul" \
             and len(node.inputs) >= 2\
-            and isinstance(node.inputs[1], gs.Constant):
+            and isinstance(node.inputs[1], gs.Constant) \
+            and (len(node.inputs[0].shape) == 2 or (len(node.inputs[0].shape) == 3)\
+                                                    and node.inputs[0].shape[0] == 1):
             return True
         return False
 
@@ -427,22 +431,60 @@ class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
         input_node = node.inputs[0]
         weights = node.inputs[1]
         output_node = node.outputs[0]
+        gemm_output = output_node
+
+        dtype = getattr(input_node, "dtype", None)
+
+        in_shape = getattr(input_node, "shape", None)
+        out_shape = getattr(output_node, "shape", None)
+
+        
+        do_squeeze = len(node.inputs[0].shape) == 3 and node.inputs[0].shape[0] == 1
+        in_shape_squeeze = in_shape[1:]
+        out_shape_squeeze = out_shape[1:]
 
         bias = None
         if node.o().op == "Add" and isinstance(node.o().inputs[1], gs.Constant):
             bias = node.o().inputs[1]
-            output_node = node.o().outputs[0]
-        prefix = f"_matmul_converted_to_gemm_{output_node.name}_"
+            gemm_output = node.o().outputs[0]
+            output_node = gemm_output
+        
+        prefix = f"_matmul_converted_to_gemm_{gemm_output.name}_"
+
         new_inputs = [input_node, weights]
         if not (bias is None):
             new_inputs+=[bias]
 
-        self.graph.layer(
+        if do_squeeze:
+            squeeze = self.graph.layer(
+                name=prefix + "squeeze",
+                op="Squeeze",
+                attrs={"axes":0},
+                inputs=[input_node],
+                outputs=[_create_var("squeeze",
+                                     shape=in_shape_squeeze,
+                                     prefix=prefix,
+                                     dtype=dtype)])[0]
+            gemm_output = _create_var("gemm",
+                                      shape=out_shape_squeeze,
+                                      prefix=prefix,
+                                      dtype=dtype)
+            new_inputs[0] = squeeze
+
+        gemm = self.graph.layer(
             name=prefix + "gemm",
             op="Gemm",
             inputs=new_inputs,
-            outputs=[output_node],
-        )
+            outputs=[gemm_output],
+        )[0]
+
+        if do_squeeze:
+            unsqueeze = self.graph.layer(
+                name=prefix + "unsqueeze",
+                op="Unsqueeze",
+                attrs={"axes":0},
+                inputs=[gemm],
+                outputs=[output_node])[0]
 
         if not (bias is None):
             node.o().outputs.clear()
