@@ -354,11 +354,11 @@ class DecomposeInstanceNorm(OnnxGraphEdit):
         )
 
 @dataclass
-class Convert1x1Conv1DToGEMM(OnnxGraphEdit):
+class Convert1x1Conv1DToGeMM(OnnxGraphEdit):
     """
-    Replace onnx.InstanceNormalization with its primitive op decomposition.
+    Replace onnx.Conv1D with GeMM where appropriate
 
-    Decomposes ``Conv1D where (kernel=1, stride=1, dilation=1, groups=1 with GEMM``
+    Decomposes ``Conv1D where (kernel=1, stride=1, dilation=1, groups=1 with GeMM``
 
     Notes: Requires constant weights
         
@@ -402,9 +402,65 @@ class Convert1x1Conv1DToGEMM(OnnxGraphEdit):
         node.outputs.clear()
 
         self._logger.debug(
-            "Replaced Conv '%s' with GEMM",
+            "Replaced Conv '%s' with GeMM",
             node.name,
         )
+
+@dataclass
+class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
+    """
+    Replace Matmul where weights are constant with GeMM
+
+    Replaces ``Matmul where weights are constant``
+
+    Notes: Requires constant weights
+        
+    """
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "MatMul" \
+            and len(node.inputs) >= 2\
+            and isinstance(node.inputs[1], gs.Constant):
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        input_node = node.inputs[0]
+        weights = node.inputs[1]
+        output_node = node.outputs[0]
+
+        bias = None
+        if node.o().op == "Add" and isinstance(node.o().inputs[1], gs.Constant):
+            bias = node.o().inputs[1]
+            output_node = node.o().outputs[0]
+        prefix = f"_matmul_converted_to_gemm_{output_node.name}_"
+        new_inputs = [input_node, weights]
+        if not (bias is None):
+            new_inputs+=[bias]
+
+        self.graph.layer(
+            name=prefix + "gemm",
+            op="Gemm",
+            inputs=new_inputs,
+            outputs=[output_node],
+        )
+
+        if not (bias is None):
+            node.o().outputs.clear()
+            node.o().inputs.clear()
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        if bias is None:
+            self._logger.debug(
+                "Replaced MatMul '%s' with GeMM",
+                node.name,
+            )
+        else:
+            self._logger.debug(
+                "Replaced MatMul -> Add '%s' with GeMM",
+                node.name,
+            )
 
 @dataclass
 class ConvertReduceSumToConvertMean(OnnxGraphEdit):
@@ -457,7 +513,6 @@ class ConvertReduceSumToConvertMean(OnnxGraphEdit):
             "Replaced ReduceSum(x) '%s' with ReduceMean(x) * len(x)",
             node.name,
         )
-
 
 @dataclass
 class ConvertReciprocalMulToDiv(OnnxGraphEdit):
@@ -517,4 +572,7 @@ class NormalizationPatches:
     
 class MiscTsukiPatches:
     def convert_1x1_conv1d_to_gemm(self):
-        self.apply_edit(Convert1x1Conv1DToGEMM(self._graph, self._graph_name))
+        self.apply_edit(Convert1x1Conv1DToGeMM(self._graph, self._graph_name))
+
+    def convert_weight_mamtul_to_gemm(self):
+        self.apply_edit(ConvertConstantMatmulToGeMM(self._graph, self._graph_name))

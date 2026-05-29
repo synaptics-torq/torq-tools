@@ -7,13 +7,16 @@ import onnx
 import onnx_graphsurgeon as gs
 from torq.models.tsuki._graph import TsukiOnnxGraphEditor
 from ..common import maybe_load_onnx_model
+import logging
 
 
 def ensure_compatible_ops(input_path: str) -> onnx.ModelProto:
     model = maybe_load_onnx_model(input_path)
+    logging.basicConfig(level=logging.DEBUG, force=True)
     graph = gs.import_onnx(model)
     graph_editor = TsukiOnnxGraphEditor(graph)
     graph_editor.convert_1x1_conv1d_to_gemm()
+    graph_editor.convert_weight_mamtul_to_gemm()
     return gs.export_onnx(graph)
 
 def main():

@@ -20,7 +20,7 @@ Layer/Instance normalization is not natively supported on NSS. The above command
 ```
 python3 -m src.torq.tools.fold_constants -i <model_in>.onnx -o <model_out>.onnx
 ```
-### 3. Convert 1x1 Conv to GEMM
+### 3. Convert 1x1 Conv (Or Matmul) to GEMM
 ```
 python3 -m src.torq.tools.optimize_conv1d -i <model_in>.onnx -o <model_out>.onnx
 ```

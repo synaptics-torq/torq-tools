@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import logging
 from torq.models.tsuki._graph import TsukiOnnxGraphEditor
 from ..common import maybe_load_onnx_model
 
@@ -12,9 +13,11 @@ from ..common import maybe_load_onnx_model
 def decompose_norm(input_path: str) -> onnx.ModelProto:
     model = maybe_load_onnx_model(input_path)
     graph = gs.import_onnx(model)
+    logging.basicConfig(level=logging.DEBUG, force=True)
+    N = gs.Variable(name="N", dtype=np.float32, shape=())
+
     graph_editor = TsukiOnnxGraphEditor(graph)
     graph_editor.decompose_layer_norm()
-    N = gs.Variable(name="N", dtype=np.float32, shape=())
     graph_editor.graph.inputs.append(N)
     graph_editor.decompose_instance_norm(N=N, dynamic=False)
     graph_editor.convert_reduce_sum()
