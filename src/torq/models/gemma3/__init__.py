@@ -2,9 +2,9 @@ import argparse
 from typing import Final
 
 from torq.compile import add_iree_args
-from torq.utils.logging import add_logging_args
 
 from ...utils.demo import add_common_args
+from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
 
 

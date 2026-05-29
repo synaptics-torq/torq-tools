@@ -12,15 +12,15 @@ import onnx_graphsurgeon as gs
 import ml_dtypes
 from transformers import AutoConfig
 from torq.compile import process_iree_args
-from torq.utils.logging import (
-    configure_logging,
-)
 
 from . import add_smollm2_export_args
 from ._graph import SmolLM2OnnxGraphEditor
 from ._inference import SmolLM2Dynamic, SmolLM2Static
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx
+from ...utils.logging import (
+    configure_logging,
+)
 
 
 class SmolLM2ModelExporter(OnnxModelExporterBase):

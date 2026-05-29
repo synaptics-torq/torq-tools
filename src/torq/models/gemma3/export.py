@@ -17,9 +17,6 @@ from onnx import numpy_helper
 from tokenizers import Tokenizer
 from transformers import AutoConfig
 from torq.compile import process_iree_args
-from torq.utils.logging import (
-    configure_logging,
-)
 
 from . import add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
@@ -31,6 +28,9 @@ from ._trim_vocab import (
 )
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
+from ...utils.logging import (
+    configure_logging,
+)
 
 
 class Gemma3ModelExporter(OnnxModelExporterBase):
