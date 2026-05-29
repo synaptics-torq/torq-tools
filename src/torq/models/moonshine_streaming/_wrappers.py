@@ -75,6 +75,25 @@ def kv_input_names(n_layers):
     return names
 
 
+def merged_kv_input_names(num_decoder_layers: int):
+    names = ["past_valid_len"]
+    for i in range(num_decoder_layers):
+        names += [f"past_self_key_{i}", f"past_self_value_{i}"]
+    for i in range(num_decoder_layers):
+        names += [f"past_cross_key_{i}", f"past_cross_value_{i}"]
+    return names
+
+
+def merged_kv_output_names(num_decoder_layers: int):
+    names = ["updated_past_valid_len"]
+    for i in range(num_decoder_layers):
+        names += [f"present_self_key_{i}", f"present_self_value_{i}"]
+    for i in range(num_decoder_layers):
+        names += [f"present_cross_key_{i}", f"present_cross_value_{i}"]
+    return names
+
+
+
 # ── Wrapper modules ──────────────────────────────────────────────────────────
 
 class FullEncoderWrapper(nn.Module):
@@ -142,6 +161,275 @@ class TransformerEncoderWrapper(nn.Module):
 
         hidden_states = self.final_norm(hidden_states)
         return hidden_states
+
+class MergedStaticDecoderWrapper(nn.Module):
+    """
+    Static-shape encoder-decoder wrapper suitable for:
+      - Torch export
+      - ONNX
+      - CoreML
+      - TensorRT
+      - AOT tracing
+
+    Uses:
+      - fixed-capacity KV buffers
+      - explicit past_valid_len metadata
+      - NO dynamic tensor slicing
+
+    Inputs
+    ------
+    decoder_input_ids:
+        [B, step]
+
+    encoder_hidden_states:
+        [B, enc_seq, hidden]
+
+    encoder_attention_mask:
+        [B, enc_seq]
+
+    past_valid_len:
+        [1] int64
+
+    flat_past:
+        self_k/v then cross_k/v for every layer
+
+    Self cache tensors:
+        [B, H, max_past_seq_len, D]
+
+    Cross cache tensors:
+        [B, H, enc_seq_len, D]
+
+    Outputs
+    -------
+    (
+        last_hidden_state,
+        updated_past_valid_len,
+        updated_self_k/v...,
+        updated_cross_k/v...
+    )
+    """
+
+    def __init__(
+        self,
+        model,
+        num_decoder_layers: int,
+        max_past_seq_len: int,
+        enc_seq_len: int,
+    ):
+        super().__init__()
+
+        self.base_model = model.model
+        self.n_layers = num_decoder_layers
+        self.max_past_seq_len = max_past_seq_len
+        self.enc_seq_len = enc_seq_len
+
+    def _pack_self_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """
+        Ensures fixed self-cache shape:
+            [B, H, max_past_seq_len, D]
+        """
+
+        cur_len = k.shape[2]
+
+        if cur_len > self.max_past_seq_len:
+            k = k[:, :, -self.max_past_seq_len :, :]
+            v = v[:, :, -self.max_past_seq_len :, :]
+            cur_len = self.max_past_seq_len
+
+        if cur_len < self.max_past_seq_len:
+            pad = self.max_past_seq_len - cur_len
+
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+
+        return k.contiguous(), v.contiguous()
+
+    def _pack_cross_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """
+        Ensures fixed cross-cache shape:
+            [B, H, enc_seq_len, D]
+        """
+
+        cur_len = k.shape[2]
+
+        if cur_len > self.enc_seq_len:
+            k = k[:, :, : self.enc_seq_len, :]
+            v = v[:, :, : self.enc_seq_len, :]
+            cur_len = self.enc_seq_len
+
+        if cur_len < self.enc_seq_len:
+            pad = self.enc_seq_len - cur_len
+
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+
+        return k.contiguous(), v.contiguous()
+
+    def forward(
+        self,
+        decoder_input_ids: torch.LongTensor,
+        encoder_hidden_states: torch.FloatTensor,
+        encoder_attention_mask: torch.Tensor,
+        past_valid_len: torch.LongTensor,
+        *flat_past,
+    ):
+        device = decoder_input_ids.device
+
+        #
+        # IMPORTANT:
+        #
+        # We NEVER dynamically slice cache tensors.
+        #
+        # We pass full static buffers into DynamicCache and let:
+        #
+        #   - cache_position
+        #   - causal masking
+        #   - past_valid_len
+        #
+        # control which positions are actually used.
+        #
+        # This keeps the graph export-safe.
+        #
+
+        n = self.n_layers
+
+        self_cache = DynamicCache()
+        cross_cache = DynamicCache()
+
+        #
+        # Rebuild cache objects from flat tensors
+        #
+
+        for i in range(n):
+            k = flat_past[2 * i]
+            v = flat_past[2 * i + 1]
+
+            self_cache.layers.append(
+                _layer_from_kv(k.contiguous(), v.contiguous())
+            )
+
+        cross_offset = 2 * n
+
+        for i in range(n):
+            k = flat_past[cross_offset + 2 * i]
+            v = flat_past[cross_offset + 2 * i + 1]
+
+            cross_cache.layers.append(
+                _layer_from_kv(k.contiguous(), v.contiguous())
+            )
+
+        pkv = EncoderDecoderCache(
+            self_cache,
+            cross_cache,
+        )
+
+        #
+        # cache_position
+        #
+        # Explicitly tell the decoder where new tokens belong.
+        #
+        # Example:
+        #
+        #   first step:
+        #       past_valid_len = 0
+        #       cache_position = [0]
+        #
+        #   second step:
+        #       past_valid_len = 1
+        #       cache_position = [1]
+        #
+
+        step = decoder_input_ids.shape[1]
+
+        cache_position = (
+            torch.arange(
+                step,
+                device=device,
+                dtype=torch.int64,
+            )
+            + past_valid_len.reshape(())
+        )
+
+        out = self.base_model(
+            encoder_outputs=SimpleNamespace(
+                last_hidden_state=encoder_hidden_states,
+                attention_mask=encoder_attention_mask.bool(),
+                hidden_states=None,
+                attentions=None,
+            ),
+            decoder_input_ids=decoder_input_ids,
+            past_key_values=pkv,
+            cache_position=cache_position,
+            use_cache=True,
+            return_dict=True,
+        )
+
+        hidden_state = out.last_hidden_state
+
+        new_pkv: EncoderDecoderCache = out.past_key_values
+
+        new_self_cache = new_pkv.self_attention_cache
+        new_cross_cache = new_pkv.cross_attention_cache
+
+        #
+        # Update valid length
+        #
+
+        step_tensor = torch.tensor(
+            step,
+            device=device,
+            dtype=past_valid_len.dtype,
+        )
+
+        updated_valid_len = torch.clamp(
+            past_valid_len + step_tensor,
+            max=self.max_past_seq_len,
+        )
+
+        #
+        # Flatten outputs
+        #
+
+        flat_out = [
+            hidden_state,
+            updated_valid_len,
+        ]
+
+        #
+        # Self-attention cache
+        #
+
+        for layer in new_self_cache.layers:
+            k, v = self._pack_self_cache(
+                layer.keys,
+                layer.values,
+            )
+
+            flat_out.append(k)
+            flat_out.append(v)
+
+        #
+        # Cross-attention cache
+        #
+
+        for layer in new_cross_cache.layers:
+            k, v = self._pack_cross_cache(
+                layer.keys,
+                layer.values,
+            )
+
+            flat_out.append(k)
+            flat_out.append(v)
+
+        return tuple(flat_out)
 
 
 class DecoderWrapper(nn.Module):
