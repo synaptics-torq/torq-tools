@@ -456,11 +456,11 @@ class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
             new_inputs+=[bias]
 
         if do_squeeze:
+            axes = gs.Constant(prefix + "_squeeze_axes_0", np.array([0], dtype=np.int64))
             squeeze = self.graph.layer(
                 name=prefix + "squeeze",
                 op="Squeeze",
-                attrs={"axes":0},
-                inputs=[input_node],
+                inputs=[input_node, axes],
                 outputs=[_create_var("squeeze",
                                      shape=in_shape_squeeze,
                                      prefix=prefix,
@@ -479,11 +479,11 @@ class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
         )[0]
 
         if do_squeeze:
+            axes = gs.Constant(prefix + "_unsqueeze_axes_0", np.array([0], dtype=np.int64))
             unsqueeze = self.graph.layer(
                 name=prefix + "unsqueeze",
                 op="Unsqueeze",
-                attrs={"axes":0},
-                inputs=[gemm],
+                inputs=[gemm, axes],
                 outputs=[output_node])[0]
 
         if not (bias is None):
@@ -503,6 +503,65 @@ class ConvertConstantMatmulToGeMM(OnnxGraphEdit):
                 "Replaced MatMul -> Add '%s' with GeMM",
                 node.name,
             )
+
+
+@dataclass
+class ConvertReduceMeanKeepDimsToReduceMeanUnsqueeze(OnnxGraphEdit):
+    """
+    Converts ReduceMean(x, keepdims=1) into Unsqueeze(ReduceMean(x, keepdims=0))
+
+    Notes:
+        
+    """
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "ReduceMean" \
+            and "keepdims" in node.attrs \
+            and node.attrs["keepdims"] == 1
+
+    def transform(self, node: gs.Node):
+        input_node = node.inputs[0]
+        output_node = node.outputs[0]
+        prefix = f"_reducemean_keepdims_as_unsqueeze_{output_node.name}_"
+        axis = node.inputs[1]
+        input_node_dtype = getattr(input_node, "dtype", None)
+
+        # With keepdims=1 the output keeps the reduced axes as size-1 dims.
+        # The inner ReduceMean(keepdims=0) drops them, so its shape is the
+        # output shape with those axes removed; Unsqueeze re-inserts them.
+        reduced_axes = [int(v) for v in axis.values]
+        out_shape = output_node.shape
+        inner_shape = None
+        if out_shape is not None:
+            rank = len(out_shape)
+            normalized_axes = sorted((a + rank) if a < 0 else a for a in reduced_axes)
+            inner_shape = [d for i, d in enumerate(out_shape) if i not in normalized_axes]
+
+        # keepdims must be 0 on the inner op; copy any other attrs through.
+        inner_attrs = dict(node.attrs)
+        inner_attrs["keepdims"] = 0
+
+        mean = self.graph.layer(
+            name=prefix + "reducemean",
+            op="ReduceMean",
+            inputs=[input_node, axis],
+            outputs=[gs.Variable(name=prefix + "mean_out", dtype=input_node_dtype, shape=inner_shape)],
+            attrs=inner_attrs,
+        )[0]
+
+        self.graph.layer(
+            name=prefix + "unsqueeze",
+            op="Unsqueeze",
+            inputs=[mean, axis],
+            outputs=[output_node],
+        )
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug(
+            "Replaced ReduceMean(x, keepdims=1) '%s' with Unsqueeze(ReduceMean(x, keepdims=0))",
+            node.name,
+        )
 
 @dataclass
 class ConvertReduceSumToConvertMean(OnnxGraphEdit):
@@ -594,7 +653,6 @@ class ConvertReciprocalMulToDiv(OnnxGraphEdit):
             node.name,
         )
 
-
 class NormalizationPatches:
     def decompose_layer_norm(self):
         self.apply_edit(DecomposeLayerNorm(self._graph, self._graph_name))
@@ -609,6 +667,10 @@ class NormalizationPatches:
 
     def convert_reciprocal_mul(self):
         self.apply_edit(ConvertReciprocalMulToDiv(self._graph, self._graph_name))
+
+    def apply_reduce_mean_keep_dims_patch(self):
+        self.apply_edit(ConvertReduceMeanKeepDimsToReduceMeanUnsqueeze(self._graph, self._graph_name))
+        
     #def tile_reduce_operators(self):
 
     

@@ -22,6 +22,7 @@ def decompose_norm(input_path: str) -> onnx.ModelProto:
     graph_editor.decompose_instance_norm(N=N, dynamic=False)
     graph_editor.convert_reduce_sum()
     graph_editor.convert_reciprocal_mul()
+    graph_editor.apply_reduce_mean_keep_dims_patch()
     return gs.export_onnx(graph)
 
 def main():
