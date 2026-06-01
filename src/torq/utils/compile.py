@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -18,13 +19,20 @@ except ImportError:
 logger = logging.getLogger("Torq-compile")
 
 
-def get_iree_version() -> str | None:
+def _resolve_compiler(compiler_path: str | Path | None = None) -> str:
+    if compiler_path:
+        return str(compiler_path)
+    return os.environ.get("TORQ_COMPILER_PATH", "torq-compile")
+
+
+def get_iree_version(compiler: str | None = None) -> str | None:
     import re
 
+    compiler = compiler or _resolve_compiler()
     try:
-        out = subprocess.check_output(["torq-compile", "--version"], text=True)
+        out = subprocess.check_output([compiler, "--version"], text=True)
     except FileNotFoundError:
-        logger.warning("Failed to check torq-compile version; Ensure 'torq-compile' is installed and accessible from PATH")
+        logger.warning("Failed to check torq-compile version; Ensure '%s' is installed and accessible from PATH", compiler)
         return None
     m = re.search(r"IREE compiler version ([\w.\-+]+)", out)
     if not m:
@@ -38,24 +46,25 @@ def get_iree_version() -> str | None:
 def export_onnx_to_mlir(
     onnx_model: str | Path,
     mlir_model: str | Path,
-    opset: int = 17,
-    use_cli: bool = False
+    opset: int | None = None,
+    use_binary: bool = False
 ):
     if not Path(onnx_model).exists():
         raise FileNotFoundError(f"ONNX model '{onnx_model}' not found")
 
-    if IREE_C_PYAPI and not use_cli:
+    if IREE_C_PYAPI and not use_binary:
         try:
             import sys
+            import_onnx_args = [
+                sys.executable, "-m", "iree.compiler.tools.import_onnx",
+                str(onnx_model),
+                "-o", str(mlir_model),
+                "--data-prop",
+            ]
+            if opset and opset > 0:
+                import_onnx_args += ["--opset-version", str(opset)]
             subprocess.check_output(
-                [
-                    sys.executable, "-m", "iree.compiler.tools.import_onnx",
-                    str(onnx_model),
-                    "-o", str(mlir_model),
-                    # TODO: currently unsupported, enable in future IREE versions
-                    # "--opset-version", str(opset), 
-                    "--data-prop",
-                ],
+                import_onnx_args,
                 text=True,
                 stderr=subprocess.STDOUT,
             )
@@ -66,17 +75,18 @@ def export_onnx_to_mlir(
             ) from None
     else:
         if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-onnx` CLI")
+            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-onnx` binary")
         try:
+            import_onnx_args = [
+                "iree-import-onnx",
+                str(onnx_model),
+                "-o", str(mlir_model),
+                "--data-prop",
+            ]
+            if opset and opset > 0:
+                import_onnx_args += ["--opset-version", str(opset)]
             subprocess.check_output(
-                [
-                    "iree-import-onnx",
-                    str(onnx_model),
-                    "-o", str(mlir_model),
-                    # TODO: currently unsupported, enable in future IREE versions
-                    # "--opset-version", str(opset), 
-                    "--data-prop",
-                ],
+                import_onnx_args,
                 text=True,
                 stderr=subprocess.STDOUT,
             )
@@ -94,12 +104,12 @@ def export_onnx_to_mlir(
 def export_tflite_to_mlir(
     tflite_model: str | Path,
     mlir_model: str | Path | None = None,
-    use_cli: bool = False
+    use_binary: bool = False
 ):
     if not Path(tflite_model).exists():
         raise FileNotFoundError(f"TFLite model '{tflite_model}' not found")
 
-    if IREE_C_PYAPI and not use_cli:
+    if IREE_C_PYAPI and not use_binary:
         iree_tflite_compile.compile_file(
             str(tflite_model),
             import_only=True,
@@ -107,7 +117,7 @@ def export_tflite_to_mlir(
         )
     else:
         if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-tflite` CLI")
+            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-tflite` binary")
         try:
             subprocess.check_output(
                 [
@@ -135,7 +145,8 @@ def compile_mlir_for_vm(
     target: str = "llvm-cpu",
     compiler_args: list[str] | None = None,
     cross_compile: bool = False,
-    use_cli: bool = False
+    use_binary: bool = False,
+    compiler_path: str | Path | None = None,
 ):
     compiler_args = compiler_args or []
     if target == "llvm-cpu":
@@ -154,7 +165,7 @@ def compile_mlir_for_vm(
             ]
 
             from packaging import version
-            if (iree_version := get_iree_version()) and version.parse(iree_version) >= version.parse("3.7.1"):
+            if (iree_version := get_iree_version(_resolve_compiler(compiler_path))) and version.parse(iree_version) >= version.parse("3.7.1"):
                 compiler_args.append("--iree-hal-target-device=local")
     elif target == "torq":
         compiler_args += [
@@ -167,7 +178,7 @@ def compile_mlir_for_vm(
                 "--torq-target-host-cpu-features=+neon,+crypto,+crc,+dotprod,+rdm,+rcpc,+lse"
             ]
 
-    if IREE_C_PYAPI and not use_cli:
+    if IREE_C_PYAPI and not use_binary:
         compiled_bytes = iree_c.compile_file(
             str(mlir_model),
             target_backends=[target],
@@ -177,10 +188,11 @@ def compile_mlir_for_vm(
             f.write(compiled_bytes)
     else:
         if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `torq-compile` CLI")
+            logger.warning("IREE compile python API not found, will attempt fallback to `torq-compile` binary")
+        compiler = _resolve_compiler(compiler_path)
         try:
             compile_cmd = [
-                "torq-compile",
+                compiler,
                 str(mlir_model),
                 "-o", str(output_model)
             ] + [str(arg) for arg in compiler_args]
@@ -192,7 +204,7 @@ def compile_mlir_for_vm(
             )
         except FileNotFoundError:
             raise RuntimeError(
-                "torq-compile binary not found in PATH"
+                f"torq-compile binary not found: '{compiler}'"
             ) from None
         except subprocess.CalledProcessError as e:
             raise RuntimeError(
@@ -205,10 +217,11 @@ def export_iree(
     input_model: str | Path,
     output_dir: str | Path,
     compile_vmfb: bool = True,
-    opset: int = 17,
     compiler_args: list[str] | None = None,
     cross_compile: bool = False,
-    use_iree_cli: bool = False
+    use_binary: bool = False,
+    compiler_path: str | Path | None = None,
+    opset: int | None = None,
 ):
     input_model = Path(input_model)
     output_dir = Path(output_dir)
@@ -222,9 +235,9 @@ def export_iree(
     with tempfile.TemporaryDirectory() as temp_dir:
         mlir_model = Path(temp_dir) / f"{model_name}.mlir"
         if model_type == ".onnx":
-            export_onnx_to_mlir(input_model, mlir_model, opset, use_iree_cli)
+            export_onnx_to_mlir(input_model, mlir_model, opset=opset, use_binary=use_binary)
         else:
-            export_tflite_to_mlir(input_model, mlir_model, use_iree_cli)
+            export_tflite_to_mlir(input_model, mlir_model, use_binary)
         copy2(mlir_model, output_dir / f"{model_name}.mlir")
         if compile_vmfb:
             vmfb_model = output_dir / f"{model_name}.vmfb"
@@ -233,7 +246,8 @@ def export_iree(
                 vmfb_model,
                 compiler_args=compiler_args,
                 cross_compile=cross_compile,
-                use_cli=use_iree_cli
+                use_binary=use_binary,
+                compiler_path=compiler_path,
             )
 
 
@@ -246,53 +260,34 @@ def add_iree_args(parser: argparse.ArgumentParser):
         help="ONNX opset to use, older models will be updated to this opset (default: %(default)s)"
     )
     group.add_argument(
-        "--ic-arg",
-        type=str,
-        action="append",
-        default=[],
-        metavar="ARG [=VALUE] | FILE",
-        help="IREE compile arg, provide as `--ic-arg arg` or `--ic-arg arg=value` or a flagfile"
-    )
-    group.add_argument(
         "--cross-compile",
         action="store_true",
         default=False,
         help="Cross compile for aarch64"
     )
     group.add_argument(
-        "--use-iree-cli",
+        "--use-binary",
         action="store_true",
         default=False,
         help="Enforce using the `torq-compile` binary instead of Python API"
     )
-
-
-def process_iree_args(args: argparse.Namespace) -> list[str]:
-
-    def _fmt_arg(arg: str) -> str | None:
-        arg = arg.strip()
-        if not arg:
-            return None
-        return arg if arg.startswith("--") else ("--" + arg)
-
-    def _process_flagfile(arg_file: Path) -> list[str]:
-        args = []
-        raw_args = arg_file.read_text().splitlines()
-        for raw_arg in raw_args:
-            if raw_arg.startswith("#"):
-                continue
-            if (arg := _fmt_arg(raw_arg)):
-                args.append(arg)
-        return args
-
-    iree_c_args: list[str] = []
-    for raw_arg in args.ic_arg:
-        if (arg_file := Path(raw_arg)).exists() and arg_file.is_file():
-            iree_c_args.extend(_process_flagfile(arg_file))
-        else:
-            if (arg := _fmt_arg(raw_arg)):
-                iree_c_args.append(arg)
-    return iree_c_args
+    group.add_argument(
+        "--compiler-path",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to torq-compile binary (overrides TORQ_COMPILER_PATH env var, default: torq-compile)"
+    )
+    group.add_argument(
+        "--compile-flags",
+        nargs=argparse.REMAINDER,
+        default=None,
+        metavar="FLAG",
+        help=(
+            "[Advanced] Extra flags for the Torq compiler. "
+            "Must be specified last; all remaining arguments are forwarded."
+        ),
+    )
 
 
 def main():
@@ -310,7 +305,6 @@ def main():
     parser.add_argument(
         "-t", "--target",
         type=str,
-        required=True,
         choices=["torq", "llvm-cpu"],
         default="torq",
         help="Torq compile target (choices: %(choices)s, default: %(default)s)"
@@ -369,11 +363,11 @@ def main():
             debug_dir.mkdir(parents=True, exist_ok=True)
             logger.debug("Debug directory set to '%s'", str(debug_dir))
         
-        iree_compile_args: list[str] = process_iree_args(args)
+        iree_compile_args: list[str] = args.compile_flags or []
         if debug_dir:
             iree_compile_args += [
-            f"--iree-hal-dump-executable-sources-to={debug_dir}/exec",
-            f"--iree-hal-dump-executable-intermediates-to={debug_dir}/exec",
+            f"--mlir-print-ir-after-all"
+            f"--mlir-print-ir-tree-dir=${debug_dir}/ir"
             f"--dump-compilation-phases-to={debug_dir}/compile"
         ]
         logger.debug("Added torq-compile debug args, current args: %s", str(iree_compile_args))
@@ -384,10 +378,10 @@ def main():
             mlir_model: Path = Path(output_dir / (model_file.stem + ".mlir"))
             if model_type == ".onnx":
                 logger.info("Exporting ONNX model '%s' to MLIR...", str(model_file))
-                export_onnx_to_mlir(model_file, mlir_model, args.opset, args.use_iree_cli)
+                export_onnx_to_mlir(model_file, mlir_model, opset=args.opset, use_binary=args.use_binary)
             elif model_type == ".tflite":
                 logger.info("Exporting TFLite model '%s' to MLIR...", str(model_file))
-                export_tflite_to_mlir(model_file, mlir_model, args.use_iree_cli)
+                export_tflite_to_mlir(model_file, mlir_model, args.use_binary)
             else:
                 logger.error("Unsupported model type '%s'", model_type)
                 failed += 1
@@ -404,7 +398,8 @@ def main():
                 args.target,
                 iree_compile_args,
                 args.cross_compile,
-                args.use_iree_cli
+                args.use_binary,
+                args.compiler_path,
             )
         except KeyboardInterrupt:
             raise

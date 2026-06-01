@@ -27,9 +27,7 @@ from ._graph import MoonshineOnnxGraphEditor
 from ._inference import MoonshineDynamic, MoonshineStatic
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import hf_download_models, optimum_export_onnx
-from ...utils.compile import (
-    process_iree_args,
-)
+
 from ...utils.logging import (
     configure_logging,
 )
@@ -639,7 +637,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self,
         iree_export_dir: str | os.PathLike | None = None,
         iree_compile_args: list[str] | None = None,
-        use_iree_cli: bool = False,
+        use_binary: bool = False,
         skip: list[str] | None = None,
     ):
         skip = skip or []
@@ -651,7 +649,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         return super().export_iree(
             iree_export_dir,
             iree_compile_args,
-            use_iree_cli,
+            use_binary,
             skip
         )
 
@@ -680,7 +678,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=process_iree_args(args))
+        exporter.export_iree(iree_compile_args=args.compile_flags or [])
 
 def main():
     parser = argparse.ArgumentParser(description="Export Moonshine to Torq")

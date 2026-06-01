@@ -27,9 +27,7 @@ from ._trim_vocab import (
 )
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
-from ...utils.compile import (
-    process_iree_args,
-)
+
 from ...utils.logging import (
     configure_logging,
 )
@@ -527,13 +525,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self,
         iree_export_dir: str | os.PathLike | None = None,
         iree_compile_args: list[str] | None = None,
-        use_iree_cli: bool = False,
+        use_binary: bool = False,
         skip: list[str] | None = None,
     ):
         result = super().export_iree(
             iree_export_dir=iree_export_dir,
             iree_compile_args=iree_compile_args,
-            use_iree_cli=use_iree_cli,
+            use_binary=use_binary,
             skip=skip,
         )
         self._copy_runtime_assets(self._iree_dir, self._export_paths["model"].parent)
@@ -565,7 +563,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=process_iree_args(args))
+        exporter.export_iree(iree_compile_args=args.compile_flags or [])
 
 
 def main():

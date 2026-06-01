@@ -17,9 +17,7 @@ from ._graph import SmolLM2OnnxGraphEditor
 from ._inference import SmolLM2Dynamic, SmolLM2Static
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx
-from ...utils.compile import (
-    process_iree_args,
-)
+
 from ...utils.logging import (
     configure_logging,
 )
@@ -323,7 +321,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=process_iree_args(args))
+        exporter.export_iree(iree_compile_args=args.compile_flags or [])
 
 
 def main():
