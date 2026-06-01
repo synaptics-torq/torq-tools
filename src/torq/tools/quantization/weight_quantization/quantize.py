@@ -607,7 +607,7 @@ class WeightQuantizer:
         onnx-graphsurgeon with shape inference and proper handling of
         Slice/Reshape/etc. inputs (kept as int64 per ONNX spec).
         """
-        from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
+        from ...convert_dtype.onnx import FP32Converter, Int64Converter
 
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)
@@ -631,7 +631,7 @@ class WeightQuantizer:
         scales, zero points) are preserved by the converter since they don't
         match the fp32 source dtype.
         """
-        from torq.tools.convert_dtype.onnx import FP32Converter, Int64Converter
+        from ...convert_dtype.onnx import FP32Converter, Int64Converter
 
         # Fix INT64_MAX in Slice ends before int64→int32 conversion
         self._fix_slice_int64max(model)

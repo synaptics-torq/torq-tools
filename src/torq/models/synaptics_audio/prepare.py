@@ -27,11 +27,11 @@ from typing import Mapping, Sequence
 import onnx
 import onnx_graphsurgeon as gs
 
-from torq.graph_edit import OnnxGraphEditor
-from torq.graph_edit.edits import CommonGraphEditsMixin
-from torq.tools.convert_dtype.onnx import convert_model
-from torq.utils.onnx import finalize_torq_ready_onnx
-from torq.utils.onnx_verify import verify_equivalence
+from ...graph_edit import OnnxGraphEditor
+from ...graph_edit.edits import CommonGraphEditsMixin
+from ...tools.convert_dtype.onnx import convert_model
+from ...utils.onnx import finalize_torq_ready_onnx
+from ...utils.onnx_verify import verify_equivalence
 
 from .fetch import fetch_sources
 from .recipes import Recipe

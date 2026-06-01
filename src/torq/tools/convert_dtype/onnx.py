@@ -784,12 +784,12 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
             "value_info cleanup)"
         ),
     )
-    from torq.utils.logging import add_logging_args
+    from ...utils.logging import add_logging_args
     add_logging_args(parser)
 
 
 def onnx_dtype_convert_from_args(args: argparse.Namespace):
-    from torq.utils.logging import configure_logging
+    from ...utils.logging import configure_logging
     configure_logging(args.logging)
     convert_model(
         args.input,
