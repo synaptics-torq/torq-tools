@@ -15,8 +15,8 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 from onnxruntime.transformers.optimizer import optimize_model
-from torq.compile import export_iree
 
+from ..utils.compile import export_iree
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,

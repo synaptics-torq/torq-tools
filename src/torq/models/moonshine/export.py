@@ -13,7 +13,6 @@ import numpy as np
 import ml_dtypes
 from datasets import load_dataset, Audio
 from transformers import AutoConfig, AutoProcessor
-from torq.compile import process_iree_args
 
 from . import (
     ONNX_DTYPES,
@@ -28,6 +27,9 @@ from ._graph import MoonshineOnnxGraphEditor
 from ._inference import MoonshineDynamic, MoonshineStatic
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import hf_download_models, optimum_export_onnx
+from ...utils.compile import (
+    process_iree_args,
+)
 from ...utils.logging import (
     configure_logging,
 )

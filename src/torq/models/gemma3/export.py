@@ -16,7 +16,6 @@ from huggingface_hub import hf_hub_download
 from onnx import numpy_helper
 from tokenizers import Tokenizer
 from transformers import AutoConfig
-from torq.compile import process_iree_args
 
 from . import add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
@@ -28,6 +27,9 @@ from ._trim_vocab import (
 )
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
+from ...utils.compile import (
+    process_iree_args,
+)
 from ...utils.logging import (
     configure_logging,
 )
