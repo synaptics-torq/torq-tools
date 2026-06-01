@@ -10,11 +10,11 @@ from pathlib import Path
 from shutil import copy2
 
 try:
-    import iree.compiler.tools as iree_c
+    import torq.compiler.tools as torq_c
     import iree.compiler.tflite as iree_tflite_compile
-    IREE_C_PYAPI = True
+    TORQ_C_PYAPI = True
 except ImportError:
-    IREE_C_PYAPI = False
+    TORQ_C_PYAPI = False
 
 logger = logging.getLogger("Torq-compile")
 
@@ -47,12 +47,11 @@ def export_onnx_to_mlir(
     onnx_model: str | Path,
     mlir_model: str | Path,
     opset: int | None = None,
-    use_binary: bool = False
 ):
     if not Path(onnx_model).exists():
         raise FileNotFoundError(f"ONNX model '{onnx_model}' not found")
 
-    if IREE_C_PYAPI and not use_binary:
+    if TORQ_C_PYAPI:
         try:
             import sys
             import_onnx_args = [
@@ -74,8 +73,7 @@ def export_onnx_to_mlir(
                 + "\n    ".join(e.output.strip().splitlines())
             ) from None
     else:
-        if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-onnx` binary")
+        logger.warning("Torq compiler python API not found, will attempt fallback to `iree-import-onnx` binary")
         try:
             import_onnx_args = [
                 "iree-import-onnx",
@@ -104,20 +102,18 @@ def export_onnx_to_mlir(
 def export_tflite_to_mlir(
     tflite_model: str | Path,
     mlir_model: str | Path | None = None,
-    use_binary: bool = False
 ):
     if not Path(tflite_model).exists():
         raise FileNotFoundError(f"TFLite model '{tflite_model}' not found")
 
-    if IREE_C_PYAPI and not use_binary:
+    if TORQ_C_PYAPI:
         iree_tflite_compile.compile_file(
             str(tflite_model),
             import_only=True,
             output_file=str(mlir_model)
         )
     else:
-        if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `iree-import-tflite` binary")
+        logger.warning("Torq compiler python API not found, will attempt fallback to `iree-import-tflite` binary")
         try:
             subprocess.check_output(
                 [
@@ -178,8 +174,8 @@ def compile_mlir_for_vm(
                 "--torq-target-host-cpu-features=+neon,+crypto,+crc,+dotprod,+rdm,+rcpc,+lse"
             ]
 
-    if IREE_C_PYAPI and not use_binary:
-        compiled_bytes = iree_c.compile_file(
+    if TORQ_C_PYAPI and not use_binary:
+        compiled_bytes = torq_c.compile_file(
             str(mlir_model),
             target_backends=[target],
             extra_args=compiler_args,
@@ -187,8 +183,8 @@ def compile_mlir_for_vm(
         with open(output_model, "wb") as f:
             f.write(compiled_bytes)
     else:
-        if not IREE_C_PYAPI:
-            logger.warning("IREE compile python API not found, will attempt fallback to `torq-compile` binary")
+        if not TORQ_C_PYAPI:
+            logger.warning("Torq compiler python API not found, will attempt fallback to `torq-compile` binary")
         compiler = _resolve_compiler(compiler_path)
         try:
             compile_cmd = [
@@ -213,7 +209,7 @@ def compile_mlir_for_vm(
         ) from None
 
 
-def export_iree(
+def export_torq(
     input_model: str | Path,
     output_dir: str | Path,
     compile_vmfb: bool = True,
@@ -235,9 +231,9 @@ def export_iree(
     with tempfile.TemporaryDirectory() as temp_dir:
         mlir_model = Path(temp_dir) / f"{model_name}.mlir"
         if model_type == ".onnx":
-            export_onnx_to_mlir(input_model, mlir_model, opset=opset, use_binary=use_binary)
+            export_onnx_to_mlir(input_model, mlir_model, opset=opset)
         else:
-            export_tflite_to_mlir(input_model, mlir_model, use_binary)
+            export_tflite_to_mlir(input_model, mlir_model)
         copy2(mlir_model, output_dir / f"{model_name}.mlir")
         if compile_vmfb:
             vmfb_model = output_dir / f"{model_name}.vmfb"
@@ -251,8 +247,8 @@ def export_iree(
             )
 
 
-def add_iree_args(parser: argparse.ArgumentParser):
-    group = parser.add_argument_group("IREE args")
+def add_torq_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group("Torq args")
     group.add_argument(
         "--opset",
         type=int,
@@ -335,7 +331,7 @@ def main():
         default="INFO",
         help="Logging verbosity: %(choices)s (default: %(default)s)"
     )
-    add_iree_args(parser)
+    add_torq_args(parser)
     args = parser.parse_args()
 
     configure_logging(args.logging)
@@ -363,14 +359,14 @@ def main():
             debug_dir.mkdir(parents=True, exist_ok=True)
             logger.debug("Debug directory set to '%s'", str(debug_dir))
         
-        iree_compile_args: list[str] = args.compile_flags or []
+        torq_compile_args: list[str] = args.compile_flags or []
         if debug_dir:
-            iree_compile_args += [
+            torq_compile_args += [
                 "--mlir-print-ir-after-all",
                 f"--mlir-print-ir-tree-dir={debug_dir}/ir",
                 f"--dump-compilation-phases-to={debug_dir}/compile",
             ]
-        logger.debug("Added torq-compile debug args, current args: %s", str(iree_compile_args))
+        logger.debug("Added torq-compile debug args, current args: %s", str(torq_compile_args))
 
         output_model: Path = Path(output_dir / (model_file.stem + ".vmfb"))
         model_type: str = model_file.suffix.lower()
@@ -378,10 +374,10 @@ def main():
             mlir_model: Path = Path(output_dir / (model_file.stem + ".mlir"))
             if model_type == ".onnx":
                 logger.info("Exporting ONNX model '%s' to MLIR...", str(model_file))
-                export_onnx_to_mlir(model_file, mlir_model, opset=args.opset, use_binary=args.use_binary)
+                export_onnx_to_mlir(model_file, mlir_model, opset=args.opset)
             elif model_type == ".tflite":
                 logger.info("Exporting TFLite model '%s' to MLIR...", str(model_file))
-                export_tflite_to_mlir(model_file, mlir_model, args.use_binary)
+                export_tflite_to_mlir(model_file, mlir_model)
             else:
                 logger.error("Unsupported model type '%s'", model_type)
                 failed += 1
@@ -396,7 +392,7 @@ def main():
                 mlir_model,
                 output_model,
                 args.target,
-                iree_compile_args,
+                torq_compile_args,
                 args.local_compile,
                 args.use_binary,
                 args.compiler_path,

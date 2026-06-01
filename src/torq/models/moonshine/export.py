@@ -107,7 +107,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
-        onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
+        onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
         if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
             onnx_dir = onnx_source_dir
             print(self._models_dir)
@@ -146,14 +146,14 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             / "converted"
             / ("static" if self._static_models else "dynamic")
         )
-        iree_dir = (
+        torq_dir = (
             self._models_dir
             / "export"
-            / "iree"
+            / "torq"
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         unmerged_model_names: set[str] = set(MoonshineModelExporter.COMPONENTS.values())
@@ -633,10 +633,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             external_data=external_data,
         )
 
-    def export_iree(
+    def export_torq(
         self,
-        iree_export_dir: str | os.PathLike | None = None,
-        iree_compile_args: list[str] | None = None,
+        torq_export_dir: str | os.PathLike | None = None,
+        torq_compile_args: list[str] | None = None,
         use_binary: bool = False,
         skip: list[str] | None = None,
         local_compile: bool = False,
@@ -648,9 +648,9 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                 continue
             if (self._model_dtype == "bf16" or self._convert_dtypes) and self._replace_int_bf16_cast:
                 self._replace_int_to_bf16_casts(onnx_path, comp)
-        return super().export_iree(
-            iree_export_dir,
-            iree_compile_args,
+        return super().export_torq(
+            torq_export_dir,
+            torq_compile_args,
             use_binary,
             skip,
             local_compile=local_compile,
@@ -681,9 +681,9 @@ def export_moonshine_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
-    if not args.skip_iree:
-        exporter.export_iree(
-            iree_compile_args=args.compile_flags or [],
+    if not args.skip_torq:
+        exporter.export_torq(
+            torq_compile_args=args.compile_flags or [],
             use_binary=args.use_binary,
             local_compile=args.local_compile,
             compiler_path=args.compiler_path,

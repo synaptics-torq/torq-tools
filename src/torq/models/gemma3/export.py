@@ -117,7 +117,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
-        onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
+        onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
         if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
             onnx_dir = onnx_source_dir
         else:
@@ -168,16 +168,16 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             / "converted"
             / ("static" if self._static_models else "dynamic")
         )
-        iree_dir = (
+        torq_dir = (
             self._models_dir
             / "export"
             / model_type
             / model_topology
-            / "iree"
+            / "torq"
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir /  "model.onnx"
@@ -521,24 +521,24 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
         return result
 
-    def export_iree(
+    def export_torq(
         self,
-        iree_export_dir: str | os.PathLike | None = None,
-        iree_compile_args: list[str] | None = None,
+        torq_export_dir: str | os.PathLike | None = None,
+        torq_compile_args: list[str] | None = None,
         use_binary: bool = False,
         skip: list[str] | None = None,
         local_compile: bool = False,
         compiler_path: str | Path | None = None,
     ):
-        result = super().export_iree(
-            iree_export_dir=iree_export_dir,
-            iree_compile_args=iree_compile_args,
+        result = super().export_torq(
+            torq_export_dir=torq_export_dir,
+            torq_compile_args=torq_compile_args,
             use_binary=use_binary,
             skip=skip,
             local_compile=local_compile,
             compiler_path=compiler_path,
         )
-        self._copy_runtime_assets(self._iree_dir, self._export_paths["model"].parent)
+        self._copy_runtime_assets(self._torq_dir, self._export_paths["model"].parent)
         return result
 
 def export_gemma3_from_args(args: argparse.Namespace):
@@ -566,9 +566,9 @@ def export_gemma3_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
-    if not args.skip_iree:
-        exporter.export_iree(
-            iree_compile_args=args.compile_flags or [],
+    if not args.skip_torq:
+        exporter.export_torq(
+            torq_compile_args=args.compile_flags or [],
             use_binary=args.use_binary,
             local_compile=args.local_compile,
             compiler_path=args.compiler_path,

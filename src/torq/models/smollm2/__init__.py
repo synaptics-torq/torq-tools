@@ -1,7 +1,7 @@
 import argparse
 from typing import Final
 
-from ...utils.compile import add_iree_args
+from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
@@ -61,10 +61,10 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--skip-iree",
+        "--skip-torq",
         action="store_true",
         default=False,
-        help="Skip exporting to IREE"
+        help="Skip Torq compile/export"
     )
     parser.add_argument(
         "--replace-int-bf16-cast",
@@ -87,7 +87,7 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
     add_logging_args(parser)
-    add_iree_args(parser)
+    add_torq_args(parser)
 
 
 def add_smollm2_infer_args(parser: argparse.ArgumentParser):
