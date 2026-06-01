@@ -38,7 +38,7 @@ Issues = "https://github.com/synaptics-torq/torq-tools/issues"
 
 [project.scripts]
 torq-convert-dtype = "torq.tools.convert_dtype.__main__:main"
-torq-compile-model = "torq.compile:main"
+torq-compile-model = "torq.utils.compile:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
 torq-quantize-model = "torq.tools.quantization.weight_quantization.__main__:main"

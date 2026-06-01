@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
 import argparse
 import logging
 import subprocess
@@ -295,7 +298,7 @@ def process_iree_args(args: argparse.Namespace) -> list[str]:
 def main():
     import argparse
     import sys
-    from .utils.logging import configure_logging
+    from .logging import configure_logging
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -309,7 +312,8 @@ def main():
         type=str,
         required=True,
         choices=["torq", "llvm-cpu"],
-        help="Torq compile target (choices: %(choices)s)"
+        default="torq",
+        help="Torq compile target (choices: %(choices)s, default: %(default)s)"
     )
     parser.add_argument(
         "-o", "--output-dir",
