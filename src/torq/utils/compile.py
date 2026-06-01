@@ -144,7 +144,7 @@ def compile_mlir_for_vm(
     output_model: str | Path,
     target: str = "llvm-cpu",
     compiler_args: list[str] | None = None,
-    cross_compile: bool = False,
+    local_compile: bool = False,
     use_binary: bool = False,
     compiler_path: str | Path | None = None,
 ):
@@ -153,7 +153,7 @@ def compile_mlir_for_vm(
         compiler_args += [
             "--iree-hal-target-backends=llvm-cpu"
         ]
-        if cross_compile:
+        if not local_compile:
             compiler_args += [
                 "--iree-llvmcpu-target-triple=aarch64-unknown-linux-gnu",
                 "--iree-llvmcpu-target-cpu-features=+neon,+crypto,+crc,+dotprod,+rdm,+rcpc,+lse",
@@ -171,7 +171,7 @@ def compile_mlir_for_vm(
         compiler_args += [
             "--iree-hal-target-backends=torq",
         ]
-        if cross_compile:
+        if not local_compile:
             compiler_args += [
                 "--torq-target-host-triple=aarch64-unknown-linux-gnu",
                 "--torq-target-host-cpu=generic",
@@ -218,7 +218,7 @@ def export_iree(
     output_dir: str | Path,
     compile_vmfb: bool = True,
     compiler_args: list[str] | None = None,
-    cross_compile: bool = False,
+    local_compile: bool = False,
     use_binary: bool = False,
     compiler_path: str | Path | None = None,
     opset: int | None = None,
@@ -245,7 +245,7 @@ def export_iree(
                 mlir_model,
                 vmfb_model,
                 compiler_args=compiler_args,
-                cross_compile=cross_compile,
+                local_compile=local_compile,
                 use_binary=use_binary,
                 compiler_path=compiler_path,
             )
@@ -260,10 +260,10 @@ def add_iree_args(parser: argparse.ArgumentParser):
         help="ONNX opset to use, older models will be updated to this opset (default: %(default)s)"
     )
     group.add_argument(
-        "--cross-compile",
+        "--local-compile",
         action="store_true",
         default=False,
-        help="Cross compile for aarch64"
+        help="Compile for the local host instead of cross-compiling for aarch64"
     )
     group.add_argument(
         "--use-binary",
@@ -366,10 +366,10 @@ def main():
         iree_compile_args: list[str] = args.compile_flags or []
         if debug_dir:
             iree_compile_args += [
-            f"--mlir-print-ir-after-all"
-            f"--mlir-print-ir-tree-dir=${debug_dir}/ir"
-            f"--dump-compilation-phases-to={debug_dir}/compile"
-        ]
+                "--mlir-print-ir-after-all",
+                f"--mlir-print-ir-tree-dir={debug_dir}/ir",
+                f"--dump-compilation-phases-to={debug_dir}/compile",
+            ]
         logger.debug("Added torq-compile debug args, current args: %s", str(iree_compile_args))
 
         output_model: Path = Path(output_dir / (model_file.stem + ".vmfb"))
@@ -397,7 +397,7 @@ def main():
                 output_model,
                 args.target,
                 iree_compile_args,
-                args.cross_compile,
+                args.local_compile,
                 args.use_binary,
                 args.compiler_path,
             )

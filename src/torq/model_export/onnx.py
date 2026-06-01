@@ -224,6 +224,8 @@ class OnnxModelExporterBase(ABC):
         iree_compile_args: list[str] | None = None,
         use_binary: bool = False,
         skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
     ):
         self._iree_dir = Path(iree_export_dir or self._iree_dir)
         skip = skip or []
@@ -248,6 +250,8 @@ class OnnxModelExporterBase(ABC):
                 self._iree_dir,
                 opset=get_model_opset(model),
                 compiler_args=iree_compile_args,
-                use_binary=use_binary
+                use_binary=use_binary,
+                local_compile=local_compile,
+                compiler_path=compiler_path,
             )
             self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(self._iree_dir), onnx_path.stem)

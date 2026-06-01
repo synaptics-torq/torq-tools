@@ -639,6 +639,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         iree_compile_args: list[str] | None = None,
         use_binary: bool = False,
         skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
     ):
         skip = skip or []
         for comp, onnx_path in self._export_paths.items():
@@ -650,7 +652,9 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             iree_export_dir,
             iree_compile_args,
             use_binary,
-            skip
+            skip,
+            local_compile=local_compile,
+            compiler_path=compiler_path,
         )
 
 def export_moonshine_from_args(args: argparse.Namespace):
@@ -678,7 +682,12 @@ def export_moonshine_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=args.compile_flags or [])
+        exporter.export_iree(
+            iree_compile_args=args.compile_flags or [],
+            use_binary=args.use_binary,
+            local_compile=args.local_compile,
+            compiler_path=args.compiler_path,
+        )
 
 def main():
     parser = argparse.ArgumentParser(description="Export Moonshine to Torq")

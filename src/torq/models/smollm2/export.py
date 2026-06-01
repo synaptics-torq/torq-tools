@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -301,6 +302,45 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             ]
         )
 
+    def _copy_runtime_assets(
+        self,
+        dst_dir: str | os.PathLike,
+        src_dir: str | os.PathLike | None = None,
+        *,
+        include_npy_data: bool = True,
+    ) -> None:
+        src_dir = Path(src_dir or self._export_paths["model"].parent)
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        asset_names = ["config.json", "tokenizer.json"]
+        if include_npy_data:
+            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
+        for asset_name in asset_names:
+            src_path = src_dir / asset_name
+            if not src_path.exists():
+                continue
+            shutil.copy2(src_path, dst_dir / asset_name)
+
+    def export_iree(
+        self,
+        iree_export_dir: str | os.PathLike | None = None,
+        iree_compile_args: list[str] | None = None,
+        use_binary: bool = False,
+        skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
+    ):
+        result = super().export_iree(
+            iree_export_dir=iree_export_dir,
+            iree_compile_args=iree_compile_args,
+            use_binary=use_binary,
+            skip=skip,
+            local_compile=local_compile,
+            compiler_path=compiler_path,
+        )
+        self._copy_runtime_assets(self._iree_dir, self._export_paths["model"].parent)
+        return result
+
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = SmolLM2ModelExporter(
@@ -321,7 +361,12 @@ def export_smollm2_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=args.compile_flags or [])
+        exporter.export_iree(
+            iree_compile_args=args.compile_flags or [],
+            use_binary=args.use_binary,
+            local_compile=args.local_compile,
+            compiler_path=args.compiler_path,
+        )
 
 
 def main():
