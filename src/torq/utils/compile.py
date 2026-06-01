@@ -138,7 +138,7 @@ def export_tflite_to_mlir(
 def compile_mlir_for_vm(
     mlir_model: str | Path,
     output_model: str | Path,
-    target: str = "llvm-cpu",
+    target: str = "torq",
     compiler_args: list[str] | None = None,
     local_compile: bool = False,
     use_binary: bool = False,
@@ -164,14 +164,10 @@ def compile_mlir_for_vm(
             if (iree_version := get_iree_version(_resolve_compiler(compiler_path))) and version.parse(iree_version) >= version.parse("3.7.1"):
                 compiler_args.append("--iree-hal-target-device=local")
     elif target == "torq":
-        compiler_args += [
-            "--iree-hal-target-backends=torq",
-        ]
-        if not local_compile:
+        if local_compile:
             compiler_args += [
-                "--torq-target-host-triple=aarch64-unknown-linux-gnu",
-                "--torq-target-host-cpu=generic",
-                "--torq-target-host-cpu-features=+neon,+crypto,+crc,+dotprod,+rdm,+rcpc,+lse"
+                "--torq-css-qemu",
+                "--torq-target-host-triple=native"
             ]
 
     if TORQ_C_PYAPI and not use_binary:
@@ -289,14 +285,15 @@ def add_torq_args(parser: argparse.ArgumentParser):
 def main():
     import argparse
     import sys
+    from shutil import rmtree
     from .logging import configure_logging
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model",
         type=Path,
-        metavar=".onnx | .tflite | .mlir | DIR",
-        help="Path to MLIR or ONNX/TFLite model, or directory containing models"
+        metavar=".onnx | .tflite | .mlir",
+        help="Path to MLIR or ONNX/TFLite model"
     )
     parser.add_argument(
         "-t", "--target",
@@ -306,11 +303,11 @@ def main():
         help="Torq compile target (choices: %(choices)s, default: %(default)s)"
     )
     parser.add_argument(
-        "-o", "--output-dir",
+        "-o", "--output",
         type=Path,
-        metavar="DIR",
+        metavar="FILE",
         default=None,
-        help="Output directory (default: <model_dir>/<model_name>)"
+        help="Output .vmfb file path (default: <model stem>.vmfb in model's directory)"
     )
     parser.add_argument(
         "-d", "--dump-debug",
@@ -337,82 +334,70 @@ def main():
     configure_logging(args.logging)
 
     if not args.model.exists():
-        print(f"Invalid model file/directory '{args.model}'")
+        print(f"Invalid model file '{args.model}'")
         sys.exit(1)
-    if args.model.is_dir():
-        model_files: list[Path] = [f for f in args.model.iterdir() if f.is_file() and f.suffix in (".onnx", ".mlir")]
-        if not model_files:
-            print(f"No models to compile in '{args.model}'")
+
+    model_file: Path = args.model
+    output_model: Path = args.output or model_file.parent / (model_file.stem + ".vmfb")
+    output_dir: Path = output_model.parent
+    logger.debug("Output directory set to '%s'", str(output_dir))
+
+    debug_dir = None
+    if args.dump_debug:
+        debug_dir = args.debug_dir or (output_dir / model_file.stem)
+        logger.debug("Debug directory set to '%s'", str(debug_dir))
+        if debug_dir.exists():
+            rmtree(debug_dir)
+            logger.debug("Deleted existing debug files at '%s'", str(debug_dir))
+        debug_dir.mkdir(exist_ok=True)
+
+    torq_compile_args: list[str] = args.compile_flags or []
+    if debug_dir:
+        torq_compile_args += [
+            "--mlir-print-ir-after-all",
+            f"--mlir-print-ir-tree-dir={debug_dir}/ir",
+            f"--dump-compilation-phases-to={debug_dir}/compile",
+        ]
+    logger.debug("Added torq-compile debug args, current args: %s", str(torq_compile_args))
+
+    model_type: str = model_file.suffix.lower()
+    if model_type != ".mlir":
+        mlir_model: Path = output_dir / (model_file.stem + ".mlir")
+        if model_type == ".onnx":
+            logger.info("Exporting ONNX model '%s' to MLIR...", str(model_file))
+            export_onnx_to_mlir(model_file, mlir_model, opset=args.opset)
+        elif model_type == ".tflite":
+            logger.info("Exporting TFLite model '%s' to MLIR...", str(model_file))
+            export_tflite_to_mlir(model_file, mlir_model)
+        else:
+            print(f"Unsupported model type '{model_type}'")
             sys.exit(1)
+        logger.info("Successfully exported '%s'", str(mlir_model))
     else:
-        model_files: list[Path] = [args.model]
+        mlir_model: Path = model_file
 
-    success = 0
-    failed = 0
-    for model_file in model_files:
-        output_dir: Path = args.output_dir or (Path(model_file.parent) / Path(model_file).stem)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug("Output directory set to '%s'", str(output_dir))
-        debug_dir = None
-        if args.dump_debug:
-            debug_dir: Path = debug_dir or (output_dir / model_file.stem / "debug")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            logger.debug("Debug directory set to '%s'", str(debug_dir))
-        
-        torq_compile_args: list[str] = args.compile_flags or []
+    logger.info("Compiling MLIR model '%s' for %s...", str(mlir_model), args.target)
+    try:
+        compile_mlir_for_vm(
+            mlir_model,
+            output_model,
+            args.target,
+            torq_compile_args,
+            args.local_compile,
+            args.use_binary,
+            args.compiler_path,
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        logger.error("Compilation failed for target %s: %s", args.target, str(e))
         if debug_dir:
-            torq_compile_args += [
-                "--mlir-print-ir-after-all",
-                f"--mlir-print-ir-tree-dir={debug_dir}/ir",
-                f"--dump-compilation-phases-to={debug_dir}/compile",
-            ]
-        logger.debug("Added torq-compile debug args, current args: %s", str(torq_compile_args))
-
-        output_model: Path = Path(output_dir / (model_file.stem + ".vmfb"))
-        model_type: str = model_file.suffix.lower()
-        if model_type != ".mlir":
-            mlir_model: Path = Path(output_dir / (model_file.stem + ".mlir"))
-            if model_type == ".onnx":
-                logger.info("Exporting ONNX model '%s' to MLIR...", str(model_file))
-                export_onnx_to_mlir(model_file, mlir_model, opset=args.opset)
-            elif model_type == ".tflite":
-                logger.info("Exporting TFLite model '%s' to MLIR...", str(model_file))
-                export_tflite_to_mlir(model_file, mlir_model)
-            else:
-                logger.error("Unsupported model type '%s'", model_type)
-                failed += 1
-                continue
-            logger.info("Successfully exported '%s'", str(mlir_model))
+            logger.info("Debug symbols dumped to '%s'", str(debug_dir))
         else:
-            mlir_model: Path = model_file
-
-        logger.info("Compiling MLIR model '%s' for %s...", str(mlir_model), args.target)
-        try:
-            compile_mlir_for_vm(
-                mlir_model,
-                output_model,
-                args.target,
-                torq_compile_args,
-                args.local_compile,
-                args.use_binary,
-                args.compiler_path,
-            )
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            logger.error("Compilation failed for target %s: %s", args.target, str(e))
-            if debug_dir:
-                logger.info("Debug symbols dumped to '%s'", str(debug_dir))
-            else:
-                logger.info("Run with '-d' to dump debug symbols")
-            failed += 1
-        else:
-            logger.info("Successfully compiled '%s'", str(output_model))
-            success += 1
-
-    print(f"Summary: successfully compiled {success} models, failed to compile {failed} models")
-    if failed:
+            logger.info("Run with '-d' to dump debug symbols")
         sys.exit(1)
+
+    logger.info("Successfully compiled '%s'", str(output_model))
 
 
 if __name__ == "__main__":

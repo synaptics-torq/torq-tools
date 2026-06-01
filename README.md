@@ -154,13 +154,6 @@ python3 -m src.torq.tools.convert_static tflite \
 > This tool assumes the model's default `shape` values are valid and mutually consistent. If any tensor has an invalid
 > default shape (e.g., `0` or `-1`), the exported model will have incorrect static shapes.
 
-#### Compile models
-A helper utility is provided for compiling ONNX or MLIR models into VMFB binaries.
-```bash
-python -m src.torq.utils.compile model_bf16.onnx -t llvm-cpu
-python -m src.torq.utils.compile model_bf16.mlir -t llvm-cpu
-```
-
 #### Run inference
 You can run inference directly using helper scripts that support multiple runtimes.
 ```
@@ -197,10 +190,6 @@ torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config qua
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
-
-# compile models
-torq-compile-model model_bf16.onnx -t llvm-cpu
-torq-compile-model model_bf16.mlir -t llvm-cpu
 
 # run inference
 torq-infer-model moonshine apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
