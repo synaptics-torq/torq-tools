@@ -206,8 +206,8 @@ class MoonshineStatic(MoonshineBase):
     def __init__(
         self,
         encoder: InferenceRunner,
+        gen_encoder_cache: InferenceRunner | None,
         decoder: InferenceRunner,
-        decoder_with_past: InferenceRunner,
         model_size: Literal["base", "tiny"],
         max_inp_len: int,
         max_dec_len: int,
@@ -218,10 +218,13 @@ class MoonshineStatic(MoonshineBase):
 
         self._encoder = encoder
         self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
+        self._gen_encoder_cache = gen_encoder_cache
+        if self._gen_encoder_cache is not None:
+            self._logger.info("Loaded gen_encoder_cache '%s'", str(self._gen_encoder_cache.model_path))
+        else:
+            self._logger.info("Encoder cache folded into encoder")
         self._decoder = decoder
         self._logger.info("Loaded decoder '%s'", str(self._decoder.model_path))
-        self._decoder_with_past = decoder_with_past
-        self._logger.info("Loaded decoder with past '%s'", str(self._decoder_with_past.model_path))
         self._preprocessor = preprocessor
         if self._preprocessor is not None:
             self._logger.info("Loaded preprocessor '%s'", str(self._preprocessor.model_path))
@@ -230,14 +233,17 @@ class MoonshineStatic(MoonshineBase):
             cache_name: (1, self._n_kv_heads, self._max_dec_len, self._head_dim)
             for cache_name in self._dec_cache_names
         }
+        # Initialize decoder (self-attn) KV caches at padded size
+        for cache_name, shape in self._dec_cache_shapes.items():
+            self._kv_cache[cache_name] = np.zeros(shape, dtype=np.float32)
         self._token_embeddings: np.ndarray | None = self._find_token_embeddings()
 
     @classmethod
     def from_onnx(
         cls,
         encoder_model: str | os.PathLike,
+        gen_encoder_cache_model: str | os.PathLike | None,
         decoder_model: str | os.PathLike,
-        decoder_with_past_model: str | os.PathLike,
         model_size: Literal["base", "tiny"],
         n_threads: int | None = None,
         preprocessor_model: str | os.PathLike | None = None,
@@ -247,17 +253,17 @@ class MoonshineStatic(MoonshineBase):
         max_inp_len: int = next(
             inp.shape for inp in input_ort.get_inputs() if inp.name == "input_values"
         )[-1]
-        decoder_with_past_ort = ort.InferenceSession(decoder_with_past_model, providers=['CPUExecutionProvider'])
+        decoder_ort = ort.InferenceSession(decoder_model, providers=['CPUExecutionProvider'])
         max_dec_len: int = next(
             inp.shape
-            for inp in decoder_with_past_ort.get_inputs()
+            for inp in decoder_ort.get_inputs()
             if "decoder" in inp.name
         )[2]  # assuming shape [B, H, L, D]
 
         return cls(
             ORTInferenceRunner(encoder_model, n_threads=n_threads),
+            ORTInferenceRunner(gen_encoder_cache_model, n_threads=n_threads) if gen_encoder_cache_model else None,
             ORTInferenceRunner(decoder_model, n_threads=n_threads),
-            ORTInferenceRunner(decoder_with_past_model, n_threads=n_threads),
             model_size,
             max_inp_len,
             max_dec_len,
@@ -269,8 +275,8 @@ class MoonshineStatic(MoonshineBase):
     def from_tflite(
         cls,
         encoder_model: str | os.PathLike,
+        gen_encoder_cache_model: str | os.PathLike | None,
         decoder_model: str | os.PathLike,
-        decoder_with_past_model: str | os.PathLike,
         model_size: Literal["base", "tiny"],
         n_threads: int | None = None,
         preprocessor_model: str | os.PathLike | None = None,
@@ -281,18 +287,18 @@ class MoonshineStatic(MoonshineBase):
         max_inp_len: int = next(
             list(inp["shape"]) for inp in input_int.get_input_details() if inp["name"] == "input_values"
         )[-1]
-        decoder_with_past_int = lite_rt.Interpreter(decoder_with_past_model)
-        decoder_with_past_int.allocate_tensors()
+        decoder_int = lite_rt.Interpreter(decoder_model)
+        decoder_int.allocate_tensors()
         max_dec_len: int = next(
             list(inp["shape"])
-            for inp in decoder_with_past_int.get_input_details()
+            for inp in decoder_int.get_input_details()
             if "decoder" in inp["name"]
         )[2] # assuming shape [B, H, L, D]
 
         return cls(
             TFLiteInferenceRunner(encoder_model, n_threads=n_threads),
+            TFLiteInferenceRunner(gen_encoder_cache_model, n_threads=n_threads) if gen_encoder_cache_model else None,
             TFLiteInferenceRunner(decoder_model, n_threads=n_threads),
-            TFLiteInferenceRunner(decoder_with_past_model, n_threads=n_threads),
             model_size,
             max_inp_len,
             max_dec_len,
@@ -304,8 +310,8 @@ class MoonshineStatic(MoonshineBase):
     def from_vmfb(
         cls,
         encoder_model: str | os.PathLike,
+        gen_encoder_cache_model: str | os.PathLike | None,
         decoder_model: str | os.PathLike,
-        decoder_with_past_model: str | os.PathLike,
         model_size: Literal["base", "tiny"],
         max_inp_len: int,
         max_dec_len: int,
@@ -314,8 +320,8 @@ class MoonshineStatic(MoonshineBase):
     ) -> "MoonshineStatic":
         return cls(
             VMFBInferenceRunner(encoder_model, n_threads=n_threads),
+            VMFBInferenceRunner(gen_encoder_cache_model, n_threads=n_threads) if gen_encoder_cache_model else None,
             VMFBInferenceRunner(decoder_model, n_threads=n_threads),
-            VMFBInferenceRunner(decoder_with_past_model, n_threads=n_threads),
             model_size,
             max_inp_len,
             max_dec_len,
@@ -326,9 +332,7 @@ class MoonshineStatic(MoonshineBase):
         self,
         emb_pattern: str = "decoder*token_embeddings.npy",
     ) -> np.ndarray | None:
-        paths = []
-        for model in (self._decoder, self._decoder_with_past):
-            paths.extend(model.model_path.parent.glob(emb_pattern))
+        paths = list(self._decoder.model_path.parent.glob(emb_pattern))
         if not paths:
             return None
 
@@ -384,20 +388,14 @@ class MoonshineStatic(MoonshineBase):
         return {"input_ids": np.array([input_tokens], dtype=np.int64)}
 
     def _run_decoder(
-        self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
+        self, input_tokens: list[int], *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
         decoder_inputs = self._get_decoder_token_input(input_tokens)
-        if seq_len == 0:
-            decoder_inputs.update({
-                "encoder_hidden_states": encoder_out,
-            })
-            logits, *cache = self._decoder.infer(decoder_inputs)
-        else:
-            decoder_inputs.update({
-                **self._kv_cache,
-                "current_len": np.array([[seq_len]], dtype=np.int64),
-            })
-            logits, *cache = self._decoder_with_past.infer(decoder_inputs)
+        decoder_inputs.update({
+            **self._kv_cache,
+            "current_len": np.array([[seq_len]], dtype=np.int64),
+        })
+        logits, *cache = self._decoder.infer(decoder_inputs)
         next_token = logits[0, -1].argmax().item()
         return next_token, cache
 
@@ -419,18 +417,34 @@ class MoonshineStatic(MoonshineBase):
         input = self._size_input(input)
         if self._preprocessor is not None:
             input = self._preprocessor.infer({"input_values": input})[0]
-        encoder_out = self._encoder.infer(
-            {"input_features" if self._preprocessor is not None else "input_values": input}
-        )[0].astype(np.float32)
+        encoder_input_name = "input_features" if self._preprocessor is not None else "input_values"
+        encoder_out = self._encoder.infer({encoder_input_name: input})
 
-        next_token, init_cache = self._run_decoder(tokens, encoder_out, seq_len=0)
-        self._update_cache(init_cache, update_all=True)
+        # Generate cross-attn KV cache
+        if self._gen_encoder_cache is not None:
+            # Unfolded: encoder produces hidden states, gen_encoder_cache produces KV
+            encoder_hidden_states = encoder_out[0].astype(np.float32)
+            encoder_cache_outputs = self._gen_encoder_cache.infer(
+                {"encoder_hidden_states": encoder_hidden_states}
+            )
+        else:
+            # Folded: encoder directly outputs cross-attn KV caches
+            encoder_cache_outputs = encoder_out
+
+        # Populate encoder (cross-attn) cache entries
+        enc_cache_names = [k for k in self._all_cache_names if "encoder" in k]
+        for k, v in zip(enc_cache_names, encoder_cache_outputs):
+            self._kv_cache[k] = v
+
+        # First decoder call with seq_len=0 (zero-initialized self-attn KV)
+        next_token, cache = self._run_decoder(tokens, seq_len=0)
+        self._update_cache(cache)
         self._n_tokens_gen += 1
         tokens.append(next_token)
 
         for i in range(max_tokens):
             next_token, cache = self._run_decoder(
-                [next_token], encoder_out, seq_len=i + 1
+                [next_token], seq_len=i + 1
             )
             self._update_cache(cache)
 
@@ -473,35 +487,28 @@ def load_moonshine(
 ) -> MoonshineDynamic | MoonshineStatic:
     models, kind = find_models(model_dir)
     encoder = None
+    gen_encoder_cache = None
     decoder_merged = None  # dynamic model
-    decoder, decoder_with_past = None, None  # static model
+    decoder = None  # static model
     for m in models:
         if m.stem == "encoder":
             encoder = m
+        elif m.stem == "gen_encoder_cache":
+            gen_encoder_cache = m
         elif m.stem == "decoder_merged":
             decoder_merged = m
         elif m.stem == "decoder":
             decoder = m
-        elif m.stem == "decoder_with_past":
-            decoder_with_past = m
-    is_static = decoder_merged is None and decoder is not None and decoder_with_past is not None
+    # Static if we have a decoder and either gen_encoder_cache or a folded encoder (no decoder_merged)
+    is_static = decoder_merged is None and decoder is not None
     if not encoder:
         raise FileNotFoundError(
             f"Missing encoder model 'encoder.{kind}' @ '{model_dir}'"
         )
     if not decoder_merged and not is_static:
         raise FileNotFoundError(
-            f"Missing merged decoder model 'decoder_merged.{kind}' @ '{model_dir}'"
+            f"Missing model files @ '{model_dir}': need either 'decoder_merged.{kind}' or 'encoder.{kind}' + 'decoder.{kind}'"
         )
-    if not decoder_merged:
-        if not decoder:
-            raise FileNotFoundError(
-                f"Missing decoder model 'decoder.{kind}' @ '{model_dir}'"
-            )
-        if not decoder_with_past:
-            raise FileNotFoundError(
-                f"Missing decoder with past model 'decoder_with_past.{kind}' @ '{model_dir}'"
-            )
 
     if is_static:
         if kind == "vmfb":
@@ -511,8 +518,8 @@ def load_moonshine(
                 )
             return MoonshineStatic.from_vmfb(
                 encoder,
+                gen_encoder_cache,
                 decoder,
-                decoder_with_past,
                 model_size,
                 max_inp_len,
                 max_dec_len,
@@ -520,10 +527,10 @@ def load_moonshine(
             )
         elif kind == "tflite":
             return MoonshineStatic.from_tflite(
-                encoder, decoder, decoder_with_past, model_size, n_threads=n_threads
+                encoder, gen_encoder_cache, decoder, model_size, n_threads=n_threads
             )
         return MoonshineStatic.from_onnx(
-            encoder, decoder, decoder_with_past, model_size, n_threads=n_threads
+            encoder, gen_encoder_cache, decoder, model_size, n_threads=n_threads
         )
     else:
         if kind == "vmfb":
