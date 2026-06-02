@@ -17,7 +17,12 @@ from ...utils.demo import format_answer
 
 
 def _transcribe(wav: str | os.PathLike, runner, tokenizer) -> str:
-    data, _ = sf.read(wav, dtype="float32")
+    data, sr = sf.read(wav, dtype="float32")
+    if data.ndim == 2:
+        data = data.mean(axis=1)
+    if sr != 16000:
+        from scipy.signal import resample_poly
+        data = resample_poly(data, up=16000, down=sr).astype(np.float32)
     speech = data.astype(np.float32)[np.newaxis, :]
     tokens = runner.run(speech)
     text = tokenizer.decode_batch(tokens, skip_special_tokens=True)[0]

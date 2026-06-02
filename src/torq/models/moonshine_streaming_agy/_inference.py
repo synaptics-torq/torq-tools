@@ -503,6 +503,27 @@ def load_moonshine(
 
     is_static = max_dec_len is not None
 
+    if not is_static:
+        if kind == "onnx":
+            try:
+                import onnxruntime as ort
+                sess = ort.InferenceSession(str(preprocessor or encoder), providers=['CPUExecutionProvider'])
+                inp_shape = next(inp.shape for inp in sess.get_inputs() if inp.name == "input_values")
+                if inp_shape and isinstance(inp_shape[-1], int) and inp_shape[-1] > 1:
+                    is_static = True
+            except Exception:
+                pass
+        elif kind == "tflite":
+            try:
+                import ai_edge_litert.interpreter as lite_rt
+                interpreter = lite_rt.Interpreter(str(preprocessor or encoder))
+                interpreter.allocate_tensors()
+                inp_shape = next(list(inp["shape"]) for inp in interpreter.get_input_details() if inp["name"] == "input_values")
+                if inp_shape and isinstance(inp_shape[-1], int) and inp_shape[-1] > 1:
+                    is_static = True
+            except Exception:
+                pass
+
     if is_static:
         if kind == "vmfb":
             if not isinstance(max_inp_len, int) or not isinstance(max_dec_len, int):
