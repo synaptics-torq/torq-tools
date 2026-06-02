@@ -1,597 +1,682 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
-"""Export Moonshine Streaming models to ONNX.
+#### Currently copied from moonshine to adapt
 
-Produces dynamic-shape ONNX models (split encoder architecture):
-  preprocessor.onnx              — CNN embedder (audio → features)
-  encoder.onnx                   — transformer layers (features → hidden states)
-  decoder.onnx                   — first decode step (no KV cache)
-  decoder_with_past.onnx         — subsequent decode steps (with KV cache)
-  decoder_token_embeddings.npy   — vocab embedding matrix for external logit computation
-  tokenizer.json                 — tokenizer for inference
 
-The decoders output last_hidden_state (not logits). Logits are computed
-externally: logits = last_hidden_state @ decoder_token_embeddings.T
-
-Usage via CLI:
-    torq-export-model moonshine-streaming -s tiny --skip-iree --extract-embeddings --split-encoder
-"""
 
 import argparse
-import logging
+import os
 import shutil
 from pathlib import Path
+from typing import Literal, Final
 
-import numpy as np
 import onnx
-import torch
-
-from torq.utils.logging import configure_logging
-
-from ._wrappers import (
-    FullEncoderWrapper,
-    PreprocessorWrapper,
-    TransformerEncoderWrapper,
-    DecoderWrapper,
-    DecoderWithPastWrapper,
-    kv_output_names,
-    kv_input_names,
+import onnx_graphsurgeon as gs
+import numpy as np
+import ml_dtypes
+from datasets import load_dataset, Audio
+from transformers import AutoConfig, AutoProcessor
+from torq.compile import process_iree_args
+from torq.utils.logging import (
+    configure_logging,
 )
 
-logger = logging.getLogger(__name__)
+from . import (
+    ONNX_DTYPES,
+    OPTIMUM_DTYPES,
+    STATIC_MODEL_COMPONENTS,
+    DEFAULT_CONV_KERNEL_SIZES,
+    DEFAULT_CONV_STRIDES,
+    add_moonshine_export_args,
+)
+
+from ._graph import MoonshineOnnxGraphEditor
+from ._inference import MoonshineDynamic, MoonshineStatic
+from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...model_export.hf import hf_download_models, optimum_export_onnx
 
 
-# ── Model download ───────────────────────────────────────────────────────────
+class MoonshineModelExporter(OnnxModelExporterBase):
 
-def download_model(model_id: str, local_dir: Path) -> Path:
-    """Download model files from HuggingFace Hub into local_dir."""
-    from huggingface_hub import snapshot_download
-
-    local_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading %s → %s ...", model_id, local_dir.resolve())
-    snapshot_download(
-        repo_id=model_id,
-        local_dir=str(local_dir),
-        local_dir_use_symlinks=False,
-        ignore_patterns=["*.msgpack", "*.h5", "flax_model*", "tf_model*"],
-    )
-    logger.info("Download complete.")
-    return local_dir
-
-
-# ── ONNX consolidation ──────────────────────────────────────────────────────
-
-def _consolidate_onnx(output_path: Path):
-    """Embed external tensor data into the .onnx file and remove .data files.
-
-    The dynamo exporter sometimes creates external .onnx.data files for weights.
-    This merges everything into a single self-contained .onnx protobuf.
-    """
-    from onnx.external_data_helper import convert_model_from_external_data
-
-    data_path = Path(str(output_path) + ".data")
-    if not data_path.exists():
-        return
-
-    model = onnx.load(str(output_path), load_external_data=True)
-    convert_model_from_external_data(model)
-    onnx.save(model, str(output_path))
-    data_path.unlink()
-
-
-# ── Export functions ─────────────────────────────────────────────────────────
-
-# Register asinh symbolic for TorchScript compatibility (safety net for older torch)
-def _asinh_symbolic(g, input):
-    return g.op("Asinh", input)
-torch.onnx.register_custom_op_symbolic("aten::asinh", _asinh_symbolic, opset_version=18)
-
-
-def export_preprocessor(model, output_path: Path):
-    """Export CNN embedder: raw audio → feature sequence + frame-level mask."""
-    wrapper = PreprocessorWrapper(model).eval()
-    dummy_audio = torch.randn(1, 32000)
-    dummy_mask = torch.ones(1, 32000, dtype=torch.long)
-
-    batch = torch.export.Dim("batch", min=1)
-    audio_len = torch.export.Dim("audio_length", min=80, max=960000)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (dummy_audio, dummy_mask),
-            str(output_path),
-            dynamo=True,
-            input_names=["input_values", "attention_mask"],
-            output_names=["input_features", "padding_mask"],
-            dynamic_shapes={
-                "input_values": {0: batch, 1: audio_len},
-                "attention_mask": {0: batch, 1: audio_len},
-            },
-        )
-    _consolidate_onnx(output_path)
-    logger.info("preprocessor → %s", output_path)
-
-
-def export_encoder(model, output_path: Path, enc_hidden: int):
-    """Export transformer encoder layers: embedder features + mask → hidden states."""
-    wrapper = TransformerEncoderWrapper(model).eval()
-    dummy_features = torch.randn(1, 100, enc_hidden)
-    dummy_mask = torch.ones(1, 100, dtype=torch.bool)
-
-    batch = torch.export.Dim("batch", min=1)
-    seq_len = torch.export.Dim("seq_length", min=1, max=3000)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (dummy_features, dummy_mask),
-            str(output_path),
-            dynamo=True,
-            input_names=["input_features", "attention_mask"],
-            output_names=["last_hidden_state"],
-            dynamic_shapes={
-                "input_features": {0: batch, 1: seq_len},
-                "attention_mask": {0: batch, 1: seq_len},
-            },
-        )
-    _consolidate_onnx(output_path)
-    logger.info("encoder → %s", output_path)
-
-
-def export_decoder(model, output_path: Path, num_decoder_layers: int, enc_hidden: int):
-    """Export first decode step (no KV cache)."""
-    wrapper = DecoderWrapper(model, num_decoder_layers).eval()
-    dummy_dec_ids = torch.ones(1, 1, dtype=torch.long)
-    dummy_enc_hidden = torch.randn(1, 50, enc_hidden)
-    dummy_enc_mask = torch.ones(1, 50, dtype=torch.long)
-
-    batch = torch.export.Dim("batch", min=1)
-    enc_seq = torch.export.Dim("enc_seq", min=1)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (dummy_dec_ids, dummy_enc_hidden, dummy_enc_mask),
-            str(output_path),
-            dynamo=True,
-            input_names=["decoder_input_ids", "encoder_hidden_states", "encoder_attention_mask"],
-            output_names=["last_hidden_state"] + kv_output_names(num_decoder_layers),
-            dynamic_shapes={
-                "decoder_input_ids": {0: batch},
-                "encoder_hidden_states": {0: batch, 1: enc_seq},
-                "encoder_attention_mask": {0: batch, 1: enc_seq},
-            },
-        )
-    _consolidate_onnx(output_path)
-    logger.info("decoder → %s", output_path)
-
-
-def export_decoder_with_past(
-    model, output_path: Path, num_decoder_layers: int,
-    num_heads: int, head_dim: int, enc_hidden: int,
-):
-    """Export cached decode step (with KV cache)."""
-    wrapper = DecoderWithPastWrapper(model, num_decoder_layers).eval()
-
-    dummy_dec_ids = torch.ones(1, 1, dtype=torch.long)
-    dummy_enc_hidden = torch.randn(1, 50, enc_hidden)
-    dummy_enc_mask = torch.ones(1, 50, dtype=torch.long)
-
-    B, H, HEAD = 1, num_heads, head_dim
-    dummy_self_past = [(torch.randn(B, H, 5, HEAD), torch.randn(B, H, 5, HEAD))
-                       for _ in range(num_decoder_layers)]
-    dummy_cross_past = [(torch.randn(B, H, 50, HEAD), torch.randn(B, H, 50, HEAD))
-                        for _ in range(num_decoder_layers)]
-    flat_past = []
-    for k, v in dummy_self_past:
-        flat_past += [k, v]
-    for k, v in dummy_cross_past:
-        flat_past += [k, v]
-
-    batch = torch.export.Dim("batch", min=1)
-    enc_seq = torch.export.Dim("enc_seq", min=1)
-    past_seq = torch.export.Dim("past_seq", min=1)
-
-    n = num_decoder_layers
-    flat_past_shapes = []
-    for i in range(2 * n):
-        flat_past_shapes.append({0: batch, 2: past_seq})
-    for i in range(2 * n):
-        flat_past_shapes.append({0: batch, 2: enc_seq})
-
-    dyn_shapes = {
-        "decoder_input_ids": {0: batch},
-        "encoder_hidden_states": {0: batch, 1: enc_seq},
-        "encoder_attention_mask": {0: batch, 1: enc_seq},
-        "flat_past": tuple(flat_past_shapes),
+    COMPONENTS: Final[dict[str, str]] = {
+        "encoder": "encoder_model.onnx",
+        "decoder": "decoder_model.onnx",
+        "decoder_with_past": "decoder_with_past_model.onnx",
     }
 
-    input_names = ["decoder_input_ids", "encoder_hidden_states", "encoder_attention_mask"] + kv_input_names(num_decoder_layers)
-    output_names = ["last_hidden_state"] + kv_output_names(num_decoder_layers)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (dummy_dec_ids, dummy_enc_hidden, dummy_enc_mask, *flat_past),
-            str(output_path),
-            dynamo=True,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_shapes=dyn_shapes,
-        )
-    _consolidate_onnx(output_path)
-    logger.info("decoder_with_past → %s", output_path)
-
-
-def save_token_embeddings(model, output_path: Path):
-    """Extract decoder token embeddings (tied to proj_out) and save as .npy."""
-    embeddings = model.model.decoder.embed_tokens.weight.detach().cpu().numpy()
-    np.save(str(output_path), embeddings)
-    logger.info(
-        "decoder_token_embeddings → %s  (shape %s, %.1f MB)",
-        output_path, embeddings.shape, embeddings.nbytes / 1e6,
-    )
-
-
-# ── Validation ───────────────────────────────────────────────────────────────
-
-def validate(model, output_dir: Path):
-    """Numerical check: split ONNX pipeline (preprocessor → encoder) vs PyTorch full encoder."""
-    import onnxruntime as ort
-
-    full_wrapper = FullEncoderWrapper(model).eval()
-    preproc_sess = ort.InferenceSession(str(output_dir / "preprocessor.onnx"))
-    enc_sess = ort.InferenceSession(str(output_dir / "encoder.onnx"))
-
-    test_lengths = [16000, 48000, 80000]
-    print()
-
-    for audio_len in test_lengths:
-        dummy_audio = np.random.randn(1, audio_len).astype(np.float32)
-        dummy_mask = np.ones((1, audio_len), dtype=np.int64)
-
-        with torch.no_grad():
-            pt_out = full_wrapper(
-                torch.from_numpy(dummy_audio),
-                torch.from_numpy(dummy_mask),
-            ).numpy()
-
-        preproc_outs = preproc_sess.run(None, {
-            "input_values": dummy_audio,
-            "attention_mask": dummy_mask,
-        })
-        features = preproc_outs[0]
-        padding_mask = preproc_outs[1]
-
-        ort_out = enc_sess.run(None, {
-            "input_features": features,
-            "attention_mask": padding_mask,
-        })[0]
-
-        max_diff = np.abs(pt_out - ort_out).max()
-        duration_s = audio_len / 16000
-        print(f"  Split pipeline validation ({duration_s:.0f}s audio) — "
-              f"shape {ort_out.shape}, max diff: {max_diff:.6f}")
-        assert max_diff < 1e-4, f"Validation failed! max_diff={max_diff}"
-
-    print("  ALL PASSED")
-
-
-# ── Static shape conversion ──────────────────────────────────────────────────
-
-def compute_streaming_enc_seq_len(num_samples: int) -> int:
-    """Compute encoder output sequence length for a given number of audio samples.
-
-    The streaming preprocessor applies two strided-2 causal Conv1D layers
-    after framing at 80 samples/frame::
-
-        frames = num_samples // 80
-        enc_seq_len = (frames - 1) // 4 + 1
-    """
-    frames = num_samples // 80
-    return (frames - 1) // 4 + 1
-
-
-def _make_preprocessor_static(
-    model: onnx.ModelProto,
-    num_samples: int,
-    enc_seq_len: int,
-) -> onnx.ModelProto:
-    """Fix preprocessor I/O dims to static values."""
-    from ._graph import MoonshineStreamingOnnxGraphEditor
-
-    editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "preprocessor")
-    editor.fix_preprocessor_io(num_samples, enc_seq_len)
-    return editor.to_onnx(override_ir=model.ir_version)
-
-
-def _make_encoder_static(
-    model: onnx.ModelProto,
-    enc_seq_len: int,
-) -> onnx.ModelProto:
-    """Fix encoder I/O dims to static values."""
-    from ._graph import MoonshineStreamingOnnxGraphEditor
-
-    editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "encoder")
-    editor.fix_encoder_io(enc_seq_len)
-    return editor.to_onnx(override_ir=model.ir_version)
-
-
-def _make_decoder_static(
-    model: onnx.ModelProto,
-    enc_seq_len: int,
-) -> onnx.ModelProto:
-    """Fix first-step decoder I/O dims to static values (no KV cache edits)."""
-    from ._graph import MoonshineStreamingOnnxGraphEditor
-
-    editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "decoder")
-    editor.fix_decoder_io(enc_seq_len, max_tokens=0, with_past=False)
-    return editor.to_onnx(override_ir=model.ir_version)
-
-
-def _make_decoder_with_past_static(
-    model: onnx.ModelProto,
-    enc_seq_len: int,
-    max_tokens: int,
-) -> onnx.ModelProto:
-    """Convert decoder_with_past to static shapes with fixed KV buffer.
-
-    Applies the following transformations in order:
-      1. Rename self-attention Softmax nodes (dynamo names → expected pattern)
-      2. Fix all I/O dimensions to static values
-      3. Add ``current_len`` as a new int64 model input
-      4. Replace dynamic KV cache Concat with static Where-based blend
-      5. Add causal attention mask before self-attention Softmax
-    """
-    import onnx_graphsurgeon as gs
-    from ._graph import MoonshineStreamingOnnxGraphEditor
-
-    export_dtype = onnx.TensorProto.FLOAT
-
-    editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-        model, "decoder_with_past", export_dtype
-    )
-
-    # 1. Rename before fix_io_dims (relies on symbolic dim strings)
-    editor.rename_self_attn_softmax()
-
-    # 2. Static I/O
-    editor.fix_decoder_io(enc_seq_len, max_tokens, with_past=True)
-
-    # 3. Add current_len input [1,1] → squeeze to [1]
-    graph = editor.graph
-    cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
-    graph.inputs.append(cur_len_2d)
-    cur_len = graph.layer(
-        name="current_len_to_1d",
-        op="Squeeze",
-        inputs=[cur_len_2d, [0]],
-        outputs=[
-            gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])
-        ],
-    )[0]
-
-    # 4. Replace Concat→output KV cache with static Where blend
-    editor.replace_dynamic_kv_cache(cur_len, max_tokens)
-
-    # 5. Causal attention mask
-    editor.mask_future_attn_scores(cur_len, max_tokens)
-
-    # 6. Replace Shape(past_self_key_*) → Squeeze seq-len with cur_len
-    editor.replace_shape_seq_len(cur_len)
-
-    return editor.to_onnx(override_ir=model.ir_version)
-
-
-def make_static(
-    dynamic_dir: Path,
-    static_dir: Path,
-    num_samples: int,
-    max_tokens: int,
-    enc_seq_len: int,
-    decoder_enc_seq_len: int | None = None,
-):
-    """Load dynamic ONNX models, apply static-shape conversion, save to static_dir.
-
-    Args:
-        num_samples: encoder input audio samples (may be smaller for TTFT reduction).
-        max_tokens: max decoder tokens.
-        enc_seq_len: encoder output sequence length (from num_samples).
-        decoder_enc_seq_len: decoder cross-attention size. If None, same as enc_seq_len.
-            When set larger than enc_seq_len, the decoder expects padded encoder output
-            with an encoder_attention_mask to indicate valid positions.
-    """
-    if decoder_enc_seq_len is None:
-        decoder_enc_seq_len = enc_seq_len
-
-    static_dir.mkdir(parents=True, exist_ok=True)
-
-    components = {
-        "preprocessor": lambda m: _make_preprocessor_static(m, num_samples, enc_seq_len),
-        "encoder": lambda m: _make_encoder_static(m, enc_seq_len),
-        "decoder": lambda m: _make_decoder_static(m, decoder_enc_seq_len),
-        "decoder_with_past": lambda m: _make_decoder_with_past_static(m, decoder_enc_seq_len, max_tokens),
+    COMPONENTS_MERGED: Final[dict[str, str]] = {
+        "encoder": "encoder_model.onnx",
+        "decoder_merged": "decoder_model_merged.onnx",
     }
 
-    for comp_name, convert_fn in components.items():
-        src = dynamic_dir / f"{comp_name}.onnx"
-        dst = static_dir / f"{comp_name}.onnx"
-        logger.info("(%s) Making graph static...", comp_name)
-        model = onnx.load(str(src))
-        static_model = convert_fn(model)
-        onnx.save(static_model, str(dst))
-        logger.info("(%s) → %s", comp_name, dst)
+    def __init__(
+        self,
+        model_size: Literal["base", "tiny"] = "tiny",
+        model_dtype: str = "float",
+        split_encoder: bool = False,
+        extract_embeddings: bool = False,
+        keep_individual_kv_io: bool = True,
+        static_models: bool = True,
+        *,
+        hf_repo: str | None = None,
+        max_audio_s: int = 5,
+        max_tok_per_s: int = 6,
+        models_dir: str | os.PathLike = "models",
+        onnx_source_dir: str | os.PathLike | None = None,
+        show_model_info: bool = False,
+        use_optimum: bool = False,
+        convert_dtypes: bool = False,
+        skip_export: list[str] | None = None,
+        **edit_args
+    ):
+        self._model_size = model_size
+        self._split_encoder = split_encoder
+        self._extract_embeddings = extract_embeddings
+        self._keep_individual_kv_io = keep_individual_kv_io
+        self._onnx_source_dir = onnx_source_dir
+        self._use_optimum = use_optimum
+        self._hf_repo = hf_repo or f"UsefulSensors/moonshine-{self._model_size}"
+        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._num_samples = max_audio_s * 16_000
+        self._max_tokens = max_audio_s * max_tok_per_s
+        self._hidden_size = int(self._config.hidden_size)
+        self._conv_kernel_sizes = getattr(self._config, 'conv_kernel_sizes', DEFAULT_CONV_KERNEL_SIZES)
+        self._conv_strides = getattr(self._config, 'conv_strides', DEFAULT_CONV_STRIDES)
+        self._enc_seq_len = self.compute_encoder_seq_len(
+            self._num_samples, self._conv_kernel_sizes, self._conv_strides
+        )
+        self._vocab_size = int(self._config.vocab_size)
+        self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
+        self._broadcast_ops = edit_args.get("broadcast_ops", None)
+        self._merged_decoder = True
+        opt_configs = {
+            comp: ORTOptimizerConfig(
+                num_heads=self._config.encoder_num_attention_heads 
+                if comp == "encoder" else
+                self._config.decoder_num_attention_heads,
+                hidden_size=self._config.hidden_size
+            ) for comp in STATIC_MODEL_COMPONENTS
+        }
 
-    # Copy non-ONNX assets
-    for name in ("decoder_token_embeddings.npy", "tokenizer.json"):
-        src = dynamic_dir / name
-        dst = static_dir / name
-        if src.exists():
-            shutil.copy2(src, dst)
+        super().__init__(
+            model_dtype,
+            static_models,
+            self._config,
+            Path(models_dir) / self._hf_repo,
+            show_model_info=show_model_info,
+            convert_dtypes=convert_dtypes,
+            opt_configs=opt_configs,
+            skip_export=skip_export,
+        )
 
-    logger.info("Static models saved to %s", static_dir)
+    def _setup_dirs(self) -> list[Path]:
+        onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
+        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
+            onnx_dir = onnx_source_dir
+            print(self._models_dir)
+        else:
+            if self._use_optimum or self._model_dtype in OPTIMUM_DTYPES:
+                self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
+                if self._model_dtype not in OPTIMUM_DTYPES:
+                    raise ValueError(f"'{self._model_dtype}' is an invalid dtype for optimium export, choose one of {OPTIMUM_DTYPES}")
+                onnx_dir = self._models_dir / "source" / "onnx" / self._model_size / self._model_dtype
+                onnx_dir.mkdir(parents=True, exist_ok=True)
+                optimum_export_onnx(
+                    onnx_dir, self._hf_repo, self._model_dtype, list(MoonshineModelExporter.COMPONENTS.values())
+                )
+            else:
+                if self._model_dtype not in ONNX_DTYPES:
+                    raise ValueError(f"'{self._model_dtype}' is an invalid dtype for pre-existing ONNX models, choose one of {ONNX_DTYPES}")
+                onnx_dir = self._models_dir / "source" / "onnx" / "merged" / self._model_size / self._model_dtype
+                onnx_dir.mkdir(parents=True, exist_ok=True)
+                hf_download_models(
+                    "UsefulSensors/moonshine",
+                    list(MoonshineModelExporter.COMPONENTS_MERGED.values()),
+                    subfolder=f"onnx/merged/{self._model_size}/{self._model_dtype}",
+                    local_dir=self._models_dir / "source",
+                )
+        export_dir = (
+            self._models_dir
+            / "export"
+            / "onnx"
+            / self._model_dtype
+            / ("static" if self._static_models else "dynamic")
+        )
+        convert_dir = (
+            self._models_dir 
+            / "export"
+            / "onnx"
+            / "converted"
+            / ("static" if self._static_models else "dynamic")
+        )
+        iree_dir = (
+            self._models_dir
+            / "export"
+            / "iree"
+            / ("converted" if self._convert_dtypes else self._model_dtype)
+            / ("static" if self._static_models else "dynamic")
+        )
+        return onnx_dir, export_dir, convert_dir, iree_dir
 
+    def _load_onnx(self) -> dict[str, onnx.ModelProto]:
+        unmerged_model_names: set[str] = set(MoonshineModelExporter.COMPONENTS.values())
+        merged_model_names: set[str] = set(MoonshineModelExporter.COMPONENTS_MERGED.values())
+        model_names: set[str] = set(list(p.name for p in self._onnx_dir.glob("*.onnx")))
+        if merged_model_names.issubset(model_names) and unmerged_model_names.issubset(model_names):
+            self._logger.warning("(ONNX-load) Found both merged and un-merged decoder models @ '%s', defaulting to loading merged", str(self._onnx_dir))
+            model_names = merged_model_names
+            self._merged_decoder = True
+        elif unmerged_model_names.issubset(model_names):
+            self._logger.info("(ONNX-load) Found encoder and un-merged decoder models @ '%s'", str(self._onnx_dir))
+            self._merged_decoder = False
+        elif merged_model_names.issubset(model_names):
+            self._logger.info("(ONNX-load) Found encoder and merged decoder model @ '%s'", str(self._onnx_dir))
+            self._merged_decoder = True
+        else:
+            raise ValueError(
+                f"Expected merged models {merged_model_names} or un-merged models {unmerged_model_names} @ '{self._onnx_dir}'"
+            )
+        comps = MoonshineModelExporter.COMPONENTS_MERGED if self._merged_decoder else MoonshineModelExporter.COMPONENTS
+        return {
+            comp: onnx.load(self._onnx_dir / comp_model_name)
+            for comp, comp_model_name in comps.items()
+        }
 
-# ── Main export pipeline ─────────────────────────────────────────────────────
+    def _make_encoder_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        """
+        Make the encoder model static by replacing dynamic dimensions with fixed values.
 
-def export_moonshine_streaming_from_args(args: argparse.Namespace):
-    """Main entry point called by the CLI dispatcher."""
+        Args:
+            model: Encoder model with dynamic I/O
+
+        Returns:
+            onnx.ModelProto: The modified encoder model with static dimensions
+        """
+
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
+        editor.fix_encoder_io(self._num_samples, self._enc_seq_len)
+        new_encoder = editor.to_onnx(override_ir=model.ir_version)
+        graph = gs.import_onnx(new_encoder)
+        graph.name = "main"
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        new_encoder = gs.export_onnx(graph)
+        new_encoder.ir_version = model.ir_version
+        return new_encoder
+
+    def _make_decoder_model_static(
+        self, decoder_model: onnx.ModelProto, with_past: bool
+    ) -> onnx.ModelProto:
+        """
+        Make decoder models static by replacing dynamic dimensions with fixed values and applying necessary transformations.
+
+        Replaces KV caching and other dynamic operations with static equivalents in the cached decoder model.
+
+        Args:
+            decoder_model (onnx.ModelProto): ONNX decoder model to modify
+            with_past (bool): Whether the model is the cached branch of the decoder
+
+        Returns:
+            onnx.ModelProto: The modified decoder model with static dimensions and transformations applied
+
+        Raises:
+            ValueError: If an unexpected dynamic dimension is found in the model inputs, outputs, or nodes
+        """
+        graph: gs.Graph = gs.import_onnx(decoder_model)
+        self._logger.debug(
+            "Set export data type to %s for model data type %s",
+            onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype),
+            self._model_dtype
+        )
+        comp = "decoder" + ("_with_past" if with_past else "")
+        pad_len = (
+            self._config.hidden_size // self._config.decoder_num_attention_heads
+        ) % 8
+
+        editor = MoonshineOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
+        editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
+
+        # Remove redundant Cast ops
+        editor.remove_redundant_casts()
+        # Remove isNaN ops
+        editor.remove_isNaN()
+        # Move model output if it's fed by a Concat node which has a Pad consumer
+        if not with_past:
+            editor.move_output_from_concat(pad_len=pad_len)
+
+        if with_past:
+            cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
+            graph.inputs.append(cur_len_2d)
+            cur_len = graph.layer(
+                name="current_len_to_1d",
+                op="Squeeze",
+                inputs=[cur_len_2d, [0]],
+                outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
+            )[0]
+
+            (
+                editor
+                # Replace dynamic KV cache
+                .replace_dynamic_kv_cache(cur_len, self._max_tokens)
+                # Add causal attention score mask
+                .mask_future_attn_scores(cur_len, self._max_tokens)
+                # Replace dynamic sequence length getter with `cur_len`
+                .add_curr_len_input(cur_len)
+                # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
+                .convert_to_static_index()
+            )
+
+        new_model = editor.to_onnx(override_ir=decoder_model.ir_version)
+        return new_model
+
+    def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike, component: str):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+
+        # Repalce potentially unsupported int64 -> float cast with lookup table
+        editor.replace_int64_float_cast(max_int=self._max_tokens)
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def _patch_static_preprocessor(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
+
+        # Decompose large strided Conv1D into im2col + MatMul
+        editor.decompose_strided_conv1d()
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def _patch_static_encoder(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)        # Decompose large strided Conv1D into im2col + MatMul
+
+        # Decompose large strided Conv1D into im2col + MatMul
+        if not self._split_encoder:
+            editor.decompose_strided_conv1d()
+
+        # Replace constant Div ops with Mul
+        editor.replace_constant_div_with_mul()
+        # Broadcast op inputs to match output shape
+        if self._broadcast_ops is not None:
+            editor.broadcast_op_inputs(
+                ops=self._broadcast_ops,
+            )
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def _patch_static_decoder(self, model_path: str | os.PathLike, component: str):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+
+        # Fold MatMul A @ B where B is a scalar into Mul
+        editor.fold_scalar_matmul()
+        # Manually dequantize projection scores
+        if self._model_dtype in ("quantized", "quantized_4bit"):
+            editor.dequantize_projections_matmul(
+                hidden_size=self._hidden_size,
+                vocab_size=self._vocab_size
+            )
+        # Broadcast op inputs to match output shape
+        if self._broadcast_ops is not None:
+            editor.broadcast_op_inputs(
+                ops=self._broadcast_ops,
+            )
+
+        if self._extract_embeddings:
+            # Extract token embeddings LUT
+            embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
+            embeddings_inp = "token_embedding"
+            editor.extract_token_embeddings(
+                self._hidden_size,
+                self._vocab_size,
+                embeddings_npy,
+                inp_name=embeddings_inp
+            )
+            editor.reorder_graph_input(embeddings_inp, 0)
+
+        # Replace Pad ops with Concat ops
+        editor.replace_pad_with_concat()
+
+        if not self._keep_individual_kv_io:
+            n_kv_heads = self._config.decoder_num_attention_heads
+            head_dim = self._hidden_size // n_kv_heads
+            with_past = "with_past" in component
+            dec_seq_len = self._max_tokens if with_past else 1
+            # Combine decoder (self-attn) key+value into single tensor per layer
+            editor.combine_kv_io_tensors(
+                [1, n_kv_heads, dec_seq_len, head_dim],
+                kv_layer_re=r"\.(\d+)\.decoder\.(key|value)$",
+                combined_name_fmt="{prefix}.{layer}.decoder"
+            )
+            # Combine encoder (cross-attn) key+value into single tensor per layer
+            editor.combine_kv_io_tensors(
+                [1, n_kv_heads, self._enc_seq_len, head_dim],
+                kv_layer_re=r"\.(\d+)\.encoder\.(key|value)$",
+                combined_name_fmt="{prefix}.{layer}.encoder"
+            )
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
+    def _dedup_decoder_embeddings_npy(self, emb_dir: str | os.PathLike):
+        emb_dir = Path(emb_dir)
+        if (d_emb_p := emb_dir / f"decoder_token_embeddings.npy").exists() \
+            and (dp_emb_p := emb_dir / f"decoder_with_past_token_embeddings.npy").exists():
+            d_emb = np.load(d_emb_p)
+            dp_emb = np.load(dp_emb_p)
+            if np.array_equal(d_emb, dp_emb):
+                dp_emb_p.unlink()
+
+    @staticmethod
+    def compute_encoder_seq_len(
+        num_samples: int,
+        conv_kernel_sizes: list[int] = DEFAULT_CONV_KERNEL_SIZES,
+        conv_strides: list[int] = DEFAULT_CONV_STRIDES,
+    ) -> int:
+        """Compute encoder output sequence length from audio sample count and conv parameters.
+
+        Mirrors ``MoonshinePreTrainedModel._get_feat_extract_output_lengths``
+        from HuggingFace transformers, parameterised by the conv kernel sizes
+        and strides so it works for any Moonshine variant.
+        """
+        length = num_samples
+        for kernel_size, stride in zip(conv_kernel_sizes, conv_strides):
+            length = int((length - kernel_size) / stride + 1)
+        return length
+
+    @staticmethod
+    def split_merged_encoder(
+        merged_model: onnx.ModelProto,
+        hidden_size: int,
+    ) -> tuple[onnx.ModelProto, onnx.ModelProto]:
+        assert merged_model.ir_version <= 10
+        graph = gs.import_onnx(merged_model)
+
+        # Extract encoder sequence length dim name from the original model
+        enc_seq_len_dim = "encoder_sequence_length"
+        if graph.outputs:
+            out_shape = graph.outputs[0].shape
+            if len(out_shape) >= 2 and isinstance(out_shape[1], str):
+                enc_seq_len_dim = out_shape[1]
+
+        preproc_out: gs.Node | None = None
+        for node in graph.nodes:
+            if node.op != "Mul":
+                continue
+            if any(isinstance(inp, gs.Constant) for inp in node.inputs):
+                continue
+            inp_A: gs.Node = node.i(tensor_idx=0)
+            inp_B: gs.Node = node.i(tensor_idx=1)
+            consumer: gs.Node = node.o().o()
+            if (inp_A.op == "Conv" and inp_B.op == "Add" and consumer.op == "Transpose"):
+                preproc_out = node
+                break
+        
+        if preproc_out is None:
+            raise ValueError("Unable to split encoder model: preprocessor boundary not found")
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as t_dir:
+            merged_model_path = Path(t_dir) / "merged_encoder.onnx"
+            preprocessor_path = Path(t_dir) / "preprocessor.onnx"
+            encoder_path = Path(t_dir) / "encoder.onnx"
+            onnx.save(merged_model, merged_model_path) 
+            onnx.utils.extract_model(
+                merged_model_path,
+                preprocessor_path,
+                input_names=[i.name for i in graph.inputs],
+                output_names=[preproc_out.outputs[0].name]
+            )
+            onnx.utils.extract_model(
+                merged_model_path,
+                encoder_path,
+                input_names=[preproc_out.outputs[0].name],
+                output_names=[o.name for o in graph.outputs]
+            )
+
+            preprocessor_ext = gs.import_onnx(onnx.load(preprocessor_path))
+            preprocessor_ext.name = graph.name
+            preprocessor_ext.outputs[0].name = "input_features"
+            preprocessor_ext.outputs[0].shape = ["batch_size", hidden_size, enc_seq_len_dim]
+            preprocessor_ext.cleanup(
+                remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+            ).toposort()
+            preprocessor_model = gs.export_onnx(preprocessor_ext)
+            preprocessor_model.ir_version = merged_model.ir_version
+
+            encoder_ext = gs.import_onnx(onnx.load(encoder_path))
+            encoder_ext.name = "main"
+            encoder_ext.inputs[0].name = "input_features"
+            encoder_ext.inputs[0].shape = ["batch_size", hidden_size, enc_seq_len_dim]
+            encoder_ext.cleanup(
+                remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+            ).toposort()
+            encoder_model = gs.export_onnx(encoder_ext)
+            encoder_model.ir_version = merged_model.ir_version
+
+            return preprocessor_model, encoder_model
+
+    @staticmethod
+    def split_merged_decoder(merged_model: onnx.ModelProto) -> tuple[onnx.ModelProto, onnx.ModelProto]:
+        assert merged_model.ir_version <= 10
+        if_node = next(n for n in merged_model.graph.node if n.op_type == "If")
+        then_branch = None
+        else_branch = None
+        for attr in if_node.attribute:
+            if attr.name == "then_branch":
+                then_branch = attr.g
+            elif attr.name == "else_branch":
+                else_branch = attr.g
+        if not then_branch or not else_branch:
+            raise ValueError("Merged decoder If node missing branches")
+        
+        outputs = merged_model.graph.output
+        same_outputs: bool = all([
+            out_merged == out == out_with_past 
+            for out_merged, out, out_with_past 
+            in zip(
+                [out.name for out in outputs],
+                [out.name for out in then_branch.output],
+                [out.name for out in else_branch.output]
+            )
+        ])
+
+        decoder_graph = onnx.helper.make_graph(
+            nodes=else_branch.node,
+            name="main",
+            inputs=[input for input in merged_model.graph.input if input.name in ("input_ids", "encoder_hidden_states")],
+            outputs=outputs if same_outputs else else_branch.output,
+            initializer=list(merged_model.graph.initializer) + list(else_branch.initializer)
+        )
+        decoder_model = onnx.helper.make_model(decoder_graph, opset_imports=merged_model.opset_import)
+        decoder_model.ir_version = merged_model.ir_version
+
+        decoder_with_past_graph = onnx.helper.make_graph(
+            nodes=then_branch.node,
+            name="main",
+            inputs=[input for input in merged_model.graph.input if input.name not in ("encoder_hidden_states", "use_cache_branch")],
+            outputs=[out for out in (outputs if same_outputs else then_branch.output) if "encoder" not in out.name],
+            initializer=list(merged_model.graph.initializer) + list(then_branch.initializer)
+        )
+        decoder_with_past_model = onnx.helper.make_model(decoder_with_past_graph, opset_imports=merged_model.opset_import)
+        decoder_with_past_model.ir_version = merged_model.ir_version
+
+        return decoder_model, decoder_with_past_model
+
+    def make_static(self):
+        if self._merged_decoder:
+            decoder, decoder_with_past = self.split_merged_decoder(self._components["decoder_merged"])
+            self._components["decoder"] = self.check_model(decoder)
+            self._components["decoder_with_past"] = self.check_model(decoder_with_past)
+            del self._components["decoder_merged"]
+            assert set(self._components) == set(STATIC_MODEL_COMPONENTS)
+            self._logger.info("(decoder_merged) Decoder split into regular and with_past models")
+
+        if self._split_encoder:
+            self._components["preprocessor"], self._components["encoder"] = \
+                self.split_merged_encoder(self._components["encoder"], self._hidden_size)
+            self._components["preprocessor"] = self._make_encoder_model_static(self._components["preprocessor"])
+            self._logger.info("(encoder) Encoder split into preprocessor and encoder models")
+        self._logger.info("(encoder) Making graph static...")
+        self._components["encoder"] = self._make_encoder_model_static(self._components["encoder"])
+        self._logger.info("(decoder) Making graph static...")
+        self._components["decoder"] = self._make_decoder_model_static(
+            self._components["decoder"], False
+        )
+        self._logger.info("(decoder_with_past) Making graph static...")
+        self._components["decoder_with_past"] = self._make_decoder_model_static(
+            self._components["decoder_with_past"], True
+        )
+
+    def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
+        if component == "preprocessor":
+            self._patch_static_preprocessor(model_path)
+        elif component == "encoder":
+            self._patch_static_encoder(model_path)
+        elif "decoder" in component:
+            self._patch_static_decoder(model_path, component)
+            self._dedup_decoder_embeddings_npy(Path(model_path).parent)
+
+    def validate_onnx(self, n_iters: int = 5):
+
+        def _sample_input(idx: int) -> np.ndarray:
+            sample = dataset[idx]["audio"]
+            inputs: np.ndarray = processor(
+                sample["array"],
+                sampling_rate=processor.feature_extractor.sampling_rate,
+                return_tensors="np",
+            )
+            return inputs["input_values"]
+
+        if self._static_models:
+            runner = MoonshineStatic.from_onnx(
+                encoder_model=self._export_dir / "encoder.onnx",
+                decoder_model=self._export_dir / "decoder.onnx",
+                decoder_with_past_model=self._export_dir / "decoder_with_past.onnx",
+                model_size=self._model_size,
+                preprocessor_model=self._export_dir / "preprocessor.onnx" if self._split_encoder else None,
+                combined_kv_io=not self._keep_individual_kv_io
+            )
+        else:
+            runner = MoonshineDynamic.from_onnx(
+                encoder_model=self._export_dir / "encoder.onnx",
+                decoder_model=self._export_dir / "decoder_merged.onnx",
+                model_size=self._model_size
+            )
+        val_runner = MoonshineDynamic.from_onnx(
+            encoder_model=self._onnx_dir / "encoder_model.onnx",
+            decoder_model=self._onnx_dir / "decoder_model_merged.onnx",
+            model_size=self._model_size,
+            max_inp_len=runner.max_inp_len
+        )
+
+        processor = AutoProcessor.from_pretrained(f"{self._hf_repo}")
+        dataset = load_dataset(
+            path="hf-internal-testing/librispeech_asr_dummy",
+            name="clean",
+            split="validation",
+        )
+        dataset = dataset.cast_column(
+            "audio", Audio(processor.feature_extractor.sampling_rate)
+        )
+        self._logger.debug("(ONNX-validation) Loaded dataset 'hf-internal-testing/librispeech_asr_dummy', details: %s", str(dataset))
+
+        for i in range(n_iters):
+            if i >= len(dataset):
+                self._logger.warning("(ONNX-validation) No more samples to validate, stopping")
+                break
+
+            input = _sample_input(i)
+            tokens = runner.run(input)
+            val_tokens = val_runner.run(input)
+            if not np.array_equal(tokens, val_tokens):
+                result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_tokens},\nGenerated:\n{tokens}"
+            else:
+                result = f"Validation successful, identical outputs"
+            self._logger.info(
+                "(ONNX-validation) [iter %d, %.3f ms]: %s",
+                i,
+                runner.last_infer_time * 1000,
+                result
+            )
+        self._logger.info(
+            "(ONNX-validation) Avg. inference time: %.3f ms",
+            runner.avg_infer_time * 1000
+        )
+
+    def convert_models(
+        self, 
+        convert_dir: str | os.PathLike | None = None,
+        preserve_io: bool = False,
+        skip: list[str] | None = None,
+    ):
+        skip = skip or []
+        external_data = None if any(m in self._skip_export for m in ("decoder", "decoder_with_past")) else \
+        [(self._export_paths["decoder"].parent / "decoder_token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))]
+        super().convert_models(
+            convert_dir=convert_dir,
+            preserve_io=preserve_io,
+            skip=skip,
+            external_data=external_data,
+        )
+
+    def export_iree(
+        self,
+        iree_export_dir: str | os.PathLike | None = None,
+        iree_compile_args: list[str] | None = None,
+        use_iree_cli: bool = False,
+        skip: list[str] | None = None,
+    ):
+        skip = skip or []
+        for comp, onnx_path in self._export_paths.items():
+            if comp in skip:
+                continue
+            if (self._model_dtype == "bf16" or self._convert_dtypes) and self._replace_int_bf16_cast:
+                self._replace_int_to_bf16_casts(onnx_path, comp)
+        return super().export_iree(
+            iree_export_dir,
+            iree_compile_args,
+            use_iree_cli,
+            skip
+        )
+
+def export_moonshine_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-
-    # Resolve HF repo
-    hf_repo = args.hf_repo or f"UsefulSensors/moonshine-streaming-{args.model_size}"
-    static_models = not args.dynamic_models
-
-    # Load config to get model dimensions
-    from transformers import AutoConfig, MoonshineStreamingForConditionalGeneration
-
-    config = AutoConfig.from_pretrained(hf_repo)
-    num_decoder_layers = config.num_hidden_layers
-    num_heads = config.num_attention_heads
-    head_dim = config.head_dim
-    enc_hidden = config.encoder_hidden_size
-
-    # Setup directories
-    models_dir = Path(args.models_dir)
-    dynamic_dir = models_dir / hf_repo / "export" / "onnx" / "float" / "dynamic"
-    dynamic_dir.mkdir(parents=True, exist_ok=True)
-
-    # Static shape parameters
-    num_samples = args.input_seconds * 16000
-    max_tokens = args.input_seconds * args.tokens_per_sec
-    enc_seq_len = compute_streaming_enc_seq_len(num_samples)
-
-    # Encoder chunk window for overlap-and-save incremental encoding.
-    # If --chunk-seconds is given, the encoder processes only a bounded
-    # window per step: overlap + chunk_frames + finalization_delay.
-    # Otherwise (non-incremental), encoder takes the full audio at once.
-    chunk_seconds = getattr(args, 'chunk_seconds', None)
-    if chunk_seconds is not None:
-        # Compute overlap and finalization from model config
-        enc_cfg = getattr(config, 'encoder_config', config)
-        sliding_windows = enc_cfg.sliding_windows
-        finalization_delay = sum(right for _, right in sliding_windows)
-        left_reach = sum(left for left, _ in sliding_windows)
-        cnn_left = 3  # receptive field of two stride-2 kernel-5 causal convs
-        overlap_frames = left_reach + cnn_left
-
-        chunk_frames = int(chunk_seconds * 50)  # 50 Hz post-CNN rate
-        encoder_window_frames = overlap_frames + chunk_frames + finalization_delay
-        # Convert post-CNN frames → audio samples: need (frame-1)*4+1 pre-CNN frames
-        encoder_pre_cnn = (encoder_window_frames - 1) * 4 + 1
-        encoder_num_samples = encoder_pre_cnn * 80  # 80 samples per pre-CNN frame
-        encoder_enc_seq_len = compute_streaming_enc_seq_len(encoder_num_samples)
-    else:
-        encoder_num_samples = num_samples
-        encoder_enc_seq_len = enc_seq_len
-        overlap_frames = None
-        finalization_delay = None
-        chunk_frames = None
-
-    # Decoder cross-attention size is always the full input_seconds size
-    decoder_enc_seq_len = enc_seq_len
-
-    if static_models:
-        static_dir = models_dir / hf_repo / "export" / "onnx" / "float" / "static"
-        static_dir.mkdir(parents=True, exist_ok=True)
-        output_dir = static_dir
-    else:
-        output_dir = dynamic_dir
-
-    # Local weights directory (download if needed)
-    weights_dir = models_dir / hf_repo / "weights"
-    if not (weights_dir / "model.safetensors").exists():
-        download_model(hf_repo, weights_dir)
-    else:
-        logger.info("Using cached weights in %s", weights_dir.resolve())
-
-    # Load model
-    print(f"\nLoading model from {weights_dir} ...")
-    model = MoonshineStreamingForConditionalGeneration.from_pretrained(
-        str(weights_dir),
-        torch_dtype=torch.float32,
-        local_files_only=True,
-        attn_implementation="eager",
-    ).eval()
-    model.config.use_cache = True
-
-    # Export dynamic ONNX models
-    print("\nExporting dynamic ONNX models ...")
-    export_preprocessor(model, dynamic_dir / "preprocessor.onnx")
-    export_encoder(model, dynamic_dir / "encoder.onnx", enc_hidden)
-    export_decoder(model, dynamic_dir / "decoder.onnx", num_decoder_layers, enc_hidden)
-    export_decoder_with_past(
-        model, dynamic_dir / "decoder_with_past.onnx",
-        num_decoder_layers, num_heads, head_dim, enc_hidden,
+    exporter = MoonshineModelExporter(
+        args.model_size,
+        args.dtype,
+        args.split_encoder,
+        args.extract_embeddings,
+        not args.combine_kv_io,
+        not args.dynamic_models,
+        hf_repo=args.hf_repo,
+        max_audio_s=args.input_seconds,
+        max_tok_per_s=args.tokens_per_sec,
+        models_dir=args.models_dir,
+        onnx_source_dir=args.onnx_source_dir,
+        show_model_info=args.show_model_info,
+        use_optimum=args.use_optimum,
+        convert_dtypes=args.convert_dtypes,
+        skip_export=args.skip_export,
+        replace_int_bf16_cast=args.replace_int_bf16_cast,
+        broadcast_ops=args.broadcast_ops
     )
-    save_token_embeddings(model, dynamic_dir / "decoder_token_embeddings.npy")
-
-    # Copy tokenizer
-    tok_src = weights_dir / "tokenizer.json"
-    tok_dst = dynamic_dir / "tokenizer.json"
-    shutil.copy2(tok_src, tok_dst)
-    print(f"  tokenizer → {tok_dst}")
-
-    # Make static
-    if static_models:
-        if chunk_seconds is not None:
-            print(
-                f"\nConverting to static shapes "
-                f"(chunk={chunk_seconds}s → encoder window={encoder_num_samples} samples / "
-                f"{encoder_enc_seq_len} frames "
-                f"[overlap={overlap_frames} + chunk={chunk_frames} + fin={finalization_delay}], "
-                f"decoder cross-attn={decoder_enc_seq_len} frames, "
-                f"max_tokens={max_tokens}) ..."
-            )
-        else:
-            print(
-                f"\nConverting to static shapes "
-                f"(encoder={args.input_seconds}s / {encoder_num_samples} samples / "
-                f"{encoder_enc_seq_len} frames, "
-                f"decoder cross-attn={decoder_enc_seq_len} frames, "
-                f"max_tokens={max_tokens}) ..."
-            )
-        make_static(
-            dynamic_dir, static_dir, encoder_num_samples, max_tokens,
-            encoder_enc_seq_len, decoder_enc_seq_len,
-        )
-
-    # Validate split encoder pipeline (uses dynamic models)
-    if not args.skip_validation:
-        print("\nValidating split encoder pipeline ...")
-        validate(model, dynamic_dir)
-
-    # Summary
-    print(f"\nDone. Output in: {output_dir.resolve()}/")
-    for f in sorted(output_dir.glob("*.onnx")) + sorted(output_dir.glob("*.npy")):
-        size_mb = f.stat().st_size / 1e6
-        tag = "numpy" if f.suffix == ".npy" else "fp32"
-        print(f"  {f.name:50s}  {size_mb:7.1f} MB  [{tag}]")
-    if static_models:
-        if chunk_seconds is not None:
-            print(
-                f"\n  Static config: chunk={chunk_seconds}s, "
-                f"encoder window={encoder_enc_seq_len} frames, "
-                f"decoder buffer={decoder_enc_seq_len} frames, "
-                f"max_tokens={max_tokens}"
-            )
-        else:
-            print(
-                f"\n  Static config: encoder={args.input_seconds}s "
-                f"({encoder_enc_seq_len} frames), "
-                f"decoder={decoder_enc_seq_len} frames, "
-                f"max_tokens={max_tokens}"
-            )
-
+    exporter.export_onnx(validate=not args.skip_validation)
+    if args.convert_dtypes:
+        exporter.convert_models(preserve_io=args.preserve_io_dtypes)
+    if not args.skip_iree:
+        exporter.export_iree(iree_compile_args=process_iree_args(args))
 
 def main():
-    """Standalone entry point for direct script execution."""
-    from . import add_moonshine_streaming_export_args
-    parser = argparse.ArgumentParser(description="Export Moonshine Streaming to ONNX")
-    add_moonshine_streaming_export_args(parser)
-    export_moonshine_streaming_from_args(parser.parse_args())
+    parser = argparse.ArgumentParser(description="Export Moonshine to Torq")
+    add_moonshine_export_args(parser)
+    export_moonshine_from_args(parser.parse_args())
 
 
 if __name__ == "__main__":
