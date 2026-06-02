@@ -296,6 +296,8 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir = self._models_dir / "source" / "onnx" / "merged" / self._model_size / self._model_dtype
+        if self._static_models:
+            onnx_dir = onnx_dir / f"static_i{self._num_samples // 16000}"
         export_dir = (
             self._models_dir
             / "export"
@@ -582,6 +584,16 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         if cfg_src.exists():
             shutil.copy2(cfg_src, cfg_dst)
 
+    def export_onnx(self, validate: bool = True):
+        super().export_onnx(validate=False)
+        for filename in ("decoder_token_embeddings.npy", "tokenizer.json", "config.json"):
+            src = self._onnx_dir / filename
+            dst = self._export_dir / filename
+            if src.exists():
+                shutil.copy2(src, dst)
+        if validate:
+            self.validate_onnx()
+
     def validate_onnx(self, n_iters: int = 5):
         self._logger.info("Validating exported ONNX models...")
         if self._static_models:
@@ -599,11 +611,37 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
                 decoder_with_past_model=self._export_dir / "decoder_with_past.onnx",
                 model_size=self._model_size,
                 preprocessor_model=self._export_dir / "preprocessor.onnx",
+                max_inp_len=self._num_samples,
             )
 
-        dummy_audio = np.random.randn(runner.max_inp_len or 32000).astype(np.float32)
-        tokens = runner.run(dummy_audio)
-        self._logger.info("Successfully transcribed dummy audio, tokens: %s", str(tokens))
+        wav_path = Path(__file__).parent / "OSR_us_000_0010_8k.wav"
+        if wav_path.exists():
+            self._logger.info("Loading test audio file '%s' for validation...", wav_path.name)
+            import soundfile as sf
+            from scipy.signal import resample_poly
+            from tokenizers import Tokenizer
+
+            data, sr = sf.read(wav_path, dtype="float32")
+            if data.ndim == 2:
+                data = data.mean(axis=1)
+            if sr != 16000:
+                data = resample_poly(data, up=16000, down=sr).astype(np.float32)
+
+            speech = data.astype(np.float32)[np.newaxis, :]
+            tokens = runner.run(speech)
+
+            tokenizer_path = self._export_dir / "tokenizer.json"
+            if tokenizer_path.exists():
+                tokenizer = Tokenizer.from_file(str(tokenizer_path))
+                transcribed = tokenizer.decode_batch(tokens, skip_special_tokens=True)[0]
+                self._logger.info("Validation transcription: '%s'", transcribed)
+            else:
+                self._logger.info("Successfully ran validation, tokens: %s", str(tokens))
+        else:
+            self._logger.warning("Test audio file '%s' not found, running with dummy audio...", wav_path)
+            dummy_audio = np.random.randn(runner.max_inp_len or 32000).astype(np.float32)
+            tokens = runner.run(dummy_audio)
+            self._logger.info("Successfully transcribed dummy audio, tokens: %s", str(tokens))
 
     def convert_models(
         self, 

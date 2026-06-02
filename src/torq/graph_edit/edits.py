@@ -148,8 +148,18 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
-            return isinstance(node.i(), gs.Node)
+        if node.op == "Softmax":
+            is_self_attn = node.name.endswith("self_attn/Softmax")
+            if not is_self_attn and node.inputs:
+                inp_shape = getattr(node.inputs[0], "shape", None)
+                if inp_shape and len(inp_shape) >= 1:
+                    last_dim = inp_shape[-1]
+                    if isinstance(last_dim, str):
+                        is_self_attn = ("past_seq" in last_dim)
+                    else:
+                        is_self_attn = (last_dim == self.max_tokens)
+            if is_self_attn:
+                return isinstance(node.i(), gs.Node)
         return False
 
     def transform(self, node: gs.Node):
@@ -236,21 +246,21 @@ class AddCurrLenInput(OnnxGraphEdit):
     cur_len: gs.Variable
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
-            return isinstance(node.o(), gs.Node) and node.o().op == "Gather"
+        if node.op == "Shape" and any(x in node.inputs[0].name for x in ("past_key_values", "past_self")):
+            return isinstance(node.o(), gs.Node) and node.o().op in ("Gather", "Squeeze")
         return False
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Shape")
         gather_node: gs.Node = node.o()
-        if not isinstance(gather_node, gs.Node) or gather_node.op != "Gather":
-            raise ValueError(f"Expected Gather node after Shape, got {gather_node}")
+        if not isinstance(gather_node, gs.Node) or gather_node.op not in ("Gather", "Squeeze"):
+            raise ValueError(f"Expected Gather or Squeeze node after Shape, got {gather_node}")
 
         gather_out: gs.Variable = gather_node.outputs[0]
         consumers: list[gs.Node] = list(gather_out.outputs)
         rewire_consumers(consumers, gather_out, self.cur_len)
 
-        # disconnect Shape + Gather branch
+        # disconnect Shape + Gather/Squeeze branch
         node.inputs.clear()
         gather_node.outputs.clear()
 
