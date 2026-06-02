@@ -9,11 +9,11 @@ import soundfile as sf
 import numpy as np
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
-from torq.utils.logging import configure_logging
 
 from . import add_moonshine_infer_args
 from ._inference import load_moonshine
 from ...utils.demo import format_answer
+from ...utils.logging import configure_logging
 
 
 def _transcribe(wav: str | os.PathLike, runner, tokenizer) -> str:

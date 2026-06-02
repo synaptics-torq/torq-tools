@@ -4,10 +4,9 @@
 import argparse
 from typing import Final
 
-from torq.compile import add_iree_args
-from torq.utils.logging import add_logging_args
-
+from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
+from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
 
 
@@ -82,10 +81,10 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
     )
     parser.add_argument(
-        "--skip-iree",
+        "--skip-torq",
         action="store_true",
         default=False,
-        help="Skip exporting to IREE"
+        help="Skip Torq compile/export"
     )
     parser.add_argument(
         "--replace-int-bf16-cast",
@@ -120,7 +119,7 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Moonshine model's HuggingFace repo ID (default: UsefulSensors/moonshine-{model_size})"
     )
     add_logging_args(parser)
-    add_iree_args(parser)
+    add_torq_args(parser)
 
 
 def add_moonshine_infer_args(parser: argparse.ArgumentParser):

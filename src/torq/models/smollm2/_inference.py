@@ -16,14 +16,11 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-from torq.runtime import (
-    InferenceRunner,
-    VMFBInferenceRunner
-)
-
 from ...inference.runners import (
+    InferenceRunner,
     ORTInferenceRunner,
-    TFLiteInferenceRunner
+    TFLiteInferenceRunner,
+    VMFBInferenceRunner
 )
 
 DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named SmolLM. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."

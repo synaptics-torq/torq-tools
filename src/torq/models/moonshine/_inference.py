@@ -13,14 +13,11 @@ import numpy as np
 import ai_edge_litert.interpreter as lite_rt
 import onnxruntime as ort
 
-from torq.runtime import (
-    InferenceRunner,
-    VMFBInferenceRunner
-)
-
 from ...inference.runners import (
+    InferenceRunner,
     ORTInferenceRunner,
-    TFLiteInferenceRunner
+    TFLiteInferenceRunner,
+    VMFBInferenceRunner
 )
 
 
