@@ -34,6 +34,7 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "DecomposeLayerNormalization",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -756,6 +757,140 @@ class ExtractConstantLUT(OnnxGraphEdit):
         )
 
 
+@dataclass
+class DecomposeLayerNormalization(OnnxGraphEdit):
+    """
+    Decompose ONNX LayerNormalization into basic arithmetic operations.
+    Useful for hardware targets that do not natively legalize LayerNormalization.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "LayerNormalization"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "LayerNormalization")
+        
+        X = node.inputs[0]
+        scale = node.inputs[1]
+        bias = node.inputs[2] if len(node.inputs) > 2 else None
+        
+        axis = node.attrs.get("axis", -1)
+        epsilon = node.attrs.get("epsilon", 1e-05)
+        
+        # Normalize axis
+        if axis < 0 and X.shape is not None:
+            axis = axis % len(X.shape)
+            
+        Y = node.outputs[0]
+        
+        # Create axes constant for ReduceMean
+        axes_const = gs.Constant(
+            name=node.name + "_axes",
+            values=np.array([axis], dtype=np.int64)
+        )
+        
+        # 1. Compute mean: mean = ReduceMean(X, axes)
+        mean = self.graph.layer(
+            name=node.name + "_mean",
+            op="ReduceMean",
+            inputs=[X, axes_const],
+            outputs=[gs.Variable(name=node.name + "_mean_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 2. Subtract mean: X_diff = Sub(X, mean)
+        x_diff = self.graph.layer(
+            name=node.name + "_sub_mean",
+            op="Sub",
+            inputs=[X, mean],
+            outputs=[gs.Variable(name=node.name + "_diff", dtype=X.dtype)]
+        )[0]
+        
+        # 3. Compute variance: var = ReduceMean((X - mean)^2, axes)
+        x_diff_sq = self.graph.layer(
+            name=node.name + "_diff_sq",
+            op="Mul",
+            inputs=[x_diff, x_diff],
+            outputs=[gs.Variable(name=node.name + "_diff_sq_val", dtype=X.dtype)]
+        )[0]
+        
+        var = self.graph.layer(
+            name=node.name + "_var",
+            op="ReduceMean",
+            inputs=[x_diff_sq, axes_const],
+            outputs=[gs.Variable(name=node.name + "_var_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 4. Standard deviation: stddev = Sqrt(var + eps)
+        eps_const = gs.Constant(
+            name=node.name + "_eps",
+            values=np.array(epsilon, dtype=np.float32),
+        )
+        
+        var_eps = self.graph.layer(
+            name=node.name + "_var_eps",
+            op="Add",
+            inputs=[var, eps_const],
+            outputs=[gs.Variable(name=node.name + "_var_eps_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev = self.graph.layer(
+            name=node.name + "_stddev",
+            op="Sqrt",
+            inputs=[var_eps],
+            outputs=[gs.Variable(name=node.name + "_stddev_val", dtype=X.dtype)]
+        )[0]
+        
+        # 5. Normalize: X_norm = Div(X_diff, stddev)
+        x_norm = self.graph.layer(
+            name=node.name + "_div_stddev",
+            op="Div",
+            inputs=[x_diff, stddev],
+            outputs=[gs.Variable(name=node.name + "_norm", dtype=X.dtype)]
+        )[0]
+        
+        # 6. Apply scale and optional bias
+        if bias is not None:
+            x_scaled = self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale],
+                outputs=[gs.Variable(name=node.name + "_scaled", dtype=X.dtype)]
+            )[0]
+            self.graph.layer(
+                name=node.name + "_add_bias",
+                op="Add",
+                inputs=[x_scaled, bias],
+                outputs=[Y]
+            )
+        else:
+            self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale],
+                outputs=[Y]
+            )
+            
+        # Rewire other optional outputs if they are used by any consumer
+        if len(node.outputs) > 1 and len(node.outputs[1].outputs) > 0:
+            rewire_consumers(node.outputs[1].outputs, node.outputs[1], mean)
+        if len(node.outputs) > 2 and len(node.outputs[2].outputs) > 0:
+            inv_std_dev = self.graph.layer(
+                name=node.name + "_inv_stddev",
+                op="Reciprocal",
+                inputs=[stddev],
+                outputs=[gs.Variable(name=node.name + "_inv_stddev_val", dtype=X.dtype)]
+            )[0]
+            rewire_consumers(node.outputs[2].outputs, node.outputs[2], inv_std_dev)
+            
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+        
+        self._logger.debug("Decomposed LayerNormalization node '%s'", node.name)
+
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
@@ -1037,4 +1172,8 @@ class CommonGraphEditsMixin:
 
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def decompose_layer_normalization(self):
+        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
         return self

@@ -116,3 +116,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
     def decompose_strided_conv1d(self):
         self.apply_edit(DecomposeStridedConv1D(self._graph, self._graph_name))
         return self
+
+    def decompose_layer_normalization(self):
+        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
+        return self

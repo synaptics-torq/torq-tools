@@ -20,6 +20,23 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# Monkeypatch onnx_graphsurgeon to support BFLOAT16 constant export on newer ONNX
+# versions where onnx.helper.float32_to_bfloat16 no longer exists. Those helpers
+# were removed when ONNX adopted ml_dtypes, but onnx_graphsurgeon has not caught
+# up yet, leaving _NUMPY_ARRAY_CONVERTERS empty and causing an AssertionError when
+# serializing any constant tagged with export_dtype=BFLOAT16.
+try:
+    from onnx_graphsurgeon.exporters import onnx_exporter as _gs_exporter
+    import ml_dtypes as _ml_dtypes
+    if onnx.TensorProto.BFLOAT16 not in _gs_exporter._NUMPY_ARRAY_CONVERTERS:
+        def _float32_to_bfloat16(arr):
+            return arr.astype(np.float32).astype(_ml_dtypes.bfloat16).view(np.uint16)
+        _gs_exporter._NUMPY_ARRAY_CONVERTERS[onnx.TensorProto.BFLOAT16] = _float32_to_bfloat16
+        logger.debug("Patched onnx_graphsurgeon to support BFLOAT16 constant export.")
+except Exception as _e:
+    logger.warning("Could not patch onnx_graphsurgeon for BFLOAT16 support: %s", _e)
+
+
 __all__ = [
     # CLI helpers
     "add_onnx_args",

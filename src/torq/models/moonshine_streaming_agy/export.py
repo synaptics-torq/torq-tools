@@ -509,12 +509,14 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
     def _make_preprocessor_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
         editor.fix_preprocessor_io(self._num_samples)
+        editor.decompose_layer_normalization()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
     def _make_encoder_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
         editor.fix_encoder_io(self._enc_seq_len)
+        editor.decompose_layer_normalization()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -526,6 +528,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
 
         editor = MoonshineStreamingOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
+        editor.decompose_layer_normalization()
 
         # Remove redundant Cast ops
         editor.remove_redundant_casts()
