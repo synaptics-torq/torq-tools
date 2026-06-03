@@ -35,6 +35,7 @@ __all__ = [
     "BroadcastOpInputs",
     "ExtractConstantLUT",
     "DecomposeLayerNormalization",
+    "DecomposeBooleanAnd",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
 ]
@@ -891,6 +892,78 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
         self._logger.debug("Decomposed LayerNormalization node '%s'", node.name)
 
 
+@dataclass
+class DecomposeBooleanAnd(OnnxGraphEdit):
+    """
+    Decompose ONNX And on boolean (i1) tensors into Cast(int8) + Mul + Cast(bool).
+
+    Hardware DMA engines (e.g. torq_api `_parse_mem_bdg_ldims`) assert that every
+    dimension count n[i] > 0.  Bit-packed i1 tensors cause this assertion to fire
+    because the byte-count for a small boolean dimension rounds to 0.  Casting
+    inputs through int8 gives the hardware byte-aligned, element-per-byte data.
+
+    `Mul(int8, int8)` is semantically equivalent to `And(bool, bool)` for 0/1
+    values, so the output is cast back to bool to preserve downstream type
+    expectations.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "And":
+            return False
+        # Match whenever at least one input is boolean.
+        return any(
+            isinstance(inp, (gs.Variable, gs.Constant)) and inp.dtype == np.bool_
+            for inp in node.inputs
+        )
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "And")
+
+        # Cast each input i1 -> int8
+        inputs_int8 = []
+        for i, inp in enumerate(node.inputs):
+            cast_out = self.graph.layer(
+                name=f"{node.name}_inp{i}_to_int8",
+                op="Cast",
+                inputs=[inp],
+                outputs=[gs.Variable(
+                    name=f"{node.name}_inp{i}_int8",
+                    dtype=np.int8,
+                    shape=inp.shape,
+                )],
+                attrs={"to": onnx.TensorProto.INT8},
+            )[0]
+            inputs_int8.append(cast_out)
+
+        # Mul(int8, int8) is And for 0/1 values; supports implicit broadcasting.
+        orig_output = node.outputs[0]
+        mul_out = self.graph.layer(
+            name=f"{node.name}_mul_int8",
+            op="Mul",
+            inputs=inputs_int8,
+            outputs=[gs.Variable(
+                name=f"{node.name}_mul_int8_out",
+                dtype=np.int8,
+                shape=orig_output.shape,
+            )],
+        )[0]
+
+        # Cast result back to bool; reuse orig_output variable so consumers update
+        # automatically.
+        self.graph.layer(
+            name=f"{node.name}_to_bool",
+            op="Cast",
+            inputs=[mul_out],
+            outputs=[orig_output],
+            attrs={"to": onnx.TensorProto.BOOL},
+        )
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Decomposed boolean And node '%s' into Cast+Mul+Cast", node.name)
+
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
@@ -1176,4 +1249,14 @@ class CommonGraphEditsMixin:
 
     def decompose_layer_normalization(self):
         self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
+        return self
+
+    def decompose_boolean_and(self):
+        """Replace And(i1, i1) -> i1 with Cast(int8) + Mul + Cast(bool).
+
+        Avoids hardware DMA assertion failures on bit-packed boolean tensors.
+        Call before broadcast_op_inputs so that downstream Mul ops get the
+        explicit Expand treatment instead of the now-removed And nodes.
+        """
+        self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
         return self

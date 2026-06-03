@@ -120,3 +120,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
     def decompose_layer_normalization(self):
         self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
         return self
+
+    def decompose_boolean_and(self):
+        self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
+        return self

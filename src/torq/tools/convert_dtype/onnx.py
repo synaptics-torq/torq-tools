@@ -467,6 +467,14 @@ class Int64Converter(OnnxDtypeConverterBase):
         "GatherND": ((1,),),        # v13: inputs: (indices, )
         "Pad": ((1, 3),),           # v25: inputs: (pads, axes)
         "ReduceMean": ((1,),),      # v18: inputs: (axes, )
+        "ReduceSum": ((1,),),
+        "ReduceMax": ((1,),),
+        "ReduceMin": ((1,),),
+        "ReduceProd": ((1,),),
+        "ReduceLogSum": ((1,),),
+        "ReduceLogSumExp": ((1,),),
+        "ReduceL1": ((1,),),
+        "ReduceL2": ((1,),),
         "Reshape": ((1,),),         # v25: inputs: (shape, )
         "Resize": ((3,),),          # v19: inputs: (sizes, )
         "Slice": ((1, 2, 3, 4),),   # v13: inputs: (starts, ends, axes, steps)

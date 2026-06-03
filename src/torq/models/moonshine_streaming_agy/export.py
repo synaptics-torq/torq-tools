@@ -236,6 +236,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         model_dtype: str = "float",
         static_models: bool = True,
         *,
+        extract_embeddings: bool = False,
         hf_repo: str | None = None,
         max_audio_s: int = 5,
         max_tok_per_s: int = 6,
@@ -247,12 +248,14 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         **edit_args
     ):
         self._model_size = model_size
+        self._extract_embeddings = extract_embeddings
         self._onnx_source_dir = onnx_source_dir
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-streaming-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._num_samples = max_audio_s * 16_000
         self._max_tokens = max_audio_s * max_tok_per_s
         self._hidden_size = int(self._config.hidden_size)
+        self._vocab_size = int(self._config.vocab_size)
 
         # Standard conv layers of moonshine preprocessor do two strided causal convs of stride 2
         # giving a total input reduction of stride 4.
@@ -517,6 +520,11 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
         editor.fix_encoder_io(self._enc_seq_len)
         editor.decompose_layer_normalization()
+        # Replace And(i1,i1)->i1 with Cast(int8)+Mul+Cast(bool) to avoid hardware
+        # DMA assertion failures on bit-packed boolean tensors, then make the
+        # resulting Mul broadcasting explicit.
+        editor.decompose_boolean_and()
+        editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -560,6 +568,11 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
                 .convert_to_static_index()
             )
 
+        # Replace And(i1,i1)->i1 with Cast(int8)+Mul+Cast(bool) to avoid hardware
+        # DMA assertion failures on bit-packed boolean tensors, then make the
+        # resulting Mul broadcasting explicit.
+        editor.decompose_boolean_and()
+        editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -570,12 +583,37 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         self._components["decoder"] = self._make_decoder_model_static(self._components["decoder"], False)
         self._components["decoder_with_past"] = self._make_decoder_model_static(self._components["decoder_with_past"], True)
 
+    def _dedup_decoder_embeddings_npy(self, emb_dir: str | os.PathLike):
+        emb_dir = Path(emb_dir)
+        if (d_emb_p := emb_dir / f"decoder_token_embeddings.npy").exists() \
+            and (dp_emb_p := emb_dir / f"decoder_with_past_token_embeddings.npy").exists():
+            d_emb = np.load(d_emb_p)
+            dp_emb = np.load(dp_emb_p)
+            if np.array_equal(d_emb, dp_emb):
+                dp_emb_p.unlink()
+
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         # Move token embeddings and tokenizer over to the export folder
         emb_src = self._onnx_dir / "decoder_token_embeddings.npy"
         emb_dst = Path(model_path).parent / "decoder_token_embeddings.npy"
         if emb_src.exists():
             shutil.copy2(emb_src, emb_dst)
+
+        if "decoder" in component and self._extract_embeddings:
+            # Extract token embeddings LUT
+            embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
+            embeddings_inp = "token_embedding"
+            editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
+            editor.extract_token_embeddings(
+                self._hidden_size,
+                self._vocab_size,
+                embeddings_npy,
+                inp_name=embeddings_inp
+            )
+            editor.reorder_graph_input(embeddings_inp, 0)
+            new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
+            onnx.save(new_model, model_path)
+            self._dedup_decoder_embeddings_npy(Path(model_path).parent)
 
         tok_src = self._onnx_dir / "tokenizer.json"
         tok_dst = Path(model_path).parent / "tokenizer.json"
@@ -669,6 +707,7 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         args.model_size,
         args.dtype,
         not args.dynamic_models,
+        extract_embeddings=args.extract_embeddings,
         hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,

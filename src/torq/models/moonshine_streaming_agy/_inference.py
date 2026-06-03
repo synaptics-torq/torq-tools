@@ -98,6 +98,43 @@ class MoonshineStreamingBase(ABC):
             )
         return input.reshape((1, self._max_inp_len))
 
+    def _expects_token_embedding(self) -> bool:
+        if not hasattr(self, "_use_token_embedding"):
+            self._use_token_embedding = False
+            decoder = getattr(self, "_decoder", None)
+            if decoder is not None:
+                if hasattr(decoder, "_sess") and hasattr(decoder._sess, "get_inputs"):
+                    try:
+                        self._use_token_embedding = any(inp.name == "token_embedding" for inp in decoder._sess.get_inputs())
+                    except Exception:
+                        pass
+                elif hasattr(decoder, "_interpreter") and hasattr(decoder._interpreter, "get_input_details"):
+                    try:
+                        self._use_token_embedding = any(inp["name"] == "token_embedding" for inp in decoder._interpreter.get_input_details())
+                    except Exception:
+                        pass
+                elif hasattr(decoder, "inputs_info"):
+                    try:
+                        info = decoder.inputs_info
+                        if isinstance(info, dict):
+                            self._use_token_embedding = "token_embedding" in info
+                        elif isinstance(info, (list, tuple)):
+                            self._use_token_embedding = any(
+                                (item == "token_embedding" or (isinstance(item, dict) and item.get("name") == "token_embedding"))
+                                for item in info
+                            )
+                        elif hasattr(info, "__contains__"):
+                            self._use_token_embedding = "token_embedding" in info
+                    except Exception:
+                        pass
+        return self._use_token_embedding
+
+    def _get_decoder_token_input(self, last_tok: int) -> dict[str, np.ndarray]:
+        if self._expects_token_embedding() and isinstance(self._token_embeddings, np.ndarray):
+            emb = self._token_embeddings[last_tok]
+            return {"token_embedding": np.expand_dims(emb, axis=(0, 1))}
+        return {"decoder_input_ids": np.array([[last_tok]], dtype=np.int64)}
+
     @abstractmethod
     def run(self, input: np.ndarray, max_tokens: int | None = None) -> np.ndarray: ...
 
@@ -161,7 +198,7 @@ class MoonshineStreamingDynamic(MoonshineStreamingBase):
     def _run_decoder(
         self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        decoder_inputs = {"decoder_input_ids": np.array([[input_tokens[-1]]], dtype=np.int64)}
+        decoder_inputs = self._get_decoder_token_input(input_tokens[-1])
         if seq_len == 0:
             decoder_inputs["encoder_hidden_states"] = encoder_out
             hidden, *cache = self._decoder.infer(decoder_inputs)
@@ -385,7 +422,7 @@ class MoonshineStreamingStatic(MoonshineStreamingBase):
     def _run_decoder(
         self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        decoder_inputs = {"decoder_input_ids": np.array([[input_tokens[-1]]], dtype=np.int64)}
+        decoder_inputs = self._get_decoder_token_input(input_tokens[-1])
         if seq_len == 0:
             decoder_inputs["encoder_hidden_states"] = encoder_out
             hidden, *cache = self._decoder.infer(decoder_inputs)
