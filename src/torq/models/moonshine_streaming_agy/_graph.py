@@ -124,3 +124,30 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
     def decompose_boolean_and(self):
         self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
         return self
+
+    def remove_identity_gather_nd(self):
+        import numpy as np
+        gather_nd_nodes = [node for node in self._graph.nodes if node.op == "GatherND"]
+        for node in gather_nd_nodes:
+            if len(node.inputs) == 2:
+                data_input = node.inputs[0]
+                indices_input = node.inputs[1]
+                if isinstance(indices_input, gs.Constant):
+                    indices_arr = indices_input.values
+                    if indices_arr.ndim == 3 and indices_arr.shape[0] == 1 and indices_arr.shape[2] == 2:
+                        is_identity = True
+                        for i in range(indices_arr.shape[1]):
+                            if not np.array_equal(indices_arr[0, i], [0, i]):
+                                is_identity = False
+                                break
+                        if is_identity:
+                            output_var = node.outputs[0]
+                            for consumer in list(output_var.outputs):
+                                for idx, inp in enumerate(consumer.inputs):
+                                    if inp is output_var:
+                                        consumer.inputs[idx] = data_input
+                            node.outputs.clear()
+                            node.inputs.clear()
+        self._graph.cleanup().toposort()
+        return self
+

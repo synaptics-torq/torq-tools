@@ -730,6 +730,12 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         if emb_src.exists():
             shutil.copy2(emb_src, emb_dst)
 
+        if "encoder" in component:
+            editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
+            editor.remove_identity_gather_nd()
+            new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
+            onnx.save(new_model, model_path)
+
         if "decoder" in component and self._extract_embeddings:
             # Extract token embeddings LUT
             embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
