@@ -3,12 +3,12 @@
 
 from . import (
     moonshine,
-    moonshine_streaming,
+    moonshine_streaming_agy,
     smollm2,
 )
 
 all = [
     "moonshine",
-    "moonshine_streaming",
+    "moonshine_streaming_agy",
     "smollm2",
 ]

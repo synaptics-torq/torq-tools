@@ -25,6 +25,7 @@ from . import (
     ONNX_DTYPES,
     OPTIMUM_DTYPES,
     STATIC_MODEL_COMPONENTS,
+    STATIC_MODEL_COMPONENTS_UNFOLDED,
     add_moonshine_streaming_export_args,
 )
 
@@ -237,6 +238,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         static_models: bool = True,
         *,
         extract_embeddings: bool = False,
+        fold_encoder_cache: bool = True,
         hf_repo: str | None = None,
         max_audio_s: int = 5,
         max_tok_per_s: int = 6,
@@ -249,6 +251,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
     ):
         self._model_size = model_size
         self._extract_embeddings = extract_embeddings
+        self._fold_encoder_cache = fold_encoder_cache
         self._onnx_source_dir = onnx_source_dir
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-streaming-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
@@ -279,11 +282,12 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
             getattr(self._config, "num_attention_heads", 8)
         )
 
+        components_list = STATIC_MODEL_COMPONENTS if fold_encoder_cache else STATIC_MODEL_COMPONENTS_UNFOLDED
         opt_configs = {
             comp: ORTOptimizerConfig(
                 num_heads=enc_heads if comp == "encoder" else dec_heads,
                 hidden_size=self._config.hidden_size
-            ) for comp in STATIC_MODEL_COMPONENTS
+            ) for comp in components_list
         }
 
         super().__init__(
@@ -576,12 +580,139 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
+    @staticmethod
+    def extract_encoder_cache(static_decoder: onnx.ModelProto) -> onnx.ModelProto:
+        """Extract the cross-attention KV cache generation subgraph from the static decoder.
+
+        The cross-attn KV caches (present_cross_key/value_*) depend only on encoder_hidden_states,
+        so they can be computed independently in a separate model.
+
+        Args:
+            static_decoder: The full static decoder model
+
+        Returns:
+            An ONNX model that takes encoder_hidden_states and produces all cross-attn KV caches
+        """
+        graph = gs.import_onnx(static_decoder)
+
+        encoder_cache_output_names = {out.name for out in graph.outputs if "cross" in out.name}
+        encoder_input = next(
+            inp for inp in graph.inputs
+            if "encoder" in inp.name
+        )
+
+        # Keep only the encoder cache outputs and encoder_hidden_states input
+        graph.outputs = [out for out in graph.outputs if out.name in encoder_cache_output_names]
+        graph.inputs = [encoder_input]
+
+        # Fold constants (Shape ops produce known values in a static graph)
+        # This severs dependencies on input_ids through shape-computation paths
+        graph.fold_constants(size_threshold=1024 * 1024)  # 1 MiB limit to avoid bloat
+        graph.name = "main"
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+
+        gen_encoder_cache = gs.export_onnx(graph)
+        gen_encoder_cache.ir_version = static_decoder.ir_version
+        return gen_encoder_cache
+
+    @staticmethod
+    def fold_encoder_cache(
+        encoder_model: onnx.ModelProto,
+        gen_encoder_cache: onnx.ModelProto
+    ) -> onnx.ModelProto:
+        """Merge gen_encoder_cache into encoder, so encoder outputs cross-attn KV caches directly.
+
+        Connects encoder's output (last_hidden_state or encoder_hidden_states) to gen_encoder_cache's input,
+        making the intermediate state an internal tensor.
+
+        Args:
+            encoder_model: The static encoder model
+            gen_encoder_cache: The extracted cross-attn KV cache generation model
+
+        Returns:
+            A merged ONNX model: input_values/input_features → cross-attn KV caches
+        """
+        enc_graph = gs.import_onnx(encoder_model)
+        cache_graph = gs.import_onnx(gen_encoder_cache)
+
+        # Rename all nodes and tensors in cache_graph to avoid name collisions
+        # inputs[0] is the rewired input (encoder_hidden_states), which we don't want to rename
+        rewired_input_name = cache_graph.inputs[0].name
+        
+        # We also don't want to rename outputs since they are the final model outputs
+        output_names = {out.name for out in cache_graph.outputs}
+
+        for node in cache_graph.nodes:
+            if node.name:
+                node.name = f"cache_fold/{node.name}"
+            for inp in node.inputs:
+                if isinstance(inp, (gs.Variable, gs.Constant)):
+                    if inp.name != rewired_input_name and inp.name not in output_names:
+                        inp.name = f"cache_fold/{inp.name}"
+            for out in node.outputs:
+                if isinstance(out, (gs.Variable, gs.Constant)):
+                    if out.name not in output_names:
+                        out.name = f"cache_fold/{out.name}"
+
+        # The encoder has one output (last_hidden_state)
+        # gen_encoder_cache has one input (encoder_hidden_states)
+        # Wire them together by replacing cache_graph's input with encoder's output tensor
+        enc_output_tensor = enc_graph.outputs[0]
+        cache_input_tensor = cache_graph.inputs[0]
+
+        # Rewire all consumers in cache_graph that reference the cache input
+        for node in cache_graph.nodes:
+            for i, inp in enumerate(node.inputs):
+                if inp is cache_input_tensor:
+                    node.inputs[i] = enc_output_tensor
+
+        # Merge: add all cache_graph nodes and initializers into enc_graph
+        enc_graph.nodes.extend(cache_graph.nodes)
+        # Set outputs to be the cache outputs
+        enc_graph.outputs = cache_graph.outputs
+
+        enc_graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+
+        merged = gs.export_onnx(enc_graph)
+        merged.ir_version = encoder_model.ir_version
+        return merged
+
     def make_static(self):
         self._logger.info("Verifying and finalizing static dimensions...")
         self._components["preprocessor"] = self._make_preprocessor_model_static(self._components["preprocessor"])
+
+        decoder = self._components.pop("decoder")
+        decoder_with_past = self._components.pop("decoder_with_past")
+
+        self._logger.info("(encoder) Making encoder static...")
         self._components["encoder"] = self._make_encoder_model_static(self._components["encoder"])
-        self._components["decoder"] = self._make_decoder_model_static(self._components["decoder"], False)
-        self._components["decoder_with_past"] = self._make_decoder_model_static(self._components["decoder_with_past"], True)
+
+        self._logger.info("(decoder) Making full decoder static for encoder cache extraction...")
+        static_full_decoder = self._make_decoder_model_static(decoder, False)
+
+        self._logger.info("(gen_encoder_cache) Extracting cross-attn KV cache subgraph...")
+        gen_encoder_cache = self.extract_encoder_cache(static_full_decoder)
+
+        if self._fold_encoder_cache:
+            # Fold gen_encoder_cache into encoder
+            self._logger.info("(encoder) Folding gen_encoder_cache into encoder...")
+            self._components["encoder"] = self.fold_encoder_cache(
+                self._components["encoder"], gen_encoder_cache
+            )
+        else:
+            self._components["gen_encoder_cache"] = gen_encoder_cache
+
+        # Use decoder_with_past as the unified decoder
+        self._logger.info("(decoder) Making unified decoder static...")
+        self._components["decoder"] = self._make_decoder_model_static(
+            decoder_with_past, True
+        )
+        expected = set(STATIC_MODEL_COMPONENTS if self._fold_encoder_cache else STATIC_MODEL_COMPONENTS_UNFOLDED)
+        assert set(self._components) >= expected
 
     def _dedup_decoder_embeddings_npy(self, emb_dir: str | os.PathLike):
         emb_dir = Path(emb_dir)
@@ -638,10 +769,11 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
     def validate_onnx(self, n_iters: int = 5):
         self._logger.info("Validating exported ONNX models...")
         if self._static_models:
+            gen_encoder_cache_model = None if self._fold_encoder_cache else self._export_dir / "gen_encoder_cache.onnx"
             runner = MoonshineStreamingStatic.from_onnx(
                 encoder_model=self._export_dir / "encoder.onnx",
+                gen_encoder_cache_model=gen_encoder_cache_model,
                 decoder_model=self._export_dir / "decoder.onnx",
-                decoder_with_past_model=self._export_dir / "decoder_with_past.onnx",
                 model_size=self._model_size,
                 preprocessor_model=self._export_dir / "preprocessor.onnx",
             )
@@ -708,6 +840,7 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         args.dtype,
         not args.dynamic_models,
         extract_embeddings=args.extract_embeddings,
+        fold_encoder_cache=not args.no_fold_encoder_cache,
         hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,

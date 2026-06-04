@@ -4,7 +4,7 @@
 import argparse
 
 from .moonshine import add_moonshine_export_args
-from .moonshine_streaming import add_moonshine_streaming_export_args
+from .moonshine_streaming_agy import add_moonshine_streaming_export_args
 from .smollm2 import add_smollm2_export_args
 
 
@@ -29,7 +29,7 @@ def main():
         from .moonshine.export import export_moonshine_from_args
         export_moonshine_from_args(args)
     elif args.model_name == "moonshine-streaming":
-        from .moonshine_streaming.export import export_moonshine_streaming_from_args
+        from .moonshine_streaming_agy.export import export_moonshine_streaming_from_args
         export_moonshine_streaming_from_args(args)
     elif args.model_name == "smollm2":
         from .smollm2.export import export_smollm2_from_args

@@ -16,7 +16,8 @@ DEFAULT_DEC_TOK_PER_SEC: Final[int] = 6
 DEFAULT_MODEL_SIZE: Final[str] = "tiny"
 ONNX_DTYPES: Final[list[str]] = ["float"]  # Streaming models currently support FP32 base export
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
-STATIC_MODEL_COMPONENTS: Final[list[str]] = ["preprocessor", "encoder", "decoder", "decoder_with_past"]
+STATIC_MODEL_COMPONENTS: Final[list[str]] = ["preprocessor", "encoder", "decoder"]
+STATIC_MODEL_COMPONENTS_UNFOLDED: Final[list[str]] = ["preprocessor", "encoder", "gen_encoder_cache", "decoder"]
 
 
 def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
@@ -80,10 +81,16 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         help="Replace int64 -> bf16 casts with a look-up table"
     )
     parser.add_argument(
+        "--no-fold-encoder-cache",
+        action="store_true",
+        default=False,
+        help="Keep gen_encoder_cache as a separate model instead of folding into encoder"
+    )
+    parser.add_argument(
         "--skip-export",
         type=str,
         nargs="+",
-        choices=["preprocessor", "encoder", "decoder", "decoder_with_past"],
+        choices=["preprocessor", "encoder", "gen_encoder_cache", "decoder"],
         help="Skip export of specific components"
     )
     parser.add_argument(
