@@ -3,6 +3,7 @@
 *.vmfb
 *.mlir
 models/
+models_fixed/
 !src/torq/models/
 .venv/
 .torq/
