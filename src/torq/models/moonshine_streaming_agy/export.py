@@ -517,6 +517,63 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
         editor.fix_preprocessor_io(self._num_samples)
         editor.decompose_layer_normalization()
+
+        # Pre-process Conv nodes for DecomposeStridedConv1D compatibility:
+        # 1. Pre-populate kernel_shape if missing from weights shape
+        # 2. Extract non-zero pads to explicit Pad nodes
+        import numpy as np
+        import onnx_graphsurgeon as gs
+        
+        for node in list(editor._graph.nodes):
+            if node.op == "Conv":
+                weight = node.inputs[1]
+                if ("kernel_shape" not in node.attrs or not node.attrs["kernel_shape"]) and weight.shape is not None:
+                    if len(weight.shape) == 3:
+                        node.attrs["kernel_shape"] = [weight.shape[2]]
+
+        for node in list(editor._graph.nodes):
+            if node.op == "Conv":
+                pads = node.attrs.get("pads", [0, 0])
+                if any(p != 0 for p in pads):
+                    conv_in = node.inputs[0]
+                    rank = len(conv_in.shape) if conv_in.shape is not None else 3
+                    
+                    pad_width = [0] * rank
+                    pad_width[-1] = pads[0]
+                    pad_width_after = [0] * rank
+                    pad_width_after[-1] = pads[1]
+                    
+                    pads_array = np.array(pad_width + pad_width_after, dtype=np.int64)
+                    pads_const = gs.Constant(
+                        name=node.name + "_explicit_pads_const",
+                        values=pads_array
+                    )
+                    
+                    padded_shape = list(conv_in.shape) if conv_in.shape is not None else [1, 1, 1]
+                    if conv_in.shape is not None:
+                        padded_shape[-1] = conv_in.shape[-1] + pads[0] + pads[1]
+                        
+                    padded_in = gs.Variable(
+                        name=node.name + "_padded_input",
+                        dtype=conv_in.dtype,
+                        shape=padded_shape
+                    )
+                    
+                    pad_node = gs.Node(
+                        op="Pad",
+                        name=node.name + "_explicit_pad",
+                        inputs=[conv_in, pads_const],
+                        outputs=[padded_in],
+                        attrs={"mode": "constant"}
+                    )
+                    editor._graph.nodes.append(pad_node)
+                    node.inputs[0] = padded_in
+                    node.attrs["pads"] = [0, 0]
+                    
+        editor._graph.cleanup().toposort()
+
+        editor.decompose_strided_conv1d()
+        editor.replace_pad_with_concat()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -733,6 +790,13 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         if "encoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
             editor.remove_identity_gather_nd()
+            new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
+            onnx.save(new_model, model_path)
+
+        if "preprocessor" in component:
+            editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
+            editor.decompose_reduce_sum()
+            editor.decompose_asinh()
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
