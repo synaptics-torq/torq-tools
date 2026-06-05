@@ -234,6 +234,7 @@ class OnnxModelExporterBase(ABC):
         self._torq_dir.mkdir(parents=True, exist_ok=True)
         for comp, onnx_path in self._export_paths.items():
             if comp in skip:
+                self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
             self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
             model = onnx.load(onnx_path)
