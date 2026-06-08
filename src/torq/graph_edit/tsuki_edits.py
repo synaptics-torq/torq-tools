@@ -514,9 +514,10 @@ class ConvertReduceMeanKeepDimsToReduceMeanUnsqueeze(OnnxGraphEdit):
         
     """
     def match(self, node: gs.Node) -> bool:
+        # ReduceMean's keepdims defaults to 1 when the attr is absent, so a
+        # missing attr or an explicit keepdims==1 both need converting.
         return node.op == "ReduceMean" \
-            and "keepdims" in node.attrs \
-            and node.attrs["keepdims"] == 1
+            and node.attrs.get("keepdims", 1) == 1
 
     def transform(self, node: gs.Node):
         input_node = node.inputs[0]

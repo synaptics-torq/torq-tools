@@ -9,7 +9,8 @@ from .onnx import fold_constants
 
 def fold_constants_from_file(input_path: str) -> onnx.ModelProto:
     model = maybe_load_onnx_model(input_path)
-    folded_model, _ = fold_constants(model)
+    folded_model, report = fold_constants(model)
+    print(f"Pruned {report['removed_nodes']} layers")
     return folded_model
 
 
