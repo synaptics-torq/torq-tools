@@ -34,8 +34,8 @@ def convert_model(
     for subgraph in model_t.subgraphs:
         for tensor in subgraph.tensors:
             if (
-                tensor.hasRank
-                and tensor.shapeSignature is not None
+                tensor.shapeSignature is not None
+                and len(tensor.shapeSignature) > 0 
                 and -1 in tensor.shapeSignature
             ):
                 tensor.shapeSignature = None
