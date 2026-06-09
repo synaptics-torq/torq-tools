@@ -127,13 +127,13 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         self.apply_edit(DecomposeStridedConv1D(self._graph, self._graph_name))
         return self
 
-    # def decompose_layer_normalization(self):
-    #     self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
-    #     return self
+    def decompose_layer_normalization(self):
+        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
+        return self
 
-    # def decompose_boolean_and(self):
-    #     self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
-    #     return self
+    def decompose_boolean_and(self):
+        self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
+        return self
 
     def remove_identity_gather_nd(self):
         import numpy as np

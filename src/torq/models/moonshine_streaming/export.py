@@ -515,7 +515,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
     def _make_preprocessor_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
         editor.fix_preprocessor_io(self._num_samples)
-        # editor.decompose_layer_normalization()
+        editor.decompose_layer_normalization()
 
         # Pre-process Conv nodes for DecomposeStridedConv1D compatibility:
         # 1. Pre-populate kernel_shape if missing from weights shape
@@ -579,12 +579,12 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
     def _make_encoder_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
         editor.fix_encoder_io(self._enc_seq_len)
-        # editor.decompose_layer_normalization()
+        editor.decompose_layer_normalization()
         # Replace And(i1,i1)->i1 with Cast(int8)+Mul+Cast(bool) to avoid hardware
         # DMA assertion failures on bit-packed boolean tensors, then make the
         # resulting Mul broadcasting explicit.
-        # editor.decompose_boolean_and()
-        # editor.broadcast_op_inputs(["Mul"])
+        editor.decompose_boolean_and()
+        editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -596,7 +596,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
 
         editor = MoonshineStreamingOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
-        # editor.decompose_layer_normalization()
+        editor.decompose_layer_normalization()
 
         # Remove redundant Cast ops
         editor.remove_redundant_casts()
@@ -631,8 +631,8 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         # Replace And(i1,i1)->i1 with Cast(int8)+Mul+Cast(bool) to avoid hardware
         # DMA assertion failures on bit-packed boolean tensors, then make the
         # resulting Mul broadcasting explicit.
-        # editor.decompose_boolean_and()
-        # editor.broadcast_op_inputs(["Mul"])
+        editor.decompose_boolean_and()
+        editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
