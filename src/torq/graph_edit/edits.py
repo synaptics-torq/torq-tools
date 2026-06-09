@@ -159,21 +159,8 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Softmax":
-            if node.name.endswith("self_attn/Softmax") or "self_attn" in node.name:
-                return isinstance(node.i(), gs.Node)
-            try:
-                prod = node.i()
-                if prod.op == "Add" and len(prod.inputs) == 2:
-                    val = prod.inputs[1]
-                    if val.shape is not None and len(val.shape) > 0:
-                        last_dim = val.shape[-1]
-                        if last_dim == self.max_tokens:
-                            return True
-                        if isinstance(last_dim, str) and "past_seq" in last_dim:
-                            return True
-            except Exception:
-                pass
+        if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
+            return isinstance(node.i(), gs.Node)
         return False
 
     def transform(self, node: gs.Node):

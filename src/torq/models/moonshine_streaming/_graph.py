@@ -6,14 +6,22 @@ import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
-from ...graph_edit import (
+# from ...graph_edit import (
+#     OnnxGraphEdit,
+#     DimMatchType,
+#     FixedDimMapping,
+#     OnnxGraphEditor,
+#     rewire_consumers,
+# )
+# from ...graph_edit.edits import *
+from .onnx import (
     OnnxGraphEdit,
     DimMatchType,
     FixedDimMapping,
     OnnxGraphEditor,
     rewire_consumers,
 )
-from ...graph_edit.edits import *
+from .edits import *
 
 # Re-use the excellent graph surgeon edits from the standard Moonshine implementation
 from ..moonshine._graph import (

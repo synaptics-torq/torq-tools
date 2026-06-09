@@ -149,7 +149,6 @@ class OnnxGraphEditor:
         ).toposort()
         if self._is_rnn:
             self.restore_rnn_output_arity(self._graph)
-        self._clear_intermediate_shapes()
         onnx_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(self._graph),
             check_type=check_type,
@@ -205,16 +204,7 @@ class OnnxGraphEditor:
             self.apply_edit(edit)
         return self
 
-    def _clear_intermediate_shapes(self):
-        inputs_outputs_names = {t.name for t in self._graph.inputs + self._graph.outputs}
-        for name, tensor in self._graph.tensors().items():
-            if name in inputs_outputs_names:
-                continue
-            if isinstance(tensor, gs.Variable):
-                tensor.shape = None
-
     def _infer_shapes(self):
-        self._clear_intermediate_shapes()
         model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(self._graph),
             check_type=True,
@@ -226,34 +216,29 @@ class OnnxGraphEditor:
 
     def fix_io_dims(self, to_fix: list[FixedDimMapping] | None = None):
         to_fix = tuple(to_fix or [])
-        
-        # 1. Fix shapes of all inputs/outputs, raising ValueError if any dynamic dimension is unmapped.
         for tensor in self._graph.inputs + self._graph.outputs:
-            old_shape = list(tensor.shape) if tensor.shape is not None else None
-            if tensor.shape is not None:
-                for i, dim in enumerate(tensor.shape):
-                    if not isinstance(dim, str):
-                        continue
-                    if dim.isdigit():
-                        tensor.shape[i] = int(dim)
-                        continue
-                    for fixed_dim in to_fix:
-                        if fixed_dim.matches(dim):
-                            tensor.shape[i] = fixed_dim.value
-                            break
-                    else: # no match found, unexpected dim!
-                        raise ValueError(
-                            f"Unexpected dynamic dimension '{dim}' in tensor '{tensor.name}'"
-                        )
-                if tensor.shape != old_shape:
-                    self._logger.debug(
-                        "Fixing IO '%s': %s -> %s",
-                        tensor.name,
-                        str(old_shape),
-                        str(tensor.shape)
+            old_shape = list(tensor.shape)
+            for i, dim in enumerate(tensor.shape):
+                if not isinstance(dim, str):
+                    continue
+                if dim.isdigit():
+                    tensor.shape[i] = int(dim)
+                    continue
+                for fixed_dim in to_fix:
+                    if fixed_dim.matches(dim):
+                        tensor.shape[i] = fixed_dim.value
+                        break
+                else: # no match found, unexpected dim!
+                    raise ValueError(
+                        f"Unexpected dynamic dimension '{dim}' in tensor '{tensor.name}'"
                     )
-
-
+            if tuple(tensor.shape) != tuple(old_shape):
+                self._logger.debug(
+                    "Fixing IO '%s': %s -> %s",
+                    tensor.name,
+                    str(old_shape),
+                    str(tensor.shape)
+                )
 
     def _reorder_graph_io(
         self,
