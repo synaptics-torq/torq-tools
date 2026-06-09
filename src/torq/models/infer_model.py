@@ -4,6 +4,7 @@
 import argparse
 
 from .moonshine import add_moonshine_infer_args
+from .moonshine_streaming import add_moonshine_streaming_infer_args
 from .smollm2 import add_smollm2_infer_args
 from .gemma3 import add_gemma3_infer_args
 
@@ -14,6 +15,9 @@ def main():
 
     moonshine = model.add_parser("moonshine", help="Run Moonshine inference")
     add_moonshine_infer_args(moonshine)
+
+    moonshine_streaming = model.add_parser("moonshine_streaming", help="Run Moonshine Streaming inference")
+    add_moonshine_streaming_infer_args(moonshine_streaming)
 
     smollm2 = model.add_parser("smollm2", help="Run SmolLM2 inference")
     add_smollm2_infer_args(smollm2)
@@ -26,6 +30,9 @@ def main():
     if args.model_name == "moonshine":
         from .moonshine.infer import infer_moonshine
         infer_moonshine(args)
+    elif args.model_name == "moonshine_streaming":
+        from .moonshine_streaming.infer import infer_moonshine as infer_moonshine_streaming
+        infer_moonshine_streaming(args)
     elif args.model_name == "smollm2":
         from .smollm2.infer import infer_smollm2
         infer_smollm2(args)

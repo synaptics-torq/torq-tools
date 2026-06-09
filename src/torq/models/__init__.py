@@ -15,6 +15,7 @@ from typing import Any
 __all__ = [
     "gemma3",
     "moonshine",
+    "moonshine_streaming",
     "smollm2",
     "synaptics_audio",
 ]
