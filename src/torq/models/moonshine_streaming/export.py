@@ -585,7 +585,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         # DMA assertion failures on bit-packed boolean tensors, then make the
         # resulting Mul broadcasting explicit.
         editor.decompose_boolean_and()
-        editor.broadcast_op_inputs(["Mul"])
+        # editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -634,7 +634,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         # DMA assertion failures on bit-packed boolean tensors, then make the
         # resulting Mul broadcasting explicit.
         editor.decompose_boolean_and()
-        editor.broadcast_op_inputs(["Mul"])
+        # editor.broadcast_op_inputs(["Mul"])
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
@@ -791,6 +791,8 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         if "encoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
             editor.remove_identity_gather_nd()
+            editor.eliminate_transposes()
+            editor.collapse_reshape_chains()
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
@@ -801,21 +803,25 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
-        if "decoder" in component and self._extract_embeddings:
-            # Extract token embeddings LUT
-            embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
-            embeddings_inp = "token_embedding"
+        if "decoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
-            editor.extract_token_embeddings(
-                self._hidden_size,
-                self._vocab_size,
-                embeddings_npy,
-                inp_name=embeddings_inp
-            )
-            editor.reorder_graph_input(embeddings_inp, 0)
+            editor.eliminate_transposes()
+            editor.collapse_reshape_chains()
+            if self._extract_embeddings:
+                # Extract token embeddings LUT
+                embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
+                embeddings_inp = "token_embedding"
+                editor.extract_token_embeddings(
+                    self._hidden_size,
+                    self._vocab_size,
+                    embeddings_npy,
+                    inp_name=embeddings_inp
+                )
+                editor.reorder_graph_input(embeddings_inp, 0)
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
-            self._dedup_decoder_embeddings_npy(Path(model_path).parent)
+            if self._extract_embeddings:
+                self._dedup_decoder_embeddings_npy(Path(model_path).parent)
 
         tok_src = self._onnx_dir / "tokenizer.json"
         tok_dst = Path(model_path).parent / "tokenizer.json"

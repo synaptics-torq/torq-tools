@@ -22,6 +22,8 @@ from ...utils.onnx import (
     normalize_layer_name
 )
 
+from ...graph_edit.edits import EliminateTranspose, CollapseReshapeChain
+
 __all__ = [
     "ReplaceDynamicKVCache",
     "MaskFutureAttentionScores",
@@ -1605,4 +1607,12 @@ class CommonGraphEditsMixin:
         explicit Expand treatment instead of the now-removed And nodes.
         """
         self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
+        return self
+
+    def eliminate_transposes(self):
+        self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
+        return self
+
+    def collapse_reshape_chains(self):
+        self.apply_edit(CollapseReshapeChain(self._graph, self._graph_name))
         return self
