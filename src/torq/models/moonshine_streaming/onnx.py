@@ -179,6 +179,8 @@ class OnnxGraphEditor:
 
     def fix_io_dims(self, to_fix: list[FixedDimMapping] | None = None):
         to_fix = tuple(to_fix or [])
+        self._dim_map = {mapping.match_name: mapping.value for mapping in to_fix}
+        self._dim_map["batch"] = 1
         for tensor in self._graph.inputs + self._graph.outputs:
             old_shape = list(tensor.shape)
             for i, dim in enumerate(tensor.shape):

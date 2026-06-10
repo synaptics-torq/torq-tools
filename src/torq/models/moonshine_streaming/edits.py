@@ -764,6 +764,12 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
     Decompose ONNX LayerNormalization into basic arithmetic operations.
     Useful for hardware targets that do not natively legalize LayerNormalization.
     """
+    dim_map: dict[str, int] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dim_map is None:
+            self.dim_map = {"batch": 1}
 
     def match(self, node: gs.Node) -> bool:
         return node.op == "LayerNormalization"
@@ -778,16 +784,47 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
         axis = node.attrs.get("axis", -1)
         epsilon = node.attrs.get("epsilon", 1e-05)
         
-        # Normalize axis
-        if axis < 0 and X.shape is not None:
-            axis = axis % len(X.shape)
+        # Normalize axis and calculate reduction axes (all axes from `axis` to `rank - 1`)
+        rank = len(X.shape) if X.shape is not None else 0
+        if rank > 0:
+            axis = axis % rank
+            reduce_axes = list(range(axis, rank))
+        else:
+            reduce_axes = [axis]
             
         Y = node.outputs[0]
         
+        # Resolve target shape to static integers using dim_map
+        target_shape = []
+        if X.shape is not None:
+            for d in X.shape:
+                if isinstance(d, str):
+                    target_shape.append(self.dim_map.get(d, 1))
+                else:
+                    target_shape.append(d)
+        else:
+            target_shape = [1, 150, 320]
+            
+        target_shape_const = gs.Constant(
+            name=node.name + "_target_shape",
+            values=np.array(target_shape, dtype=np.int64)
+        )
+
+        def expand_tensor(tensor, name_suffix):
+            # If shape is already matching target_shape, skip expand
+            if tensor.shape is not None and list(tensor.shape) == list(target_shape):
+                return tensor
+            return self.graph.layer(
+                name=node.name + "_" + name_suffix + "_expand",
+                op="Expand",
+                inputs=[tensor, target_shape_const],
+                outputs=[gs.Variable(name=node.name + "_" + name_suffix + "_expanded", dtype=tensor.dtype, shape=target_shape)]
+            )[0]
+
         # Create axes constant for ReduceMean
         axes_const = gs.Constant(
             name=node.name + "_axes",
-            values=np.array([axis], dtype=np.int64)
+            values=np.array(reduce_axes, dtype=np.int64)
         )
         
         # 1. Compute mean: mean = ReduceMean(X, axes)
@@ -799,11 +836,12 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
             attrs={"keepdims": 1}
         )[0]
         
-        # 2. Subtract mean: X_diff = Sub(X, mean)
+        # 2. Subtract mean: X_diff = Sub(X, mean_expanded)
+        mean_expanded = expand_tensor(mean, "mean")
         x_diff = self.graph.layer(
             name=node.name + "_sub_mean",
             op="Sub",
-            inputs=[X, mean],
+            inputs=[X, mean_expanded],
             outputs=[gs.Variable(name=node.name + "_diff", dtype=X.dtype)]
         )[0]
         
@@ -824,9 +862,19 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
         )[0]
         
         # 4. Standard deviation: stddev = Sqrt(var + eps)
+        # Ensure we use a valid NumPy dtype matching X.dtype for the epsilon constant
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
         eps_const = gs.Constant(
             name=node.name + "_eps",
-            values=np.array(epsilon, dtype=np.float32),
+            values=np.array(epsilon, dtype=np_dtype),
         )
         
         var_eps = self.graph.layer(
@@ -843,33 +891,44 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
             outputs=[gs.Variable(name=node.name + "_stddev_val", dtype=X.dtype)]
         )[0]
         
-        # 5. Normalize: X_norm = Div(X_diff, stddev)
+        # 5. Normalize: X_norm = Mul(X_diff, stddev_inv_expanded) where stddev_inv = Reciprocal(stddev)
+        stddev_inv = self.graph.layer(
+            name=node.name + "_stddev_inv",
+            op="Reciprocal",
+            inputs=[stddev],
+            outputs=[gs.Variable(name=node.name + "_stddev_inv_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev_inv_expanded = expand_tensor(stddev_inv, "stddev_inv")
+        
         x_norm = self.graph.layer(
-            name=node.name + "_div_stddev",
-            op="Div",
-            inputs=[x_diff, stddev],
+            name=node.name + "_mul_stddev_inv",
+            op="Mul",
+            inputs=[x_diff, stddev_inv_expanded],
             outputs=[gs.Variable(name=node.name + "_norm", dtype=X.dtype)]
         )[0]
         
         # 6. Apply scale and optional bias
+        scale_expanded = expand_tensor(scale, "scale")
         if bias is not None:
+            bias_expanded = expand_tensor(bias, "bias")
             x_scaled = self.graph.layer(
                 name=node.name + "_mul_scale",
                 op="Mul",
-                inputs=[x_norm, scale],
+                inputs=[x_norm, scale_expanded],
                 outputs=[gs.Variable(name=node.name + "_scaled", dtype=X.dtype)]
             )[0]
             self.graph.layer(
                 name=node.name + "_add_bias",
                 op="Add",
-                inputs=[x_scaled, bias],
+                inputs=[x_scaled, bias_expanded],
                 outputs=[Y]
             )
         else:
             self.graph.layer(
                 name=node.name + "_mul_scale",
                 op="Mul",
-                inputs=[x_norm, scale],
+                inputs=[x_norm, scale_expanded],
                 outputs=[Y]
             )
             
