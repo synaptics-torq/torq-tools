@@ -35,6 +35,8 @@ __all__ = [
     "BroadcastOpInputs",
     "ExtractConstantLUT",
     "DecomposeLayerNormalization",
+    "DecomposeLayerNormalizationMulReciprocal",
+    "DecomposeGelu",
     "DecomposeBooleanAnd",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
@@ -759,9 +761,9 @@ class ExtractConstantLUT(OnnxGraphEdit):
 
 
 @dataclass
-class DecomposeLayerNormalization(OnnxGraphEdit):
+class DecomposeLayerNormalizationMulReciprocal(OnnxGraphEdit):
     """
-    Decompose ONNX LayerNormalization into basic arithmetic operations.
+    Decompose ONNX LayerNormalization into basic arithmetic operations using Mul and Reciprocal.
     Useful for hardware targets that do not natively legalize LayerNormalization.
     """
     dim_map: dict[str, int] = None
@@ -948,7 +950,282 @@ class DecomposeLayerNormalization(OnnxGraphEdit):
         node.inputs.clear()
         node.outputs.clear()
         
+        self._logger.debug("Decomposed LayerNormalization (Mul/Reciprocal) node '%s'", node.name)
+
+
+@dataclass
+class DecomposeLayerNormalization(OnnxGraphEdit):
+    """
+    Decompose ONNX LayerNormalization into basic arithmetic operations using Pow and Div.
+    Closely matches standard PyTorch export/decomposition.
+    """
+    dim_map: dict[str, int] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dim_map is None:
+            self.dim_map = {"batch": 1}
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "LayerNormalization"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "LayerNormalization")
+        
+        X = node.inputs[0]
+        scale = node.inputs[1]
+        bias = node.inputs[2] if len(node.inputs) > 2 else None
+        
+        axis = node.attrs.get("axis", -1)
+        epsilon = node.attrs.get("epsilon", 1e-05)
+        
+        # Normalize axis and calculate reduction axes
+        rank = len(X.shape) if X.shape is not None else 0
+        if rank > 0:
+            axis = axis % rank
+            reduce_axes = list(range(axis, rank))
+        else:
+            reduce_axes = [axis]
+            
+        Y = node.outputs[0]
+        
+        # Resolve target shape to static integers using dim_map
+        target_shape = []
+        if X.shape is not None:
+            for d in X.shape:
+                if isinstance(d, str):
+                    target_shape.append(self.dim_map.get(d, 1))
+                else:
+                    target_shape.append(d)
+        else:
+            target_shape = [1, 150, 320]
+            
+        target_shape_const = gs.Constant(
+            name=node.name + "_target_shape",
+            values=np.array(target_shape, dtype=np.int64)
+        )
+
+        def expand_tensor(tensor, name_suffix):
+            if tensor.shape is not None and list(tensor.shape) == list(target_shape):
+                return tensor
+            return self.graph.layer(
+                name=node.name + "_" + name_suffix + "_expand",
+                op="Expand",
+                inputs=[tensor, target_shape_const],
+                outputs=[gs.Variable(name=node.name + "_" + name_suffix + "_expanded", dtype=tensor.dtype, shape=target_shape)]
+            )[0]
+
+        # Create axes constant for ReduceMean
+        axes_const = gs.Constant(
+            name=node.name + "_axes",
+            values=np.array(reduce_axes, dtype=np.int64)
+        )
+        
+        # 1. Compute mean: mean = ReduceMean(X, axes)
+        mean = self.graph.layer(
+            name=node.name + "_mean",
+            op="ReduceMean",
+            inputs=[X, axes_const],
+            outputs=[gs.Variable(name=node.name + "_mean_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 2. Subtract mean: X_diff = Sub(X, mean_expanded)
+        mean_expanded = expand_tensor(mean, "mean")
+        x_diff = self.graph.layer(
+            name=node.name + "_sub_mean",
+            op="Sub",
+            inputs=[X, mean_expanded],
+            outputs=[gs.Variable(name=node.name + "_diff", dtype=X.dtype)]
+        )[0]
+        
+        # 3. Compute variance: var = ReduceMean((X - mean)^2, axes) using Pow
+        # Ensure we use a valid NumPy dtype matching X.dtype
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        pow_exp = gs.Constant(
+            name=node.name + "_pow_exp",
+            values=np.array(2.0, dtype=np_dtype)
+        )
+        x_diff_sq = self.graph.layer(
+            name=node.name + "_diff_sq",
+            op="Pow",
+            inputs=[x_diff, pow_exp],
+            outputs=[gs.Variable(name=node.name + "_diff_sq_val", dtype=X.dtype)]
+        )[0]
+        
+        var = self.graph.layer(
+            name=node.name + "_var",
+            op="ReduceMean",
+            inputs=[x_diff_sq, axes_const],
+            outputs=[gs.Variable(name=node.name + "_var_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 4. Standard deviation: stddev = Sqrt(var + eps)
+        eps_const = gs.Constant(
+            name=node.name + "_eps",
+            values=np.array(epsilon, dtype=np_dtype),
+        )
+        
+        var_eps = self.graph.layer(
+            name=node.name + "_var_eps",
+            op="Add",
+            inputs=[var, eps_const],
+            outputs=[gs.Variable(name=node.name + "_var_eps_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev = self.graph.layer(
+            name=node.name + "_stddev",
+            op="Sqrt",
+            inputs=[var_eps],
+            outputs=[gs.Variable(name=node.name + "_stddev_val", dtype=X.dtype)]
+        )[0]
+        
+        # 5. Normalize: X_norm = Div(X_diff, stddev_expanded)
+        stddev_expanded = expand_tensor(stddev, "stddev")
+        
+        x_norm = self.graph.layer(
+            name=node.name + "_div_stddev",
+            op="Div",
+            inputs=[x_diff, stddev_expanded],
+            outputs=[gs.Variable(name=node.name + "_norm", dtype=X.dtype)]
+        )[0]
+        
+        # 6. Apply scale and optional bias
+        scale_expanded = expand_tensor(scale, "scale")
+        if bias is not None:
+            bias_expanded = expand_tensor(bias, "bias")
+            x_scaled = self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[gs.Variable(name=node.name + "_scaled", dtype=X.dtype)]
+            )[0]
+            self.graph.layer(
+                name=node.name + "_add_bias",
+                op="Add",
+                inputs=[x_scaled, bias_expanded],
+                outputs=[Y]
+            )
+        else:
+            self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[Y]
+            )
+            
+        # Rewire other optional outputs if they are used by any consumer
+        if len(node.outputs) > 1 and len(node.outputs[1].outputs) > 0:
+            rewire_consumers(node.outputs[1].outputs, node.outputs[1], mean)
+        if len(node.outputs) > 2 and len(node.outputs[2].outputs) > 0:
+            inv_std_dev = self.graph.layer(
+                name=node.name + "_inv_stddev",
+                op="Reciprocal",
+                inputs=[stddev],
+                outputs=[gs.Variable(name=node.name + "_inv_stddev_val", dtype=X.dtype)]
+            )[0]
+            rewire_consumers(node.outputs[2].outputs, node.outputs[2], inv_std_dev)
+            
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+        
         self._logger.debug("Decomposed LayerNormalization node '%s'", node.name)
+
+
+@dataclass
+class DecomposeGelu(OnnxGraphEdit):
+    """
+    Decompose ONNX Gelu into basic arithmetic operations (Mul, Add, Erf).
+    Formula: Gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "Gelu"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Gelu")
+        X = node.inputs[0]
+        Y = node.outputs[0]
+
+        # Resolve correct numpy dtype matching X.dtype
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        # Create constant values
+        const_half = gs.Constant(
+            name=node.name + "_gelu_half",
+            values=np.array(0.5, dtype=np_dtype)
+        )
+        const_one = gs.Constant(
+            name=node.name + "_gelu_one",
+            values=np.array(1.0, dtype=np_dtype)
+        )
+        const_inv_sqrt2 = gs.Constant(
+            name=node.name + "_gelu_inv_sqrt2",
+            values=np.array(1.0 / np.sqrt(2.0), dtype=np_dtype)
+        )
+
+        # 1. Mul: x_scaled = Mul(X, 1 / sqrt(2))
+        x_scaled = self.graph.layer(
+            name=node.name + "_scale",
+            op="Mul",
+            inputs=[X, const_inv_sqrt2],
+            outputs=[gs.Variable(name=node.name + "_scaled_val", dtype=X.dtype)]
+        )[0]
+
+        # 2. Erf: erf_val = Erf(x_scaled)
+        erf_val = self.graph.layer(
+            name=node.name + "_erf",
+            op="Erf",
+            inputs=[x_scaled],
+            outputs=[gs.Variable(name=node.name + "_erf_val", dtype=X.dtype)]
+        )[0]
+
+        # 3. Add: erf_plus_1 = Add(erf_val, 1)
+        erf_plus_1 = self.graph.layer(
+            name=node.name + "_add_one",
+            op="Add",
+            inputs=[erf_val, const_one],
+            outputs=[gs.Variable(name=node.name + "_plus_one_val", dtype=X.dtype)]
+        )[0]
+
+        # 4. Mul: x_half = Mul(X, 0.5)
+        x_half = self.graph.layer(
+            name=node.name + "_half",
+            op="Mul",
+            inputs=[X, const_half],
+            outputs=[gs.Variable(name=node.name + "_half_val", dtype=X.dtype)]
+        )[0]
+
+        # 5. Mul: Y = Mul(x_half, erf_plus_1)
+        self.graph.layer(
+            name=node.name + "_mul_final",
+            op="Mul",
+            inputs=[x_half, erf_plus_1],
+            outputs=[Y]
+        )
+
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Decomposed Gelu node '%s'", node.name)
 
 
 @dataclass
@@ -1307,7 +1584,17 @@ class CommonGraphEditsMixin:
         return self
 
     def decompose_layer_normalization(self):
-        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name))
+        dim_map = getattr(self, "_dim_map", None)
+        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name, dim_map=dim_map))
+        return self
+
+    def decompose_layer_normalization_mul_reciprocal(self):
+        dim_map = getattr(self, "_dim_map", None)
+        self.apply_edit(DecomposeLayerNormalizationMulReciprocal(self._graph, self._graph_name, dim_map=dim_map))
+        return self
+
+    def decompose_gelu(self):
+        self.apply_edit(DecomposeGelu(self._graph, self._graph_name))
         return self
 
     def decompose_boolean_and(self):

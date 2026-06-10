@@ -580,6 +580,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
         editor.fix_encoder_io(self._enc_seq_len)
         editor.decompose_layer_normalization()
+        editor.decompose_gelu()
         # Replace And(i1,i1)->i1 with Cast(int8)+Mul+Cast(bool) to avoid hardware
         # DMA assertion failures on bit-packed boolean tensors, then make the
         # resulting Mul broadcasting explicit.
@@ -597,6 +598,7 @@ class MoonshineStreamingModelExporter(OnnxModelExporterBase):
         editor = MoonshineStreamingOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
         editor.decompose_layer_normalization()
+        editor.decompose_gelu()
 
         # Remove redundant Cast ops
         editor.remove_redundant_casts()
