@@ -16,8 +16,8 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 from onnxruntime.transformers.optimizer import optimize_model
-from torq.compile import export_iree
 
+from ..utils.compile import export_torq
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,
@@ -79,7 +79,7 @@ class OnnxModelExporterBase(ABC):
         except KeyError:
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
-        self._onnx_dir, self._export_dir, self._convert_dir, self._iree_dir = self._setup_dirs()
+        self._onnx_dir, self._export_dir, self._convert_dir, self._torq_dir = self._setup_dirs()
         if self._export_dir.exists():
             shutil.rmtree(self._export_dir, ignore_errors=True)
         self._export_dir.mkdir(parents=True, exist_ok=True)
@@ -264,22 +264,25 @@ class OnnxModelExporterBase(ABC):
             np.save(data_converted_npy, data_converted)
             self._logger.debug("(ONNX-convert) Saved converted external data to '%s'", str(data_converted_npy))
 
-    def export_iree(
+    def export_torq(
         self,
-        iree_export_dir: str | os.PathLike | None = None,
-        iree_compile_args: list[str] | None = None,
-        use_iree_cli: bool = False,
+        torq_export_dir: str | os.PathLike | None = None,
+        torq_compile_args: list[str] | None = None,
+        use_binary: bool = False,
         skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
     ):
-        self._iree_dir = Path(iree_export_dir or self._iree_dir)
+        self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
-        if self._iree_dir.exists():
-            shutil.rmtree(self._iree_dir, ignore_errors=True)
-        self._iree_dir.mkdir(parents=True, exist_ok=True)
+        if self._torq_dir.exists():
+            shutil.rmtree(self._torq_dir, ignore_errors=True)
+        self._torq_dir.mkdir(parents=True, exist_ok=True)
         for comp, onnx_path in self._export_paths.items():
             if comp in skip:
+                self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
-            self._logger.info("(IREE-export) Exporting %s model @ '%s' to IREE...", comp, str(onnx_path))
+            self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
             model = onnx.load(onnx_path)
             graph = gs.import_onnx(model)
             graph.name = "main"
@@ -289,11 +292,13 @@ class OnnxModelExporterBase(ABC):
             model = gs.export_onnx(graph)
             self.check_model(model)
             onnx.save(model, onnx_path)
-            export_iree(
+            export_torq(
                 onnx_path,
-                self._iree_dir,
+                self._torq_dir,
                 opset=get_model_opset(model),
-                compiler_args=iree_compile_args,
-                use_iree_cli=use_iree_cli
+                compiler_args=torq_compile_args,
+                use_binary=use_binary,
+                local_compile=local_compile,
+                compiler_path=compiler_path,
             )
-            self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(self._iree_dir), onnx_path.stem)
+            self._logger.info("(Torq-export) Successfully exported '%s/%s.vmfb'", str(self._torq_dir), onnx_path.stem)

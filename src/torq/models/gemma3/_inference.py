@@ -16,17 +16,40 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-from torq.runtime import (
+from ...inference.runners import (
     InferenceRunner,
+    ORTInferenceRunner,
+    TFLiteInferenceRunner,
     VMFBInferenceRunner
 )
 
-from ...inference.runners import (
-    ORTInferenceRunner,
-    TFLiteInferenceRunner
+DEFAULT_SYS_PROMPT: Final[str] = (
+    "You are a helpful AI assistant named Gemma. "
+    "Answer in 1-2 sentences. No lists, no bullet points, no repetition."
 )
 
-DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named Gemma. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
+
+def _default_repo_id(instruct_model: bool) -> str:
+    repo_id = "google/gemma-3-270m"
+    if instruct_model:
+        repo_id += "-it"
+    return repo_id
+
+
+def _resolve_asset_path(
+    model_path: str | os.PathLike,
+    asset_name: str,
+    repo_id: str | None,
+    instruct_model: bool,
+) -> str:
+    local_path = Path(model_path).parent / asset_name
+    if local_path.exists():
+        return str(local_path)
+    repo_id = repo_id or _default_repo_id(instruct_model)
+    try:
+        return hf_hub_download(repo_id, asset_name, local_files_only=True)
+    except Exception:
+        return hf_hub_download(repo_id, asset_name)
 
 
 @dataclass(frozen=True)
@@ -93,9 +116,7 @@ class Gemma3Base(ABC):
         self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
         self._bos_token: str = self._tokenizer.decode([self._bos_token_id], skip_special_tokens=False)
         self._eos_token: str = self._tokenizer.decode([self._eos_token_id], skip_special_tokens=False)
-        self._start_of_turn: str = self._tokenizer.decode([105], skip_special_tokens=False)
-        self._end_of_turn: str = self._tokenizer.decode([106], skip_special_tokens=False)
-        self._end_of_turn_id: int = 106
+        self._end_of_turn_id: int = self._tokenizer.token_to_id("<end_of_turn>")
         self._logger.info("Loaded model '%s'", str(self._model.model_path))
 
         self._n_tokens_gen: int = 0
@@ -191,16 +212,17 @@ class Gemma3Base(ABC):
             num_tokens_gen += 1
         return next_token, num_tokens_gen
     
-    def _tokenize_input(self, input: str, role: str) -> list[int]:
-        if not self._instruct_model:
+    def _tokenize_input(self, input: str, role: str | None = None) -> list[int]:
+        if not self._instruct_model or role is None:
             return self._tokenizer.encode(input).ids
-        # Gemma3 chat format: <start_of_turn>role\n...content...<end_of_turn>\n
-        # The model generation prompt uses role="model" (not "assistant")
-        # Strip auto-prepended BOS — caller adds it once at conversation start.
+        # Gemma 3 chat format: <start_of_turn>role\ntext<end_of_turn>\n
+        # BOS is added once at warmup start; strip auto-prepended BOS here.
         if role == "model":
-            ids = self._tokenizer.encode(self._start_of_turn + "model\n").ids
+            ids = self._tokenizer.encode("<start_of_turn>model\n").ids
         else:
-            ids = self._tokenizer.encode(self._start_of_turn + role + "\n" + input + self._end_of_turn + "\n").ids
+            ids = self._tokenizer.encode(
+                "<start_of_turn>" + role + "\n" + input + "<end_of_turn>\n"
+            ).ids
         if ids and ids[0] == self._bos_token_id:
             ids = ids[1:]
         return ids
@@ -221,7 +243,6 @@ class Gemma3Base(ABC):
         if not self._instruct_model:
             self._logger.warning("Not an instruct model, skipping system prompt warm-up")
             return 0
-        # Gemma3 format: <bos><start_of_turn>system\n{sys_prompt}<end_of_turn>\n<start_of_turn>model\n
         sys_tokens = [self._bos_token_id] + self._tokenize_input(self._sys_prompt, "system")
         if isinstance(self._max_prompt_tokens, int):
             if len(sys_tokens) > self._max_prompt_tokens:
@@ -256,51 +277,21 @@ class Gemma3Dynamic(Gemma3Base):
         instruct_model: bool = False,
         repo_id: str | None = None
     ):
-        if repo_id is None:
-            repo_id: str = "google/gemma-3-270m"
-            if instruct_model:
-                repo_id += "-it"
-        self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
-            model.model_path
-        )
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
-
-    @staticmethod
-    def _find_token_embeddings(
-        model_path: str | os.PathLike,
-        emb_pattern: str = "token_embeddings.npy",
-    ) -> np.ndarray | None:
-        model_dir = Path(model_path).parent
-        # Search the model directory and up to 2 parent levels (covers
-        # source/int4_converted/ -> source/int4/ sibling layout)
-        search_dirs = [model_dir]
-        for parent in [model_dir.parent, model_dir.parent.parent]:
-            search_dirs.extend(parent.glob("*"))
-            search_dirs.append(parent)
-        paths = []
-        for d in search_dirs:
-            if d.is_dir():
-                paths.extend(d.glob(emb_pattern))
-        if not paths:
-            return None
-        paths = list({p.resolve(): p for p in paths}.values())
-        if len(paths) > 1:
-            raise RuntimeError(
-                f"Expected a single token embedding file, found {len(paths)}: {paths}"
-            )
-        return np.load(paths[0])
 
     @classmethod
     def from_onnx(
@@ -355,31 +346,27 @@ class Gemma3Dynamic(Gemma3Base):
         self, token: int, curr_seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
         input_ids = np.array([[token]], dtype=np.int64)
-        if isinstance(self._token_embeddings, np.ndarray):
-            inputs = {
-                "token_embedding": np.expand_dims(self._token_embeddings[token], axis=(0, 1)),
-                "input_ids": input_ids,
-            }
-        else:
-            inputs = {
-                "input_ids": input_ids,
-            }
         attn_mask = np.ones([1, curr_seq_len + 1], dtype=np.int64)
-        inputs.update({
+        pos_ids = np.array([[curr_seq_len]], dtype=np.int64)
+        inputs = {
+            "input_ids": input_ids,
             "attention_mask": attn_mask,
             **self._kv_cache
-        })
+        }
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
-        if next_token == self._eos_token_id or next_token == self._end_of_turn_id:
+        if next_token == self._eos_token_id:
+            return True
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
             return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:
                 return True
             return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,
@@ -413,27 +400,33 @@ class Gemma3Static(Gemma3Base):
         repo_id: str | None = None,
         combined_kv_io: bool = True
     ):
-        if repo_id is None:
-            repo_id: str = "google/gemma-3-270m"
-            if instruct_model:
-                repo_id += "-it"
         self._combined_kv_io = combined_kv_io
         self._token_embeddings: np.ndarray | None = self._find_token_embeddings(
             model.model_path
         )
+        self._token_id_lut: np.ndarray | None = self._find_token_id_lut(
+            model.model_path
+        )
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
         super().__init__(
             model,
             ModelConfig.from_json_config(
-                hf_hub_download(repo_id, "config.json"),
+                config_path,
                 instruct_model
             ),
             max_prompt_tokens,
             max_gen_tokens,
             Tokenizer.from_file(
-                hf_hub_download(repo_id, "tokenizer.json")
+                tokenizer_path
             ),
             DEFAULT_SYS_PROMPT if instruct_model else None
         )
+        if self._token_id_lut is not None:
+            self._logger.info(
+                "Loaded token ID LUT (%d entries) for trimmed vocab remap",
+                len(self._token_id_lut),
+            )
 
     @classmethod
     def from_onnx(
@@ -476,21 +469,41 @@ class Gemma3Static(Gemma3Base):
         )
 
     @staticmethod
-    def _find_token_embeddings(
+    def _find_data_file(
         model_path: str | os.PathLike,
-        emb_pattern: str = "token_embeddings.npy",
-    ) -> np.ndarray | None:
-        paths = []
-        paths.extend(Path(model_path).parent.glob(emb_pattern))
+        pattern: str,
+        description: str,
+    ) -> Path | None:
+        paths = list(Path(model_path).parent.glob(pattern))
         if not paths:
             return None
 
         paths = list({p.resolve(): p for p in paths}.values())
         if len(paths) > 1:
             raise RuntimeError(
-                f"Expected a single token embedding file, found {len(paths)}: {paths}"
+                f"Expected a single {description} file, found {len(paths)}: {paths}"
             )
-        return np.load(paths[0])
+        return paths[0]
+
+    @staticmethod
+    def _find_token_embeddings(
+        model_path: str | os.PathLike,
+        emb_pattern: str = "token_embeddings.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, emb_pattern, "token embedding")
+        if path is None:
+            return None
+        return np.load(path)
+
+    @staticmethod
+    def _find_token_id_lut(
+        model_path: str | os.PathLike,
+        lut_pattern: str = "token_id_lut.npy",
+    ) -> np.ndarray | None:
+        path = Gemma3Static._find_data_file(model_path, lut_pattern, "token ID LUT")
+        if path is None:
+            return None
+        return np.load(path)
 
     def _init_cache(self) -> dict[str, np.ndarray]:
         if self._combined_kv_io:
@@ -528,20 +541,27 @@ class Gemma3Static(Gemma3Base):
             "position_ids": pos_ids,
             **self._kv_cache
         })
-        # Provide attention_mask if the model requires it (e.g. model_q4 with attn_bias)
-        if any(i.name == "attention_mask" for i in self._model._sess.get_inputs()):
-            inputs["attention_mask"] = np.ones([1, self._max_gen_tokens], dtype=np.int64)
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
+        if self._token_id_lut is not None:
+            if next_token >= len(self._token_id_lut):
+                raise RuntimeError(
+                    f"Sampled compact token index {next_token} outside token ID LUT "
+                    f"with {len(self._token_id_lut)} entries"
+                )
+            next_token = int(self._token_id_lut[next_token])
         return next_token, cache
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
-        if next_token == self._eos_token_id or next_token == self._end_of_turn_id:
+        if next_token == self._eos_token_id:
+            return True
+        if self._end_of_turn_id is not None and next_token == self._end_of_turn_id:
             return True
         if not self._instruct_model and len(gen_tokens) > 2:
             if next_token == self._double_nl_token_id:
                 return True
             return all(t == self._nl_token_id for t in gen_tokens[-2:])
+        return False
 
     def _run(
         self,

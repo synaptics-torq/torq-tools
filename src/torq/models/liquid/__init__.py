@@ -4,8 +4,9 @@
 import argparse
 from typing import Final
 
-from torq.compile import add_iree_args
 from torq.utils.logging import add_logging_args
+
+from ...utils.compile import add_torq_args
 
 from ...utils.demo import add_common_args
 from ...utils.onnx import add_onnx_args
@@ -73,10 +74,10 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--skip-iree",
+        "--skip-torq",
         action="store_true",
         default=False,
-        help="Skip exporting to IREE"
+        help="Skip compiling the exported ONNX to a Torq vmfb"
     )
     parser.add_argument(
         "--keep-individual-kv-io",
@@ -99,7 +100,7 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         help="Simulate bf16 inference by sandwiching each op with fp32→bf16→fp32 casts (for measuring quantization impact)",
     )
     add_logging_args(parser)
-    add_iree_args(parser)
+    add_torq_args(parser)
 
 
 def add_liquid_infer_args(parser: argparse.ArgumentParser):

@@ -12,9 +12,8 @@ from typing import Final
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
-from torq.utils.logging import add_logging_args, configure_logging
 
-from ...utils.onnx import is_same_dtype, upgrade_model
+from ...utils.onnx import finalize_torq_ready_onnx, is_same_dtype, upgrade_model
 
 logger = logging.getLogger("ONNX-Dtype-Converter")
 
@@ -41,6 +40,7 @@ class OnnxDtypeConverterBase(ABC):
         export_dtype: str,
         convert_io: bool = False,
         direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
     ):
         if export_dtype not in self.allowed_dtypes():
             raise ValueError(
@@ -54,6 +54,7 @@ class OnnxDtypeConverterBase(ABC):
         self._original_onnx_dtype = self._validate_dtype(original_dtype)
         self._export_onnx_dtype = self._validate_dtype(export_dtype)
         self._convert_exceptions: dict[str, str] = {}
+        self._remove_unused_node_outputs = not preserve_unused_node_outputs
 
     @staticmethod
     def _validate_dtype(dtype: str) -> onnx.TensorProto.DataType:
@@ -147,21 +148,17 @@ class OnnxDtypeConverterBase(ABC):
         elif isinstance(tensor, gs.Constant):
             new_const_name: str = tensor.name + f"_{self._export_dtype_str}"
             if not (new_const := graph.tensors().get(new_const_name)):
-                if self._original_onnx_dtype == onnx.TensorProto.FLOAT and self._export_onnx_dtype == onnx.TensorProto.BFLOAT16:
-                    new_const = gs.Constant(
-                        new_const_name,
-                        tensor.values,
-                        export_dtype=self._export_onnx_dtype
-                    )
-                else:
-                    try:
-                        np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
-                    except (TypeError, ValueError, KeyError):
-                        raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
-                    new_const = gs.Constant(
-                        new_const_name,
-                        tensor.values.astype(np_type)
-                    )
+                try:
+                    np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+                except (TypeError, ValueError, KeyError):
+                    raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+                cast_fn = getattr(self, "_cast_constant_values", None)
+                cast_values = (
+                    cast_fn(tensor.values, np_type)
+                    if cast_fn is not None
+                    else tensor.values.astype(np_type)
+                )
+                new_const = gs.Constant(new_const_name, cast_values)
             logger.debug("Add %s initializer '%s'", self._export_dtype_str, new_const.name)
             try:
                 if is_attr:
@@ -278,7 +275,7 @@ class OnnxDtypeConverterBase(ABC):
             )
         graph = graph.cleanup(
             remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
+            remove_unused_node_outputs=self._remove_unused_node_outputs,
         ).toposort()
 
     def _check_tensor_dtypes(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
@@ -304,7 +301,7 @@ class OnnxDtypeConverterBase(ABC):
     def _check_conversion(self, graph: gs.Graph) -> tuple[list[str], list[str]]:
         graph.cleanup(
             remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
+            remove_unused_node_outputs=self._remove_unused_node_outputs,
         ).toposort()
         return self._check_tensor_dtypes(graph)
 
@@ -326,12 +323,16 @@ class OnnxDtypeConverterBase(ABC):
             )
         try:
             onnx.checker.check_model(input_model, full_check=True)
-        except onnx.checker.ValidationError as e:
-            logger.warning(
-                "ONNX model validation failed; model may be malformed: %s",
-                e,
-                exc_info=True,
-            )
+        except (onnx.checker.ValidationError, Exception) as e:
+            if "InferenceError" in type(e).__name__ or isinstance(
+                e, onnx.checker.ValidationError
+            ):
+                logger.warning(
+                    "ONNX model validation failed; model may be malformed: %s",
+                    e,
+                )
+            else:
+                raise
 
         root, *subgraphs = self._collect_all_graphs(gs.import_onnx(input_model))
         all_tensors: list[str] = []
@@ -385,17 +386,45 @@ class OnnxDtypeConverterBase(ABC):
 
 class FP32Converter(OnnxDtypeConverterBase):
 
+    _ALLOWED_BF16_ROUNDING: Final[tuple[str, ...]] = ("nearest", "truncate")
+
     def __init__(
         self,
         export_dtype: str,
         convert_io: bool = False,
-        direct_cast: bool = True
+        direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
+        bf16_rounding: str = "nearest",
     ):
-        super().__init__("fp32", export_dtype, convert_io, direct_cast)
+        if bf16_rounding not in self._ALLOWED_BF16_ROUNDING:
+            raise ValueError(
+                f"Invalid bf16_rounding '{bf16_rounding}', select from {list(self._ALLOWED_BF16_ROUNDING)}"
+            )
+        self._bf16_rounding = bf16_rounding
+        super().__init__(
+            "fp32",
+            export_dtype,
+            convert_io,
+            direct_cast,
+            preserve_unused_node_outputs,
+        )
 
     @classmethod
     def allowed_dtypes(cls) -> tuple[str, ...]:
         return ("bf16", "fp16")
+
+    def _cast_constant_values(self, values: np.ndarray, np_type: np.dtype) -> np.ndarray:
+        # Override fp32→bf16 cast when truncate-toward-zero is requested. Default astype
+        # uses ml_dtypes.bfloat16 which rounds-to-nearest-even.
+        if (
+            self._export_onnx_dtype == onnx.TensorProto.BFLOAT16
+            and self._bf16_rounding == "truncate"
+            and values.dtype == np.float32
+        ):
+            u32 = np.ascontiguousarray(values).view(np.uint32)
+            u16 = (u32 >> 16).astype(np.uint16)
+            return u16.view(np_type).reshape(values.shape)
+        return values.astype(np_type)
 
     def _convert_graph(
         self,
@@ -480,9 +509,16 @@ class Int64Converter(OnnxDtypeConverterBase):
         self,
         export_dtype: str = "int32",
         convert_io: bool = False,
-        direct_cast: bool = True
+        direct_cast: bool = True,
+        preserve_unused_node_outputs: bool = False,
     ):
-        super().__init__("int64", export_dtype, convert_io, direct_cast)
+        super().__init__(
+            "int64",
+            export_dtype,
+            convert_io,
+            direct_cast,
+            preserve_unused_node_outputs,
+        )
 
         self._original_sdtype_str  = self._original_dtype_str
         self._original_udtype_str  = "u" + self._original_dtype_str
@@ -655,16 +691,29 @@ def _convert_internal(
     convert_dtype: str,
     convert_io: bool,
     target_opset: int,
+    preserve_unused_node_outputs: bool,
+    bf16_rounding: str = "nearest",
 ):
     model = onnx.load(input_model)
     model = upgrade_model(model, target_opset)
 
     if convert_dtype in FP32Converter.allowed_dtypes():
-        converter = FP32Converter(convert_dtype, convert_io=convert_io)
+        converter = FP32Converter(
+            convert_dtype,
+            convert_io=convert_io,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
+            bf16_rounding=bf16_rounding,
+        )
     elif convert_dtype in Int64Converter.allowed_dtypes():
-        converter = Int64Converter(convert_dtype, convert_io=convert_io)
+        converter = Int64Converter(
+            convert_dtype,
+            convert_io=convert_io,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
+        )
     else:
-        allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(Int64Converter.allowed_dtypes())
+        allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(
+            Int64Converter.allowed_dtypes()
+        )
         raise ValueError(
             f"Invalid convert dtype '{convert_dtype}', choose from {allowed_dtypes}"
         )
@@ -680,8 +729,13 @@ def convert_model(
     convert_io: bool = False,
     max_float: float = 1e9,
     target_opset: int = 22,
+    torq_onnx_finalize: bool = False,
+    preserve_unused_node_outputs: bool = False,
+    bf16_rounding: str = "nearest",
 ):
     if use_modelopt:
+        if bf16_rounding != "nearest":
+            raise ValueError("bf16_rounding is only supported with the internal converter (--modelopt is incompatible)")
         converted_model = _convert_modelopt(
             input_model,
             convert_dtype=convert_dtype,
@@ -694,10 +748,14 @@ def convert_model(
             convert_dtype=convert_dtype,
             convert_io=convert_io,
             target_opset=target_opset,
+            preserve_unused_node_outputs=preserve_unused_node_outputs,
+            bf16_rounding=bf16_rounding,
         )
 
     export_dir = Path(output_model).parent
     export_dir.mkdir(parents=True, exist_ok=True)
+    if torq_onnx_finalize:
+        converted_model = finalize_torq_ready_onnx(converted_model)
     onnx.save(converted_model, output_model)
     logger.info("Saved converted model to '%s'", str(output_model))
 
@@ -747,10 +805,28 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         default=False,
         help="Use TensorRT modelopt for dtype conversion"
     )
+    parser.add_argument(
+        "--bf16-rounding",
+        type=str,
+        choices=FP32Converter._ALLOWED_BF16_ROUNDING,
+        default="nearest",
+        help="Rounding mode for fp32→bf16 constants (default: %(default)s). 'truncate' drops the low 16 mantissa bits.",
+    )
+    parser.add_argument(
+        "--torq-onnx-finalize",
+        action="store_true",
+        default=False,
+        help=(
+            "Run Torq-oriented ONNX post-process (ORT symbolic shapes, IR cap, "
+            "value_info cleanup)"
+        ),
+    )
+    from ...utils.logging import add_logging_args
     add_logging_args(parser)
 
 
 def onnx_dtype_convert_from_args(args: argparse.Namespace):
+    from ...utils.logging import configure_logging
     configure_logging(args.logging)
     convert_model(
         args.input,
@@ -759,7 +835,9 @@ def onnx_dtype_convert_from_args(args: argparse.Namespace):
         args.modelopt,
         args.convert_io,
         args.max_float,
-        args.opset
+        args.opset,
+        torq_onnx_finalize=args.torq_onnx_finalize,
+        bf16_rounding=args.bf16_rounding,
     )
 
 

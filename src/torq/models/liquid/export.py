@@ -10,7 +10,6 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 import ml_dtypes
-from torq.compile import process_iree_args
 from torq.utils.logging import configure_logging
 
 
@@ -59,6 +58,16 @@ HF_REPO_BASE: dict[str, str] = {
 HF_REPO_ONNX: dict[str, str] = {
     "350m": "LiquidAI/LFM2.5-350M-ONNX",
 }
+
+# torq-compile flags LFM2.5 needs on top of the compiler's SL2610 defaults.
+# `--torq-enable-split-constants-optimization` in particular is required: we
+# measured it faster (303 ms vs 432 ms/step) and lower-heap because each
+# dispatch reads its constant slice straight from the mmap'd vmfb instead of
+# staging the whole blob into anonymous DRAM.
+LIQUID_TORQ_FLAGS: tuple[str, ...] = (
+    "--torq-enable-transpose-optimization",
+    "--torq-enable-split-constants-optimization",
+)
 
 
 class LiquidModelExporter(OnnxModelExporterBase):
@@ -1017,79 +1026,32 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
-    def export_iree(
+    def export_torq(
         self,
-        iree_export_dir: str | os.PathLike | None = None,
-        iree_compile_args: list[str] | None = None,
-        use_iree_cli: bool = False,
+        torq_export_dir: str | os.PathLike | None = None,
+        torq_compile_args: list[str] | None = None,
+        use_binary: bool = False,
         skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
     ):
-        """Compile the exported (bf16) ONNX via the ``compile_v1.5.sh`` script.
+        """Compile the exported (bf16) ONNX to a Torq vmfb.
 
-        This bypasses ``torq.compile.export_iree`` because the script's
-        torq-target flags (``--torq-hw=SL2610`` etc.) handle LFM2.5 cleanly
-        whereas the default llvm-cpu pipeline crashes in
-        ``AutoInputConversionPipelinePass``.  The script lives at the repo
-        root and we invoke it without modification.
+        Prepends LFM2.5's validated torq-compile flag set (``LIQUID_TORQ_FLAGS``)
+        — in particular ``--torq-enable-split-constants-optimization``, which
+        we measured to be faster and lower-heap than the default — ahead of any
+        user-supplied ``--compile-flags``, then defers to the shared
+        ``torq.utils.compile`` driver via the base exporter.
         """
-        import shutil
-        import subprocess
-
-        compile_script = Path(
-            "/home/kshanmug/torq/torq-compiler-dev/compile_v1.5.sh"
+        merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
+        return super().export_torq(
+            torq_export_dir=torq_export_dir,
+            torq_compile_args=merged_args,
+            use_binary=use_binary,
+            skip=skip,
+            local_compile=local_compile,
+            compiler_path=compiler_path,
         )
-        if not compile_script.exists():
-            raise FileNotFoundError(
-                f"compile_v1.5.sh not found at '{compile_script}'"
-            )
-
-        self._iree_dir = Path(iree_export_dir or self._iree_dir)
-        skip = skip or []
-        if self._iree_dir.exists():
-            shutil.rmtree(self._iree_dir, ignore_errors=True)
-        self._iree_dir.mkdir(parents=True, exist_ok=True)
-
-        for comp, onnx_path in self._export_paths.items():
-            if comp in skip:
-                continue
-            self._logger.info(
-                "(IREE-export) Compiling %s ('%s') via compile_v1.5.sh ...",
-                comp, str(onnx_path),
-            )
-            # The script writes the .mlir/.vmfb next to the input model;
-            # copy the source ONNX into the IREE output dir first so the
-            # artifacts land where the rest of the pipeline expects them.
-            staged_onnx = self._iree_dir / onnx_path.name
-            shutil.copy2(onnx_path, staged_onnx)
-            data_path = onnx_path.with_suffix(".onnx_data")
-            if data_path.exists():
-                shutil.copy2(data_path, self._iree_dir / data_path.name)
-
-            cmd = [
-                "bash", str(compile_script), str(staged_onnx),
-                "--torq-enable-transpose-optimization",
-                "--torq-enable-torq-hl-tiling",
-            ]
-            if iree_compile_args:
-                cmd.extend(iree_compile_args)
-            self._logger.info("(IREE-export) %s", " ".join(cmd))
-            try:
-                out = subprocess.check_output(
-                    cmd, text=True, stderr=subprocess.STDOUT
-                )
-                self._logger.info("(IREE-export) %s", out.strip())
-            except subprocess.CalledProcessError as e:
-                self._logger.error(
-                    "(IREE-export) compile_v1.5.sh failed for %s:\n%s",
-                    comp, e.output,
-                )
-                raise
-
-            vmfb = staged_onnx.with_suffix(".vmfb")
-            if vmfb.exists():
-                self._logger.info("(IREE-export) Wrote '%s'", vmfb)
-            else:
-                self._logger.warning("(IREE-export) Expected vmfb at '%s' (not found)", vmfb)
 
     def convert_models(
         self,
@@ -1148,8 +1110,13 @@ def export_liquid_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
-    if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=process_iree_args(args))
+    if not args.skip_torq:
+        exporter.export_torq(
+            torq_compile_args=args.compile_flags or [],
+            use_binary=args.use_binary,
+            local_compile=args.local_compile,
+            compiler_path=args.compiler_path,
+        )
 
 
 def main():

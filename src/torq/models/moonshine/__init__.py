@@ -4,10 +4,9 @@
 import argparse
 from typing import Final
 
-from torq.compile import add_iree_args
-from torq.utils.logging import add_logging_args
-
+from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
+from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
 
 
@@ -16,7 +15,8 @@ DEFAULT_DEC_TOK_PER_SEC: Final[int] = 6
 DEFAULT_MODEL_SIZE: Final[str] = "tiny"
 ONNX_DTYPES: Final[list[str]] = ["float", "quantized", "quantized_4bit"]
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
-STATIC_MODEL_COMPONENTS: Final[list[str]] = ["encoder", "decoder", "decoder_with_past"]
+STATIC_MODEL_COMPONENTS: Final[list[str]] = ["encoder", "decoder"]
+STATIC_MODEL_COMPONENTS_UNFOLDED: Final[list[str]] = ["encoder", "gen_encoder_cache", "decoder"]
 DEFAULT_CONV_KERNEL_SIZES: Final[list[int]] = [127, 7, 3]
 DEFAULT_CONV_STRIDES: Final[list[int]] = [64, 3, 2]
 
@@ -82,10 +82,18 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
     )
     parser.add_argument(
-        "--skip-iree",
+        "--no-fold-encoder-cache",
         action="store_true",
         default=False,
-        help="Skip exporting to IREE"
+        help="Keep gen_encoder_cache as a separate model instead of folding into encoder"
+    )
+    parser.add_argument(
+        "--skip-torq",
+        type=str,
+        nargs="+",
+        choices=["all", "encoder", "preprocessor", "gen_encoder_cache", "decoder"],
+        default=None,
+        help="Skip Torq export/compile: 'all' to skip entirely, or specify components to skip."
     )
     parser.add_argument(
         "--replace-int-bf16-cast",
@@ -97,7 +105,7 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         "--skip-export",
         type=str,
         nargs="+",
-        choices=["encoder", "decoder", "decoder_with_past", "decoder_merged"],
+        choices=["encoder", "gen_encoder_cache", "decoder", "decoder_merged"],
         help="Skip export of specific components"
     )
     parser.add_argument(
@@ -120,7 +128,7 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Moonshine model's HuggingFace repo ID (default: UsefulSensors/moonshine-{model_size})"
     )
     add_logging_args(parser)
-    add_iree_args(parser)
+    add_torq_args(parser)
 
 
 def add_moonshine_infer_args(parser: argparse.ArgumentParser):

@@ -1,10 +1,9 @@
 import argparse
 from typing import Final
 
-from torq.compile import add_iree_args
-from torq.utils.logging import add_logging_args
-
+from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
+from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
 
 
@@ -13,7 +12,7 @@ DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
-MODEL_DTYPES: Final[list[str]] = ["fp32", "int4", "int8"]
+TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "digits", "digits-non-latin", "other"]
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -39,11 +38,15 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         help="Export instruct model variant"
     )
     parser.add_argument(
-        "--model-dtype",
+        "--hf-repo",
         type=str,
-        choices=MODEL_DTYPES,
-        default="fp32",
-        help="Model data type / quantization (default: %(default)s)",
+        help="Custom Gemma3 HuggingFace repository"
+    )
+    parser.add_argument(
+        "--hf-repo-subdir",
+        type=str,
+        metavar="DIR",
+        help="Sub-directory within the HuggingFace repository containing the model files"
     )
     add_onnx_args(
         parser,
@@ -70,10 +73,37 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--skip-iree",
+        "--skip-torq",
         action="store_true",
         default=False,
-        help="Skip exporting to IREE"
+        help="Skip Torq compile/export"
+    )
+    parser.add_argument(
+        "--trim-vocab",
+        action="store_true",
+        default=False,
+        help="Trim static export vocab to selected token groups plus required safety tokens"
+    )
+    parser.add_argument(
+        "--split-lm-head",
+        action="store_true",
+        default=False,
+        help="Split the final LM head into lm_head.onnx and export hidden states from model.onnx"
+    )
+    parser.add_argument(
+        "--trim-vocab-groups",
+        type=str,
+        nargs="+",
+        choices=TRIM_VOCAB_GROUPS,
+        default=["latin", "punct", "digits"],
+        metavar="GROUP",
+        help="Token groups to retain when --trim-vocab is enabled (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--trim-byte-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain byte fallback tokens when --trim-vocab is enabled (default: %(default)s)",
     )
     parser.add_argument(
         "--replace-int-bf16-cast",
@@ -95,38 +125,8 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=None,
         help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
-    parser.add_argument(
-        "--dequantize-weights",
-        action="store_true",
-        default=False,
-        help="Dequantize int4 MatMulNBits weights to fp32 MatMul (int4 only, default: keep quantized)",
-    )
-    parser.add_argument(
-        "--dequantize-weights-linear",
-        action="store_true",
-        default=False,
-        help="Replace MatMulNBits with DequantizeLinear+Reshape+MatMul (int4 only, runtime dequantization)",
-    )
-    parser.add_argument(
-        "--simulate-bf16",
-        action="store_true",
-        default=False,
-        help="Simulate bf16 inference by sandwiching each op with fp32→bf16→fp32 casts (for measuring quantization impact)",
-    )
-    parser.add_argument(
-        "--fp8-e5m2",
-        action="store_true",
-        default=False,
-        help="Quantize fp32 weights to fp8-e5m2 (then dequantize back to fp32) before export",
-    )
-    parser.add_argument(
-        "--fp8-e4m3",
-        action="store_true",
-        default=False,
-        help="Quantize fp32 weights to fp8-e4m3fn (then dequantize back to fp32) before export",
-    )
     add_logging_args(parser)
-    add_iree_args(parser)
+    add_torq_args(parser)
 
 
 def add_gemma3_infer_args(parser: argparse.ArgumentParser):

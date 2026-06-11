@@ -2,25 +2,25 @@
 Collection of tools for the development of Torq models
 
 ## Installation
-**The Torq compiler is required to run Torq tools.** 
-<br>Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler as a release package or a Docker.
 
-
-Once the compiler is available, this repository can be installed either as a pip package or as a Git submodule within another project.
-First, clone the repository:
+Clone the repository:
 ```bash
 git clone https://github.com/synaptics-torq/torq-tools.git
 torq_tools_dir=$(readlink -f torq-tools)
 ```
 
+### Compiler dependency
+
+The Torq compiler Python package (`torq-compiler`) is **required when exporting models** (i.e. when running model exporters or compiling `.onnx`/`.tflite` files). These workflows need the compiler's Python bindings to convert ONNX/TFLite -> MLIR -> VMFB.
+
+The compiler package is **not required** if you only need to compile pre-exported `.mlir` files and already have a `torq-compile` binary available on your `PATH` (or pointed to via `--compiler-path` / `TORQ_COMPILER_PATH`).
+
+Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler Python package.
+
 ### Option 1: Install with pip
 Installing via pip makes `torq-tools` available system-wide (or within your virtual environment).
-A virtual environment is **strongly recommended**, as this project depends on several large packages. 
+A virtual environment is **strongly recommended**, as this project depends on several large packages.
 
-- **If using the compiler release package:**
-  Activate the same virtual environment that was used to set it up.
-- **If using Docker:**
-  You can use the system Python environment, as it already operates within an isolated environment.
 ```bash
 cd your_project
 source .venv/bin/activate
@@ -98,8 +98,40 @@ python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.on
 > [!WARNING]
 > Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64. 
 > Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
+#### Quantize ONNX model weights
+Quantize MatMul weights in fp32 ONNX models to int4/int8 with optional per-layer sensitivity analysis.
+Supports two output modes: DequantizeLinear (DQL) nodes for runtime dequantization, or pre-dequantized bf16 for direct IREE compilation.
 
-#### Export supported models to static graphs
+**Sensitivity analysis** — determines optimal per-layer bit-width:
+```bash
+python3 -m torq.tools.quantization.weight_quantization analyze \
+    -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json \
+    --embeddings token_embeddings.npy --tokenizer tokenizer.json \
+    --bits 4 8 --num-tokens 15
+```
+
+**Quantize with per-layer config** (DQL output for sharing/further compilation):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_int8_int4_dql.onnx --config quant_config.json
+```
+
+**Quantize with pre-dequantized bf16** (ready for IREE compilation):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_bf16.onnx --config quant_config.json --dequantize-weights
+```
+
+**Uniform quantization** (all layers same bit-width):
+```bash
+python3 -m torq.tools.quantization.weight_quantization quantize \
+    -i model_fp32.onnx -o model_int8.onnx --bits 8
+```
+
+> [!NOTE]
+> For reduced-vocab models, pass `--token-lut token_id_lut.npy` to the analyze command
+> to map reduced vocab indices back to full vocab IDs during evaluation.
+#### Export supported ONNX models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
@@ -110,12 +142,17 @@ For example, to export a static bf16 Moonshine model:
 python3 -m src.torq.models.moonshine.export --convert-dtype bf16
 ``` 
 
-#### Compile models
-A helper utility is provided for compiling ONNX or MLIR models into VMFB binaries.
+#### Convert TFLite models to static shapes
+Converts dynamic TFLite models to static by removing `shapeSignature` metadata from tensors, forcing the runtime to use the concrete dimensions already present in the `shape` field. This works for most dynamic models whose default shapes are valid.
 ```bash
-python -m src.torq.utils.compile model_bf16.onnx -t llvm-cpu
-python -m src.torq.utils.compile model_bf16.mlir -t llvm-cpu
+python3 -m src.torq.tools.convert_static tflite \
+  -i path/model.tflite \
+  -o path/model_static.tflite
 ```
+
+> [!WARNING]
+> This tool assumes the model's default `shape` values are valid and mutually consistent. If any tensor has an invalid
+> default shape (e.g., `0` or `-1`), the exported model will have incorrect static shapes.
 
 #### Run inference
 You can run inference directly using helper scripts that support multiple runtimes.
@@ -127,18 +164,6 @@ Example: run Moonshine inference with ONNX and VMFB backends:
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_iree_onnx/ -s tiny --max-inp-len 80000 --max-dec-len 30
 ```
-> [!Note]
-><details>
-><summary>Notes on using the Torq compiler docker for compilation and inference</summary>
-> The iree-compile and iree-run-module binaries used depend on your environment:
-> 
-> - Inside the Torq compiler Docker:
-> Uses the binaries bundled in the image, ensuring full compatibility with the Torq runtime.
-> 
-> - Outside the Docker (e.g., in a local venv):
-> Uses binaries installed from PyPI. These are fine for testing or validation but not guaranteed to match Torq runtime behavior exactly.
->
-></details>
 
 ### CLI usage
 If `torq-tools` was installed as a Python package, all major tools are also exposed as CLI commands.
@@ -146,12 +171,13 @@ If `torq-tools` was installed as a Python package, all major tools are also expo
 # convert to bf16
 torq-convert-dtype onnx -d bf16 -i model_fp32.onnx -o model_bf16.onnx
 
+# quantize weights
+torq-quantize-model analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
+torq-quantize-model quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
+torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
+
 # export models
 torq-export-model moonshine --convert-dtype bf16
-
-# compile models
-torq-compile-model model_bf16.onnx -t llvm-cpu
-torq-compile-model model_bf16.mlir -t llvm-cpu
 
 # run inference
 torq-infer-model moonshine apostle.wav -m models/moonshine_tiny_onnx/ -s tiny

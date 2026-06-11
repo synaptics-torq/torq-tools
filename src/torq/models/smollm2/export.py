@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -11,16 +12,16 @@ import onnx
 import onnx_graphsurgeon as gs
 import ml_dtypes
 from transformers import AutoConfig
-from torq.compile import process_iree_args
-from torq.utils.logging import (
-    configure_logging,
-)
 
 from . import add_smollm2_export_args
 from ._graph import SmolLM2OnnxGraphEditor
 from ._inference import SmolLM2Dynamic, SmolLM2Static
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx
+
+from ...utils.logging import (
+    configure_logging,
+)
 
 
 class SmolLM2ModelExporter(OnnxModelExporterBase):
@@ -68,7 +69,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
-        onnx_dir, export_dir, convert_dir, iree_dir = [None] * 4
+        onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
         if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
             onnx_dir = onnx_source_dir
         else:
@@ -91,14 +92,14 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             / "converted"
             / ("static" if self._static_models else "dynamic")
         )
-        iree_dir = (
+        torq_dir = (
             self._models_dir
             / "export"
-            / "iree"
+            / "torq"
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir /  "model.onnx"
@@ -301,6 +302,45 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             ]
         )
 
+    def _copy_runtime_assets(
+        self,
+        dst_dir: str | os.PathLike,
+        src_dir: str | os.PathLike | None = None,
+        *,
+        include_npy_data: bool = True,
+    ) -> None:
+        src_dir = Path(src_dir or self._export_paths["model"].parent)
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        asset_names = ["config.json", "tokenizer.json"]
+        if include_npy_data:
+            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
+        for asset_name in asset_names:
+            src_path = src_dir / asset_name
+            if not src_path.exists():
+                continue
+            shutil.copy2(src_path, dst_dir / asset_name)
+
+    def export_torq(
+        self,
+        torq_export_dir: str | os.PathLike | None = None,
+        torq_compile_args: list[str] | None = None,
+        use_binary: bool = False,
+        skip: list[str] | None = None,
+        local_compile: bool = False,
+        compiler_path: str | Path | None = None,
+    ):
+        result = super().export_torq(
+            torq_export_dir=torq_export_dir,
+            torq_compile_args=torq_compile_args,
+            use_binary=use_binary,
+            skip=skip,
+            local_compile=local_compile,
+            compiler_path=compiler_path,
+        )
+        self._copy_runtime_assets(self._torq_dir, self._export_paths["model"].parent)
+        return result
+
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = SmolLM2ModelExporter(
@@ -320,8 +360,13 @@ def export_smollm2_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
-    if not args.skip_iree:
-        exporter.export_iree(iree_compile_args=process_iree_args(args))
+    if not args.skip_torq:
+        exporter.export_torq(
+            torq_compile_args=args.compile_flags or [],
+            use_binary=args.use_binary,
+            local_compile=args.local_compile,
+            compiler_path=args.compiler_path,
+        )
 
 
 def main():
