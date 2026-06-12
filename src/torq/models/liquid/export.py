@@ -59,13 +59,23 @@ HF_REPO_ONNX: dict[str, str] = {
     "350m": "LiquidAI/LFM2.5-350M-ONNX",
 }
 
-# torq-compile flags LFM2.5 needs on top of the compiler's SL2610 defaults.
-# `--torq-enable-split-constants-optimization` in particular is required: we
-# measured it faster (303 ms vs 432 ms/step) and lower-heap because each
-# dispatch reads its constant slice straight from the mmap'd vmfb instead of
-# staging the whole blob into anonymous DRAM.
+# Full torq-compile flag set LFM2.5 needs — the validated set the legacy
+# compile_v1.5.sh hardcoded.  All of these matter for the bf16 model:
+#   --torq-convert-dtypes / --torq-convert-io-dtype run the dtype-conversion
+#     passes; without them a tensor's element type resolves to `none` and
+#     torq-compile asserts out (Kernel.cpp `elementType != DType::none`).
+#   --torq-hw=SL2610 / --torq-disable-slicing / --torq-enable-annotate-tied-operands
+#     target + lowering options the chip needs.
+#   --torq-enable-split-constants-optimization is faster (303 vs 432 ms/step)
+#     and lower-heap (each dispatch reads its constant slice from the mmap'd
+#     vmfb instead of staging the whole blob into anonymous DRAM).
 LIQUID_TORQ_FLAGS: tuple[str, ...] = (
+    "--torq-hw=SL2610",
+    "--torq-disable-slicing",
     "--torq-enable-transpose-optimization",
+    "--torq-convert-dtypes",
+    "--torq-enable-annotate-tied-operands",
+    "--torq-convert-io-dtype",
     "--torq-enable-split-constants-optimization",
 )
 
@@ -110,6 +120,14 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._hf_repo_onnx = HF_REPO_ONNX[model_size]
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
+        # Chip-specific graph rewrites. The SL2610's depthwise-conv path
+        # crashes torq-compile (Kernel.cpp DType::none assertion) on LFM2.5's
+        # short conv, so by default we replace each depthwise Conv1D with a
+        # bit-exact batched-MatMul chain.  The 512-chunk lm_head split is no
+        # longer needed now that tile-and-fuse is default — the exporter emits
+        # a single [1024, 65536] MatMul unless --split-lm-head is passed.
+        self._replace_conv1d = not edit_args.get("keep_conv1d", False)
+        self._split_lm_head = edit_args.get("split_lm_head", False)
 
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
@@ -671,6 +689,173 @@ class LiquidModelExporter(OnnxModelExporterBase):
         return new_model, len(chunk_outputs)
 
     @staticmethod
+    def _unsplit_lm_head_matmul(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
+        """Pre-transpose the lm_head weight host-side and replace
+        ``MatMul(hidden, Transpose(W))`` with a single ``MatMul(hidden, W_T)``.
+
+        With ``torq-compile``'s tile-and-fuse enabled by default, the chip
+        tiles a single ``[H, V]`` MatMul against the 512 KB LRAM without the
+        export-time 512-chunk split.  Skipping the split shrinks the
+        compile-time IR (fewer dispatches feed ``SegmentNSSPrograms`` /
+        ``ResolveAddresses``) and produces a simpler vmfb.
+        """
+        graph = gs.import_onnx(model)
+        target = None
+        for node in graph.nodes:
+            if node.op != "MatMul" or len(node.inputs) < 2:
+                continue
+            rhs = node.inputs[1]
+            if not isinstance(rhs, gs.Variable):
+                continue
+            producer_inputs = getattr(rhs, "inputs", None) or []
+            if not producer_inputs:
+                continue
+            producer = producer_inputs[0]
+            if producer.op != "Transpose":
+                continue
+            w = producer.inputs[0]
+            if not isinstance(w, gs.Constant) or w.values.ndim != 2:
+                continue
+            if max(w.values.shape) < 16384:
+                continue
+            target = (node, producer, w)
+            break
+
+        if target is None:
+            return model, 0
+
+        matmul_node, transpose_node, weight = target
+        wt_const = gs.Constant(name=f"{weight.name}_T", values=weight.values.T.copy())
+        matmul_node.inputs[1] = wt_const
+        transpose_node.outputs.clear()
+        transpose_node.inputs.clear()
+        graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        new_model = gs.export_onnx(graph)
+        new_model.ir_version = model.ir_version
+        return new_model, 1
+
+    @staticmethod
+    def _replace_conv1d_with_matmul(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
+        """Replace LFM2.5's depthwise Conv1D with a bit-exact MatMul chain.
+
+        The SL2610's depthwise-conv lowering asserts out of torq-compile
+        (``Kernel.cpp`` ``DType::none``) on this kernel.  The replacement is
+        mathematically identical: slice each output time-step's K-wide
+        receptive field out of the input, reshape into a per-channel batched
+        MatMul (``[C, 1, K] @ [C, K, 1] -> [C, 1, 1]``), and concat the
+        per-step results back along the time axis.
+
+        Matches only depthwise 1D Convs (``groups == out_channels``, weight
+        rank 3, single spatial dim, stride/dilation 1, no padding) — anything
+        else is left alone for ``_inject_zero_bias_into_conv`` to handle.
+        """
+        graph = gs.import_onnx(model)
+        replaced = 0
+        for node in list(graph.nodes):
+            if node.op != "Conv" or len(node.inputs) < 2:
+                continue
+            w_in = node.inputs[1]
+            if not isinstance(w_in, gs.Constant):
+                continue
+            w = w_in.values
+            if w.ndim != 3:
+                continue  # not 1D conv
+            C_out, C_in_per_g, K = int(w.shape[0]), int(w.shape[1]), int(w.shape[2])
+            groups = int(node.attrs.get("group", 1))
+            if groups != C_out or C_in_per_g != 1:
+                continue  # not depthwise
+            if (list(node.attrs.get("strides", [1])) != [1]
+                    or list(node.attrs.get("pads", [0, 0])) != [0, 0]
+                    or list(node.attrs.get("dilations", [1])) != [1]):
+                continue  # unusual conv geometry — leave alone
+
+            X = node.inputs[0]
+            X_shape = list(X.shape) if X.shape else None
+            if not X_shape or len(X_shape) != 3:
+                continue
+            N, C, L_in = X_shape
+            if int(C) != C_out:
+                continue
+            L_out = int(L_in) - K + 1
+            if L_out <= 0:
+                continue
+
+            base = node.name or f"conv_{replaced}"
+            np_dtype = w.dtype
+
+            # Reshape kernel [C, 1, K] -> [C, K, 1] (direct reshape preserves
+            # per-channel weight order; no transpose).
+            w_b_const = gs.Constant(
+                name=f"{w_in.name}_KbyN",
+                values=w.reshape(C_out, K, 1).copy(),
+            )
+
+            def _i64(name, vals):
+                return gs.Constant(name=name, values=np.array(vals, dtype=np.int64))
+
+            window_results: list[gs.Variable] = []
+            for t in range(L_out):
+                sl_out = gs.Variable(f"{base}/slice_{t}", dtype=np_dtype, shape=[N, C, K])
+                graph.nodes.append(gs.Node(
+                    op="Slice", name=f"{base}/slice_{t}",
+                    inputs=[
+                        X,
+                        _i64(f"{base}/slice_{t}_starts", [t]),
+                        _i64(f"{base}/slice_{t}_ends", [t + K]),
+                        _i64(f"{base}/slice_{t}_axes", [2]),
+                        _i64(f"{base}/slice_{t}_steps", [1]),
+                    ],
+                    outputs=[sl_out],
+                ))
+                rsh_in = gs.Variable(f"{base}/resh_{t}", dtype=np_dtype, shape=[C, 1, K])
+                graph.nodes.append(gs.Node(
+                    op="Reshape", name=f"{base}/resh_{t}",
+                    inputs=[sl_out, _i64(f"{base}/resh_{t}_shape", [C_out, 1, K])],
+                    outputs=[rsh_in],
+                ))
+                mm_out = gs.Variable(f"{base}/matmul_{t}", dtype=np_dtype, shape=[C, 1, 1])
+                graph.nodes.append(gs.Node(
+                    op="MatMul", name=f"{base}/matmul_{t}",
+                    inputs=[rsh_in, w_b_const], outputs=[mm_out],
+                ))
+                step_out = gs.Variable(f"{base}/out_{t}", dtype=np_dtype, shape=[N, C, 1])
+                graph.nodes.append(gs.Node(
+                    op="Reshape", name=f"{base}/out_{t}_resh",
+                    inputs=[mm_out, _i64(f"{base}/out_{t}_shape", [N, C_out, 1])],
+                    outputs=[step_out],
+                ))
+                window_results.append(step_out)
+
+            original_output = node.outputs[0]
+            if L_out == 1:
+                only = window_results[0]
+                only.name = original_output.name
+                for n in graph.nodes:
+                    n.inputs = [only if i is original_output else i for i in n.inputs]
+                graph.outputs = [only if o is original_output else o for o in graph.outputs]
+            else:
+                graph.nodes.append(gs.Node(
+                    op="Concat", name=f"{base}/concat",
+                    inputs=window_results, outputs=[original_output],
+                    attrs={"axis": 2},
+                ))
+
+            node.outputs.clear()
+            node.inputs.clear()
+            replaced += 1
+
+        if replaced:
+            graph.cleanup(
+                remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+            ).toposort()
+            new_model = gs.export_onnx(graph)
+            new_model.ir_version = model.ir_version
+            return new_model, replaced
+        return model, 0
+
+    @staticmethod
     def _inject_zero_bias_into_conv(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
         """LFM2.5's config has ``conv_bias: false`` so every ONNX Conv op
         ships with no bias input.  torq-compile's depthwise-conv lowering
@@ -858,15 +1043,32 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # Re-run shape inference + iteratively fold residual Shape ops so
         # intermediate dims are concrete integers, not dim_param symbols.
         new_model = self._propagate_static_shapes(new_model)
-        # Inject zero bias into Conv ops missing one (torq-compile workaround).
+        # Replace depthwise Conv1D with a bit-exact batched-MatMul chain; the
+        # SL2610's depthwise-conv path asserts out of torq-compile on this
+        # kernel.  Disabled by --keep-conv1d.
+        if self._replace_conv1d:
+            new_model, n_conv = self._replace_conv1d_with_matmul(new_model)
+            if n_conv:
+                self._logger.info(
+                    "(conv-rewrite) Replaced %d depthwise Conv1D op(s) with batched MatMul",
+                    n_conv,
+                )
+        # Inject zero bias into any Conv ops we couldn't replace above.
         new_model, n_bias = self._inject_zero_bias_into_conv(new_model)
         if n_bias:
             self._logger.info("(conv-bias) Injected zero bias into %d Conv op(s)", n_bias)
-        # Split lm_head MatMul into LRAM-fit chunks (SL2610 has 512 KB LRAM,
-        # the 134 MB tied embedding cannot otherwise be allocated).
-        new_model, n_chunks = self._split_lm_head_matmul(new_model, chunk_size=128)
-        if n_chunks:
-            self._logger.info("(lm-head) Split lm_head MatMul into %d chunks", n_chunks)
+        # lm_head: default to a single [1024, 65536] MatMul (tile-and-fuse
+        # handles it); --split-lm-head keeps the legacy 512-chunk split.
+        if self._split_lm_head:
+            new_model, n_chunks = self._split_lm_head_matmul(new_model, chunk_size=128)
+            if n_chunks:
+                self._logger.info("(lm-head) Split lm_head MatMul into %d chunks", n_chunks)
+        else:
+            new_model, n_unsplit = self._unsplit_lm_head_matmul(new_model)
+            if n_unsplit:
+                self._logger.info(
+                    "(lm-head) Folded Transpose into pre-transposed weight; "
+                    "single [H, V] MatMul")
         # Re-run shape inference once more so the new chunks have full
         # value_info for downstream consumers / static-shape checks.
         del new_model.graph.value_info[:]
@@ -1106,6 +1308,8 @@ def export_liquid_from_args(args: argparse.Namespace):
         convert_dtypes=args.convert_dtypes,
         broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
+        keep_conv1d=args.keep_conv1d,
+        split_lm_head=args.split_lm_head,
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:

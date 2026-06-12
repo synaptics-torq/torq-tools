@@ -99,6 +99,25 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         default=False,
         help="Simulate bf16 inference by sandwiching each op with fp32→bf16→fp32 casts (for measuring quantization impact)",
     )
+    parser.add_argument(
+        "--keep-conv1d",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep the original depthwise Conv1D nodes (default: replace with a "
+            "bit-exact batched-MatMul chain). The SL2610's depthwise-conv path "
+            "crashes torq-compile; use only for CPU/ORT targets."
+        ),
+    )
+    parser.add_argument(
+        "--split-lm-head",
+        action="store_true",
+        default=False,
+        help=(
+            "Split the lm_head MatMul into 512 chunks of [1024, 128] (default: "
+            "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
+        ),
+    )
     add_logging_args(parser)
     add_torq_args(parser)
 

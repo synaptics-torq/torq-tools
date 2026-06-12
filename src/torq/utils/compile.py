@@ -340,6 +340,7 @@ def main():
     model_file: Path = args.model
     output_model: Path = args.output or model_file.parent / (model_file.stem + ".vmfb")
     output_dir: Path = output_model.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
     logger.debug("Output directory set to '%s'", str(output_dir))
 
     debug_dir = None

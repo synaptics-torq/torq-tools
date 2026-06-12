@@ -145,13 +145,10 @@ MLIR → vmfb via `torq-compile`), and the liquid export adds
 on top of `torq-compile`'s SL2610 defaults.
 
 To compile a standalone ONNX/MLIR later (e.g. a diagnostic variant), use the
-same driver directly. The output directory must already exist (the tool
-writes the intermediate `.mlir` next to the `-o` path and does not create
-parent dirs):
+same driver directly (the output directory is created automatically):
 
 ```sh
 export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
-mkdir -p models/export/iree/bf16/static
 python -m torq.utils.compile \
   models/export/onnx/bf16/static/model.onnx \
   -o models/export/iree/bf16/static/model.vmfb \
