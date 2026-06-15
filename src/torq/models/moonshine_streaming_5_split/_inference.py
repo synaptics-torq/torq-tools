@@ -103,35 +103,6 @@ class MoonshineStreaming5Split:
             raise FileNotFoundError("Missing token embeddings file 'decoder_token_embeddings.npy'")
         return np.load(paths[0])
 
-    def _encode_streaming(self, all_features: np.ndarray) -> np.ndarray:
-        """
-        Encode all_features using the stateful streaming encoder in a single call.
-
-        Splits into stable_features (all frames except the last total_lookahead)
-        and right_ctx (the final total_lookahead frames that provide right context).
-        Left-context buffers are initialised to zero — valid for a fresh utterance.
-        """
-        total_la = self._total_lookahead
-        zero_bufs = {
-            f"buf_{i}": np.zeros((1, lc, self._hidden_size), dtype=np.float32)
-            for i, lc in enumerate(self._enc_left_ctx)
-        }
-
-        T = all_features.shape[1]
-        if T <= total_la:
-            stable_feats = all_features
-            right_ctx = np.zeros((1, total_la, self._hidden_size), dtype=np.float32)
-        else:
-            stable_feats = all_features[:, :-total_la, :]
-            right_ctx = all_features[:, -total_la:, :]
-
-        res = self._encoder.infer({
-            "stable_features": stable_feats,
-            "right_ctx": right_ctx,
-            **zero_bufs,
-        })
-        return res[0]  # encoded_stable [1, T_stable, hidden]
-
     def run(
         self,
         input_audio: np.ndarray,
@@ -141,68 +112,112 @@ class MoonshineStreaming5Split:
         self._n_tokens_gen = 0
         st = time.time()
 
-        # 1. Initialize preprocessor (frontend) states
+        # Initialize frontend state
         sample_buffer = np.zeros((1, 79), dtype=np.float32)
         sample_len = np.zeros(1, dtype=np.int64)
-        
-        # Conv buffer dimensions based on model size
         c1 = self._hidden_size * 2 if self._model_size == "tiny" else 1536
-        c2 = self._hidden_size if self._model_size == "tiny" else 768
-        
         conv1_buffer = np.zeros((1, self._hidden_size, 4), dtype=np.float32)
         conv2_buffer = np.zeros((1, c1, 4), dtype=np.float32)
         frame_count = np.zeros(1, dtype=np.int64)
 
-        # 2. Accumulate features step-by-step
-        accum_features = []
-
-        # Process input audio in chunks
         audio_len = input_audio.shape[-1]
-        for offset in range(0, audio_len, chunk_len):
-            audio_chunk = input_audio[:, offset : offset + chunk_len]
-            if audio_chunk.shape[-1] < chunk_len:
-                # Pad last chunk if needed
-                audio_chunk = np.pad(audio_chunk, ((0, 0), (0, chunk_len - audio_chunk.shape[-1])), mode="constant")
-
-            # Run Frontend
-            res = self._frontend.infer({
-                "audio_chunk": audio_chunk,
-                "sample_buffer": sample_buffer,
-                "sample_len": sample_len,
-                "conv1_buffer": conv1_buffer,
-                "conv2_buffer": conv2_buffer,
-                "frame_count": frame_count,
-            })
-            features, sample_buffer, sample_len, conv1_buffer, conv2_buffer, new_frame_count = res
-
-            accum_features.append(features)
-            frame_count = new_frame_count
-
-        if not accum_features:
-            raise ValueError("No features were processed from the audio input.")
-
-        all_features = np.concatenate(accum_features, axis=1)
 
         if self._is_streaming_encoder:
-            encoded = self._encode_streaming(all_features)
+            # True streaming: frontend → encoder (with buffer state) → adapter, per audio chunk.
+            # Cross KV and decoder run once after all memory chunks are accumulated.
+            total_la = self._total_lookahead
+            n_enc_layers = len(self._enc_left_ctx)
+            enc_bufs = {
+                f"buf_{i}": np.zeros((1, lc, self._hidden_size), dtype=np.float32)
+                for i, lc in enumerate(self._enc_left_ctx)
+            }
+            pending = np.zeros((1, 0, self._hidden_size), dtype=np.float32)
+            memory_chunks: list[np.ndarray] = []
+            pos_offset = np.zeros(1, dtype=np.int64)
+
+            for offset in range(0, audio_len, chunk_len):
+                audio_chunk = input_audio[:, offset:offset + chunk_len]
+                if audio_chunk.shape[-1] < chunk_len:
+                    audio_chunk = np.pad(audio_chunk, ((0, 0), (0, chunk_len - audio_chunk.shape[-1])))
+
+                res = self._frontend.infer({
+                    "audio_chunk": audio_chunk,
+                    "sample_buffer": sample_buffer,
+                    "sample_len": sample_len,
+                    "conv1_buffer": conv1_buffer,
+                    "conv2_buffer": conv2_buffer,
+                    "frame_count": frame_count,
+                })
+                features, sample_buffer, sample_len, conv1_buffer, conv2_buffer, frame_count = res
+
+                pending = np.concatenate([pending, features], axis=1)
+                stable_count = max(0, pending.shape[1] - total_la)
+
+                if stable_count > 0:
+                    stable_feats = pending[:, :stable_count, :]
+                    right_ctx = pending[:, stable_count:stable_count + total_la, :]
+                    if right_ctx.shape[1] < total_la:
+                        pad = np.zeros((1, total_la - right_ctx.shape[1], self._hidden_size), dtype=np.float32)
+                        right_ctx = np.concatenate([right_ctx, pad], axis=1)
+
+                    enc_res = self._encoder.infer({
+                        "stable_features": stable_feats,
+                        "right_ctx": right_ctx,
+                        **enc_bufs,
+                    })
+                    encoded_stable = enc_res[0]
+                    enc_bufs = {f"buf_{i}": enc_res[i + 1] for i in range(n_enc_layers)}
+
+                    mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
+                    memory_chunks.append(mem)
+                    pos_offset = np.array([int(pos_offset[0]) + encoded_stable.shape[1]], dtype=np.int64)
+                    pending = pending[:, stable_count:, :]
+
+            # Flush remaining pending frames with zero right context
+            if pending.shape[1] > 0:
+                right_ctx = np.zeros((1, total_la, self._hidden_size), dtype=np.float32)
+                enc_res = self._encoder.infer({
+                    "stable_features": pending,
+                    "right_ctx": right_ctx,
+                    **enc_bufs,
+                })
+                encoded_stable = enc_res[0]
+                mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
+                memory_chunks.append(mem)
+
+            if not memory_chunks:
+                raise ValueError("No features were processed from the audio input.")
+            memory = np.concatenate(memory_chunks, axis=1)
+
         else:
+            # Batch path: accumulate all features, encode once, then adapt once.
+            accum_features: list[np.ndarray] = []
+            for offset in range(0, audio_len, chunk_len):
+                audio_chunk = input_audio[:, offset:offset + chunk_len]
+                if audio_chunk.shape[-1] < chunk_len:
+                    audio_chunk = np.pad(audio_chunk, ((0, 0), (0, chunk_len - audio_chunk.shape[-1])))
+
+                res = self._frontend.infer({
+                    "audio_chunk": audio_chunk,
+                    "sample_buffer": sample_buffer,
+                    "sample_len": sample_len,
+                    "conv1_buffer": conv1_buffer,
+                    "conv2_buffer": conv2_buffer,
+                    "frame_count": frame_count,
+                })
+                features, sample_buffer, sample_len, conv1_buffer, conv2_buffer, frame_count = res
+                accum_features.append(features)
+
+            if not accum_features:
+                raise ValueError("No features were processed from the audio input.")
+            all_features = np.concatenate(accum_features, axis=1)
             encoded = self._encoder.infer({"features": all_features})[0]
+            memory = self._adapter.infer({"encoded": encoded, "pos_offset": np.zeros(1, dtype=np.int64)})[0]
 
-        # Run Adapter once
-        pos_offset = np.zeros(1, dtype=np.int64)
-        memory = self._adapter.infer({
-            "encoded": encoded,
-            "pos_offset": pos_offset
-        })[0]
-
-        # Run Cross KV Generator once to get the stacked cross KV caches
+        # Cross KV once, then autoregressive decode
         out_k_cross, out_v_cross = self._cross_kv.infer({"memory": memory})
 
-        # 3. Autoregressive decoding phase
-        # Start with BOS token
         tokens = [self._start_token_id]
-        
-        # Initialize self-attention KV cache as empty (seq_len = 0)
         k_self = np.zeros((self._n_layers, 1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
         v_self = np.zeros((self._n_layers, 1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
 
@@ -211,8 +226,6 @@ class MoonshineStreaming5Split:
 
         for _ in range(max_tokens):
             token_input = np.array([[tokens[-1]]], dtype=np.int64)
-            
-            # Run Decoder Step
             res = self._decoder.infer({
                 "token": token_input,
                 "k_self": k_self,
@@ -221,12 +234,9 @@ class MoonshineStreaming5Split:
                 "out_v_cross": out_v_cross,
             })
             logits, k_self, v_self, _, _ = res
-
-            # Select argmax to get next token
             next_token = int(logits[0, -1, :].argmax())
             tokens.append(next_token)
             self._n_tokens_gen += 1
-
             if next_token == self._end_token_id:
                 break
 
