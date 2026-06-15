@@ -124,6 +124,89 @@ class StatefulPreprocessorWrapper(torch.nn.Module):
         return features, sample_buffer_out, sample_len_out, conv1_buffer_out, conv2_buffer_out, frame_count_out
 
 
+class StatefulEncoderWrapper(torch.nn.Module):
+    """
+    Stateful streaming encoder with per-layer left-context hidden-state buffers.
+
+    Processes new stable frames alongside a fixed right-context window so each
+    stable frame is encoded exactly once.  The right-context window is always
+    total_lookahead = sum(right_ctx_per_layer) frames wide (16 for tiny).
+
+    Inputs
+    ------
+    stable_features  [1, T_stable, hidden]        dynamic T_stable
+    right_ctx        [1, total_lookahead, hidden]  static — lookahead frames
+    buf_i            [1, left_ctx_i, hidden]       static — per-layer cache
+
+    Outputs
+    -------
+    encoded_stable   [1, T_stable, hidden]
+    buf_i_out        [1, left_ctx_i, hidden]       updated caches
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        enc = model.model.encoder
+        self.layers = enc.layers
+        self.final_norm = enc.final_norm
+        self.config = enc.config
+        self._left_ctx = [int(w[0]) for w in self.config.sliding_windows]
+        self._right_ctx = [int(w[1]) for w in self.config.sliding_windows]
+        self._total_lookahead = sum(self._right_ctx)
+
+    def forward(
+        self,
+        stable_features: torch.Tensor,
+        right_ctx: torch.Tensor,
+        buf_0: torch.Tensor,
+        buf_1: torch.Tensor,
+        buf_2: torch.Tensor,
+        buf_3: torch.Tensor,
+        buf_4: torch.Tensor,
+        buf_5: torch.Tensor,
+    ) -> tuple:
+        from transformers.models.moonshine_streaming.modeling_moonshine_streaming import (
+            create_bidirectional_mask,
+            sliding_window_mask_function,
+        )
+        bufs = [buf_0, buf_1, buf_2, buf_3, buf_4, buf_5]
+        bufs_out = []
+        # rc is a Python int constant — enables static end-anchored slices in ONNX
+        rc = self._total_lookahead
+
+        stable_in = stable_features
+        right_ctx_h = right_ctx
+
+        for layer_idx, (layer, buf) in enumerate(zip(self.layers, bufs)):
+            lc = self._left_ctx[layer_idx]        # Python int constant
+            layer_rc = self._right_ctx[layer_idx] # Python int constant
+
+            window = torch.cat([buf, stable_in, right_ctx_h], dim=1)
+
+            attn_mask = torch.ones(
+                window.shape[0], window.shape[1], dtype=torch.bool, device=window.device
+            )
+            layer_mask = create_bidirectional_mask(
+                config=self.config,
+                inputs_embeds=window,
+                attention_mask=attn_mask,
+                and_mask_function=sliding_window_mask_function((lc, layer_rc)),
+            )
+
+            out = layer(window, attention_mask=layer_mask)
+            out = out[0] if isinstance(out, tuple) else out
+
+            # Buffer: last lc frames of [buf | stable_in] — static end-anchored slice
+            bufs_out.append(torch.cat([buf, stable_in], dim=1)[:, -lc:, :])
+
+            # Peel off left buf and right ctx with static offsets to avoid dynamic indices
+            out_trimmed = out[:, lc:, :]           # removes left_buf portion [1, T+rc, hidden]
+            stable_in = out_trimmed[:, :-rc, :]    # [1, T_stable, hidden]
+            right_ctx_h = out_trimmed[:, -rc:, :]  # [1, rc, hidden]
+
+        return (self.final_norm(stable_in), *bufs_out)
+
+
 class EncoderWrapper(torch.nn.Module):
     """Pure Transformer encoder layer forwarding features."""
 
@@ -426,11 +509,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
                 },
             )
 
-        self._logger.info("Exporting pure Transformer Encoder to ONNX...")
-        encoder = EncoderWrapper(model).eval()
-        dummy_features = torch.randn(1, 5, enc_hidden)
-
         if self._static_models:
+            self._logger.info("Exporting pure Transformer Encoder to ONNX...")
+            encoder = EncoderWrapper(model).eval()
+            dummy_features = torch.randn(1, 5, enc_hidden)
             torch.onnx.export(
                 encoder,
                 (dummy_features,),
@@ -440,18 +522,31 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
                 output_names=["encoded"],
             )
         else:
-            batch = torch.export.Dim("batch", min=1)
-            seq_len = torch.export.Dim("seq_length", min=1, max=3000)
+            self._logger.info("Exporting Stateful Streaming Encoder as encoder.onnx...")
+            streaming_enc = StatefulEncoderWrapper(model).eval()
+            n_enc_layers = len(streaming_enc.layers)
+            total_la = streaming_enc._total_lookahead
+            left_ctxs = streaming_enc._left_ctx
+
+            dummy_stable = torch.randn(1, 10, enc_hidden)
+            dummy_right_ctx = torch.zeros(1, total_la, enc_hidden)
+            dummy_bufs = [torch.zeros(1, lc, enc_hidden) for lc in left_ctxs]
+
+            buf_in_names = [f"buf_{i}" for i in range(n_enc_layers)]
+            buf_out_names = [f"buf_{i}_out" for i in range(n_enc_layers)]
+            t_stable = torch.export.Dim("t_stable", min=1)
+            # dynamic_shapes as a list — positional match to (stable_features, right_ctx, buf_0..N)
+            # Only stable_features has a dynamic dim; all buffers and right_ctx are static.
+            dynamic_shapes_list = [{1: t_stable}] + [None] * (1 + n_enc_layers)
+
             torch.onnx.export(
-                encoder,
-                (dummy_features,),
+                streaming_enc,
+                (dummy_stable, dummy_right_ctx, *dummy_bufs),
                 str(self._onnx_dir / "encoder.onnx"),
                 dynamo=True,
-                input_names=["features"],
-                output_names=["encoded"],
-                dynamic_shapes={
-                    "input_features": {0: batch, 1: seq_len},
-                },
+                input_names=["stable_features", "right_ctx"] + buf_in_names,
+                output_names=["encoded_stable"] + buf_out_names,
+                dynamic_shapes=dynamic_shapes_list,
             )
 
         self._logger.info("Exporting Adapter wrapper to ONNX...")
@@ -668,7 +763,9 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
 
     def export_onnx(self, validate: bool = True):
         super().export_onnx(validate=False)
-        for filename in ("decoder_token_embeddings.npy", "tokenizer.json", "config.json"):
+        for filename in (
+            "decoder_token_embeddings.npy", "tokenizer.json", "config.json",
+        ):
             src = self._onnx_dir / filename
             dst = self._export_dir / filename
             if src.exists():

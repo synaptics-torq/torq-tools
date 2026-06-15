@@ -48,6 +48,26 @@ class MoonshineStreaming5Split:
             self._head_dim: int = 64
             self._hidden_size: int = 640
 
+        # Detect streaming encoder by presence of 'right_ctx' input in encoder.onnx
+        enc_inputs = self._encoder._sess.get_inputs()
+        enc_input_names = {inp.name for inp in enc_inputs}
+        if "right_ctx" in enc_input_names:
+            self._enc_left_ctx: list[int] = [
+                inp.shape[1] for inp in enc_inputs if inp.name.startswith("buf_")
+            ]
+            self._total_lookahead: int = next(
+                inp.shape[1] for inp in enc_inputs if inp.name == "right_ctx"
+            )
+            self._is_streaming_encoder = True
+            self._logger.info(
+                "Streaming encoder detected: %d layers, left_ctx=%s, total_lookahead=%d",
+                len(self._enc_left_ctx), self._enc_left_ctx, self._total_lookahead,
+            )
+        else:
+            self._enc_left_ctx = []
+            self._total_lookahead = 0
+            self._is_streaming_encoder = False
+
         self._start_token_id: int = 1
         self._end_token_id: int = 2
 
@@ -82,6 +102,35 @@ class MoonshineStreaming5Split:
         if not paths:
             raise FileNotFoundError("Missing token embeddings file 'decoder_token_embeddings.npy'")
         return np.load(paths[0])
+
+    def _encode_streaming(self, all_features: np.ndarray) -> np.ndarray:
+        """
+        Encode all_features using the stateful streaming encoder in a single call.
+
+        Splits into stable_features (all frames except the last total_lookahead)
+        and right_ctx (the final total_lookahead frames that provide right context).
+        Left-context buffers are initialised to zero — valid for a fresh utterance.
+        """
+        total_la = self._total_lookahead
+        zero_bufs = {
+            f"buf_{i}": np.zeros((1, lc, self._hidden_size), dtype=np.float32)
+            for i, lc in enumerate(self._enc_left_ctx)
+        }
+
+        T = all_features.shape[1]
+        if T <= total_la:
+            stable_feats = all_features
+            right_ctx = np.zeros((1, total_la, self._hidden_size), dtype=np.float32)
+        else:
+            stable_feats = all_features[:, :-total_la, :]
+            right_ctx = all_features[:, -total_la:, :]
+
+        res = self._encoder.infer({
+            "stable_features": stable_feats,
+            "right_ctx": right_ctx,
+            **zero_bufs,
+        })
+        return res[0]  # encoded_stable [1, T_stable, hidden]
 
     def run(
         self,
@@ -132,11 +181,12 @@ class MoonshineStreaming5Split:
         if not accum_features:
             raise ValueError("No features were processed from the audio input.")
 
-        # Concatenate all accumulated features along the sequence dimension (axis 1)
         all_features = np.concatenate(accum_features, axis=1)
 
-        # Run Encoder once on the concatenated features
-        encoded = self._encoder.infer({"features": all_features})[0]
+        if self._is_streaming_encoder:
+            encoded = self._encode_streaming(all_features)
+        else:
+            encoded = self._encoder.infer({"features": all_features})[0]
 
         # Run Adapter once
         pos_offset = np.zeros(1, dtype=np.int64)
