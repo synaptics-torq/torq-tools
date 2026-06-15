@@ -9,7 +9,9 @@ from transformers.cache_utils import EncoderDecoderCache, DynamicCache
 from types import SimpleNamespace
 
 # Add src to python path
-sys.path.append("/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/src")
+from pathlib import Path
+project_root = Path(__file__).resolve().parents[4]
+sys.path.append(str(project_root / "src"))
 
 from torq.models.moonshine_streaming_5_split.export import (
     StatefulPreprocessorWrapper,
@@ -25,7 +27,7 @@ def debug_parity():
     processor = AutoProcessor.from_pretrained(model_id)
 
     # Load ONNX models
-    onnx_dir = "/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/dynamic"
+    onnx_dir = project_root / "models" / "UsefulSensors" / "moonshine-streaming-tiny" / "export" / "onnx" / "float" / "dynamic"
     sess_preproc = ort.InferenceSession(os.path.join(onnx_dir, "frontend.onnx"), providers=['CPUExecutionProvider'])
     sess_encoder = ort.InferenceSession(os.path.join(onnx_dir, "encoder.onnx"), providers=['CPUExecutionProvider'])
     sess_adapter = ort.InferenceSession(os.path.join(onnx_dir, "adapter.onnx"), providers=['CPUExecutionProvider'])
@@ -33,7 +35,7 @@ def debug_parity():
     sess_decoder = ort.InferenceSession(os.path.join(onnx_dir, "decoder_kv.onnx"), providers=['CPUExecutionProvider'])
 
     # 1. Load and prepare audio
-    wav_path = "/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/src/torq/models/moonshine_streaming/OSR_us_000_0010_8k.wav"
+    wav_path = project_root / "src" / "torq" / "models" / "moonshine_streaming" / "OSR_us_000_0010_8k.wav"
     data, sr = sf.read(wav_path)
     if data.ndim == 2:
         data = data.mean(axis=1)

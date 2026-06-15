@@ -6,8 +6,11 @@ import onnxruntime as ort
 
 def compare():
     # Paths to the ONNX models
-    base_dir = "/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/models_base/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/dynamic"
-    split_dir = "/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/dynamic"
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parents[4]
+    
+    base_dir = project_root / "models_base" / "UsefulSensors" / "moonshine-streaming-tiny" / "export" / "onnx" / "float" / "dynamic"
+    split_dir = project_root / "models" / "UsefulSensors" / "moonshine-streaming-tiny" / "export" / "onnx" / "float" / "dynamic"
 
     print("Loading baseline model from:", os.path.join(base_dir, "preprocessor.onnx"))
     sess_base = ort.InferenceSession(os.path.join(base_dir, "preprocessor.onnx"), providers=['CPUExecutionProvider'])
@@ -15,7 +18,7 @@ def compare():
     sess_split = ort.InferenceSession(os.path.join(split_dir, "frontend.onnx"), providers=['CPUExecutionProvider'])
 
     # 1. Load test audio
-    wav_path = "/home/yhtet/projects/moonshine-streaming/core/torq-tools-dev/src/torq/models/moonshine_streaming/OSR_us_000_0010_8k.wav"
+    wav_path = project_root / "src" / "torq" / "models" / "moonshine_streaming" / "OSR_us_000_0010_8k.wav"
     data, sr = sf.read(wav_path)
     if data.ndim == 2:
         data = data.mean(axis=1)
