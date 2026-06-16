@@ -101,11 +101,11 @@ class MoonshineStreaming5Split:
         if self._is_static_decoder:
             # Derive max_tokens and max_memory_len from the pre-allocated buffer shapes.
             # k_self shape: [n_layers, 1, n_kv_heads, max_tokens, head_dim]
-            k_self_inp = next(inp for inp in dec_inputs if inp.name == "k_self")
-            self._max_tokens: int = k_self_inp.shape[3]
+            k_self_inp = next(inp for inp in dec_inputs if inp.name == "k_self_0")
+            self._max_tokens: int = k_self_inp.shape[2]
             # k_cross (out_k_cross) shape: [n_layers, 1, n_kv_heads, max_memory_len, head_dim]
-            k_cross_inp = next(inp for inp in dec_inputs if inp.name == "out_k_cross")
-            self._max_memory_len: int = k_cross_inp.shape[3]
+            k_cross_inp = next(inp for inp in dec_inputs if inp.name == "k_cross_0")
+            self._max_memory_len: int = k_cross_inp.shape[2]
             self._logger.info(
                 "Static decoder detected: max_tokens=%d, max_memory_len=%d",
                 self._max_tokens, self._max_memory_len,
@@ -407,25 +407,37 @@ class MoonshineStreaming5Split:
                 else:
                     dec_feed = {"token": np.array([[tokens[-1]]], dtype=np.int64)}
 
-                res = self._decoder.infer({
+                dec_feed_kv = {
                     **dec_feed,
-                    "k_self": k_self,
-                    "v_self": v_self,
-                    "out_k_cross": out_k_cross,
-                    "out_v_cross": out_v_cross,
                     "current_len": current_len,
                     "cross_kv_valid_len": cross_kv_valid,
                     "position_ids": current_len,
-                })
-                logits, k_self, v_self, _, _ = res
+                }
+                for i in range(self._n_layers):
+                    dec_feed_kv[f"k_self_{i}"] = k_self[i]
+                    dec_feed_kv[f"v_self_{i}"] = v_self[i]
+                    dec_feed_kv[f"k_cross_{i}"] = out_k_cross[i]
+                    dec_feed_kv[f"v_cross_{i}"] = out_v_cross[i]
+                res = self._decoder.infer(dec_feed_kv)
+                logits = res[0]
+                for i in range(self._n_layers):
+                    k_self[i] = res[1 + i * 2]
+                    v_self[i] = res[2 + i * 2]
                 next_token = int(logits[0, -1, :].argmax())
                 tokens.append(next_token)
                 self._n_tokens_gen += 1
                 if next_token == self._end_token_id:
                     break
         else:
-            k_self = np.zeros((self._n_layers, 1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
-            v_self = np.zeros((self._n_layers, 1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
+            # Per-layer lists: seq dim grows each step, can't use a fixed stacked array.
+            k_self_layers = [
+                np.zeros((1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
+                for _ in range(self._n_layers)
+            ]
+            v_self_layers = [
+                np.zeros((1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
+                for _ in range(self._n_layers)
+            ]
 
             for _ in range(max_tokens):
                 if self._extract_embeddings:
@@ -433,14 +445,17 @@ class MoonshineStreaming5Split:
                 else:
                     dec_feed = {"token": np.array([[tokens[-1]]], dtype=np.int64)}
 
-                res = self._decoder.infer({
-                    **dec_feed,
-                    "k_self": k_self,
-                    "v_self": v_self,
-                    "out_k_cross": out_k_cross,
-                    "out_v_cross": out_v_cross,
-                })
-                logits, k_self, v_self, _, _ = res
+                dec_feed_kv = {**dec_feed}
+                for i in range(self._n_layers):
+                    dec_feed_kv[f"k_self_{i}"] = k_self_layers[i]
+                    dec_feed_kv[f"v_self_{i}"] = v_self_layers[i]
+                    dec_feed_kv[f"k_cross_{i}"] = out_k_cross[i]
+                    dec_feed_kv[f"v_cross_{i}"] = out_v_cross[i]
+                res = self._decoder.infer(dec_feed_kv)
+                logits = res[0]
+                for i in range(self._n_layers):
+                    k_self_layers[i] = res[1 + i * 2]
+                    v_self_layers[i] = res[2 + i * 2]
                 next_token = int(logits[0, -1, :].argmax())
                 tokens.append(next_token)
                 self._n_tokens_gen += 1
