@@ -447,6 +447,39 @@ decoder variant with `token: [1, max_spec_tokens]` fixed, with its own `cur_len`
 
 ---
 
+## Note — `--extract-embeddings` (Not Yet Implemented)
+
+The `--extract-embeddings` CLI flag exists but is currently **dead code**. The
+`decoder_token_embeddings.npy` file is always saved unconditionally regardless of the
+flag. More importantly, the embedding table is still **baked into `decoder_kv.onnx`**:
+`DecoderKVWrapper.forward` calls `self.decoder(input_ids=token, ...)` which internally
+calls `embed_tokens`. The flag has no effect on the exported model.
+
+`_token_embeddings` is loaded in `_inference.py` but never used; the decoder receives raw
+token IDs and does the lookup itself.
+
+**What full implementation would require:**
+
+1. **Export**: gate on `_extract_embeddings`; change `DecoderKVWrapper` to accept
+   `inputs_embeds` (float `[1, 1, hidden_size]`) instead of `input_ids` (int64 `[1, 1]`),
+   performing `embed_tokens(token)` inside the wrapper before the decoder call so the ONNX
+   model no longer contains the embedding table.
+
+2. **`_inference.py`**: do `token_emb = self._token_embeddings[token_id]` before each
+   decoder call and pass `token_emb` instead of `token`.
+
+3. **Demo**: load `decoder_token_embeddings.npy` at startup; replace
+   `"token": np.array([[t]], dtype=np.int64)` with
+   `"token_emb": token_embeddings[t][np.newaxis, np.newaxis, :]` in all decoder calls.
+
+Motivation for hardware: the embedding table (~32k × 320 = 10M weights for tiny) is a
+large constant lookup that may be more efficient to run on the host CPU rather than
+compiling into a hardware kernel.
+
+**Leave as-is until hardware constraints make this necessary.**
+
+---
+
 ## Shape Summary
 
 | Component   | Key input shapes (static)                                                          | Key output shapes (static)                               | Cadence        |

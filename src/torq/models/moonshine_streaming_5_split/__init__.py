@@ -86,6 +86,16 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         help="Replace int64 -> bf16 casts with a look-up table"
     )
     parser.add_argument(
+        "--chunk-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Audio chunk size in samples for static streaming export. "
+             "When set, exports frontend/encoder/adapter/cross_kv/decoder as a fixed "
+             "per-chunk streaming pipeline (e.g. 1280 = 80ms @ 16kHz). "
+             "Mutually exclusive with --dynamic-models.",
+    )
+    parser.add_argument(
         "--skip-export",
         type=str,
         nargs="+",

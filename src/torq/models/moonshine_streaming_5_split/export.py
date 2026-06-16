@@ -124,6 +124,68 @@ class StatefulPreprocessorWrapper(torch.nn.Module):
         return features, sample_buffer_out, sample_len_out, conv1_buffer_out, conv2_buffer_out, frame_count_out
 
 
+class StaticStreamingFrontendWrapper(torch.nn.Module):
+    """
+    Simplified frontend for static streaming export with a fixed chunk size.
+
+    Drops the variable-length sample-buffer / sample_len carry-over logic entirely
+    (it is only needed when chunk sizes vary).  With a fixed chunk_len, n_frames is
+    a Python constant so every internal tensor shape is concrete at export time,
+    producing a fully static ONNX graph with no symbolic interior dimensions.
+
+    Inputs
+    ------
+    audio_chunk   [1, chunk_len]         exactly chunk_len PCM samples
+    conv1_buffer  [1, hidden_size, 4]    causal conv1 state
+    conv2_buffer  [1, c1, 4]             causal conv2 state
+
+    Outputs
+    -------
+    features          [1, F, hidden_size]   F = chunk_len // frame_len // 4
+    conv1_buffer_out  [1, hidden_size, 4]
+    conv2_buffer_out  [1, c1, 4]
+    """
+
+    def __init__(self, model, chunk_len: int):
+        super().__init__()
+        embedder = model.model.encoder.embedder
+        self.cmvn = embedder.cmvn
+        self.comp = embedder.comp
+        self.linear = embedder.linear
+        self.conv1 = embedder.conv1
+        self.conv2 = embedder.conv2
+        self.frame_len: int = int(embedder.frame_len)
+        self.n_frames: int = chunk_len // self.frame_len  # Python constant → concrete shapes
+
+    def forward(self, audio_chunk, conv1_buffer, conv2_buffer):
+        # Reshape to frames — n_frames is a Python int, so shapes are concrete
+        x = audio_chunk.reshape(1, self.n_frames, self.frame_len)
+        x = self.cmvn(x)
+        x = self.comp(x)
+        x = torch.nn.functional.silu(self.linear(x))
+
+        # Causal conv1 (stride 2)
+        x = x.transpose(1, 2)  # [1, hidden, n_frames]
+        x1_padded = torch.cat([conv1_buffer, x], dim=2)
+        x1_conv = torch.nn.functional.conv1d(
+            x1_padded, self.conv1.weight, self.conv1.bias,
+            stride=self.conv1.stride, dilation=self.conv1.dilation,
+        )
+        conv1_buffer_out = x1_padded[:, :, -4:]
+        x1_silu = torch.nn.functional.silu(x1_conv)
+
+        # Causal conv2 (stride 2)
+        x2_padded = torch.cat([conv2_buffer, x1_silu], dim=2)
+        x2_conv = torch.nn.functional.conv1d(
+            x2_padded, self.conv2.weight, self.conv2.bias,
+            stride=self.conv2.stride, dilation=self.conv2.dilation,
+        )
+        conv2_buffer_out = x2_padded[:, :, -4:]
+
+        features = x2_conv.transpose(1, 2)  # [1, F, hidden]
+        return features, conv1_buffer_out, conv2_buffer_out
+
+
 class StatefulEncoderWrapper(torch.nn.Module):
     """
     Stateful streaming encoder with per-layer left-context hidden-state buffers.
@@ -314,7 +376,9 @@ class DecoderKVWrapper(torch.nn.Module):
         self.decoder.pos_emb = ZeroEmbedding(self.decoder.pos_emb.embedding_dim)
         self.decoder.proj = torch.nn.Identity()
 
-    def forward(self, token, k_self, v_self, out_k_cross, out_v_cross):
+    def forward(self, token, k_self, v_self, out_k_cross, out_v_cross,
+                cross_kv_valid_len: torch.Tensor | None = None,
+                position_ids: torch.Tensor | None = None):
         # Construct past_key_values cache
         self_cache = DynamicCache()
         cross_cache = DynamicCache()
@@ -335,12 +399,22 @@ class DecoderKVWrapper(torch.nn.Module):
             dtype=k_self.dtype, device=k_self.device
         )
 
+        # When cross_kv_valid_len is provided, mask padded cross-KV slots via the
+        # existing encoder_attention_mask path so they receive -inf attention weight.
+        encoder_attention_mask = None
+        if cross_kv_valid_len is not None:
+            encoder_attention_mask = (
+                torch.arange(enc_seq_len, device=out_k_cross.device) < cross_kv_valid_len
+            ).unsqueeze(0)  # [1, enc_seq_len]
+
         # Call decoder
         dec_out = self.decoder(
             input_ids=token,
             past_key_values=pkv,
             use_cache=True,
+            position_ids=position_ids,
             encoder_hidden_states=dummy_encoder_hidden,
+            encoder_attention_mask=encoder_attention_mask,
         )
 
         logits = self.proj_out(dec_out.last_hidden_state)
@@ -366,6 +440,7 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         hf_repo: str | None = None,
         max_audio_s: int = 5,
         max_tok_per_s: int = 6,
+        chunk_len: int | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -382,10 +457,16 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         self._max_tokens = max_audio_s * max_tok_per_s
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
+        self._chunk_len = chunk_len
+        # streaming_static: per-chunk static pipeline (chunk_len set, not dynamic)
+        self._streaming_static = chunk_len is not None and static_models
 
         # Standard conv layers of moonshine preprocessor do two strided causal convs of stride 2
         # giving a total input reduction of stride 4.
         self._enc_seq_len = self._num_samples // 320
+        # F and max_memory_len are derived after the model is loaded (see _derive_feature_stride)
+        self._feature_stride: int | None = None  # frames per chunk_len samples
+        self._max_memory_len: int | None = None   # max cross-KV slots for streaming static
 
         self._n_layers = getattr(self._config, "decoder_num_hidden_layers", getattr(self._config, "num_hidden_layers", 6))
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
@@ -414,14 +495,22 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir = self._models_dir / "source" / "onnx" / "merged" / self._model_size / self._model_dtype
-        if self._static_models:
+        if self._streaming_static:
+            onnx_dir = onnx_dir / f"streaming_static_c{self._chunk_len}"
+        elif self._static_models:
             onnx_dir = onnx_dir / f"static_i{self._num_samples // 16000}"
+        if self._streaming_static:
+            export_subdir = "streaming_static"
+        elif self._static_models:
+            export_subdir = "static"
+        else:
+            export_subdir = "dynamic"
         export_dir = (
             self._models_dir
             / "export"
             / "onnx"
             / self._model_dtype
-            / ("static" if self._static_models else "dynamic")
+            / export_subdir
         )
         convert_dir = (
             self._models_dir
@@ -438,6 +527,26 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
             / ("static" if self._static_models else "dynamic")
         )
         return onnx_dir, export_dir, convert_dir, iree_dir
+
+    def _derive_feature_stride(self, model, chunk_len: int) -> int:
+        """Run the frontend wrapper once with chunk_len samples to measure F."""
+        preproc = StatefulPreprocessorWrapper(model).eval()
+        enc_hidden = self._hidden_size
+        c1 = enc_hidden * 2
+        dummy_audio = torch.zeros(1, chunk_len)
+        dummy_sample_buf = torch.zeros(1, 79)
+        dummy_sample_len = torch.zeros(1, dtype=torch.int64)
+        dummy_conv1_buf = torch.zeros(1, enc_hidden, 4)
+        dummy_conv2_buf = torch.zeros(1, c1, 4)
+        dummy_frame_cnt = torch.zeros(1, dtype=torch.int64)
+        with torch.no_grad():
+            features, *_ = preproc(
+                dummy_audio, dummy_sample_buf, dummy_sample_len,
+                dummy_conv1_buf, dummy_conv2_buf, dummy_frame_cnt,
+            )
+        F = int(features.shape[1])
+        self._logger.info("Derived feature stride F=%d for chunk_len=%d", F, chunk_len)
+        return F
 
     def _generate_source_onnx(self):
         from huggingface_hub import snapshot_download
@@ -469,6 +578,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         # Save tokenizer
         shutil.copy2(local_dir / "tokenizer.json", self._onnx_dir / "tokenizer.json")
         shutil.copy2(local_dir / "config.json", self._onnx_dir / "config.json")
+
+        if self._streaming_static:
+            self._export_streaming_static_source_onnx(model)
+            return
 
         self._logger.info("Exporting Stateful Preprocessor (frontend) to ONNX...")
         preproc = StatefulPreprocessorWrapper(model).eval()
@@ -646,7 +759,128 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
                 },
             )
 
+    def _export_streaming_static_source_onnx(self, model) -> None:
+        """Export all 5 components with fixed per-chunk shapes for the streaming static path."""
+        import json
+        chunk_len = self._chunk_len
+        enc_hidden = self._hidden_size
+        c1 = enc_hidden * 2
+
+        # ── Derive F ────────────────────────────────────────────────────────────
+        F = self._derive_feature_stride(model, chunk_len)
+        self._feature_stride = F
+        # max cross-KV slots: conservative upper bound = total feature frames for max audio
+        self._max_memory_len = self._enc_seq_len  # same as batch encoder seq len
+
+        # ── Frontend ─────────────────────────────────────────────────────────────
+        self._logger.info("Exporting Streaming Static Frontend to ONNX (chunk_len=%d)...", chunk_len)
+        preproc = StaticStreamingFrontendWrapper(model, chunk_len).eval()
+        dummy_audio     = torch.zeros(1, chunk_len)
+        dummy_conv1_buf = torch.zeros(1, enc_hidden, 4)
+        dummy_conv2_buf = torch.zeros(1, c1, 4)
+        torch.onnx.utils.export(
+            preproc,
+            (dummy_audio, dummy_conv1_buf, dummy_conv2_buf),
+            str(self._onnx_dir / "frontend.onnx"),
+            opset_version=17,
+            input_names=["audio_chunk", "conv1_buffer", "conv2_buffer"],
+            output_names=["features", "conv1_buffer_out", "conv2_buffer_out"],
+        )
+
+        # ── Streaming Encoder ────────────────────────────────────────────────────
+        self._logger.info("Exporting Streaming Static Encoder to ONNX (F=%d)...", F)
+        streaming_enc = StatefulEncoderWrapper(model).eval()
+        n_enc_layers  = len(streaming_enc.layers)
+        total_la      = streaming_enc._total_lookahead
+        left_ctxs     = streaming_enc._left_ctx
+        dummy_stable  = torch.zeros(1, F, enc_hidden)
+        dummy_right   = torch.zeros(1, total_la, enc_hidden)
+        dummy_bufs    = [torch.zeros(1, lc, enc_hidden) for lc in left_ctxs]
+        torch.onnx.export(
+            streaming_enc,
+            (dummy_stable, dummy_right, *dummy_bufs),
+            str(self._onnx_dir / "encoder.onnx"),
+            dynamo=True,
+            input_names=["stable_features", "right_ctx"] + [f"buf_{i}" for i in range(n_enc_layers)],
+            output_names=["encoded_stable"] + [f"buf_{i}_out" for i in range(n_enc_layers)],
+        )
+
+        # ── Adapter ──────────────────────────────────────────────────────────────
+        self._logger.info("Exporting Streaming Static Adapter to ONNX (F=%d)...", F)
+        adapter          = AdapterWrapper(model.model.decoder).eval()
+        dummy_encoded    = torch.zeros(1, F, enc_hidden)
+        dummy_pos_offset = torch.zeros(1, dtype=torch.int64)
+        torch.onnx.export(
+            adapter,
+            (dummy_encoded, dummy_pos_offset),
+            str(self._onnx_dir / "adapter.onnx"),
+            dynamo=True,
+            input_names=["encoded", "pos_offset"],
+            output_names=["memory"],
+        )
+
+        # ── Cross KV ─────────────────────────────────────────────────────────────
+        self._logger.info("Exporting Streaming Static Cross KV to ONNX (F=%d)...", F)
+        cross_kv     = CrossKVGeneratorWrapper(model.model.decoder).eval()
+        memory_dim   = self._config.hidden_size
+        dummy_memory = torch.zeros(1, F, memory_dim)
+        torch.onnx.export(
+            cross_kv,
+            (dummy_memory,),
+            str(self._onnx_dir / "cross_kv.onnx"),
+            dynamo=True,
+            input_names=["memory"],
+            output_names=["k_cross", "v_cross"],
+        )
+
+        # ── Decoder ──────────────────────────────────────────────────────────────
+        self._logger.info(
+            "Exporting Streaming Static Decoder to ONNX "
+            "(max_tokens=%d, max_memory_len=%d)...",
+            self._max_tokens, self._max_memory_len,
+        )
+        decoder_kv        = DecoderKVWrapper(model).eval()
+        dummy_token       = torch.ones(1, 1, dtype=torch.long)
+        dummy_k_self      = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                         self._max_tokens, self._head_dim)
+        dummy_v_self      = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                         self._max_tokens, self._head_dim)
+        dummy_k_cross     = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                         self._max_memory_len, self._head_dim)
+        dummy_v_cross     = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                         self._max_memory_len, self._head_dim)
+        dummy_cross_valid = torch.tensor([1], dtype=torch.long)
+        # position_ids drives RoPE for the new token; trace at max_tokens so it's
+        # dynamic (not constant-folded), then at inference step T we pass [[T]].
+        dummy_position_ids = torch.tensor([[self._max_tokens]], dtype=torch.long)
+        torch.onnx.export(
+            decoder_kv,
+            (dummy_token, dummy_k_self, dummy_v_self,
+             dummy_k_cross, dummy_v_cross, dummy_cross_valid, dummy_position_ids),
+            str(self._onnx_dir / "decoder_kv.onnx"),
+            dynamo=True,
+            input_names=["token", "k_self", "v_self",
+                         "out_k_cross", "out_v_cross", "cross_kv_valid_len", "position_ids"],
+            output_names=["logits", "out_k_self", "out_v_self",
+                          "out_k_cross_out", "out_v_cross_out"],
+        )
+
+        # ── streaming_config.json ────────────────────────────────────────────────
+        warmup_chunks = (total_la + F - 1) // F  # ceil(right_ctx / F)
+        config = {
+            "chunk_len": chunk_len,
+            "feature_stride": F,
+            "right_ctx": total_la,
+            "warmup_chunks": warmup_chunks,
+            "max_tokens": self._max_tokens,
+            "max_memory_len": self._max_memory_len,
+        }
+        with open(self._onnx_dir / "streaming_config.json", "w") as f:
+            json.dump(config, f, indent=2)
+        self._logger.info("Streaming config: %s", config)
+
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
+        import json as _json
         source_files = {
             "frontend": self._onnx_dir / "frontend.onnx",
             "encoder": self._onnx_dir / "encoder.onnx",
@@ -660,6 +894,24 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         if any_missing:
             self._logger.info("Source ONNX models not found. Downloading PyTorch model and exporting...")
             self._generate_source_onnx()
+
+        # For streaming_static, load F and max_memory_len from the JSON config written at export time.
+        # (They are already set if we just ran _generate_source_onnx; this branch handles the cached case.)
+        if self._streaming_static and self._feature_stride is None:
+            config_path = self._onnx_dir / "streaming_config.json"
+            if not config_path.exists():
+                raise FileNotFoundError(
+                    f"streaming_config.json not found at {config_path}. "
+                    "Delete the cached ONNX files and re-export to regenerate it."
+                )
+            with open(config_path) as _f:
+                _cfg = _json.load(_f)
+            self._feature_stride = _cfg["feature_stride"]
+            self._max_memory_len = _cfg["max_memory_len"]
+            self._logger.info(
+                "Loaded streaming config from disk: F=%d, max_memory_len=%d",
+                self._feature_stride, self._max_memory_len,
+            )
 
         return {
             comp: onnx.load(path)
@@ -718,7 +970,75 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
+    # ── Streaming-static graph-edit helpers ──────────────────────────────────
+
+    def _make_streaming_frontend_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model, "frontend", self._onnx_export_dtype)
+        # StaticStreamingFrontendWrapper uses n_frames as a Python constant so all
+        # internal shapes are concrete; only batch and feat_len may still be symbolic.
+        editor.fix_frontend_io(chunk_len=self._chunk_len, feat_len=self._feature_stride)
+        editor.decompose_layer_normalization()
+        for node in list(editor._graph.nodes):
+            if node.op == "Conv":
+                weight = node.inputs[1]
+                if ("kernel_shape" not in node.attrs or not node.attrs["kernel_shape"]) and weight.shape is not None:
+                    if len(weight.shape) == 3:
+                        node.attrs["kernel_shape"] = [weight.shape[2]]
+        editor._graph.cleanup().toposort()
+        editor.decompose_strided_conv1d()
+        editor.replace_pad_with_concat()
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return self.check_model(new_model, skip_data_prop=True)
+
+    def _make_streaming_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        F = self._feature_stride
+        editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
+        editor.fix_streaming_encoder_io(stable_len=F)
+        editor.decompose_layer_normalization()
+        editor.decompose_gelu()
+        editor.decompose_boolean_and()
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return self.check_model(new_model)
+
+    def _make_streaming_adapter_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        F = self._feature_stride
+        editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model, "adapter", self._onnx_export_dtype)
+        editor.fix_adapter_io(seq_len=F)
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return self.check_model(new_model)
+
+    def _make_streaming_cross_kv_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        F = self._feature_stride
+        editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model, "cross_kv", self._onnx_export_dtype)
+        editor.fix_cross_kv_io(seq_len=F)
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return self.check_model(new_model)
+
+    def _make_streaming_decoder_kv_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+        editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model, "decoder_kv", self._onnx_export_dtype)
+        editor.make_decoder_static(self._max_tokens)
+        editor.decompose_layer_normalization()
+        editor.decompose_gelu()
+        editor.decompose_boolean_and()
+        # Clear stale shape annotations so ONNX shape inference recomputes them
+        # from scratch after the KV-cache dimension change (max_tokens+1 → max_tokens).
+        editor.clear_intermediate_shapes()
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        return self.check_model(new_model)
+
     def make_static(self):
+        if self._streaming_static:
+            F = self._feature_stride
+            assert F is not None, "feature_stride is None — _load_onnx must run first"
+            self._logger.info("Applying streaming static graph edits (F=%d, max_tokens=%d)...",
+                              F, self._max_tokens)
+            self._components["frontend"]   = self._make_streaming_frontend_static(self._components["frontend"])
+            self._components["encoder"]    = self._make_streaming_encoder_static(self._components["encoder"])
+            self._components["adapter"]    = self._make_streaming_adapter_static(self._components["adapter"])
+            self._components["cross_kv"]   = self._make_streaming_cross_kv_static(self._components["cross_kv"])
+            self._components["decoder_kv"] = self._make_streaming_decoder_kv_static(self._components["decoder_kv"])
+            return
+
         self._logger.info("Verifying and finalizing static dimensions...")
         self._components["frontend"] = self._make_frontend_static(self._components["frontend"])
         self._components["encoder"] = self._make_encoder_static(self._components["encoder"])
@@ -770,6 +1090,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
             dst = self._export_dir / filename
             if src.exists():
                 shutil.copy2(src, dst)
+        if self._streaming_static:
+            src = self._onnx_dir / "streaming_config.json"
+            if src.exists():
+                shutil.copy2(src, self._export_dir / "streaming_config.json")
         if validate:
             self.validate_onnx()
 
@@ -817,6 +1141,8 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
 
 def export_moonshine_streaming_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
+    if getattr(args, "chunk_len", None) and args.dynamic_models:
+        raise ValueError("--chunk-len and --dynamic-models are mutually exclusive")
     exporter = MoonshineStreaming5SplitExporter(
         args.model_size,
         args.dtype,
@@ -825,6 +1151,7 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,
+        chunk_len=getattr(args, "chunk_len", None),
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
