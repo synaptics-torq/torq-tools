@@ -363,20 +363,27 @@ class ZeroEmbedding(torch.nn.Module):
 
 
 class DecoderKVWrapper(torch.nn.Module):
-    """Decoder executing with token input and stacked self/cross caches."""
+    """Decoder executing with token input and stacked self/cross caches.
 
-    def __init__(self, model):
+    When extract_embeddings=True the first forward argument is a float
+    inputs_embeds tensor [1, 1, hidden_size] instead of an integer token id
+    [1, 1].  The embed_tokens lookup is skipped entirely so it becomes dead
+    code in the exported ONNX graph.
+    """
+
+    def __init__(self, model, extract_embeddings: bool = False):
         super().__init__()
         self.base_model = model.model
         self.proj_out = model.proj_out
         self.n_layers = len(self.base_model.decoder.layers)
         self.decoder = self.base_model.decoder
+        self._extract_embeddings = extract_embeddings
 
         # Replace pos_emb and proj with proper nn.Modules during initialization
         self.decoder.pos_emb = ZeroEmbedding(self.decoder.pos_emb.embedding_dim)
         self.decoder.proj = torch.nn.Identity()
 
-    def forward(self, token, k_self, v_self, out_k_cross, out_v_cross,
+    def forward(self, token_or_embed, k_self, v_self, out_k_cross, out_v_cross,
                 cross_kv_valid_len: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None):
         # Construct past_key_values cache
@@ -407,15 +414,25 @@ class DecoderKVWrapper(torch.nn.Module):
                 torch.arange(enc_seq_len, device=out_k_cross.device) < cross_kv_valid_len
             ).unsqueeze(0)  # [1, enc_seq_len]
 
-        # Call decoder
-        dec_out = self.decoder(
-            input_ids=token,
-            past_key_values=pkv,
-            use_cache=True,
-            position_ids=position_ids,
-            encoder_hidden_states=dummy_encoder_hidden,
-            encoder_attention_mask=encoder_attention_mask,
-        )
+        # Call decoder — bypass embed_tokens when embeddings are extracted externally
+        if self._extract_embeddings:
+            dec_out = self.decoder(
+                inputs_embeds=token_or_embed,
+                past_key_values=pkv,
+                use_cache=True,
+                position_ids=position_ids,
+                encoder_hidden_states=dummy_encoder_hidden,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+        else:
+            dec_out = self.decoder(
+                input_ids=token_or_embed,
+                past_key_values=pkv,
+                use_cache=True,
+                position_ids=position_ids,
+                encoder_hidden_states=dummy_encoder_hidden,
+                encoder_attention_mask=encoder_attention_mask,
+            )
 
         logits = self.proj_out(dec_out.last_hidden_state)
 
@@ -721,8 +738,12 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
             )
 
         self._logger.info("Exporting Decoder KV wrapper to ONNX...")
-        decoder_kv = DecoderKVWrapper(model).eval()
-        dummy_dec_ids = torch.ones(1, 1, dtype=torch.long)
+        decoder_kv = DecoderKVWrapper(model, extract_embeddings=self._extract_embeddings).eval()
+        dummy_dec_ids = (
+            torch.zeros(1, 1, self._hidden_size) if self._extract_embeddings
+            else torch.ones(1, 1, dtype=torch.long)
+        )
+        first_input_name = "inputs_embeds" if self._extract_embeddings else "token"
         dummy_k_self = torch.randn(self._n_layers, 1, self._num_kv_heads, 1, self._head_dim)
         dummy_v_self = torch.randn(self._n_layers, 1, self._num_kv_heads, 1, self._head_dim)
         dummy_k_cross = torch.randn(self._n_layers, 1, self._num_kv_heads, 5, self._head_dim)
@@ -739,7 +760,7 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
                 (dummy_dec_ids, dummy_k_self, dummy_v_self, dummy_k_cross, dummy_v_cross),
                 str(self._onnx_dir / "decoder_kv.onnx"),
                 dynamo=True,
-                input_names=["token", "k_self", "v_self", "out_k_cross", "out_v_cross"],
+                input_names=[first_input_name, "k_self", "v_self", "out_k_cross", "out_v_cross"],
                 output_names=["logits", "out_k_self", "out_v_self", "out_k_cross_out", "out_v_cross_out"],
             )
         else:
@@ -748,10 +769,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
                 (dummy_dec_ids, dummy_k_self, dummy_v_self, dummy_k_cross, dummy_v_cross),
                 str(self._onnx_dir / "decoder_kv.onnx"),
                 dynamo=True,
-                input_names=["token", "k_self", "v_self", "out_k_cross", "out_v_cross"],
+                input_names=[first_input_name, "k_self", "v_self", "out_k_cross", "out_v_cross"],
                 output_names=["logits", "out_k_self", "out_v_self", "out_k_cross_out", "out_v_cross_out"],
                 dynamic_shapes={
-                    "token": {0: batch, 1: dec_seq},
+                    first_input_name: {0: batch, 1: dec_seq},
                     "k_self": {1: batch, 3: past_seq},
                     "v_self": {1: batch, 3: past_seq},
                     "out_k_cross": {1: batch, 3: enc_seq},
@@ -836,30 +857,38 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         # ── Decoder ──────────────────────────────────────────────────────────────
         self._logger.info(
             "Exporting Streaming Static Decoder to ONNX "
-            "(max_tokens=%d, max_memory_len=%d)...",
-            self._max_tokens, self._max_memory_len,
+            "(max_tokens=%d, max_memory_len=%d, extract_embeddings=%s)...",
+            self._max_tokens, self._max_memory_len, self._extract_embeddings,
         )
-        decoder_kv        = DecoderKVWrapper(model).eval()
-        dummy_token       = torch.ones(1, 1, dtype=torch.long)
-        dummy_k_self      = torch.zeros(self._n_layers, 1, self._num_kv_heads,
-                                         self._max_tokens, self._head_dim)
-        dummy_v_self      = torch.zeros(self._n_layers, 1, self._num_kv_heads,
-                                         self._max_tokens, self._head_dim)
-        dummy_k_cross     = torch.zeros(self._n_layers, 1, self._num_kv_heads,
-                                         self._max_memory_len, self._head_dim)
-        dummy_v_cross     = torch.zeros(self._n_layers, 1, self._num_kv_heads,
-                                         self._max_memory_len, self._head_dim)
-        dummy_cross_valid = torch.tensor([1], dtype=torch.long)
-        # position_ids drives RoPE for the new token; trace at max_tokens so it's
-        # dynamic (not constant-folded), then at inference step T we pass [[T]].
+        decoder_kv    = DecoderKVWrapper(model, extract_embeddings=self._extract_embeddings).eval()
+        dummy_k_self  = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                     self._max_tokens, self._head_dim)
+        dummy_v_self  = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                     self._max_tokens, self._head_dim)
+        dummy_k_cross = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                     self._max_memory_len, self._head_dim)
+        dummy_v_cross = torch.zeros(self._n_layers, 1, self._num_kv_heads,
+                                     self._max_memory_len, self._head_dim)
+        dummy_cross_valid  = torch.tensor([1], dtype=torch.long)
+        # position_ids drives RoPE; trace at max_tokens to avoid constant-folding.
         dummy_position_ids = torch.tensor([[self._max_tokens]], dtype=torch.long)
+
+        if self._extract_embeddings:
+            # First input is float embeddings [1, 1, hidden_size]; embed_tokens
+            # is never called so it is pruned from the ONNX graph entirely.
+            dummy_first_input  = torch.zeros(1, 1, self._hidden_size)
+            first_input_name   = "inputs_embeds"
+        else:
+            dummy_first_input  = torch.ones(1, 1, dtype=torch.long)
+            first_input_name   = "token"
+
         torch.onnx.export(
             decoder_kv,
-            (dummy_token, dummy_k_self, dummy_v_self,
+            (dummy_first_input, dummy_k_self, dummy_v_self,
              dummy_k_cross, dummy_v_cross, dummy_cross_valid, dummy_position_ids),
             str(self._onnx_dir / "decoder_kv.onnx"),
             dynamo=True,
-            input_names=["token", "k_self", "v_self",
+            input_names=[first_input_name, "k_self", "v_self",
                          "out_k_cross", "out_v_cross", "cross_kv_valid_len", "position_ids"],
             output_names=["logits", "out_k_self", "out_v_self",
                           "out_k_cross_out", "out_v_cross_out"],
@@ -874,6 +903,7 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
             "warmup_chunks": warmup_chunks,
             "max_tokens": self._max_tokens,
             "max_memory_len": self._max_memory_len,
+            "extract_embeddings": self._extract_embeddings,
         }
         with open(self._onnx_dir / "streaming_config.json", "w") as f:
             json.dump(config, f, indent=2)

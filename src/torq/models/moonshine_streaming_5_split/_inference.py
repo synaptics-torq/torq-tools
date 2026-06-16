@@ -96,6 +96,8 @@ class MoonshineStreaming5Split:
         dec_inputs = self._decoder._sess.get_inputs()
         dec_input_names = {inp.name for inp in dec_inputs}
         self._is_static_decoder = "current_len" in dec_input_names
+        # Detect embedding extraction: decoder takes float inputs_embeds instead of int token.
+        self._extract_embeddings = "inputs_embeds" in dec_input_names
         if self._is_static_decoder:
             # Derive max_tokens and max_memory_len from the pre-allocated buffer shapes.
             # k_self shape: [n_layers, 1, n_kv_heads, max_tokens, head_dim]
@@ -397,12 +399,16 @@ class MoonshineStreaming5Split:
             valid_len = cross_kv_fill if self._is_streaming_encoder else out_k_cross.shape[3]
 
             for step in range(max_tokens):
-                token_input = np.array([[tokens[-1]]], dtype=np.int64)
                 current_len = np.array([[step]], dtype=np.int64)  # [1, 1]
                 cross_kv_valid = np.array([valid_len], dtype=np.int64)  # [1]
 
+                if self._extract_embeddings:
+                    dec_feed = {"inputs_embeds": self._token_embeddings[tokens[-1]].reshape(1, 1, -1)}
+                else:
+                    dec_feed = {"token": np.array([[tokens[-1]]], dtype=np.int64)}
+
                 res = self._decoder.infer({
-                    "token": token_input,
+                    **dec_feed,
                     "k_self": k_self,
                     "v_self": v_self,
                     "out_k_cross": out_k_cross,
@@ -422,9 +428,13 @@ class MoonshineStreaming5Split:
             v_self = np.zeros((self._n_layers, 1, self._n_kv_heads, 0, self._head_dim), dtype=np.float32)
 
             for _ in range(max_tokens):
-                token_input = np.array([[tokens[-1]]], dtype=np.int64)
+                if self._extract_embeddings:
+                    dec_feed = {"inputs_embeds": self._token_embeddings[tokens[-1]].reshape(1, 1, -1)}
+                else:
+                    dec_feed = {"token": np.array([[tokens[-1]]], dtype=np.int64)}
+
                 res = self._decoder.infer({
-                    "token": token_input,
+                    **dec_feed,
                     "k_self": k_self,
                     "v_self": v_self,
                     "out_k_cross": out_k_cross,
