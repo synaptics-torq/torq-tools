@@ -496,7 +496,7 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
     def _setup_dirs(self) -> list[Path]:
         onnx_dir = self._models_dir / "source" / "onnx" / "merged" / self._model_size / self._model_dtype
         if self._streaming_static:
-            onnx_dir = onnx_dir / f"streaming_static_c{self._chunk_len}"
+            onnx_dir = onnx_dir / f"streaming_static_c{self._chunk_len}_t{self._max_tokens}"
         elif self._static_models:
             onnx_dir = onnx_dir / f"static_i{self._num_samples // 16000}"
         if self._streaming_static:
