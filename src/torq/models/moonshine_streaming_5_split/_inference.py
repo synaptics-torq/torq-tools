@@ -120,8 +120,9 @@ class MoonshineStreaming5Split:
         self._n_tokens_gen: int = 0
         self._infer_times: deque[float] = deque(maxlen=100)
 
-        # Load token embeddings
+        # Load token embeddings and position embedding table
         self._token_embeddings = self._find_token_embeddings()
+        self._pos_emb = self._find_pos_emb()
 
     @classmethod
     def from_onnx(
@@ -147,6 +148,12 @@ class MoonshineStreaming5Split:
         paths = list(self._decoder.model_path.parent.glob("decoder*token_embeddings.npy"))
         if not paths:
             raise FileNotFoundError("Missing token embeddings file 'decoder_token_embeddings.npy'")
+        return np.load(paths[0])
+
+    def _find_pos_emb(self) -> np.ndarray:
+        paths = list(self._adapter.model_path.parent.glob("adapter_pos_emb.npy"))
+        if not paths:
+            raise FileNotFoundError("Missing position embedding file 'adapter_pos_emb.npy'")
         return np.load(paths[0])
 
     def run(
@@ -233,8 +240,9 @@ class MoonshineStreaming5Split:
                         enc_res = self._encoder.infer({"stable_features": stable_feats, "right_ctx": right_ctx, **enc_bufs})
                         encoded_stable = enc_res[0]
                         enc_bufs = {f"buf_{i}": enc_res[i + 1] for i in range(n_enc_layers)}
-                        mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
-                        pos_offset = np.array([int(pos_offset[0]) + F], dtype=np.int64)
+                        pos_emb = self._pos_emb[int(pos_offset[0]):int(pos_offset[0]) + F].reshape(1, F, -1)
+                        mem = self._adapter.infer({"encoded": encoded_stable, "position_embeddings": pos_emb})[0]
+                        pos_offset[0] += F
                         kv_outs = self._cross_kv.infer({"memory": mem})
                         new_k, new_v = kv_outs[0], kv_outs[1]
                         if self._is_static_decoder:
@@ -266,8 +274,10 @@ class MoonshineStreaming5Split:
                         encoded_stable = enc_res[0]
                         enc_bufs = {f"buf_{i}": enc_res[i + 1] for i in range(n_enc_layers)}
 
-                        mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
-                        pos_offset = np.array([int(pos_offset[0]) + encoded_stable.shape[1]], dtype=np.int64)
+                        n = encoded_stable.shape[1]
+                        pos_emb = self._pos_emb[int(pos_offset[0]):int(pos_offset[0]) + n].reshape(1, n, -1)
+                        mem = self._adapter.infer({"encoded": encoded_stable, "position_embeddings": pos_emb})[0]
+                        pos_offset[0] += n
 
                         kv_outs = self._cross_kv.infer({"memory": mem})
                         new_k, new_v = kv_outs[0], kv_outs[1]
@@ -299,8 +309,9 @@ class MoonshineStreaming5Split:
                         enc_res = self._encoder.infer({"stable_features": batch, "right_ctx": zero_right, **enc_bufs})
                         encoded_stable = enc_res[0]
                         enc_bufs = {f"buf_{i}": enc_res[i + 1] for i in range(n_enc_layers)}
-                        mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
-                        pos_offset = np.array([int(pos_offset[0]) + F], dtype=np.int64)
+                        pos_emb = self._pos_emb[int(pos_offset[0]):int(pos_offset[0]) + F].reshape(1, F, -1)
+                        mem = self._adapter.infer({"encoded": encoded_stable, "position_embeddings": pos_emb})[0]
+                        pos_offset[0] += F
                         kv_outs = self._cross_kv.infer({"memory": mem})
                         new_k, new_v = kv_outs[0], kv_outs[1]
                         if self._is_static_decoder:
@@ -321,7 +332,9 @@ class MoonshineStreaming5Split:
                         **enc_bufs,
                     })
                     encoded_stable = enc_res[0]
-                    mem = self._adapter.infer({"encoded": encoded_stable, "pos_offset": pos_offset})[0]
+                    n = encoded_stable.shape[1]
+                    pos_emb = self._pos_emb[int(pos_offset[0]):int(pos_offset[0]) + n].reshape(1, n, -1)
+                    mem = self._adapter.infer({"encoded": encoded_stable, "position_embeddings": pos_emb})[0]
                     kv_outs = self._cross_kv.infer({"memory": mem})
                     new_k, new_v = kv_outs[0], kv_outs[1]
 
@@ -377,7 +390,9 @@ class MoonshineStreaming5Split:
                 raise ValueError("No features were processed from the audio input.")
             all_features = np.concatenate(accum_features, axis=1)
             encoded = self._encoder.infer({"features": all_features})[0]
-            memory = self._adapter.infer({"encoded": encoded, "pos_offset": np.zeros(1, dtype=np.int64)})[0]
+            n = encoded.shape[1]
+            pos_emb = self._pos_emb[:n].reshape(1, n, -1)
+            memory = self._adapter.infer({"encoded": encoded, "position_embeddings": pos_emb})[0]
             out_k_cross, out_v_cross = self._cross_kv.infer({"memory": memory})
             cross_kv_fill = None  # not used in batch path
 

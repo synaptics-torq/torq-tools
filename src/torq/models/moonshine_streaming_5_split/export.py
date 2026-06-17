@@ -312,15 +312,9 @@ class AdapterWrapper(torch.nn.Module):
         self.pos_emb = decoder.pos_emb
         self.proj = decoder.proj
 
-    def forward(self, encoded, pos_offset):
-        seq_len = encoded.shape[1]
-        arange = torch.arange(seq_len, device=encoded.device)
-        indices = pos_offset.to(torch.int64) + arange
-
-        position_embeddings = self.pos_emb(indices)
-        if position_embeddings.ndim == 2:
-            position_embeddings = position_embeddings.unsqueeze(0)
-
+    def forward(self, encoded, position_embeddings):
+        # position_embeddings: [1, seq_len, hidden_size] — precomputed by host via pos_emb table lookup.
+        # No Gather node in ONNX: the [4096, 320] embedding table would OOM SL2610 LRAM.
         memory = encoded + position_embeddings
         memory = self.proj(memory)
         return memory
@@ -622,6 +616,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         embeddings = model.model.decoder.embed_tokens.weight.detach().cpu().numpy()
         np.save(self._onnx_dir / "decoder_token_embeddings.npy", embeddings)
 
+        # Save position embedding table for host-side lookup (avoids Gather on [4096,320] in ONNX)
+        pos_emb = model.model.decoder.pos_emb.weight.detach().cpu().numpy()
+        np.save(self._onnx_dir / "adapter_pos_emb.npy", pos_emb)
+
         # Save tokenizer
         shutil.copy2(local_dir / "tokenizer.json", self._onnx_dir / "tokenizer.json")
         shutil.copy2(local_dir / "config.json", self._onnx_dir / "config.json")
@@ -712,15 +710,15 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         self._logger.info("Exporting Adapter wrapper to ONNX...")
         adapter = AdapterWrapper(model.model.decoder).eval()
         dummy_encoded = torch.randn(1, 5, enc_hidden)
-        dummy_pos_offset = torch.zeros(1, dtype=torch.int64)
+        dummy_pos_emb = torch.zeros(1, 5, enc_hidden)
 
         if self._static_models:
             torch.onnx.export(
                 adapter,
-                (dummy_encoded, dummy_pos_offset),
+                (dummy_encoded, dummy_pos_emb),
                 str(self._onnx_dir / "adapter.onnx"),
                 dynamo=True,
-                input_names=["encoded", "pos_offset"],
+                input_names=["encoded", "position_embeddings"],
                 output_names=["memory"],
             )
         else:
@@ -728,14 +726,14 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
             seq_len = torch.export.Dim("seq_length", min=1, max=3000)
             torch.onnx.export(
                 adapter,
-                (dummy_encoded, dummy_pos_offset),
+                (dummy_encoded, dummy_pos_emb),
                 str(self._onnx_dir / "adapter.onnx"),
                 dynamo=True,
-                input_names=["encoded", "pos_offset"],
+                input_names=["encoded", "position_embeddings"],
                 output_names=["memory"],
                 dynamic_shapes={
                     "encoded": {0: batch, 1: seq_len},
-                    "pos_offset": None,
+                    "position_embeddings": {0: batch, 1: seq_len},
                 },
             )
 
@@ -870,13 +868,13 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         self._logger.info("Exporting Streaming Static Adapter to ONNX (F=%d)...", F)
         adapter          = AdapterWrapper(model.model.decoder).eval()
         dummy_encoded    = torch.zeros(1, F, enc_hidden)
-        dummy_pos_offset = torch.zeros(1, dtype=torch.int64)
+        dummy_pos_emb    = torch.zeros(1, F, enc_hidden)
         torch.onnx.export(
             adapter,
-            (dummy_encoded, dummy_pos_offset),
+            (dummy_encoded, dummy_pos_emb),
             str(self._onnx_dir / "adapter.onnx"),
             dynamo=True,
-            input_names=["encoded", "pos_offset"],
+            input_names=["encoded", "position_embeddings"],
             output_names=["memory"],
         )
 
@@ -1126,10 +1124,11 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         # Move embeddings/tokenizer
-        emb_src = self._onnx_dir / "decoder_token_embeddings.npy"
-        emb_dst = Path(model_path).parent / "decoder_token_embeddings.npy"
-        if emb_src.exists():
-            shutil.copy2(emb_src, emb_dst)
+        for fname in ("decoder_token_embeddings.npy", "adapter_pos_emb.npy"):
+            src = self._onnx_dir / fname
+            dst = Path(model_path).parent / fname
+            if src.exists():
+                shutil.copy2(src, dst)
 
         if "encoder" in component:
             editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
@@ -1166,6 +1165,11 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         ):
             src = self._onnx_dir / filename
             dst = self._export_dir / filename
+            if src.exists():
+                shutil.copy2(src, dst)
+        for fname in ("adapter_pos_emb.npy",):
+            src = self._onnx_dir / fname
+            dst = self._export_dir / fname
             if src.exists():
                 shutil.copy2(src, dst)
         if self._streaming_static:
