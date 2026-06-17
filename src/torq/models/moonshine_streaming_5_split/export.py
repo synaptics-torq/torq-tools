@@ -1140,7 +1140,7 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
 
         if "frontend" in component:
             editor = MoonshineStreaming5SplitOnnxGraphEditor.from_onnx(model_path, component, self._onnx_export_dtype)
-            editor.decompose_reduce_sum()
+            # editor.decompose_reduce_sum() #Supported now. No need
             editor.decompose_asinh()
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
