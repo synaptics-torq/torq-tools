@@ -397,7 +397,7 @@ class DecoderKVWrapper(torch.nn.Module):
                 k_cross_3, v_cross_3,
                 k_cross_4, v_cross_4,
                 k_cross_5, v_cross_5,
-                cross_kv_valid_len: torch.Tensor | None = None,
+                cross_attn_bias: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None):
         k_selves  = [k_self_0,  k_self_1,  k_self_2,  k_self_3,  k_self_4,  k_self_5]
         v_selves  = [v_self_0,  v_self_1,  v_self_2,  v_self_3,  v_self_4,  v_self_5]
@@ -424,17 +424,12 @@ class DecoderKVWrapper(torch.nn.Module):
             dtype=k_self_0.dtype, device=k_self_0.device
         )
 
-        # When cross_kv_valid_len is provided, mask padded cross-KV slots via the
-        # existing encoder_attention_mask path so they receive -inf attention weight.
-        encoder_attention_mask = None
-        if cross_kv_valid_len is not None:
-            # Squeeze [1] → [] so the ONNX Less node is ([enc_seq_len], scalar) rather than
-            # ([enc_seq_len], [1]).  The torq/IREE linalg lowering of onnx.Less maps a [1]
-            # operand with an indexing_map of rank 0 but a rank-1 tensor, causing a mismatch.
-            # A true scalar [] avoids that broadcasting bug.
-            encoder_attention_mask = (
-                torch.arange(enc_seq_len, device=k_cross_0.device) < cross_kv_valid_len.squeeze()
-            ).unsqueeze(0)  # [1, enc_seq_len]
+        # cross_attn_bias is a precomputed [1, n_heads, 1, enc_seq_len] float additive bias
+        # (0.0 for valid positions, -1e9 for padding) computed on the host before each step.
+        # Passing it as a 4D tensor triggers the early-exit in _preprocess_mask_arguments so
+        # HuggingFace returns it as-is, and the Add in eager_attention_forward becomes
+        # [1, n_heads, 1, enc_seq_len] + [1, n_heads, 1, enc_seq_len] — no broadcasting.
+        encoder_attention_mask = cross_attn_bias
 
         # Call decoder — bypass embed_tokens when embeddings are extracted externally
         if self._extract_embeddings:
@@ -920,7 +915,10 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         ]
         cross_kv_in_names  = [name for i in range(self._n_layers) for name in (f"k_cross_{i}", f"v_cross_{i}")]
         cross_kv_out_names = [f"out_{name}" for name in cross_kv_in_names]
-        dummy_cross_valid  = torch.tensor([1], dtype=torch.long)
+        # Precomputed cross-attention additive bias: [1, n_kv_heads, 1, max_memory_len].
+        # On the host, valid positions are 0.0 and padding slots are -1e9.  Traced with
+        # zeros here; the 4D shape is what matters for the ONNX graph structure.
+        dummy_cross_attn_bias = torch.zeros(1, self._num_kv_heads, 1, self._max_memory_len)
         # position_ids drives RoPE; trace at max_tokens to avoid constant-folding.
         dummy_position_ids = torch.tensor([[self._max_tokens]], dtype=torch.long)
 
@@ -936,11 +934,11 @@ class MoonshineStreaming5SplitExporter(OnnxModelExporterBase):
         torch.onnx.export(
             decoder_kv,
             (dummy_first_input, *self_kv_dummies, *cross_kv_dummies,
-             dummy_cross_valid, dummy_position_ids),
+             dummy_cross_attn_bias, dummy_position_ids),
             str(self._onnx_dir / "decoder_kv.onnx"),
             dynamo=True,
             input_names=[first_input_name, *self_kv_in_names,
-                         *cross_kv_in_names, "cross_kv_valid_len", "position_ids"],
+                         *cross_kv_in_names, "cross_attn_bias", "position_ids"],
             output_names=["logits", *self_kv_out_names, *cross_kv_out_names],
         )
 

@@ -398,9 +398,16 @@ class MoonshineStreaming5Split:
             )
             valid_len = cross_kv_fill if self._is_streaming_encoder else out_k_cross.shape[3]
 
+            # Precompute cross-attention bias once per decode: 0.0 for valid positions,
+            # -1e9 for padding slots.  Shape [1, n_kv_heads, 1, max_memory_len] matches
+            # attention scores exactly so no broadcasting occurs in the ONNX graph.
+            cross_attn_bias = np.zeros(
+                (1, self._n_kv_heads, 1, self._max_memory_len), dtype=np.float32
+            )
+            cross_attn_bias[:, :, :, valid_len:] = -1e9
+
             for step in range(max_tokens):
                 current_len = np.array([[step]], dtype=np.int64)  # [1, 1]
-                cross_kv_valid = np.array([valid_len], dtype=np.int64)  # [1]
 
                 if self._extract_embeddings:
                     dec_feed = {"inputs_embeds": self._token_embeddings[tokens[-1]].reshape(1, 1, -1)}
@@ -410,7 +417,7 @@ class MoonshineStreaming5Split:
                 dec_feed_kv = {
                     **dec_feed,
                     "current_len": current_len,
-                    "cross_kv_valid_len": cross_kv_valid,
+                    "cross_attn_bias": cross_attn_bias,
                     "position_ids": current_len,
                 }
                 for i in range(self._n_layers):
