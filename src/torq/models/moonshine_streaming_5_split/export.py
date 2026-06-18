@@ -44,9 +44,22 @@ def _layer_from_kv(k, v):
 
 # Patch Asinh compression to use basic ops to avoid ONNX export issues with legacy exporter
 from transformers.models.moonshine_streaming.modeling_moonshine_streaming import MoonshineStreamingAsinhCompression
+# Approximate asinh with a clamped odd polynomial in v (asinh(v) = v*(c0 + c1*v^2 + ...))
+# so the exported graph uses only Clip/Mul/Add and avoids Log + Sqrt, which the torq
+# backend cannot lower. Fit over [-_ASINH_R, _ASINH_R]; the input here is a CMVN z-score
+# scaled by exp(log_k) (~0.645), so it stays well within this range and clamping the rare
+# tail is benign (asinh saturates). Coefficients c0..c4 are for u = v**2.
+_ASINH_R = 6.0
+_ASINH_C = [9.701152e-01, -7.976821e-02, 5.723432e-03, -1.902770e-04, 2.265939e-06]
+
 def _patched_asinh_forward(self, x):
     val = torch.exp(self.log_k) * x
-    return torch.log(val + torch.sqrt(val**2 + 1.0))
+    val = val.clamp(-_ASINH_R, _ASINH_R)        # tail safety (asinh saturates, so benign)
+    u = val * val
+    p = val.new_full((), _ASINH_C[-1])
+    for c in reversed(_ASINH_C[:-1]):           # Horner in u = v**2
+        p = p * u + c
+    return val * p
 MoonshineStreamingAsinhCompression.forward = _patched_asinh_forward
 
 
