@@ -35,6 +35,7 @@ __all__ = [
     "BroadcastOpInputs",
     "ExtractConstantLUT",
     "EliminateTranspose",
+    "RetargetCrossAttnKeyLayout",
     "CollapseReshapeChain",
     "CollapseGQABroadcast",
     "TrimLMHeadVocab",
@@ -710,6 +711,136 @@ class EliminateTranspose(OnnxGraphEdit):
             self._logger.debug(
                 "Folded Transpose '%s' into Reshape '%s'", node.name, node.name + "_fold_reshape"
             )
+
+
+@dataclass
+class RetargetCrossAttnKeyLayout(OnnxGraphEdit):
+    """
+    Remove the redundant cross-attention key-cache transpose round-trip
+    shared between the encoder (cache producer) and decoder (cache consumer).
+
+    The cross-attn key cache is produced (in the encoder, or in
+    ``gen_encoder_cache`` when the cache is not folded) as
+    ``Reshape -> Transpose(perm=[0,2,1,3])`` yielding ``[B, H, L, D]``, then
+    re-transposed in the decoder via ``Transpose(perm=[0,1,3,2])`` to
+    ``[B, H, D, L]`` for the Q.K^T score MatMul. Those two transposes compose
+    to a single ``[B, L, H, D] -> [B, H, D, L]`` permutation, so the cache can
+    simply be carried in ``[B, H, D, L]`` end to end.
+
+    The edit infers its role from the graph it is applied to:
+
+    * Producer side (the key tensor is a graph **output**): rewrite the
+      feeding Transpose's perm ``[0,2,1,3] -> [0,2,3,1]`` so it emits
+      ``[B, H, D, L]`` directly, and swap the last two dims of the output.
+    * Consumer side (the key tensor is a graph **input**): drop the
+      ``perm=[0,1,3,2]`` Transpose and swap the last two dims of the input so
+      the cache feeds the score MatMul directly.
+
+    Net effect: one Transpose removed per layer from the autoregressive
+    decoder at no added cost in the encoder. Values are deliberately left in
+    ``[B, H, L, D]`` (they feed the score.V MatMul as-is), so keys and values
+    no longer share a layout -- this is incompatible with combined key/value
+    cache I/O and must be gated on individual KV I/O.
+    """
+
+    key_tensor_re: str | re.Pattern = r"\.encoder\.key$"
+    producer_perm: tuple[int, ...] = (0, 2, 1, 3)
+    consumer_perm: tuple[int, ...] = (0, 1, 3, 2)
+    retargeted_perm: tuple[int, ...] = (0, 2, 3, 1)
+
+    def __post_init__(self):
+        if isinstance(self.key_tensor_re, str):
+            self.key_tensor_re = re.compile(self.key_tensor_re)
+        self._output_names = {o.name for o in self.graph.outputs}
+        self._input_names = {i.name for i in self.graph.inputs}
+        super().__post_init__()
+        self.requires_shape_inference = True
+
+    @staticmethod
+    def _static_perm(node: gs.Node) -> tuple[int, ...] | None:
+        perm = node.attrs.get("perm", None)
+        if perm is None:
+            return None
+        return tuple(int(p) for p in perm)
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Transpose" or not node.inputs or not node.outputs:
+            return False
+        perm = self._static_perm(node)
+        if perm is None:
+            return False
+        out, inp = node.outputs[0], node.inputs[0]
+        # Producer side: this Transpose feeds a graph output named *.encoder.key
+        if (
+            perm == self.producer_perm
+            and out.name in self._output_names
+            and self.key_tensor_re.search(out.name)
+        ):
+            inp_shape = getattr(inp, "shape", None)
+            if inp_shape is None or not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+                self._logger.warning(
+                    "Skipping cross-attn key producer '%s': non-static input shape %s",
+                    node.name, inp_shape
+                )
+                return False
+            return True
+        # Consumer side: this Transpose reads a graph input named *.encoder.key
+        if (
+            perm == self.consumer_perm
+            and inp.name in self._input_names
+            and self.key_tensor_re.search(inp.name)
+        ):
+            # Only safe to drop if the input feeds this Transpose alone; any
+            # other consumer would still expect the original [B, H, L, D].
+            if len(inp.outputs) != 1:
+                self._logger.warning(
+                    "Skipping cross-attn key consumer '%s': input '%s' has %d consumers",
+                    node.name, inp.name, len(inp.outputs)
+                )
+                return False
+            inp_shape = getattr(inp, "shape", None)
+            if inp_shape is None or not all(isinstance(d, (int, np.integer)) for d in inp_shape):
+                self._logger.warning(
+                    "Skipping cross-attn key consumer '%s': non-static input shape %s",
+                    node.name, inp_shape
+                )
+                return False
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Transpose")
+        if self._static_perm(node) == self.producer_perm:
+            self._retarget_producer(node)
+        else:
+            self._drop_consumer(node)
+
+    def _retarget_producer(self, node: gs.Node):
+        out = node.outputs[0]
+        inp_shape = [int(d) for d in node.inputs[0].shape]
+        old_out_shape = list(out.shape) if out.shape is not None else None
+        node.attrs["perm"] = list(self.retargeted_perm)
+        out.shape = [inp_shape[p] for p in self.retargeted_perm]
+        self._logger.debug(
+            "Retargeted cross-attn key producer '%s': perm %s -> %s, output %s -> %s",
+            node.name, list(self.producer_perm), list(self.retargeted_perm),
+            old_out_shape, out.shape
+        )
+
+    def _drop_consumer(self, node: gs.Node):
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        old_inp_shape = [int(d) for d in inp.shape]
+        consumers: list[gs.Node] = list(out.outputs)
+        # The graph input now carries the already-transposed [B, H, D, L] layout.
+        inp.shape = [old_inp_shape[p] for p in self.consumer_perm]
+        rewire_consumers(consumers, out, inp)
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.debug(
+            "Dropped cross-attn key consumer Transpose '%s'; input '%s' %s -> %s",
+            node.name, inp.name, old_inp_shape, inp.shape
+        )
 
 
 @dataclass
@@ -2910,6 +3041,10 @@ class CommonGraphEditsMixin:
 
     def collapse_reshape_chains(self):
         self.apply_edit(CollapseReshapeChain(self._graph, self._graph_name))
+        return self
+
+    def retarget_cross_attn_key_layout(self):
+        self.apply_edit(RetargetCrossAttnKeyLayout(self._graph, self._graph_name))
         return self
 
     def collapse_gqa_broadcast(self):
