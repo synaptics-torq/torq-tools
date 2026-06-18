@@ -48,6 +48,7 @@ COMMON_ES_EN_PUNCT = {
     "&",
     "*",
     "%",
+    "¢",
     "_",
 }
 BYTE_TOKEN_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
