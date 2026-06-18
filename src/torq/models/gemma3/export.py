@@ -432,6 +432,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, _):
         self._patch_static_model(model_path)
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
 
     def validate_onnx(self, n_iters: int = 5):
         # simple dataset to test functional equivalence
