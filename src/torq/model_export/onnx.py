@@ -134,6 +134,9 @@ class OnnxModelExporterBase(ABC):
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
 
+    def _export_path_for_component(self, component: str) -> Path:
+        return self._export_dir / f"{component}.onnx"
+
     def export_onnx(self, validate: bool = True):
         if self._static_models:
             self.make_static()
@@ -142,7 +145,7 @@ class OnnxModelExporterBase(ABC):
             if comp in self._skip_export:
                 self._logger.info("Skipping export of component %s", comp)
                 continue
-            self._export_paths[comp] = self._export_dir / f"{comp}.onnx"
+            self._export_paths[comp] = self._export_path_for_component(comp)
             self._logger.info("(%s) Checking model...", comp)
             model = self.check_model(model)
             onnx.save(model, self._export_paths[comp])

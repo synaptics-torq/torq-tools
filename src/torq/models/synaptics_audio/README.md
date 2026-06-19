@@ -67,13 +67,13 @@ model, it leaves the graph unchanged:
 |--:|------|--------|---------|
 | 1 | `apply_fixed_input_shapes`              | `OnnxGraphEditor`            | Stamp explicit `Recipe.input_shape_overrides` onto `graph.input` (no-op when overrides are empty -- the common case). |
 | 2 | `freeze_shape_seeds`                    | `OnnxGraphEditor`            | Constant-fold shape-computation subgraphs feeding `Reshape` / `Expand` / `Slice` / `Pad` controls. |
-| 3 | `EliminateTranspose`                    | `graph_edit.edits`           | Remove `Transpose` nodes that don't physically rearrange data (handles singleton-axis Transposes). |
-| 4 | `DecomposeBidirectionalRnn`             | `graph_edit.edits`           | Split bidirectional `GRU` / `LSTM` / `RNN` into two unidirectional forward layers (works around torch-mlir). |
-| 5 | `EliminateRank0Gather`                  | `graph_edit.edits`           | Rewrite `Gather` ops producing rank-0 scalars + `Unsqueeze[0]` into a rank-1 path (works around an IREE codegen bug). |
-| 6 | `RewriteNegativePads`                   | `graph_edit.edits`           | Rewrite `Pad` ops with negative (crop) paddings into `Pad(positive) + Slice`. |
-| 7 | `AbsorbPadding`                         | `graph_edit.edits`           | Fuse non-negative `Pad` layers into the following `Conv`'s `pads` attribute. |
-| 8 | `EliminateSingletonGatherUnsqueeze`     | `graph_edit.edits`           | Remove singleton-axis `Gather -> unary -> Unsqueeze` rank shims. |
-| 9 | `WidenStridedDepthwiseConv`             | `graph_edit.edits`           | Widen narrow strided-depthwise `Conv`s so the Torq compiler avoids the DEDR scatter-gather codegen path. |
+| 3 | `EliminateTranspose`                    | `graph_edit.edits.shape`     | Remove `Transpose` nodes that don't physically rearrange data (handles singleton-axis Transposes). |
+| 4 | `DecomposeBidirectionalRnn`             | `graph_edit.edits.rnn`       | Split bidirectional `GRU` / `LSTM` / `RNN` into two unidirectional forward layers (works around torch-mlir). |
+| 5 | `EliminateRank0Gather`                  | `graph_edit.edits.shape`     | Rewrite `Gather` ops producing rank-0 scalars + `Unsqueeze[0]` into a rank-1 path (works around an IREE codegen bug). |
+| 6 | `RewriteNegativePads`                   | `graph_edit.edits.padding`   | Rewrite `Pad` ops with negative (crop) paddings into `Pad(positive) + Slice`. |
+| 7 | `AbsorbPadding`                         | `graph_edit.edits.padding`   | Fuse non-negative `Pad` layers into the following `Conv`'s `pads` attribute. |
+| 8 | `EliminateSingletonGatherUnsqueeze`     | `graph_edit.edits.shape`     | Remove singleton-axis `Gather -> unary -> Unsqueeze` rank shims. |
+| 9 | `WidenStridedDepthwiseConv`             | `graph_edit.edits.conv`      | Widen narrow strided-depthwise `Conv`s so the Torq compiler avoids the DEDR scatter-gather codegen path. |
 | 10 | `finalize_torq_ready_onnx`             | `torq.utils.onnx`            | Symbolic shape inference, `value_info` cleanup, IR-version cap (run after the editor exports). |
 
 Order matters: shape-resolving steps first (1-2), shape-aware rewrites in the
@@ -194,11 +194,10 @@ feature-frame count.
 ### Adding a new rewrite
 
 If the rewrite is generic (could plausibly be useful to another exporter), add
-it as an `OnnxGraphEdit` subclass in `torq.graph_edit.edits` -- the existing
-audio rewrites (`EliminateRank0Gather`, `RewriteNegativePads`, etc.) live there
-alongside the LLM-oriented ones. Then call it from `run_audio_pipeline` at the
-appropriate position (shape-resolving first, structural rewrites in the
-middle).
+it as an `OnnxGraphEdit` subclass in the appropriate `torq.graph_edit.edits`
+submodule -- for example `shape`, `padding`, `conv`, or `rnn`. Then call it
+from `run_audio_pipeline` at the appropriate position (shape-resolving first,
+structural rewrites in the middle).
 
 If the rewrite is whole-graph (not a per-node pattern -- e.g. a constant-fold
 that needs an ORT round-trip), add it as a method on `OnnxGraphEditor` next to

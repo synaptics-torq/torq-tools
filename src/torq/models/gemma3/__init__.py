@@ -21,7 +21,7 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         "--max-gen-tokens",
         type=int,
         default=DEFAULT_GEN_TOKENS,
-        help="Input audio length in seconds (default: %(default)s)",
+        help="Token generation limit (default: %(default)s)",
     )
     parser.add_argument(
         "-s",
