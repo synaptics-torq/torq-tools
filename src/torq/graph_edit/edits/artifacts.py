@@ -63,6 +63,9 @@ class ExtractConstantLUT(OnnxGraphEdit):
             shape=lut_out.shape
         )
         rewire_consumers(consumers, lut_out, lut_entry_inp)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is lut_out:
+                self.graph.outputs[i] = lut_entry_inp
         self.graph.inputs.append(lut_entry_inp)
         node.outputs.clear()
         self._logger.debug(
