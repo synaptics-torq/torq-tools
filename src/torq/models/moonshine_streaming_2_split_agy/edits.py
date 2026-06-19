@@ -1,0 +1,1639 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from pathlib import Path
+import hashlib
+import os
+import re
+
+import onnx
+import onnx_graphsurgeon as gs
+import numpy as np
+
+from .onnx import (
+    OnnxGraphEdit,
+    rewire_consumers
+)
+
+from ...utils.onnx import (
+    normalize_layer_name
+)
+
+from ...graph_edit.edits import EliminateTranspose, CollapseReshapeChain
+
+__all__ = [
+    "ReplaceDynamicKVCache",
+    "MaskFutureAttentionScores",
+    "AddCurrLenInput",
+    "ConvertToStaticIndex",
+    "DequantizeProjectionsMatMul",
+    "RemoveIsNaN",
+    "RemoveRedundantCasts",
+    "FoldScalarMatMul",
+    "ConstantBroadcastPolicy",
+    "BroadcastOpInputs",
+    "ExtractConstantLUT",
+    "DecomposeLayerNormalization",
+    "DecomposeLayerNormalizationMulReciprocal",
+    "DecomposeGelu",
+    "DecomposeBooleanAnd",
+    "CombineKVCacheMixin",
+    "CommonGraphEditsMixin",
+]
+
+
+@dataclass
+class ReplaceDynamicKVCache(OnnxGraphEdit):
+    """
+    Replace dynamic key-value cache updates with a static in-place blend.
+
+    `cache[i] = new_value if i == cur_len else cache[i]`
+
+    Args:
+        cur_len (gs.Variable): Graph input to represent current sequence length
+        max_tokens (int): Maximum sequence length
+
+    Raises:
+        ValueError: If Concat node doesn't have expected attributes
+
+    Notes:
+        - Builds a mask that is true for the current position
+        - Blends the new cache value into the existing cache using the mask
+        - Disconnects old Concat node from the graph
+        - Optimizers may CSE-deduplicate identical masks into one shared tensor
+    """
+
+    cur_len: gs.Variable
+    max_tokens: int
+
+    def __post_init__(self):
+        self.output_names = {o.name for o in self.graph.outputs}
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Concat" or node.attrs.get("axis") != -2:
+            return False
+        # Primary: Concat output is directly a graph output (torchscript / non-dynamo export)
+        if node.outputs[0].name in self.output_names:
+            return True
+        # Secondary: per-layer KV concat in dynamo stacked-cache export.
+        # One input is a Gather whose data source is a graph input (the past KV buffer).
+        for inp in node.inputs:
+            if inp.inputs:
+                producer = inp.inputs[0]
+                if producer.op == "Gather" and producer.inputs:
+                    gather_src = producer.inputs[0]
+                    if isinstance(gather_src, gs.Variable) and not gather_src.inputs:
+                        return True
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Concat")
+        cache_output = node.outputs[0].name
+        if node.attrs["axis"] != -2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
+            )
+        if len(node.inputs) != 2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat node to have 2 inputs, got {len(node.inputs)}"
+            )
+
+        past_cache_vals, new_cache_val = node.inputs
+        output = node.outputs[0]
+
+        # Update output shape to match past_cache_vals (pre-allocated buffer).
+        # The Where blend keeps the buffer size fixed; the old Concat shape
+        # (past+1) no longer applies.
+        if getattr(past_cache_vals, 'shape', None) is not None:
+            output.shape = list(past_cache_vals.shape)
+
+        # create mask for current position
+        mask_shape = [1, 1, self.max_tokens, 1]
+        if not (time_ids := self.graph.tensors().get("time_ids")):
+            time_ids = gs.Constant(
+                "time_ids", np.arange(self.max_tokens, dtype=np.int64).reshape(*mask_shape)
+            )
+        mask = self.graph.layer(
+            name=output.name + "_update_mask",
+            op="Equal",
+            inputs=[time_ids, self.cur_len],
+            outputs=[
+                gs.Variable(
+                    f"{output.name}_mask_eq", dtype=onnx.TensorProto.BOOL, shape=mask_shape
+                )
+            ],
+        )[0]
+
+        # blend new value into cache using the mask
+        self.graph.layer(
+            name=output.name + "_blend_kv",
+            op="Where",
+            inputs=[mask, new_cache_val, past_cache_vals],
+            outputs=[output],
+        )
+
+        # disconnect Concat node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Added static KV cache for output '%s'", cache_output)
+
+
+@dataclass
+class MaskFutureAttentionScores(OnnxGraphEdit):
+    """
+    Add causal masking to attention scores to prevent attending to future tokens.
+
+    Enforces left-to-right causality by assigning a large negative value to positions > `cur_len`, thereby blocking future positions.
+
+    Args:
+        cur_len (gs.Variable): Graph input to represent current sequence length
+        max_tokens (int): Maximum number of tokens in sequence
+        export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
+
+    Raises:
+        ValueError: If Softmax producer is not the expected op
+
+    Notes:
+        - Creates a mask that is only true for positions <= cur_len
+        - Rewires the attention score producer to use this mask
+        - Optimizers may CSE-deduplicate identical masks into one shared tensor
+    """
+
+    cur_len: gs.Variable
+    max_tokens: int
+    export_dtype: onnx.TensorProto.DataType
+
+    def __post_init__(self):
+        if self.export_dtype not in onnx.TensorProto.DataType.values():
+            raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Softmax":
+            is_self_attn = node.name.endswith("self_attn/Softmax")
+            if not is_self_attn and node.inputs:
+                inp_shape = getattr(node.inputs[0], "shape", None)
+                if inp_shape and len(inp_shape) >= 1:
+                    last_dim = inp_shape[-1]
+                    if isinstance(last_dim, str):
+                        is_self_attn = ("past_seq" in last_dim)
+                    else:
+                        # Accept max_tokens (after KV replacement) or max_tokens+1 (traced shape)
+                        is_self_attn = last_dim in (self.max_tokens, self.max_tokens + 1)
+            if is_self_attn:
+                return isinstance(node.i(), gs.Node)
+        return False
+
+    def transform(self, node: gs.Node):
+        if not self.export_dtype:
+            raise RuntimeError("ONNX export dtype is requried for this graph edit, provide via `export_dtype`")
+
+        self._check_node_op(node, "Softmax")
+
+        # create bool mask where positions > cur_len are effectively blocked
+        # by being set to a large negative value
+        mask_shape = [1, 1, 1, self.max_tokens]
+        if not (time_axis := self.graph.tensors().get("time_axis")):
+            time_axis = gs.Constant(
+                "time_axis", np.arange(self.max_tokens, dtype=np.int64).reshape(*mask_shape)
+            )
+        if not (attn_mask_keep := self.graph.tensors().get("attn_mask_keep")):
+            attn_mask_keep = gs.Constant(
+                "attn_mask_keep", np.asarray(0.0, dtype=np.float32),
+                export_dtype=self.export_dtype
+            )
+        if not (attn_mask_block := self.graph.tensors().get("attn_mask_block")):
+            max_float = -65504 if self.export_dtype == onnx.TensorProto.FLOAT16 else -1e9
+            attn_mask_block = gs.Constant(
+                "attn_mask_block", np.asarray(max_float, dtype=np.float32),
+                export_dtype=self.export_dtype
+            )
+        mask_lte = self.graph.layer(
+            name=node.name + "_lte_cur_len",
+            op="LessOrEqual",
+            inputs=[time_axis, self.cur_len],
+            outputs=[
+                gs.Variable(
+                    node.name + "_less", dtype=onnx.TensorProto.BOOL, shape=mask_shape
+                )
+            ],
+        )[0]
+        mask = self.graph.layer(
+            name=node.name + "_mask_attn",
+            op="Where",
+            inputs=[mask_lte, attn_mask_keep, attn_mask_block],
+            outputs=[
+                gs.Variable(node.name + "_where", dtype=node.inputs[0].dtype, shape=mask_shape)
+            ],
+        )[0]
+
+        # rewire producer node to use mask
+        producer_node: gs.Node = node.i()
+        if producer_node.op != "Add":
+            producer_output: gs.Variable = node.inputs[0]
+            consumers: list[gs.Node] = producer_output.outputs.copy()
+            add_output: gs.Variable = self.graph.layer(
+                name=node.name + "_bias_add",
+                op="Add",
+                inputs=[node.inputs[0], mask],
+                outputs=[
+                    gs.Variable(node.name + "_biased", dtype=producer_output.dtype, shape=producer_output.shape)
+                ],
+            )[0]
+            rewire_consumers(consumers, producer_output, add_output)
+        else:
+            producer_node.inputs[1] = mask
+
+        self._logger.debug("Added causal attention mask to scores at node '%s'", producer_node.name)
+
+
+@dataclass
+class AddCurrLenInput(OnnxGraphEdit):
+    """
+    Replace dynamic sequence length computation with runtime model input.
+
+    Removes the Shape->Gather runtime-calculated sequence length and replaces it with the model input `cur_len`.
+
+    Args:
+        cur_len (gs.Variable): Graph input to represent current sequence length
+
+    Raises:
+        ValueError: If Shape consumer is not a `Gather` op
+
+    Notes:
+        - Replaces `Shape(past_key_values) -> Gather(i=2)` with `cur_len`
+        - Disconnects original Shape and Gather nodes
+    """
+
+    cur_len: gs.Variable
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Shape" and any(x in node.inputs[0].name for x in ("past_key_values", "past_self")):
+            return isinstance(node.o(), gs.Node) and node.o().op in ("Gather", "Squeeze")
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Shape")
+        gather_node: gs.Node = node.o()
+        if not isinstance(gather_node, gs.Node) or gather_node.op not in ("Gather", "Squeeze"):
+            raise ValueError(f"Expected Gather or Squeeze node after Shape, got {gather_node}")
+
+        gather_out: gs.Variable = gather_node.outputs[0]
+        consumers: list[gs.Node] = list(gather_out.outputs)
+        rewire_consumers(consumers, gather_out, self.cur_len)
+
+        # disconnect Shape + Gather/Squeeze branch
+        node.inputs.clear()
+        gather_node.outputs.clear()
+
+        self._logger.debug("Replaced dynamic seq len getter at node '%s'", node.name)
+
+
+@dataclass
+class ConvertToStaticIndex(OnnxGraphEdit):
+    """
+    Convert dynamic Range-based indexing to static indexing if `index = Range(start, start + 1, 1)`.
+
+    Replaces redundant index computation `Range(start, start + 1, 1)` by wiring consumers to directly accept `start`.
+
+    Raises:
+        ValueError: If Range limit is not produced by an `Add` op
+        ValueError: If Range start and limit don't share a common producer
+
+    Notes:
+        - Directly connects Range start to consumers of Range node
+        - Disconnects Range node from the graph
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return (
+            node.op == "Range"
+            and node.i(1).op == "Add"
+            and any(inp is node.inputs[0] for inp in node.i(1).inputs)
+        )
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Range")
+        start = node.inputs[0]
+        limit_prod = node.i(1)
+        if limit_prod.op != "Add":
+            raise ValueError(
+                f"Expected Add node for limit, got {limit_prod.op} for dynamic range replacement"
+            )
+        if not any(inp is start for inp in limit_prod.inputs):
+            raise ValueError(
+                f"Range node and limit node must have common producer for dynamic range replacement"
+            )
+        range_out: gs.Variable = node.outputs[0]
+        consumers: list[gs.Node] = list(range_out.outputs)
+        for consumer in consumers:
+            for i, inp in enumerate(consumer.inputs):
+                if inp is range_out:
+                    consumer.inputs[i] = start
+
+        # disconnect Range node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Replaced dynamic range index for node '%s'", node.name)
+
+
+@dataclass
+class DequantizeProjectionsMatMul(OnnxGraphEdit):
+    """
+    Manually dequantize projection scores MatMul producer to prevent MLIR warnings.
+
+    Args:
+        hidden_size (int): SmolLM2 hidden KV dims size
+        vocab_size (int): SmolLM2 vocabulary size
+        export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
+
+    Raises:
+        ValueError: If MatMul producer is not a `DequantizeLinear` op
+        ValueError: If weights are not correctly formatted
+        ValueError: If dequantization params are not correctly formatted
+    """
+
+    hidden_size: int
+    vocab_size: int
+    export_dtype: onnx.TensorProto.DataType
+
+    def __post_init__(self):
+        if self.export_dtype not in onnx.TensorProto.DataType.values():
+            raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
+        return super().__post_init__()
+
+    def match(self, node: gs.Node):
+        if node.op == "MatMul" and node.outputs[0].name == "logits":
+            return isinstance(node.i(1), gs.Node) and node.i(1).op == "DequantizeLinear"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        dequant_node: gs.Node = node.i(1)
+        try:
+            transpose_node: gs.Node = dequant_node.i()
+        except IndexError:
+            self._logger.debug("Dequantize node does not have Transpose input, looking in inputs for const weight")
+            quant_weights: gs.Constant = dequant_node.inputs[0]
+        else:
+            quant_weights: gs.Constant = transpose_node.inputs[0]
+        if not isinstance(quant_weights, gs.Constant):
+            self._logger.warning("Dequantization weights not found, skipping")
+            return
+
+        self._check_node_op(dequant_node, "DequantizeLinear")
+
+        W_q: np.ndarray = quant_weights.values
+        if W_q.shape == (self.vocab_size, self.hidden_size):
+            W_q = W_q.T
+        if W_q.shape != (self.hidden_size, self.vocab_size):
+            raise ValueError(f"Expected weight shape of {(self.vocab_size, self.hidden_size)} or {(self.hidden_size, self.vocab_size)}, got {W_q.shape}")
+        if W_q.dtype != np.uint8:
+            raise ValueError(f"Expected uint8 weights, got {W_q.dtype}")
+
+        if len(dequant_node.inputs) < 3:
+            raise ValueError(f"Expected 3 inputs (x, scale, zp) for DequantizeLinear node, got {len(dequant_node.inputs)}")
+        scale_inp, zp_inp = dequant_node.inputs[1], dequant_node.inputs[2]
+        if not isinstance(scale_inp, gs.Constant):
+            raise ValueError(f"Expected constant scale, got {type(scale_inp)}")
+        if not isinstance(zp_inp, gs.Constant):
+            raise ValueError(f"Expected constant zp, got {type(scale_inp)}")
+        scale = scale_inp.values.item()
+        zp = zp_inp.values.item()
+        node.inputs[1] = gs.Constant(
+            node.inputs[1].name + "_float_folded",
+            (W_q.astype(np.int32) - np.int32(zp)).astype(np.float32) * np.float32(scale),
+            export_dtype=self.export_dtype
+        )
+
+        dequant_node.outputs.clear()
+
+        self._logger.debug("Dequantized projection scores producer")
+
+
+@dataclass
+class RemoveIsNaN(OnnxGraphEdit):
+    """
+    Remove unsupported IsNaN operations.
+
+    Raises:
+        ValueError: If IsNaN is not consumed by a `Where` op
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "IsNaN"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "IsNaN")
+        producer: gs.Tensor = node.inputs[0]
+        where_node: gs.Node = node.o()
+        if where_node.op != "Where":
+            raise ValueError(
+                f"Expected Where node consumer, got {where_node.op} for IsNaN replacement"
+            )
+        where_out: gs.Variable = where_node.outputs[0]
+        consumers: list[gs.Node] = list(where_out.outputs)
+        rewire_consumers(consumers, where_out, producer)
+
+        # disconnect IsNaN -> Where chain
+        node.inputs.clear()
+        where_node.inputs.clear()
+        where_node.outputs.clear()
+
+        self._logger.debug("Removed unsupported IsNaN op '%s'", node.name)
+
+
+@dataclass
+class RemoveRedundantCasts(OnnxGraphEdit):
+    """
+    Remove redundant Cast ops where input dtype == output dtype
+    """
+
+    @staticmethod
+    def _to_onnx_dtype(dtype: np.dtype | int | None) -> int | None:
+        if dtype is None:
+            return None
+        if isinstance(dtype, int):
+            return dtype
+        try:
+            return onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+        except Exception:
+            return None
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Cast" or not node.inputs or not node.outputs:
+            return False
+        inp_dtype = self._to_onnx_dtype(getattr(node.inputs[0], "dtype", None))
+        if inp_dtype is None:
+            return False
+        cast_to = node.attrs.get("to", None)
+        if isinstance(cast_to, int) and inp_dtype == cast_to:
+            return True
+        out_dtype = self._to_onnx_dtype(getattr(node.outputs[0], "dtype", None))
+        return out_dtype is not None and inp_dtype == out_dtype
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Cast")
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        consumers: list[gs.Node] = list(out.outputs)
+        rewire_consumers(consumers, out, inp)
+        for i, graph_out in enumerate(self.graph.outputs):
+            if graph_out is out:
+                self.graph.outputs[i] = inp
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.debug("Removed redundant Cast node '%s'", node.name)
+
+
+@dataclass
+class FoldScalarMatMul(OnnxGraphEdit):
+    """
+    Fold `MatMul A @ B`, where B is a batched scalar, into Mul.
+
+    Raises:
+        ValueError: If MatMul operand shapes are incompatible
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "MatMul":
+            return False
+
+        a, b = node.inputs
+        a_shape = getattr(a, "shape", None)
+        b_shape = getattr(b, "shape", None)
+        if a_shape and b_shape and len(a_shape) >= 2 and len(b_shape) >= 2:
+            return a_shape[-1] == 1 and b_shape[-2] == 1 and b_shape[-1] == 1
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        a, b = node.inputs
+        a_shape = getattr(a, "shape", None)
+        b_shape = getattr(b, "shape", None)
+        y = node.outputs[0]
+
+        if not a_shape or not b_shape or len(a_shape) < 2 or len(b_shape) < 2:
+            raise ValueError("Invalid MatMul operand shapes for scalar scale matmul replacement")
+        if not (a_shape[-1] == 1 and b_shape[-2] == 1 and b_shape[-1] == 1):
+            raise ValueError(f"Expected scalar-compatible MatMul shapes, got A={a_shape}, B={b_shape}")
+        
+        self.graph.layer(
+            name=node.name + "_mul_fold",
+            op="Mul",
+            inputs=[a, b],
+            outputs=[y]
+        )
+        node.outputs.clear()
+
+        self._logger.debug("Folded scalar MatMul node '%s' into Mul", node.name)
+
+
+@dataclass
+class ReplaceConstantDivWithMul(OnnxGraphEdit):
+    """
+    Replaces x/C with x * C' where C' = 1/C is a newly computed constant.
+
+    Args:
+        export_dtype (onnx.TensorProto.DataType): ONNX export data type for tensors
+
+    Raises:
+        TypeError: If divisor is not a constant tensor
+    """
+    export_dtype: onnx.TensorProto.DataType
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Div" and len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Div")
+        if not len(node.inputs) > 1 or not isinstance(node.inputs[1], gs.Constant):
+            raise TypeError("Expected second operand of Div to be a `gs.Constant`")
+
+        # x/C -> x * C' where C' = 1/C
+        divisor: gs.Constant = node.inputs[1]
+        if not (reciprocal := self.graph.tensors().get(divisor.name + "_reciprocal")):
+            reciprocal = gs.Constant(
+                name=divisor.name + "_reciprocal",
+                values=np.array(np.float32(1.0) / divisor.values.astype(np.float32)),
+                export_dtype=self.export_dtype,
+            )
+        node.op = "Mul"
+        node.inputs[1] = reciprocal
+
+        self._logger.debug("Replaced Div @ '%s' by constant '%s' with Mul by reciprocal", node.name, divisor.name)
+
+
+class ConstantBroadcastPolicy(Enum):
+    """
+    Strategy for handling broadcastable constants during graph edits.
+
+    - `DEFER_RUNTIME`: Insert `Expand` nodes so constants broadcast at runtime (lower memory, slower inference).
+    - `MATERIALIZE`: Pre-broadcast constants and store the expanded tensor (faster inference, higher memory).
+    - `SKIP`: Leave constants untouched and let downstream tools handle broadcasting.
+    """
+    DEFER_RUNTIME = auto()
+    MATERIALIZE = auto()
+    SKIP = auto()
+
+@dataclass
+class BroadcastOpInputs(OnnxGraphEdit):
+    """
+    Add explicit `Expand` nodes for broadcasting op inputs to output shape.
+
+    Args:
+        ops (list[str]): Ops to apply explicit input broadcasting, will apply to all ops if list is empty.
+        out_idx (int): Index of output to use as broadcast target shape (default: 0).
+        inp_idx (list[int]): Only broadcast inputs at these indices (default: None, broadcast all inputs).
+        constants_policy (ConstantBroadcastPolicy): How to treat constant inputs (default: skip).
+    """
+
+    ops: list[str]
+    out_idx: int = 0
+    inp_idx: list[int] | None = None
+    constants_policy: ConstantBroadcastPolicy = ConstantBroadcastPolicy.SKIP
+
+    def __post_init__(self):
+        self.inp_idx = self.inp_idx or []
+        return super().__post_init__()
+
+    @staticmethod
+    def _has_valid_shape(tensor: gs.Constant | gs.Variable) -> bool:
+        try:
+            shape = getattr(tensor, "shape", None)
+            return shape is not None and all(isinstance(d, (int, np.integer)) for d in shape)
+        except TypeError:
+            raise ValueError(f"{tensor.name}, {tensor.shape}")
+
+    @staticmethod
+    def _unique_tensor_id(tensor: gs.Constant | gs.Variable, hash_length: int = 8) -> str:
+        inputs = [getattr(n, "name", str(n)) for n in tensor.inputs]
+        outputs = [getattr(n, "name", str(n)) for n in tensor.outputs]
+        id_str = tensor.name + ":" + "|".join(inputs) + ">>" + "|".join(outputs)
+        return hashlib.sha256(id_str.encode()).hexdigest()[:hash_length]
+
+    def _add_broadcast_to_tensor(self, tensor: gs.Constant | gs.Variable, bcast_shape: list[int]):
+        # create copy of initial consumers to prevent cycle later
+        consumers: list[gs.Node] = tensor.outputs.copy()
+        bcast_shape_const: gs.Constant = gs.Constant(
+            name=tensor.name + "_bcast_shape",
+            values=np.array(bcast_shape).astype(np.int64)
+        )
+        bcast_out: gs.Variable = self.graph.layer(
+            name=tensor.name + "_bcast",
+            op="Expand",
+            inputs=[tensor, bcast_shape_const],
+            outputs=[gs.Variable(name=tensor.name + "_expanded", dtype=tensor.dtype, shape=bcast_shape)]
+        )[0]
+        rewire_consumers(consumers, tensor, bcast_out)
+
+    def match(self, node: gs.Node) -> bool:
+        if self.ops and node.op not in self.ops:
+            return False
+        if not node.inputs or not node.outputs:
+            return False
+
+        if not (0 <= self.out_idx < len(node.outputs)):
+            self._logger.warning(
+                "Received invalid output index; valid: %s, received: %s",
+                list(range(len(node.outputs))), self.out_idx
+            )
+            return False
+        if not self._has_valid_shape(node.outputs[self.out_idx]):
+            return False
+
+        target_inp_idxs = self.inp_idx or list(range(len(node.inputs)))
+        if any(i < 0 or i >= len(node.inputs) for i in target_inp_idxs):
+            self._logger.warning(
+                "Received invalid input indices; valid: %s, received: %s",
+                list(range(len(node.inputs))), self.inp_idx
+            )
+            return False
+        return all(self._has_valid_shape(node.inputs[i]) for i in target_inp_idxs)
+
+    def transform(self, node: gs.Node):
+        target_out: gs.Variable = node.outputs[self.out_idx]
+        assert isinstance(target_out, gs.Variable), "Node output must be `gs.Variable`"
+        if not self._has_valid_shape(target_out):
+            raise ValueError(
+                "Missing valid integer shape info for output '%s' (node: %s, '%s')",
+                target_out.name, node.op, node.name
+            )
+        bcast_shape: list[int] = list(target_out.shape)
+        target_inp_idxs = self.inp_idx or list(range(len(node.inputs)))
+        bcast_done: set[str] = set()
+
+        for i in target_inp_idxs:
+            inp = node.inputs[i]
+            if self._unique_tensor_id(inp) in bcast_done:
+                continue
+
+            if not self._has_valid_shape(inp):
+                self._logger.warning(
+                    "Broadcasting input '%s' with no valid integer shape info (node: %s, '%s')",
+                    inp.name, node.op, node.name
+                )
+            
+            if list(inp.shape) == bcast_shape:
+                continue
+            
+            if isinstance(inp, gs.Variable):
+                self._add_broadcast_to_tensor(inp, bcast_shape)
+            elif isinstance(inp, gs.Constant):
+                if getattr(inp, "dtype", None) is None:
+                    self._logger.warning(
+                        "Skipping broadcast of initializer '%s' due to missing dtype info",
+                        inp.name
+                    )
+                    continue
+                if self.constants_policy == ConstantBroadcastPolicy.SKIP:
+                    continue
+                if self.constants_policy == ConstantBroadcastPolicy.DEFER_RUNTIME:
+                    self._add_broadcast_to_tensor(inp, bcast_shape)
+                elif self.constants_policy == ConstantBroadcastPolicy.MATERIALIZE:
+                    export_dtype = inp.export_dtype
+                    if inp.dtype == onnx.TensorProto.BFLOAT16:
+                        dtype = np.float32
+                        export_dtype = onnx.TensorProto.BFLOAT16
+                    else:
+                        dtype = onnx.helper.tensor_dtype_to_np_dtype(inp.dtype) \
+                            if isinstance(inp.dtype, int) else inp.dtype
+                    bcast_values = np.broadcast_to(inp.values, bcast_shape).astype(dtype)
+                    bcast_const = gs.Constant(
+                        name=inp.name + "_bcast",
+                        values=bcast_values,
+                        export_dtype=export_dtype
+                    )
+                    bcast_const.outputs = inp.outputs
+                    inp.outputs.clear()
+                else:
+                    raise ValueError(f"Invalid constant broadcast policy '{self.constants_policy}'")
+            else:
+                raise ValueError(f"Invalid input tensor type '{type(inp)}'")
+            
+            bcast_done.add(self._unique_tensor_id(inp))
+            self._logger.debug(
+                "Broadcasted input '%s' of %s node '%s' to %s",
+                inp.name, node.op, node.name, bcast_shape
+            )
+
+
+@dataclass
+class ExtractConstantLUT(OnnxGraphEdit):
+
+    lut_shape: tuple[int, ...]
+    save_to: os.PathLike | str
+    inp_name: str | None = None
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Gather" or len(node.inputs) < 2:
+            return False
+        if node.attrs.get("axis", None) != 0:
+            return False
+        lut = node.inputs[0]
+        if not isinstance(lut, gs.Constant):
+            return False
+        lut_shape = lut.values.shape
+        if lut_shape == self.lut_shape:
+            return True
+        return False
+
+    def transform(self, node: gs.Node):
+        if not (node.op == "Gather" and len(node.inputs) >= 2 and isinstance((lut := node.inputs[0]), gs.Constant)):
+            raise ValueError(f"Gather node '{node.name}' does not have a constant data input")
+        if (axis := node.attrs.get("axis", None)) != 0:
+            raise ValueError(f"Only support axis = 0 for LUT, found axis = {axis} for Gather node '{node.name}'")
+        
+        lut_data = lut.values
+        if not isinstance(lut_data, np.ndarray):
+            self._logger.warning("Constant data is not NumPy array, attempting to load lazy values")
+            try:
+                lut_data = lut_data.load()
+            except AttributeError as e:
+                raise ValueError(f"Constant data for {node.name} is not loadable") from e
+            if not isinstance(lut_data, np.ndarray):
+                raise ValueError(f"Invalid Constant data type: {type(lut_data)}")
+        
+        self.save_to = Path(self.save_to)
+        self.save_to.parent.mkdir(parents=True, exist_ok=True)
+        np.save(self.save_to, lut_data)
+
+        if not self.inp_name:
+            self.inp_name = f"extracted_lut_{normalize_layer_name(node.name)}_input"
+        lut_out: gs.Variable = node.outputs[0]
+        consumers: list[gs.Node] = list(lut_out.outputs)        
+        lut_entry_inp = gs.Variable(
+            name=self.inp_name,
+            dtype=lut_out.dtype,
+            shape=lut_out.shape
+        )
+        rewire_consumers(consumers, lut_out, lut_entry_inp)
+        self.graph.inputs.append(lut_entry_inp)
+        node.outputs.clear()
+        self._logger.debug(
+            "Extracted LUT from '%s', consumers redirected to graph input '%s'",
+            node.name, self.inp_name
+        )
+
+
+@dataclass
+class DecomposeLayerNormalizationMulReciprocal(OnnxGraphEdit):
+    """
+    Decompose ONNX LayerNormalization into basic arithmetic operations using Mul and Reciprocal.
+    Useful for hardware targets that do not natively legalize LayerNormalization.
+    """
+    dim_map: dict[str, int] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dim_map is None:
+            self.dim_map = {"batch": 1}
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "LayerNormalization"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "LayerNormalization")
+        
+        X = node.inputs[0]
+        scale = node.inputs[1]
+        bias = node.inputs[2] if len(node.inputs) > 2 else None
+        
+        axis = node.attrs.get("axis", -1)
+        epsilon = node.attrs.get("epsilon", 1e-05)
+        
+        # Normalize axis and calculate reduction axes (all axes from `axis` to `rank - 1`)
+        rank = len(X.shape) if X.shape is not None else 0
+        if rank > 0:
+            axis = axis % rank
+            reduce_axes = list(range(axis, rank))
+        else:
+            reduce_axes = [axis]
+            
+        Y = node.outputs[0]
+        
+        # Resolve target shape to static integers using dim_map
+        target_shape = []
+        if X.shape is not None:
+            for d in X.shape:
+                if isinstance(d, str):
+                    target_shape.append(self.dim_map.get(d, 1))
+                else:
+                    target_shape.append(d)
+        else:
+            target_shape = [1, 150, 320]
+            
+        target_shape_const = gs.Constant(
+            name=node.name + "_target_shape",
+            values=np.array(target_shape, dtype=np.int64)
+        )
+
+        def expand_tensor(tensor, name_suffix):
+            # If shape is already matching target_shape, skip expand
+            if tensor.shape is not None and list(tensor.shape) == list(target_shape):
+                return tensor
+            return self.graph.layer(
+                name=node.name + "_" + name_suffix + "_expand",
+                op="Expand",
+                inputs=[tensor, target_shape_const],
+                outputs=[gs.Variable(name=node.name + "_" + name_suffix + "_expanded", dtype=tensor.dtype, shape=target_shape)]
+            )[0]
+
+        # Create axes constant for ReduceMean
+        axes_const = gs.Constant(
+            name=node.name + "_axes",
+            values=np.array(reduce_axes, dtype=np.int64)
+        )
+        
+        # 1. Compute mean: mean = ReduceMean(X, axes)
+        mean = self.graph.layer(
+            name=node.name + "_mean",
+            op="ReduceMean",
+            inputs=[X, axes_const],
+            outputs=[gs.Variable(name=node.name + "_mean_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 2. Subtract mean: X_diff = Sub(X, mean_expanded)
+        mean_expanded = expand_tensor(mean, "mean")
+        x_diff = self.graph.layer(
+            name=node.name + "_sub_mean",
+            op="Sub",
+            inputs=[X, mean_expanded],
+            outputs=[gs.Variable(name=node.name + "_diff", dtype=X.dtype)]
+        )[0]
+        
+        # 3. Compute variance: var = ReduceMean((X - mean)^2, axes)
+        x_diff_sq = self.graph.layer(
+            name=node.name + "_diff_sq",
+            op="Mul",
+            inputs=[x_diff, x_diff],
+            outputs=[gs.Variable(name=node.name + "_diff_sq_val", dtype=X.dtype)]
+        )[0]
+        
+        var = self.graph.layer(
+            name=node.name + "_var",
+            op="ReduceMean",
+            inputs=[x_diff_sq, axes_const],
+            outputs=[gs.Variable(name=node.name + "_var_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 4. Standard deviation: stddev = Sqrt(var + eps)
+        # Ensure we use a valid NumPy dtype matching X.dtype for the epsilon constant
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        eps_const = gs.Constant(
+            name=node.name + "_eps",
+            values=np.array(epsilon, dtype=np_dtype),
+        )
+        
+        var_eps = self.graph.layer(
+            name=node.name + "_var_eps",
+            op="Add",
+            inputs=[var, eps_const],
+            outputs=[gs.Variable(name=node.name + "_var_eps_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev = self.graph.layer(
+            name=node.name + "_stddev",
+            op="Sqrt",
+            inputs=[var_eps],
+            outputs=[gs.Variable(name=node.name + "_stddev_val", dtype=X.dtype)]
+        )[0]
+        
+        # 5. Normalize: X_norm = Mul(X_diff, stddev_inv_expanded) where stddev_inv = Reciprocal(stddev)
+        stddev_inv = self.graph.layer(
+            name=node.name + "_stddev_inv",
+            op="Reciprocal",
+            inputs=[stddev],
+            outputs=[gs.Variable(name=node.name + "_stddev_inv_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev_inv_expanded = expand_tensor(stddev_inv, "stddev_inv")
+        
+        x_norm = self.graph.layer(
+            name=node.name + "_mul_stddev_inv",
+            op="Mul",
+            inputs=[x_diff, stddev_inv_expanded],
+            outputs=[gs.Variable(name=node.name + "_norm", dtype=X.dtype)]
+        )[0]
+        
+        # 6. Apply scale and optional bias
+        scale_expanded = expand_tensor(scale, "scale")
+        if bias is not None:
+            bias_expanded = expand_tensor(bias, "bias")
+            x_scaled = self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[gs.Variable(name=node.name + "_scaled", dtype=X.dtype)]
+            )[0]
+            self.graph.layer(
+                name=node.name + "_add_bias",
+                op="Add",
+                inputs=[x_scaled, bias_expanded],
+                outputs=[Y]
+            )
+        else:
+            self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[Y]
+            )
+            
+        # Rewire other optional outputs if they are used by any consumer
+        if len(node.outputs) > 1 and len(node.outputs[1].outputs) > 0:
+            rewire_consumers(node.outputs[1].outputs, node.outputs[1], mean)
+        if len(node.outputs) > 2 and len(node.outputs[2].outputs) > 0:
+            inv_std_dev = self.graph.layer(
+                name=node.name + "_inv_stddev",
+                op="Reciprocal",
+                inputs=[stddev],
+                outputs=[gs.Variable(name=node.name + "_inv_stddev_val", dtype=X.dtype)]
+            )[0]
+            rewire_consumers(node.outputs[2].outputs, node.outputs[2], inv_std_dev)
+            
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+        
+        self._logger.debug("Decomposed LayerNormalization (Mul/Reciprocal) node '%s'", node.name)
+
+
+@dataclass
+class DecomposeLayerNormalization(OnnxGraphEdit):
+    """
+    Decompose ONNX LayerNormalization into basic arithmetic operations using Pow and Div.
+    Closely matches standard PyTorch export/decomposition.
+    """
+    dim_map: dict[str, int] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dim_map is None:
+            self.dim_map = {"batch": 1}
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "LayerNormalization"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "LayerNormalization")
+        
+        X = node.inputs[0]
+        scale = node.inputs[1]
+        bias = node.inputs[2] if len(node.inputs) > 2 else None
+        
+        axis = node.attrs.get("axis", -1)
+        epsilon = node.attrs.get("epsilon", 1e-05)
+        
+        # Normalize axis and calculate reduction axes
+        rank = len(X.shape) if X.shape is not None else 0
+        if rank > 0:
+            axis = axis % rank
+            reduce_axes = list(range(axis, rank))
+        else:
+            reduce_axes = [axis]
+            
+        Y = node.outputs[0]
+        
+        # Resolve target shape to static integers using dim_map
+        target_shape = []
+        if X.shape is not None:
+            for d in X.shape:
+                if isinstance(d, str):
+                    target_shape.append(self.dim_map.get(d, 1))
+                else:
+                    target_shape.append(d)
+        else:
+            target_shape = [1, 150, 320]
+            
+        target_shape_const = gs.Constant(
+            name=node.name + "_target_shape",
+            values=np.array(target_shape, dtype=np.int64)
+        )
+
+        def expand_tensor(tensor, name_suffix):
+            if tensor.shape is not None and list(tensor.shape) == list(target_shape):
+                return tensor
+            return self.graph.layer(
+                name=node.name + "_" + name_suffix + "_expand",
+                op="Expand",
+                inputs=[tensor, target_shape_const],
+                outputs=[gs.Variable(name=node.name + "_" + name_suffix + "_expanded", dtype=tensor.dtype, shape=target_shape)]
+            )[0]
+
+        # Create axes constant for ReduceMean
+        axes_const = gs.Constant(
+            name=node.name + "_axes",
+            values=np.array(reduce_axes, dtype=np.int64)
+        )
+        
+        # 1. Compute mean: mean = ReduceMean(X, axes)
+        mean = self.graph.layer(
+            name=node.name + "_mean",
+            op="ReduceMean",
+            inputs=[X, axes_const],
+            outputs=[gs.Variable(name=node.name + "_mean_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 2. Subtract mean: X_diff = Sub(X, mean_expanded)
+        mean_expanded = expand_tensor(mean, "mean")
+        x_diff = self.graph.layer(
+            name=node.name + "_sub_mean",
+            op="Sub",
+            inputs=[X, mean_expanded],
+            outputs=[gs.Variable(name=node.name + "_diff", dtype=X.dtype)]
+        )[0]
+        
+        # 3. Compute variance: var = ReduceMean((X - mean)^2, axes) using Pow
+        # Ensure we use a valid NumPy dtype matching X.dtype
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        pow_exp = gs.Constant(
+            name=node.name + "_pow_exp",
+            values=np.array(2.0, dtype=np_dtype)
+        )
+        x_diff_sq = self.graph.layer(
+            name=node.name + "_diff_sq",
+            op="Pow",
+            inputs=[x_diff, pow_exp],
+            outputs=[gs.Variable(name=node.name + "_diff_sq_val", dtype=X.dtype)]
+        )[0]
+        
+        var = self.graph.layer(
+            name=node.name + "_var",
+            op="ReduceMean",
+            inputs=[x_diff_sq, axes_const],
+            outputs=[gs.Variable(name=node.name + "_var_val", dtype=X.dtype)],
+            attrs={"keepdims": 1}
+        )[0]
+        
+        # 4. Standard deviation: stddev = Sqrt(var + eps)
+        eps_const = gs.Constant(
+            name=node.name + "_eps",
+            values=np.array(epsilon, dtype=np_dtype),
+        )
+        
+        var_eps = self.graph.layer(
+            name=node.name + "_var_eps",
+            op="Add",
+            inputs=[var, eps_const],
+            outputs=[gs.Variable(name=node.name + "_var_eps_val", dtype=X.dtype)]
+        )[0]
+        
+        stddev = self.graph.layer(
+            name=node.name + "_stddev",
+            op="Sqrt",
+            inputs=[var_eps],
+            outputs=[gs.Variable(name=node.name + "_stddev_val", dtype=X.dtype)]
+        )[0]
+        
+        # 5. Normalize: X_norm = Div(X_diff, stddev_expanded)
+        stddev_expanded = expand_tensor(stddev, "stddev")
+        
+        x_norm = self.graph.layer(
+            name=node.name + "_div_stddev",
+            op="Div",
+            inputs=[x_diff, stddev_expanded],
+            outputs=[gs.Variable(name=node.name + "_norm", dtype=X.dtype)]
+        )[0]
+        
+        # 6. Apply scale and optional bias
+        scale_expanded = expand_tensor(scale, "scale")
+        if bias is not None:
+            bias_expanded = expand_tensor(bias, "bias")
+            x_scaled = self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[gs.Variable(name=node.name + "_scaled", dtype=X.dtype)]
+            )[0]
+            self.graph.layer(
+                name=node.name + "_add_bias",
+                op="Add",
+                inputs=[x_scaled, bias_expanded],
+                outputs=[Y]
+            )
+        else:
+            self.graph.layer(
+                name=node.name + "_mul_scale",
+                op="Mul",
+                inputs=[x_norm, scale_expanded],
+                outputs=[Y]
+            )
+            
+        # Rewire other optional outputs if they are used by any consumer
+        if len(node.outputs) > 1 and len(node.outputs[1].outputs) > 0:
+            rewire_consumers(node.outputs[1].outputs, node.outputs[1], mean)
+        if len(node.outputs) > 2 and len(node.outputs[2].outputs) > 0:
+            inv_std_dev = self.graph.layer(
+                name=node.name + "_inv_stddev",
+                op="Reciprocal",
+                inputs=[stddev],
+                outputs=[gs.Variable(name=node.name + "_inv_stddev_val", dtype=X.dtype)]
+            )[0]
+            rewire_consumers(node.outputs[2].outputs, node.outputs[2], inv_std_dev)
+            
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+        
+        self._logger.debug("Decomposed LayerNormalization node '%s'", node.name)
+
+
+@dataclass
+class DecomposeGelu(OnnxGraphEdit):
+    """
+    Decompose ONNX Gelu into basic arithmetic operations (Mul, Add, Erf).
+    Formula: Gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "Gelu"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Gelu")
+        X = node.inputs[0]
+        Y = node.outputs[0]
+
+        # Resolve correct numpy dtype matching X.dtype
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        # Create constant values
+        const_half = gs.Constant(
+            name=node.name + "_gelu_half",
+            values=np.array(0.5, dtype=np_dtype)
+        )
+        const_one = gs.Constant(
+            name=node.name + "_gelu_one",
+            values=np.array(1.0, dtype=np_dtype)
+        )
+        const_inv_sqrt2 = gs.Constant(
+            name=node.name + "_gelu_inv_sqrt2",
+            values=np.array(1.0 / np.sqrt(2.0), dtype=np_dtype)
+        )
+
+        # 1. Mul: x_scaled = Mul(X, 1 / sqrt(2))
+        x_scaled = self.graph.layer(
+            name=node.name + "_scale",
+            op="Mul",
+            inputs=[X, const_inv_sqrt2],
+            outputs=[gs.Variable(name=node.name + "_scaled_val", dtype=X.dtype)]
+        )[0]
+
+        # 2. Erf: erf_val = Erf(x_scaled)
+        erf_val = self.graph.layer(
+            name=node.name + "_erf",
+            op="Erf",
+            inputs=[x_scaled],
+            outputs=[gs.Variable(name=node.name + "_erf_val", dtype=X.dtype)]
+        )[0]
+
+        # 3. Add: erf_plus_1 = Add(erf_val, 1)
+        erf_plus_1 = self.graph.layer(
+            name=node.name + "_add_one",
+            op="Add",
+            inputs=[erf_val, const_one],
+            outputs=[gs.Variable(name=node.name + "_plus_one_val", dtype=X.dtype)]
+        )[0]
+
+        # 4. Mul: x_half = Mul(X, 0.5)
+        x_half = self.graph.layer(
+            name=node.name + "_half",
+            op="Mul",
+            inputs=[X, const_half],
+            outputs=[gs.Variable(name=node.name + "_half_val", dtype=X.dtype)]
+        )[0]
+
+        # 5. Mul: Y = Mul(x_half, erf_plus_1)
+        self.graph.layer(
+            name=node.name + "_mul_final",
+            op="Mul",
+            inputs=[x_half, erf_plus_1],
+            outputs=[Y]
+        )
+
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Decomposed Gelu node '%s'", node.name)
+
+
+@dataclass
+class DecomposeBooleanAnd(OnnxGraphEdit):
+    """
+    Decompose ONNX And on boolean (i1) tensors into Cast(int8) + Mul + Cast(bool).
+
+    Hardware DMA engines (e.g. torq_api `_parse_mem_bdg_ldims`) assert that every
+    dimension count n[i] > 0.  Bit-packed i1 tensors cause this assertion to fire
+    because the byte-count for a small boolean dimension rounds to 0.  Casting
+    inputs through int8 gives the hardware byte-aligned, element-per-byte data.
+
+    `Mul(int8, int8)` is semantically equivalent to `And(bool, bool)` for 0/1
+    values, so the output is cast back to bool to preserve downstream type
+    expectations.
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "And":
+            return False
+        # Match whenever at least one input is boolean.
+        return any(
+            isinstance(inp, (gs.Variable, gs.Constant)) and inp.dtype == np.bool_
+            for inp in node.inputs
+        )
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "And")
+
+        # Cast each input i1 -> int8
+        inputs_int8 = []
+        for i, inp in enumerate(node.inputs):
+            cast_out = self.graph.layer(
+                name=f"{node.name}_inp{i}_to_int8",
+                op="Cast",
+                inputs=[inp],
+                outputs=[gs.Variable(
+                    name=f"{node.name}_inp{i}_int8",
+                    dtype=np.int8,
+                    shape=inp.shape,
+                )],
+                attrs={"to": onnx.TensorProto.INT8},
+            )[0]
+            inputs_int8.append(cast_out)
+
+        # Mul(int8, int8) is And for 0/1 values; supports implicit broadcasting.
+        orig_output = node.outputs[0]
+        mul_out = self.graph.layer(
+            name=f"{node.name}_mul_int8",
+            op="Mul",
+            inputs=inputs_int8,
+            outputs=[gs.Variable(
+                name=f"{node.name}_mul_int8_out",
+                dtype=np.int8,
+                shape=orig_output.shape,
+            )],
+        )[0]
+
+        # Cast result back to bool; reuse orig_output variable so consumers update
+        # automatically.
+        self.graph.layer(
+            name=f"{node.name}_to_bool",
+            op="Cast",
+            inputs=[mul_out],
+            outputs=[orig_output],
+            attrs={"to": onnx.TensorProto.BOOL},
+        )
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Decomposed boolean And node '%s' into Cast+Mul+Cast", node.name)
+
+
+class CombineKVCacheMixin:
+    """
+    Mixin for combining separate key/value cache I/O tensors along the heads axis.
+
+    Pairs key+value tensors per layer and merges them into single tensors
+    with doubled head dimension: [..., H, L, D] -> [..., 2*H, L, D].
+
+    Must be used with OnnxGraphEditor (defines self._graph, self._logger).
+    """
+
+    def combine_kv_io_tensors(
+        self,
+        kv_tensor_shape: list[int],
+        *,
+        input_prefix: str = "past_key_values",
+        output_prefix: str = "present",
+        kv_layer_re: str | re.Pattern = r"\.(\d+)\.(key|value)$",
+        combined_name_fmt: str = "{prefix}.{layer}"
+    ):
+        if isinstance(kv_layer_re, str):
+            kv_layer_re = re.compile(kv_layer_re)
+        # concatenate along H axis: [..., H, L, D] <-> [..., 2*H, L, D]
+        _H_DIM_AXIS = len(kv_tensor_shape) - 3
+
+        def _get_kv_pairs(
+            io_coll: list[gs.Variable], prefix: str
+        ) -> list[tuple[int, gs.Variable, gs.Variable]]:
+            io_dict: dict[int, dict[str, gs.Variable]] = defaultdict(dict)
+            for io in io_coll:
+                if not isinstance(io, gs.Variable):
+                    raise TypeError(f"Expected gs.Variable, got {type(io)}")
+                if list(io.shape) != kv_tensor_shape:
+                    continue
+                if not io.name.startswith(prefix):
+                    continue
+                m = kv_layer_re.search(io.name)
+                if m is None:
+                    continue
+                layer, role = int(m.group(1)), m.group(2)
+                if role in io_dict[layer]:
+                    raise ValueError(
+                        f"Duplicate {role} tensor for layer {layer}: "
+                        f"'{io_dict[layer][role].name}' and '{io.name}'"
+                    )
+                io_dict[layer][role] = io
+            kv_pairs: list[tuple[int, gs.Variable, gs.Variable]] = []
+            for layer in sorted(io_dict):
+                entry = io_dict[layer]
+                if "key" not in entry or "value" not in entry:
+                    raise ValueError(
+                        f"Layer {layer} is missing "
+                        f"{'key' if 'key' not in entry else 'value'} tensor"
+                    )
+                kv_pairs.append((layer, entry["key"], entry["value"]))
+            return kv_pairs
+
+        def _remove_io(tensor: gs.Variable, io_coll: list[gs.Variable]) -> int:
+            for idx, io_tensor in enumerate(io_coll):
+                if tensor is io_tensor:
+                    io_coll.pop(idx)
+                    return idx
+            return -1
+
+        def _concatenate_kv_input(
+            layer: int,
+            key_input: gs.Variable,
+            value_input: gs.Variable,
+            prefix: str,
+        ):
+            assert key_input.dtype == value_input.dtype
+            assert list(key_input.shape) == kv_tensor_shape
+            assert list(value_input.shape) == kv_tensor_shape
+            key_consumers: list[gs.Node] = key_input.outputs
+            value_consumers: list[gs.Node] = value_input.outputs
+
+            base = combined_name_fmt.format(prefix=prefix, layer=layer)
+            n_kv_heads = kv_tensor_shape[_H_DIM_AXIS]
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_input = gs.Variable(
+                name=f"{base}.key_value",
+                dtype=key_input.dtype,
+                shape=combined_shape
+            )
+            if not (kv_concat_axis := self._graph.tensors().get("kv_concat_axis")):
+                kv_concat_axis = gs.Constant(
+                    "kv_concat_axis",
+                    np.array([_H_DIM_AXIS], dtype=np.int64),
+                )
+            if not (kv_inp_key_starts := self._graph.tensors().get(
+                "kv_inp_key_starts"
+            )):
+                kv_inp_key_starts = gs.Constant(
+                    "kv_inp_key_starts", np.array([0], dtype=np.int64)
+                )
+            if not (kv_inp_key_ends := self._graph.tensors().get(
+                "kv_inp_key_ends"
+            )):
+                kv_inp_key_ends = gs.Constant(
+                    "kv_inp_key_ends",
+                    np.array([n_kv_heads], dtype=np.int64),
+                )
+            if not (kv_inp_value_starts := self._graph.tensors().get(
+                "kv_inp_value_starts"
+            )):
+                kv_inp_value_starts = gs.Constant(
+                    "kv_inp_value_starts",
+                    np.array([n_kv_heads], dtype=np.int64),
+                )
+            if not (kv_inp_value_ends := self._graph.tensors().get(
+                "kv_inp_value_ends"
+            )):
+                kv_inp_value_ends = gs.Constant(
+                    "kv_inp_value_ends",
+                    np.array([2 * n_kv_heads], dtype=np.int64),
+                )
+            key_slice: gs.Variable = self._graph.layer(
+                name=f"{base}.key_slice",
+                op="Slice",
+                inputs=[
+                    combined_input,
+                    kv_inp_key_starts,
+                    kv_inp_key_ends,
+                    kv_concat_axis,
+                ],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.key_from_combined",
+                        dtype=key_input.dtype,
+                        shape=key_input.shape,
+                    )
+                ],
+            )[0]
+            value_slice: gs.Variable = self._graph.layer(
+                name=f"{base}.value_slice",
+                op="Slice",
+                inputs=[
+                    combined_input,
+                    kv_inp_value_starts,
+                    kv_inp_value_ends,
+                    kv_concat_axis,
+                ],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.value_from_combined",
+                        dtype=value_input.dtype,
+                        shape=value_input.shape,
+                    )
+                ],
+            )[0]
+
+            rewire_consumers(key_consumers, key_input, key_slice)
+            rewire_consumers(value_consumers, value_input, value_slice)
+            key_input.outputs.clear()
+            value_input.outputs.clear()
+            insert_pos = _remove_io(key_input, self._graph.inputs)
+            _remove_io(value_input, self._graph.inputs)
+            if insert_pos >= 0:
+                self._graph.inputs.insert(insert_pos, combined_input)
+            else:
+                self._graph.inputs.append(combined_input)
+
+            self._logger.debug(
+                "Combined KV input layer %d: '%s' + '%s' -> '%s'",
+                layer,
+                key_input.name,
+                value_input.name,
+                combined_input.name,
+            )
+
+        def _concatenate_kv_output(
+            layer: int,
+            key_output: gs.Variable,
+            value_output: gs.Variable,
+            prefix: str,
+        ):
+            assert key_output.dtype == value_output.dtype
+            assert list(key_output.shape) == kv_tensor_shape
+            assert list(value_output.shape) == kv_tensor_shape
+
+            base = combined_name_fmt.format(prefix=prefix, layer=layer)
+            combined_shape = kv_tensor_shape.copy()
+            combined_shape[_H_DIM_AXIS] *= 2
+            combined_tensor: gs.Variable = self._graph.layer(
+                name=f"{base}_kv_concat",
+                op="Concat",
+                inputs=[key_output, value_output],
+                outputs=[
+                    gs.Variable(
+                        name=f"{base}.key_value",
+                        dtype=key_output.dtype,
+                        shape=combined_shape,
+                    )
+                ],
+                attrs={"axis": _H_DIM_AXIS},
+            )[0]
+            insert_pos = _remove_io(key_output, self._graph.outputs)
+            _remove_io(value_output, self._graph.outputs)
+            if insert_pos >= 0:
+                self._graph.outputs.insert(insert_pos, combined_tensor)
+            else:
+                self._graph.outputs.append(combined_tensor)
+
+            self._logger.debug(
+                "Combined KV output layer %d: '%s' + '%s' -> '%s'",
+                layer,
+                key_output.name,
+                value_output.name,
+                combined_tensor.name,
+            )
+
+        input_pairs = _get_kv_pairs(self._graph.inputs, input_prefix)
+        output_pairs = _get_kv_pairs(self._graph.outputs, output_prefix)
+        self._logger.debug(
+            "Combining KV tensors: %d input pairs, %d output pairs (axis=%d)",
+            len(input_pairs),
+            len(output_pairs),
+            _H_DIM_AXIS,
+        )
+        for kv_info in input_pairs:
+            _concatenate_kv_input(*kv_info, input_prefix)
+        for kv_info in output_pairs:
+            _concatenate_kv_output(*kv_info, output_prefix)
+        self._graph = self._graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True,
+        ).toposort()
+        return self
+
+
+class CommonGraphEditsMixin:
+    """
+    Mixin providing convenience methods for common graph edits.
+    
+    Must be used with OnnxGraphEditor (defines self._graph, self._graph_name, 
+    self._export_dtype, self.apply_edit).
+    """
+
+    def replace_dynamic_kv_cache(self, cur_len, max_tokens):
+        self.apply_edit(ReplaceDynamicKVCache(self._graph, self._graph_name, cur_len, max_tokens))
+        return self
+
+    def mask_future_attn_scores(self, cur_len, max_tokens):
+        self.apply_edit(MaskFutureAttentionScores(self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype))
+        return self
+
+    def add_curr_len_input(self, cur_len):
+        self.apply_edit(AddCurrLenInput(self._graph, self._graph_name, cur_len))
+        return self
+
+    def convert_to_static_index(self):
+        self.apply_edit(ConvertToStaticIndex(self._graph, self._graph_name))
+        return self
+
+    def dequantize_projections_matmul(self, hidden_size, vocab_size):
+        self.apply_edit(DequantizeProjectionsMatMul(self._graph, self._graph_name, hidden_size, vocab_size, self._export_dtype))
+        return self
+
+    def remove_isNaN(self):
+        self.apply_edit(RemoveIsNaN(self._graph, self._graph_name))
+        return self
+
+    def remove_redundant_casts(
+        self
+    ):
+        self.apply_edit(RemoveRedundantCasts(self._graph, self._graph_name))
+        return self
+
+    def fold_scalar_matmul(self):
+        self.apply_edit(FoldScalarMatMul(self._graph, self._graph_name))
+        return self
+    
+    def replace_constant_div_with_mul(self):
+        self.apply_edit(ReplaceConstantDivWithMul(self._graph, self._graph_name, self._export_dtype))
+
+    def broadcast_op_inputs(self, ops, output_idx=0, inputs_idx=None, constants_policy=ConstantBroadcastPolicy.SKIP):
+        self.apply_edit(BroadcastOpInputs(self._graph, self._graph_name, ops, output_idx, inputs_idx, constants_policy))
+        return self
+
+    def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
+        self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def decompose_layer_normalization(self):
+        dim_map = getattr(self, "_dim_map", None)
+        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name, dim_map=dim_map))
+        return self
+
+    def decompose_layer_normalization_mul_reciprocal(self):
+        dim_map = getattr(self, "_dim_map", None)
+        self.apply_edit(DecomposeLayerNormalizationMulReciprocal(self._graph, self._graph_name, dim_map=dim_map))
+        return self
+
+    def decompose_gelu(self):
+        self.apply_edit(DecomposeGelu(self._graph, self._graph_name))
+        return self
+
+    def decompose_boolean_and(self):
+        """Replace And(i1, i1) -> i1 with Cast(int8) + Mul + Cast(bool).
+
+        Avoids hardware DMA assertion failures on bit-packed boolean tensors.
+        Call before broadcast_op_inputs so that downstream Mul ops get the
+        explicit Expand treatment instead of the now-removed And nodes.
+        """
+        self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
+        return self
+
+    def eliminate_transposes(self):
+        self.apply_edit(EliminateTranspose(self._graph, self._graph_name))
+        return self
+
+    def collapse_reshape_chains(self):
+        self.apply_edit(CollapseReshapeChain(self._graph, self._graph_name))
+        return self
