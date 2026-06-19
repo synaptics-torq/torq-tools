@@ -77,6 +77,7 @@ class CommonGraphEditsMixin:
     
     def replace_constant_div_with_mul(self):
         self.apply_edit(ReplaceConstantDivWithMul(self._graph, self._graph_name, self._export_dtype))
+        return self
 
     def replace_int64_float_cast(self, max_int: int):
         self.apply_edit(ReplaceInt64FloatCast(self._graph, self._graph_name, max_int))

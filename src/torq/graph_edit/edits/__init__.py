@@ -47,6 +47,7 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "EliminateExpand",
     "EliminateTranspose",
     "RetargetCrossAttnKeyLayout",
     "CollapseReshapeChain",
