@@ -182,14 +182,14 @@ class MoonshineStreamingTFLite:
         tokens = [self._start_token_id]
 
         for step in range(max_tokens):
-            position_ids = np.array([[step]], dtype=np.int64)
+            position_ids = np.array([[step]], dtype=np.int32)
             self_attn_bias = np.full((1, 1, 1, self._max_tokens), -1e9, f32)
             self_attn_bias[:, :, :, :step + 1] = 0.0
 
             if self._extract_embeddings:
                 first = self._token_embeddings[tokens[-1]].reshape(1, 1, -1).astype(f32)
             else:
-                first = np.array([[tokens[-1]]], dtype=np.int64)
+                first = np.array([[tokens[-1]]], dtype=np.int32)
 
             feeds = [first]
             for i in range(self._n_layers):

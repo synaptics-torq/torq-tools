@@ -25,19 +25,23 @@ except ImportError:
 _SAMPLE_WAV = Path(__file__).parent.parent / "moonshine_streaming" / "OSR_us_000_0010_8k.wav"
 
 
-def validate(model_dir: str, model_size: str = "tiny", quantized: bool = False, wav: str | None = None):
+_SUFFIX = {"none": "", "dynamic": "_int8", "static": "_int8_static"}
+
+
+def validate(model_dir: str, model_size: str = "tiny", quant_mode: str = "none",
+             wav: str | None = None):
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("validate_tflite")
 
     p = Path(model_dir)
-    suffix = "_int8" if quantized else ""
+    suffix = _SUFFIX[quant_mode]
     fused_encoder = p / f"fused_encoder{suffix}.tflite"
     decoder = p / f"decoder_kv{suffix}.tflite"
     for mp in (fused_encoder, decoder):
         if not mp.exists():
             raise FileNotFoundError(f"Missing required model: {mp}")
 
-    logger.info("Loading TFLite runner (%s)...", "int8" if quantized else "fp32")
+    logger.info("Loading TFLite runner (%s)...", quant_mode)
     runner = MoonshineStreamingTFLite.from_tflite(fused_encoder, decoder, model_size)
 
     wav_path = Path(wav) if wav else _SAMPLE_WAV
@@ -65,7 +69,7 @@ def validate(model_dir: str, model_size: str = "tiny", quantized: bool = False, 
         tok = Tokenizer.from_file(str(tokenizer_path))
         text = tok.decode_batch(tokens, skip_special_tokens=True)[0]
         logger.info("=" * 80)
-        logger.info("Validation successful (%s)!", "int8" if quantized else "fp32")
+        logger.info("Validation successful (%s)!", quant_mode)
         logger.info("Transcription: '%s'", text)
         logger.info("=" * 80)
         return text
@@ -76,12 +80,18 @@ def validate(model_dir: str, model_size: str = "tiny", quantized: bool = False, 
 def main():
     ap = argparse.ArgumentParser(description="Validate TFLite Moonshine Streaming on sample audio.")
     ap.add_argument("-m", "--model-dir", required=True,
-                    help="Directory containing fused_encoder[_int8].tflite and decoder_kv[_int8].tflite")
+                    help="Directory with fused_encoder{,_int8,_int8_static}.tflite + decoder_kv*.tflite")
     ap.add_argument("-s", "--model-size", default="tiny", choices=["tiny", "small"])
-    ap.add_argument("--int8", action="store_true", help="Validate the *_int8.tflite models")
+    ap.add_argument("--quant-mode", choices=["none", "dynamic", "static"], default="none",
+                    help="Which exported variant to validate: none=fp32, dynamic=_int8, "
+                         "static=_int8_static.")
+    ap.add_argument("--int8", action="store_true", help="Deprecated alias for --quant-mode dynamic.")
     ap.add_argument("--wav", default=None, help="Override the input WAV (default: bundled OSR clip)")
     args = ap.parse_args()
-    validate(args.model_dir, args.model_size, quantized=args.int8, wav=args.wav)
+    quant_mode = args.quant_mode
+    if args.int8 and quant_mode == "none":
+        quant_mode = "dynamic"
+    validate(args.model_dir, args.model_size, quant_mode=quant_mode, wav=args.wav)
 
 
 if __name__ == "__main__":

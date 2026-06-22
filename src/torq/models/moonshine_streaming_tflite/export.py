@@ -16,20 +16,37 @@ def _layer_from_kv(k, v):
 
 class _StaticSelfCache(DynamicCache):
     """Fixed-size self-attention cache: writes the new token's K/V in-place at a
-    stored position via ``index_copy`` instead of concatenating.
+    stored position via a mask/select instead of concatenating.
 
     This keeps the per-layer self-KV shape constant ([1, heads, max_tokens, dim])
     across decode steps, so the exported graph is a reusable fixed-point — the
     torch-level equivalent of the 5/2-split ``make_decoder_static`` graph surgery.
     The caller sets ``self.pos`` (a 1-D index tensor) before each forward.
+
+    Note: we deliberately do NOT use ``index_copy``/``index_put``. Those lower to
+    ``SCATTER_ND`` (→ ``stablehlo.scatter`` into a *middle* axis) which the Torq/TOSA
+    path cannot legalize (``iree_linalg_ext.scatter`` requires indexing the leading
+    dim). The mask form below lowers to supported elementwise ops (iota/equal/select/
+    broadcast). All index math is int32 — the NPU supports int32/bf16 only.
     """
 
     pos: torch.Tensor
 
+    def _write_at(self, cache: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+        # cache: [1, H, L, D]; new: [1, H, 1, D]; write `new` at sequence position self.pos.
+        # Keep everything rank-4 (no 0-D scalars): rank-0 operands make the TorqHW elementwise
+        # lowering choke. Streaming decode positions are always >= 0, so no negative-index
+        # normalization is needed (unlike index_copy, which added it defensively).
+        L = cache.shape[2]
+        pos = self.pos.to(torch.int32).view(1, 1, 1, 1)
+        idx = torch.arange(L, dtype=torch.int32, device=cache.device).view(1, 1, L, 1)
+        onehot = idx == pos  # [1, 1, L, 1] bool, true only at the write position
+        return torch.where(onehot, new.expand(-1, -1, L, -1), cache)
+
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         layer = self.layers[layer_idx]
-        layer.keys = layer.keys.index_copy(2, self.pos, key_states)
-        layer.values = layer.values.index_copy(2, self.pos, value_states)
+        layer.keys = self._write_at(layer.keys, key_states)
+        layer.values = self._write_at(layer.values, value_states)
         return layer.keys, layer.values
 
 
