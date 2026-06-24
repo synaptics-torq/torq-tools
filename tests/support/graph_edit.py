@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
