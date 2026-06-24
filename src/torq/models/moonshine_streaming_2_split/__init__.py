@@ -64,6 +64,14 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         help="Extract large embeddings tables into external .npy data",
     )
     parser.add_argument(
+        "--export-attention",
+        action="store_true",
+        default=False,
+        help="Also output the decoder cross-attention weights ('cross_attn', "
+             "[depth,1,heads,1,max_memory_len]) for host-side token->frame alignment. "
+             "Adds a per-step output (no extra compute).",
+    )
+    parser.add_argument(
         "--chunk-len",
         type=int,
         default=None,

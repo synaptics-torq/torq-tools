@@ -216,13 +216,14 @@ class DecoderKVWrapper(torch.nn.Module):
     [1, 1, hidden_size] instead of an integer token id [1, 1].
     """
 
-    def __init__(self, model, extract_embeddings: bool = False):
+    def __init__(self, model, extract_embeddings: bool = False, output_attention: bool = False):
         super().__init__()
         self.base_model = model.model
         self.proj_out = model.proj_out
         self.n_layers = len(self.base_model.decoder.layers)
         self.decoder = self.base_model.decoder
         self._extract_embeddings = extract_embeddings
+        self._output_attention = output_attention
         assert self.n_layers == 6, f"DecoderKVWrapper expects 6 decoder layers, got {self.n_layers}"
 
         self.decoder.pos_emb = ZeroEmbedding(self.decoder.pos_emb.embedding_dim)
@@ -274,6 +275,7 @@ class DecoderKVWrapper(torch.nn.Module):
                 position_ids=position_ids,
                 encoder_hidden_states=dummy_encoder_hidden,
                 encoder_attention_mask=encoder_attention_mask,
+                output_attentions=self._output_attention,
             )
         else:
             dec_out = self.decoder(
@@ -283,6 +285,7 @@ class DecoderKVWrapper(torch.nn.Module):
                 position_ids=position_ids,
                 encoder_hidden_states=dummy_encoder_hidden,
                 encoder_attention_mask=encoder_attention_mask,
+                output_attentions=self._output_attention,
             )
 
         logits = self.proj_out(dec_out.last_hidden_state)
@@ -290,19 +293,30 @@ class DecoderKVWrapper(torch.nn.Module):
         out_k_selves = [layer.keys   for layer in pkv.self_attention_cache.layers]
         out_v_selves = [layer.values for layer in pkv.self_attention_cache.layers]
 
-        return (logits,
-                out_k_selves[0], out_v_selves[0],
-                out_k_selves[1], out_v_selves[1],
-                out_k_selves[2], out_v_selves[2],
-                out_k_selves[3], out_v_selves[3],
-                out_k_selves[4], out_v_selves[4],
-                out_k_selves[5], out_v_selves[5],
-                k_cross_0, v_cross_0,
-                k_cross_1, v_cross_1,
-                k_cross_2, v_cross_2,
-                k_cross_3, v_cross_3,
-                k_cross_4, v_cross_4,
-                k_cross_5, v_cross_5)
+        outputs = (logits,
+                   out_k_selves[0], out_v_selves[0],
+                   out_k_selves[1], out_v_selves[1],
+                   out_k_selves[2], out_v_selves[2],
+                   out_k_selves[3], out_v_selves[3],
+                   out_k_selves[4], out_v_selves[4],
+                   out_k_selves[5], out_v_selves[5],
+                   k_cross_0, v_cross_0,
+                   k_cross_1, v_cross_1,
+                   k_cross_2, v_cross_2,
+                   k_cross_3, v_cross_3,
+                   k_cross_4, v_cross_4,
+                   k_cross_5, v_cross_5)
+
+        if self._output_attention:
+            # Per-layer decoder→memory cross-attention probabilities, already
+            # computed inside the eager attention; stack into one output tensor
+            # [depth, 1, heads, 1, enc_seq_len]. argmax over the last axis gives
+            # the audio frame each token attends to (host-side token→frame
+            # alignment for window left-masking / word timestamps).
+            cross_attn = torch.stack(dec_out.cross_attentions, dim=0)
+            outputs = outputs + (cross_attn,)
+
+        return outputs
 
 
 class StatefulFusedEncoderWrapper(torch.nn.Module):
@@ -405,6 +419,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
         model_dtype: str = "float",
         *,
         extract_embeddings: bool = False,
+        export_attention: bool = False,
         hf_repo: str | None = None,
         max_audio_s: int = 5,
         max_tok_per_s: int = 6,
@@ -418,6 +433,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
     ):
         self._model_size = model_size
         self._extract_embeddings = extract_embeddings
+        self._export_attention = export_attention
         self._onnx_source_dir = onnx_source_dir
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-streaming-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
@@ -563,7 +579,10 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             "Exporting DecoderKVWrapper to ONNX (max_tokens=%d, max_memory_len=%d)...",
             self._max_tokens, self._max_memory_len,
         )
-        decoder_kv = DecoderKVWrapper(model, extract_embeddings=self._extract_embeddings).eval()
+        decoder_kv = DecoderKVWrapper(
+            model, extract_embeddings=self._extract_embeddings,
+            output_attention=self._export_attention,
+        ).eval()
         self_kv_dummies = [
             torch.zeros(1, self._num_kv_heads, self._max_tokens, self._head_dim)
             for _ in range(self._n_layers * 2)
@@ -586,6 +605,12 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             dummy_first_input = torch.ones(1, 1, dtype=torch.long)
             first_input_name  = "token"
 
+        decoder_out_names = ["logits", *self_kv_out_names, *cross_kv_out_names]
+        if self._export_attention:
+            # one stacked output [depth, 1, heads, 1, max_memory_len]
+            decoder_out_names.append("cross_attn")
+            self._logger.info("  + exporting cross-attention weights output 'cross_attn'")
+
         torch.onnx.export(
             decoder_kv,
             (dummy_first_input, *self_kv_dummies, *cross_kv_dummies,
@@ -594,7 +619,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             dynamo=True,
             input_names=[first_input_name, *self_kv_in_names,
                          *cross_kv_in_names, "cross_attn_bias", "position_ids"],
-            output_names=["logits", *self_kv_out_names, *cross_kv_out_names],
+            output_names=decoder_out_names,
         )
 
         # ── streaming_config.json ────────────────────────────────────────────
@@ -607,6 +632,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             "max_tokens": self._max_tokens,
             "max_memory_len": self._max_memory_len,
             "extract_embeddings": self._extract_embeddings,
+            "export_attention": self._export_attention,
         }
         with open(self._onnx_dir / "streaming_config.json", "w") as f:
             json.dump(config, f, indent=2)
@@ -793,6 +819,7 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         args.model_size,
         args.dtype,
         extract_embeddings=args.extract_embeddings,
+        export_attention=args.export_attention,
         hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,
