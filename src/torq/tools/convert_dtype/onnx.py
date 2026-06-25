@@ -598,6 +598,26 @@ class FP32Converter(OnnxDtypeConverterBase):
             return u16.view(np_type).reshape(values.shape)
         return values.astype(np_type)
 
+    def _make_default_constant_of_shape_value(self, node: gs.Node) -> gs.Constant:
+        try:
+            np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+        return gs.Constant(
+            f"{node.name or node.op}_value_{self._export_dtype_str}",
+            np.array([0], dtype=np_type),
+        )
+
+    def _convert_constant_of_shape_value(self, node: gs.Node, graph: gs.Graph):
+        if (val := node.attrs.get("value")) is not None:
+            self._convert_tensor(val, node, graph, "value", is_attr=True)
+        elif self._is_original_dtype(node.outputs[0].dtype):
+            node.attrs["value"] = self._make_default_constant_of_shape_value(node)
+
+    def _convert_random_like_dtype_attr(self, node: gs.Node):
+        if self._is_original_dtype(node.attrs.get("dtype")):
+            node.attrs["dtype"] = self._export_onnx_dtype
+
     def _convert_graph(
         self,
         graph: gs.Graph
@@ -643,9 +663,13 @@ class FP32Converter(OnnxDtypeConverterBase):
             if node.op == "Constant" and (val := node.attrs.get("value")) is not None:
                 self._convert_tensor(val, node, graph, "value", is_attr=True)
 
-            # special case: ConstantOfShape -> constant value stored as an attribute
-            if node.op == "ConstantOfShape" and (val := node.attrs.get("value")) is not None:
-                self._convert_tensor(val, node, graph, "value", is_attr=True)
+            # special case: ConstantOfShape -> output dtype is inferred from the value attribute
+            if node.op == "ConstantOfShape":
+                self._convert_constant_of_shape_value(node, graph)
+
+            # special case: Random*Like -> output dtype is controlled by an optional dtype attribute
+            if node.op in {"RandomUniformLike", "RandomNormalLike"}:
+                self._convert_random_like_dtype_attr(node)
 
             # special case: Resize -> only input and output can be cast to bf16
             if node.op == "Resize" and node.inputs[0].name not in skip_names:

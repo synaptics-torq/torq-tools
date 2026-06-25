@@ -41,6 +41,47 @@ def _make_einsum_model():
 
 
 class FP32ConverterEnforcedIoTests(unittest.TestCase):
+    def test_bf16_conversion_updates_constant_of_shape_default_value_dtype(self):
+        shape = helper.make_tensor_value_info("shape", TensorProto.INT64, [2])
+        output = helper.make_tensor_value_info("filled", TensorProto.FLOAT, [2, 3])
+        constant_of_shape = helper.make_node(
+            "ConstantOfShape",
+            ["shape"],
+            ["filled"],
+            name="fill",
+        )
+        graph = helper.make_graph([constant_of_shape], "fill_graph", [shape], [output])
+        model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 22)])
+
+        converted = FP32Converter("bf16", convert_io=True).convert_model(model)
+
+        converted_fill = next(node for node in converted.graph.node if node.op_type == "ConstantOfShape")
+        value = next(attr for attr in converted_fill.attribute if attr.name == "value").t
+
+        self.assertEqual(value.data_type, TensorProto.BFLOAT16)
+        self.assertEqual(_tensor_type(converted.graph.output[0]), TensorProto.BFLOAT16)
+
+    def test_bf16_conversion_updates_random_like_dtype_attrs(self):
+        for op_type in ("RandomUniformLike", "RandomNormalLike"):
+            with self.subTest(op_type=op_type):
+                inp = helper.make_tensor_value_info("inp", TensorProto.FLOAT, [2, 3])
+                output = helper.make_tensor_value_info("out", TensorProto.FLOAT, [2, 3])
+                node = helper.make_node(
+                    op_type,
+                    ["inp"],
+                    ["out"],
+                    name="rand",
+                    dtype=TensorProto.FLOAT,
+                )
+                graph = helper.make_graph([node], "rand_graph", [inp], [output])
+                model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 22)])
+
+                converted = FP32Converter("bf16", convert_io=True).convert_model(model)
+
+                converted_rand = next(node for node in converted.graph.node if node.op_type == op_type)
+                self.assertEqual(_attr_i(converted_rand, "dtype"), TensorProto.BFLOAT16)
+                self.assertEqual(_tensor_type(converted.graph.output[0]), TensorProto.BFLOAT16)
+
     def test_bf16_conversion_casts_all_variadic_einsum_inputs_to_fp32(self):
         converted = FP32Converter("bf16", convert_io=True).convert_model(_make_einsum_model())
 
