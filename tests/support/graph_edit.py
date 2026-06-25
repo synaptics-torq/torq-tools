@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import onnxruntime as ort
 from numpy.testing import assert_allclose
 
 from torq.utils.ort import make_cpu_session
@@ -71,7 +72,9 @@ def run_model(
         if isinstance(model_or_graph, gs.Graph)
         else cap_model_for_ort(model_or_graph)
     )
-    sess = make_cpu_session(model.SerializeToString())
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = make_cpu_session(model.SerializeToString(), sess_options=sess_options)
     names = [out.name for out in sess.get_outputs()]
     return dict(zip(names, sess.run(names, dict(feeds))))
 
