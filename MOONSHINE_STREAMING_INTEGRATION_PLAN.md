@@ -13,8 +13,8 @@ framework, and aligning its outputs/dirs with the other model exporters.
 | 3 — New edits stay model-local | ✅ absorbed into Phase 2 |
 | 4 — Align dirs / component names / `convert_models` | ✅ done (regression PASS) |
 | 5 — Static-only inference + `infer.py` + wav-path fix | ✅ done (real transcripts verified) |
-| 6 — Register (export_model/infer_model) + packaging | ◐ packaging done; registration **next** |
-| 7 — Cleanup & verify | ⬜ todo |
+| 6 — Register (export_model/infer_model) + packaging + README | ✅ done |
+| 7 — Cleanup & verify | ⬜ next |
 
 Supporting facts: dependency blocker resolved (§1.3), baseline export verified working (§4),
 and a golden-baseline byte comparison is the regression oracle for every later phase (§4.1).
@@ -245,14 +245,22 @@ per the dtype fix above — verified to be the byte-exact `astype(bfloat16)` of 
 > than the VMFB exposes (the `streaming_config.json` sidecar plus decoder shapes). The bf16 LUT
 > dtype work (Phase 4) means the converted models + sidecars are already correct for that runtime.
 
-### Phase 6 — Register & package
-- Add a `moonshine_streaming` subparser + dispatch branch in
-  `src/torq/models/export_model.py` and `src/torq/models/infer_model.py`.
-- ✅ **DONE** — Added a `moonshine-streaming` optional-dependency extra in `pyproject.toml`
+### Phase 6 — Register & package — ✅ DONE
+- ✅ Added a `moonshine_streaming` subparser + dispatch branch in
+  `src/torq/models/export_model.py` and `src/torq/models/infer_model.py`. The package
+  `__init__` is lightweight (argparse only), and the heavy `export`/`infer` modules are
+  imported lazily on dispatch, so registering streaming does **not** pull torch/transformers
+  into the other models' CLI paths.
+- ✅ `moonshine-streaming` optional-dependency extra in `pyproject.toml`
   (`transformers>=5.5.1`, `torch`, `onnxscript`, `soundfile`, `scipy`), folded into `all`, plus
-  a per-model `src/torq/models/moonshine_streaming/requirements.txt`. The
-  `torq-export-model` / `torq-infer-model` entry points already cover it via the registry.
-- Update `README.md` usage section.
+  a per-model `requirements.txt`. The `torq-export-model` / `torq-infer-model` entry points
+  cover it via the registry.
+- ✅ Updated `README.md`: extras table, export example (`--chunk-len`), inference example, and
+  the CLI-usage block.
+
+**Verification:** `torq-export-model --help` lists `{moonshine,moonshine_streaming,smollm2,gemma3}`;
+`torq-export-model moonshine_streaming --skip-torq all --chunk-len 1280 -i 8 --skip-validation`
+runs end-to-end and writes `encoder.onnx`/`decoder.onnx`; the infer subparser `--help` resolves.
 
 ### Phase 7 — Cleanup & verify
 - Run focused graph-edit tests, then broaden as needed.
