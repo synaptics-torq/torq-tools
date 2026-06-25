@@ -16,8 +16,8 @@ ONNX_DTYPES: Final[list[str]] = ["float"]
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 
 STATIC_MODEL_COMPONENTS: Final[list[str]] = [
-    "fused_encoder",
-    "decoder_kv",
+    "encoder",
+    "decoder",
 ]
 
 

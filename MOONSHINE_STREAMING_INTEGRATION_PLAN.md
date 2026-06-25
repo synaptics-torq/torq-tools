@@ -4,6 +4,21 @@ Plan for incorporating the copied `moonshine_streaming_2_split/` model into `tor
 renaming it to `moonshine_streaming`, deduplicating against the repo's shared graph-edit
 framework, and aligning its outputs/dirs with the other model exporters.
 
+## Status at a glance (updated 2026-06-25)
+
+| Phase | Status |
+|---|---|
+| 1 — Rename & restructure | ✅ done |
+| 2 — Deduplicate against shared framework | ✅ done (regression PASS) |
+| 3 — New edits stay model-local | ✅ absorbed into Phase 2 |
+| 4 — Align dirs / component names / `convert_models` | ✅ done (regression PASS) |
+| 5 — Static-only inference + `infer.py` + wav-path fix | ⬜ next |
+| 6 — Register (export_model/infer_model) + packaging | ◐ packaging done; registration todo |
+| 7 — Cleanup & verify | ⬜ todo |
+
+Supporting facts: dependency blocker resolved (§1.3), baseline export verified working (§4),
+and a golden-baseline byte comparison is the regression oracle for every later phase (§4.1).
+
 ---
 
 ## 1. Current state of the copied folder
@@ -116,40 +131,88 @@ Originally `transformers 4.57.6` shipped `moonshine` but **not** `moonshine_stre
 > removes them. The `_dim_map` reconciliation (Phase 2) and dir/name alignment (Phase 4) are
 > still pending.
 
-### Phase 2 — Deduplicate against the repo framework
-- **Delete `onnx.py`**; repoint imports to
-  `from ...graph_edit import OnnxGraphEdit, OnnxGraphEditor, FixedDimMapping, DimMatchType, rewire_consumers`.
-- **Strip the duplicated edits from `edits.py`** and the local `DecomposeStridedConv1D`;
-  import them from `torq.graph_edit.edits` and use the repo's
-  `CommonGraphEditsMixin` / `CombineKVCacheMixin`.
-- Reconcile the `_dim_map` dependency: pass `dim_map` explicitly to the LayerNorm edits from
-  the model editor (since the repo `fix_io_dims` doesn't populate it).
+### Phase 2 — Deduplicate against the repo framework — ✅ DONE (regression PASS)
 
-  > The previously-noted broken `from ..moonshine._graph import (ReplaceInt64FloatCast,
-  > ReplacePadWithConcat)` import was already removed in Phase 1 (it fed only dead code), so it
-  > is no longer a Phase 2 task.
+**Key correction discovered during execution:** the fork's "duplicated" edits are *not* all
+pure duplicates. Diffing fork-vs-repo source showed three classes are **streaming-specialised
+supersets** that are actually used by the export path and therefore **must stay model-local**:
+`ReplaceDynamicKVCache` (handles the dynamo stacked-cache Gather-from-graph-input pattern +
+pre-allocated output shape), `MaskFutureAttentionScores` (shape-based self-attn detection), and
+`AddCurrLenInput` (accepts `past_self` + Gather/Squeeze). Swapping these for the repo versions
+would change the decoder graph. `ExtractConstantLUT` also diverged but is **unused** in
+streaming (embeddings handled at the PyTorch level) → dropped.
 
-### Phase 3 — New edits stay model-local
-- Keep `DecomposeLayerNormalization`, `DecomposeLayerNormalizationMulReciprocal`,
-  `DecomposeGelu`, `DecomposeBooleanAnd` and the inline methods (`decompose_asinh`,
-  `decompose_reduce_sum`, `remove_identity_gather_nd`, `clear_intermediate_shapes`) inside
-  `moonshine_streaming/_graph.py`.
-- Net effect: one `_graph.py` containing the `MoonshineStreamingOnnxGraphEditor` (extending
-  the repo editor + repo mixins) plus the model-specific edits — mirroring how
-  `moonshine/_graph.py` keeps `MoveOutputFromConcat` local.
+What was done:
+- ✅ **Deleted forked `onnx.py`** (249 lines, a stale copy of `graph_edit/onnx.py`); editor now
+  imports `OnnxGraphEditor, FixedDimMapping, DimMatchType` from `...graph_edit` and
+  `rewire_consumers` where needed.
+- ✅ **Trimmed `edits.py`** 1639 → 826 lines: removed the 8 byte-identical duplicate edits +
+  the two mixins + unused `DequantizeProjectionsMatMul`/`ExtractConstantLUT`. Kept only the
+  **3 divergent** (`ReplaceDynamicKVCache`, `MaskFutureAttentionScores`, `AddCurrLenInput`) and
+  the **4 new** (`DecomposeLayerNormalization`(`MulReciprocal`), `DecomposeGelu`,
+  `DecomposeBooleanAnd`) — all importing `OnnxGraphEdit` from the shared package.
+- ✅ **Removed the local `DecomposeStridedConv1D`** from `_graph.py` (818 → 461 lines); the
+  shared edit is functionally identical (only diff was a `@dataclass` decorator) and is now
+  inherited via `CommonGraphEditsMixin.decompose_strided_conv1d`.
+- ✅ Editor now extends the **repo** `OnnxGraphEditor` + repo `CommonGraphEditsMixin` /
+  `CombineKVCacheMixin`, **overriding** only `replace_dynamic_kv_cache` /
+  `mask_future_attn_scores` / `add_curr_len_input` to construct the local divergent edits, and
+  adding wrappers for the 4 new decompositions.
+- ✅ **`_dim_map` reconciled**: overrode `fix_io_dims` to record the `name -> value` map the
+  LayerNorm edits need (repo `fix_io_dims` doesn't expose it).
+- ✅ Net: ~1,420 lines of duplicated framework code removed; **zero** modifications to the
+  shared `graph_edit` package; package imports only from the shared `src/torq` level.
 
-### Phase 4 — Align exporter to repo conventions
-- Rename emitted components `fused_encoder→encoder`, `decoder_kv→decoder` everywhere:
-  `STATIC_MODEL_COMPONENTS`, ONNX `output_names`, the runner's shape-detection input keys,
-  and the `apply_post_static_patches` / `make_static` branches.
-- Rewrite `_setup_dirs` to mirror `moonshine`:
-  - `export/onnx/<dtype>/static/`  (drop `2split_streaming_static`)
-  - `export/onnx/converted/static/`
-  - `export/torq/<dtype|converted>/static/`  (**fix** the current `export/iree/...`)
-  - source under `source/onnx/.../<dtype>/`.
-- Override `convert_models` (like `moonshine` does) so the external data
-  `decoder_token_embeddings.npy` **and** `adapter_pos_emb.npy` get bf16-converted alongside
-  the models.
+**Regression (oracle = §4.1):** re-ran the same `-i 8` export (EXIT=0) and re-compared to the
+golden baseline — all four `float`/`converted` graphs **byte-identical modulo cosmetic
+metadata**, all initializer weight bytes equal. Behavior preserved.
+
+> The previously-noted broken `from ..moonshine._graph import (ReplaceInt64FloatCast,
+> ReplacePadWithConcat)` import was already removed in Phase 1, so it was not a Phase 2 task.
+
+### Phase 3 — New edits stay model-local — ✅ ABSORBED INTO PHASE 2
+- The 4 new edits (`DecomposeLayerNormalization`, `DecomposeLayerNormalizationMulReciprocal`,
+  `DecomposeGelu`, `DecomposeBooleanAnd`) now live in `moonshine_streaming/edits.py`; the
+  inline methods (`decompose_asinh`, `decompose_reduce_sum`, `remove_identity_gather_nd`,
+  `clear_intermediate_shapes`) live on the editor in `moonshine_streaming/_graph.py`.
+- The editor (`MoonshineStreamingOnnxGraphEditor`) extends the **repo** editor + repo mixins
+  and adds model-local wrappers for these edits — mirroring how `moonshine/_graph.py` keeps
+  `MoveOutputFromConcat` local.
+- Pending dead-code prune (defer to Phase 7): `decompose_reduce_sum`, `fix_decoder_kv_io`, and
+  the vestigial 5-split `fix_preprocessor_io` / `fix_encoder_io` / `fix_decoder_io` helpers are
+  currently unused by the export path; `DecomposeLayerNormalizationMulReciprocal` is kept but
+  not yet called.
+
+### Phase 4 — Align exporter to repo conventions — ✅ DONE (regression PASS)
+- ✅ Renamed emitted components `fused_encoder→encoder`, `decoder_kv→decoder`:
+  `STATIC_MODEL_COMPONENTS`, the source/export ONNX file stems, the editor `component`
+  strings, the `_components` dict keys, and the `apply_post_static_patches` branches
+  (`if "encoder"/"decoder" in component`). (Tensor-level `output_names` were already
+  graph-internal and unchanged. Editor method names `fix_fused_encoder_io` and the runner's
+  internal `fused_encoder` naming are internal and left for Phase 5.)
+- ✅ Rewrote `_setup_dirs` to the shared convention:
+  - `export/onnx/<dtype>/static/`  (was `2split_streaming_static`)
+  - `export/onnx/converted/static/`  (was `2split_static`)
+  - `export/torq/<dtype|converted>/static/`  (**fixed** the `export/iree/...` mistake)
+  - source under `source/onnx/merged/<size>/<dtype>/c{chunk}_t{tokens}/` — a config subdir is
+    kept (dropping the `2split_` prefix) because the torch export bakes `chunk_len`/`max_tokens`
+    into the source graph, so a per-config cache is required for correctness.
+- ✅ Added a `convert_models` override that places the sidecars into `converted/`:
+  - The **embedding LUTs** (`decoder_token_embeddings.npy` → decoder `inputs_embeds`,
+    `adapter_pos_emb.npy` → encoder `position_embeddings`) are **bf16-converted** (via the base
+    converter's `external_data` arg). **Deliberate deviation from the golden:** the golden left
+    them float32, but the converted graphs take **BFLOAT16** for those inputs (verified), so a
+    float32 LUT would dtype-mismatch at runtime. Under `--preserve-io-dtypes` they are copied
+    float32 instead. The `moonshine` model already bf16-converts its embedding LUT the same way.
+  - The **metadata** (`tokenizer.json`, `config.json`, `streaming_config.json`) is copied
+    verbatim. Constants `EMBEDDING_SIDECARS` / `METADATA_SIDECARS` / `SIDECAR_FILES` drive this.
+- ✅ Removed the stale pre-rename dirs from the models tree.
+
+**Regression:** re-ran the `-i 8` export (EXIT=0, source regenerated under the new names) and
+compared with path-mapping (`encoder`↔`fused_encoder`, `decoder`↔`decoder_kv`): all four graphs
+content-equivalent to golden (weights equal). In `converted/`, the 3 **metadata** sidecars are
+bit-identical to golden; the 2 **embedding LUTs** are intentionally **bf16** (golden = float32)
+per the dtype fix above — verified to be the byte-exact `astype(bfloat16)` of the float originals.
 
 ### Phase 5 — Inference + entry points
 - Simplify `_inference.py` to **static-only** (remove the dynamic-decoder branch).
@@ -209,11 +272,36 @@ Confirmed observations that map to pending phases:
    two `.onnx`). → **Phase 4** (override `convert_models`).
 4. Cosmetic only: `[W] colored module is not installed` (ignorable).
 
+### 4.1 Golden-baseline comparison — ✅ FUNCTIONALLY BIT-EQUIVALENT
+
+Compared every generated file against a golden export at `baseline/moonshine-streaming-tiny/`:
+
+- **22 files bit-identical**: all weights (`model.safetensors`), external data (`*.onnx.data`),
+  `.npy` sidecars, `tokenizer.json`, all JSON configs.
+- **6 `.onnx` graphs differ by cosmetic metadata only** — after stripping `producer_version`
+  and per-node `metadata_props`, every graph is **byte-identical** and **all initializer
+  weight bytes are equal** (incl. the bf16/int32-converted weights). The two differing fields:
+  1. `producer_version` `pytorch 2.12.0+cu130` (golden) vs `2.12.1+cu130` (torch patch bump).
+  2. `pkg.torch.onnx.stack_trace` node metadata embedding the absolute export path
+     (`/home/yhtet/projects/...` vs our repo path) — the path-length delta × node count is the
+     entire ~15 KB source-graph size gap. Pure torch/dynamo debug provenance; no compute impact.
+- **9 missing** = `.mlir`/`.vmfb` (we ran `--skip-torq all`) + `converted/` sidecars (Phase 4 gap).
+
+**Conclusion:** the refactored exporter reproduces the golden computation graphs and weights
+exactly. Optional future hooks for true *byte* determinism: pin `torch==2.12.0` and/or strip
+dynamo `metadata_props` during export. **This comparison is the regression oracle for Phases
+2–6: re-export + re-compare must keep the same equivalence (graphs equal modulo that metadata).**
+
 ---
 
-## 5. Suggested execution order
+## 5. Execution order & progress
 
-1. Phase 1–2 (rename + dedup) — the bulk, lowest-risk, easy to verify by import/load.
-2. Phase 3–4 (consolidate `_graph.py`, align dirs/names, `convert_models`).
-3. Phase 5–6 (static-only inference, `infer.py`, registration, packaging).
-4. Phase 7 (verify).
+1. ✅ Phase 1–2 (rename + dedup) — done; Phase 3 absorbed into Phase 2. Regression PASS.
+2. ⬜ Phase 4 (align dirs/component names, override `convert_models`) — **next**.
+3. ⬜ Phase 5–6 (static-only inference, `infer.py`, registration; packaging already done).
+4. ⬜ Phase 7 (dead-code prune + verify).
+
+After each remaining phase, re-run the `-i 8` export and re-check against the golden baseline
+(§4.1) — graphs must stay equal modulo the cosmetic `producer_version` / dynamo `metadata_props`.
+Note Phase 4 renames the `converted/` dir and adds the `.npy` sidecars there, so the comparison
+paths shift accordingly (the *graph* equivalence must still hold).

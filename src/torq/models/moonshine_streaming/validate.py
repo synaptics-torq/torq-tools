@@ -20,8 +20,8 @@ def validate(models_dir: str, model_size: str = "tiny"):
     logger = logging.getLogger("validate_streaming")
 
     p = Path(models_dir)
-    fused_encoder = p / "fused_encoder.onnx"
-    decoder       = p / "decoder_kv.onnx"
+    fused_encoder = p / "encoder.onnx"
+    decoder       = p / "decoder.onnx"
 
     for model_path in (fused_encoder, decoder):
         if not model_path.exists():
@@ -68,7 +68,7 @@ def validate(models_dir: str, model_size: str = "tiny"):
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Validate Moonshine Streaming.")
     parser.add_argument("-m", "--model-dir", required=True,
-                        help="Directory containing fused_encoder.onnx and decoder_kv.onnx")
+                        help="Directory containing encoder.onnx and decoder.onnx")
     parser.add_argument("-s", "--model-size", default="tiny",
                         choices=["tiny", "small"], help="Model size")
     return parser.parse_args()

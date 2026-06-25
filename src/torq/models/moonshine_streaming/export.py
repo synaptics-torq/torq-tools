@@ -10,6 +10,7 @@ from typing import Literal, Final
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
+import ml_dtypes
 import torch
 from transformers import AutoConfig
 from transformers.cache_utils import EncoderDecoderCache, DynamicCache
@@ -476,22 +477,26 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
+        # Source ONNX is parameterised by (chunk_len, max_tokens) — the torch export
+        # bakes those into the graph shapes — so it keeps a config-specific subdir to
+        # avoid reusing a stale source across configs. The export/convert/torq dirs
+        # follow the shared convention used by the other model exporters.
         onnx_dir = (
             self._models_dir / "source" / "onnx" / "merged" / self._model_size
-            / self._model_dtype / f"2split_c{self._chunk_len}_t{self._max_tokens}"
+            / self._model_dtype / f"c{self._chunk_len}_t{self._max_tokens}"
         )
         export_dir = (
-            self._models_dir / "export" / "onnx" / self._model_dtype / "2split_streaming_static"
+            self._models_dir / "export" / "onnx" / self._model_dtype / "static"
         )
         convert_dir = (
-            self._models_dir / "export" / "onnx" / "converted" / "2split_static"
+            self._models_dir / "export" / "onnx" / "converted" / "static"
         )
-        iree_dir = (
-            self._models_dir / "export" / "iree"
+        torq_dir = (
+            self._models_dir / "export" / "torq"
             / ("converted" if self._convert_dtypes else self._model_dtype)
-            / "2split_static"
+            / "static"
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, convert_dir, torq_dir
 
     def _generate_source_onnx(self):
         import json
@@ -544,7 +549,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             self._chunk_len, F, total_la, (total_la + F - 1) // F,
         )
 
-        # ── Export fused_encoder.onnx ────────────────────────────────────────
+        # ── Export encoder.onnx ────────────────────────────────────────
         self._logger.info("Exporting StatefulFusedEncoderWrapper to ONNX ...")
         dummy_audio     = torch.zeros(1, self._chunk_len)
         dummy_conv1     = torch.zeros(1, enc_hidden, 4)
@@ -559,7 +564,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             fused_dummy,
             (dummy_audio, dummy_conv1, dummy_conv2, dummy_feats_buf,
              dummy_pos_emb, *dummy_bufs),
-            str(self._onnx_dir / "fused_encoder.onnx"),
+            str(self._onnx_dir / "encoder.onnx"),
             dynamo=True,
             input_names=[
                 "audio_chunk", "conv1_buffer", "conv2_buffer",
@@ -574,7 +579,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             ],
         )
 
-        # ── Export decoder_kv.onnx (identical to 5-split streaming decoder) ──
+        # ── Export decoder.onnx (identical to 5-split streaming decoder) ──
         self._logger.info(
             "Exporting DecoderKVWrapper to ONNX (max_tokens=%d, max_memory_len=%d)...",
             self._max_tokens, self._max_memory_len,
@@ -615,7 +620,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             decoder_kv,
             (dummy_first_input, *self_kv_dummies, *cross_kv_dummies,
              dummy_cross_attn_bias, dummy_position_ids),
-            str(self._onnx_dir / "decoder_kv.onnx"),
+            str(self._onnx_dir / "decoder.onnx"),
             dynamo=True,
             input_names=[first_input_name, *self_kv_in_names,
                          *cross_kv_in_names, "cross_attn_bias", "position_ids"],
@@ -642,8 +647,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         import json as _json
 
         source_files = {
-            "fused_encoder": self._onnx_dir / "fused_encoder.onnx",
-            "decoder_kv":    self._onnx_dir / "decoder_kv.onnx",
+            "encoder": self._onnx_dir / "encoder.onnx",
+            "decoder":    self._onnx_dir / "decoder.onnx",
         }
 
         any_missing = any(not path.exists() for path in source_files.values())
@@ -674,7 +679,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     def _make_fused_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-            model, "fused_encoder", self._onnx_export_dtype
+            model, "encoder", self._onnx_export_dtype
         )
         # Dynamo export produces concrete shapes; fix_io_dims handles any residual
         # symbolic dims on batch or seq axes.
@@ -705,7 +710,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     def _make_decoder_kv_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-            model, "decoder_kv", self._onnx_export_dtype
+            model, "decoder", self._onnx_export_dtype
         )
         editor.make_decoder_static(self._max_tokens)
         editor.decompose_layer_normalization()
@@ -722,11 +727,11 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             "Applying streaming static graph edits (F=%d, max_tokens=%d)...",
             F, self._max_tokens,
         )
-        self._components["fused_encoder"] = self._make_fused_encoder_static(
-            self._components["fused_encoder"]
+        self._components["encoder"] = self._make_fused_encoder_static(
+            self._components["encoder"]
         )
-        self._components["decoder_kv"] = self._make_decoder_kv_static(
-            self._components["decoder_kv"]
+        self._components["decoder"] = self._make_decoder_kv_static(
+            self._components["decoder"]
         )
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
@@ -737,7 +742,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             if src.exists():
                 shutil.copy2(src, dst)
 
-        if "fused_encoder" in component:
+        if "encoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
                 model_path, component, self._onnx_export_dtype
             )
@@ -748,7 +753,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
-        if "decoder_kv" in component:
+        if "decoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
                 model_path, component, self._onnx_export_dtype
             )
@@ -763,23 +768,63 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             if src.exists():
                 shutil.copy2(src, dst)
 
+    # Host-side runtime LUTs fed directly into the models: the token-embedding table
+    # (-> decoder ``inputs_embeds``) and the position table (-> encoder
+    # ``position_embeddings``). Their dtype must track the model's I/O dtype.
+    EMBEDDING_SIDECARS: Final[tuple[str, ...]] = (
+        "decoder_token_embeddings.npy", "adapter_pos_emb.npy",
+    )
+    # Metadata that rides alongside the models, copied verbatim.
+    METADATA_SIDECARS: Final[tuple[str, ...]] = (
+        "tokenizer.json", "config.json", "streaming_config.json",
+    )
+    SIDECAR_FILES: Final[tuple[str, ...]] = EMBEDDING_SIDECARS + METADATA_SIDECARS
+
     def export_onnx(self, validate: bool = True):
         super().export_onnx(validate=False)
-        for fname in (
-            "decoder_token_embeddings.npy", "adapter_pos_emb.npy",
-            "tokenizer.json", "config.json", "streaming_config.json",
-        ):
+        for fname in self.SIDECAR_FILES:
             src = self._onnx_dir / fname
             if src.exists():
                 shutil.copy2(src, self._export_dir / fname)
         if validate:
             self.validate_onnx()
 
+    def convert_models(
+        self,
+        convert_dir: str | os.PathLike | None = None,
+        preserve_io: bool = False,
+        skip: list[str] | None = None,
+    ):
+        # The converted models take bf16 ``position_embeddings`` / ``inputs_embeds``,
+        # so the host-side LUTs must be bf16 too (the golden export left them float32,
+        # which would dtype-mismatch the converted graph at runtime). The base
+        # converter loads each .npy, casts to the target dtype, and writes it into the
+        # converted dir. Unless ``--preserve-io-dtypes`` keeps the I/O float.
+        external_data = []
+        if not preserve_io:
+            external_data = [
+                (self._export_dir / fname, np.dtype(ml_dtypes.bfloat16))
+                for fname in self.EMBEDDING_SIDECARS
+                if (self._export_dir / fname).exists()
+            ]
+        super().convert_models(
+            convert_dir=convert_dir,
+            preserve_io=preserve_io,
+            skip=skip,
+            external_data=external_data,
+        )
+        # If I/O dtypes were preserved, copy the LUTs verbatim instead.
+        embed_to_copy = self.EMBEDDING_SIDECARS if preserve_io else ()
+        for fname in self.METADATA_SIDECARS + embed_to_copy:
+            src = self._export_dir / fname
+            if src.exists():
+                shutil.copy2(src, self._convert_dir / fname)
+
     def validate_onnx(self, n_iters: int = 5):
         self._logger.info("Validating exported streaming ONNX models...")
         runner = MoonshineStreaming.from_onnx(
-            fused_encoder_model=self._export_dir / "fused_encoder.onnx",
-            decoder_model=self._export_dir / "decoder_kv.onnx",
+            fused_encoder_model=self._export_dir / "encoder.onnx",
+            decoder_model=self._export_dir / "decoder.onnx",
             model_size=self._model_size,
         )
 
