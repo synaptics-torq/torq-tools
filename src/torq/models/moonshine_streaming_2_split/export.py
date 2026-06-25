@@ -293,19 +293,19 @@ class DecoderKVWrapper(torch.nn.Module):
         out_k_selves = [layer.keys   for layer in pkv.self_attention_cache.layers]
         out_v_selves = [layer.values for layer in pkv.self_attention_cache.layers]
 
+        # Cross-KV is input-only and unchanged by the decoder, so it is NOT
+        # re-emitted as outputs — doing so was a wasteful per-token D2H copy that
+        # every orchestrator discards. Outputs are logits + updated self-KV only
+        # (plus the optional cross_attn weights below). NOTE: any consumer that
+        # detected the cross_attn output by output *count* must use
+        # `len(out) > 1 + 2*depth` (was `1 + 4*depth`) — see full_streaming_demo.
         outputs = (logits,
                    out_k_selves[0], out_v_selves[0],
                    out_k_selves[1], out_v_selves[1],
                    out_k_selves[2], out_v_selves[2],
                    out_k_selves[3], out_v_selves[3],
                    out_k_selves[4], out_v_selves[4],
-                   out_k_selves[5], out_v_selves[5],
-                   k_cross_0, v_cross_0,
-                   k_cross_1, v_cross_1,
-                   k_cross_2, v_cross_2,
-                   k_cross_3, v_cross_3,
-                   k_cross_4, v_cross_4,
-                   k_cross_5, v_cross_5)
+                   out_k_selves[5], out_v_selves[5])
 
         if self._output_attention:
             # Per-layer decoder→memory cross-attention probabilities, already
@@ -594,7 +594,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             for _ in range(self._n_layers * 2)
         ]
         cross_kv_in_names  = [name for i in range(self._n_layers) for name in (f"k_cross_{i}", f"v_cross_{i}")]
-        cross_kv_out_names = [f"out_{name}" for name in cross_kv_in_names]
+        # Cross-KV is input-only — not re-emitted as decoder outputs (see DecoderKVWrapper.forward).
         dummy_cross_attn_bias = torch.zeros(1, self._num_kv_heads, 1, self._max_memory_len)
         dummy_position_ids    = torch.tensor([[self._max_tokens]], dtype=torch.long)
 
@@ -605,7 +605,7 @@ class MoonshineStreaming2SplitExporter(OnnxModelExporterBase):
             dummy_first_input = torch.ones(1, 1, dtype=torch.long)
             first_input_name  = "token"
 
-        decoder_out_names = ["logits", *self_kv_out_names, *cross_kv_out_names]
+        decoder_out_names = ["logits", *self_kv_out_names]
         if self._export_attention:
             # one stacked output [depth, 1, heads, 1, max_memory_len]
             decoder_out_names.append("cross_attn")
