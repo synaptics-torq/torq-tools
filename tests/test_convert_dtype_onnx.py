@@ -119,6 +119,79 @@ class FP32ConverterEnforcedIoTests(unittest.TestCase):
 
 
 class Int64ConverterEnforcedIoTests(unittest.TestCase):
+    def test_enforced_reduce_axes_cast_from_exported_constant(self):
+        data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [2, 3])
+        axes = helper.make_tensor("axes", TensorProto.INT64, [1], [1])
+        output = helper.make_tensor_value_info("reduced", TensorProto.FLOAT, [2, 1])
+        reduce = helper.make_node("ReduceL2", ["data", "axes"], ["reduced"], name="reduce")
+        graph = helper.make_graph([reduce], "reduce_graph", [data], [output], [axes])
+        model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 22)])
+
+        converted = Int64Converter("int32", convert_io=True).convert_model(model)
+
+        reduce = next(node for node in converted.graph.node if node.name == "reduce")
+        axes_cast = next(
+            node
+            for node in converted.graph.node
+            if node.op_type == "Cast" and node.output == [reduce.input[1]]
+        )
+
+        self.assertEqual(_attr_i(axes_cast, "to"), TensorProto.INT64)
+        self.assertEqual(converted.graph.initializer[0].data_type, TensorProto.INT32)
+
+    def test_enforced_reshape_shape_input_casts_after_concat_shape_builder(self):
+        data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [6])
+        shape_source = helper.make_tensor_value_info("shape_source", TensorProto.FLOAT, [2, 3])
+        unsqueeze_source = helper.make_tensor_value_info("unsqueeze_source", TensorProto.FLOAT, [1, 1, 1])
+        dim = helper.make_tensor("dim", TensorProto.INT64, [1], [3])
+        output = helper.make_tensor_value_info("reshaped", TensorProto.FLOAT, [2, 3])
+        unsqueezed = helper.make_tensor_value_info("unsqueezed", TensorProto.FLOAT, [1, 1, 1, 1])
+        unsqueeze = helper.make_node(
+            "Unsqueeze",
+            ["unsqueeze_source", "dim"],
+            ["unsqueezed"],
+            name="unsqueeze",
+        )
+        shape = helper.make_node(
+            "Shape",
+            ["shape_source"],
+            ["leading_dim"],
+            name="shape",
+            start=0,
+            end=1,
+        )
+        concat = helper.make_node("Concat", ["leading_dim", "dim"], ["target_shape"], name="concat", axis=0)
+        reshape = helper.make_node("Reshape", ["data", "target_shape"], ["reshaped"], name="reshape")
+        graph = helper.make_graph(
+            [unsqueeze, shape, concat, reshape],
+            "concat_shape_graph",
+            [data, shape_source, unsqueeze_source],
+            [output, unsqueezed],
+            [dim],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 22)])
+
+        converted = Int64Converter("int32", convert_io=True).convert_model(model)
+
+        shape = next(node for node in converted.graph.node if node.name == "shape")
+        concat = next(node for node in converted.graph.node if node.name == "concat")
+        reshape = next(node for node in converted.graph.node if node.name == "reshape")
+        shape_cast = next(
+            node
+            for node in converted.graph.node
+            if node.op_type == "Cast" and node.input == list(shape.output)
+        )
+        reshape_cast = next(
+            node
+            for node in converted.graph.node
+            if node.op_type == "Cast" and node.input == list(concat.output)
+        )
+
+        self.assertEqual(_attr_i(shape_cast, "to"), TensorProto.INT32)
+        self.assertEqual(concat.input[0], shape_cast.output[0])
+        self.assertEqual(_attr_i(reshape_cast, "to"), TensorProto.INT64)
+        self.assertEqual(reshape.input[1], reshape_cast.output[0])
+
     def test_enforced_reshape_shape_input_preserves_shape_producer_output(self):
         data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [6])
         shape_source = helper.make_tensor_value_info("shape_source", TensorProto.FLOAT, [2, 3])
@@ -173,10 +246,16 @@ class Int64ConverterEnforcedIoTests(unittest.TestCase):
             for node in converted.graph.node
             if node.op_type == "Cast" and node.input == [topk.output[1]]
         )
+        k_cast = next(
+            node
+            for node in converted.graph.node
+            if node.op_type == "Cast" and node.output == [topk.input[1]]
+        )
 
+        self.assertEqual(_attr_i(k_cast, "to"), TensorProto.INT64)
         self.assertEqual(_attr_i(index_cast, "to"), TensorProto.INT32)
         self.assertEqual(identity.input[0], index_cast.output[0])
-        self.assertEqual(converted.graph.initializer[0].data_type, TensorProto.INT64)
+        self.assertEqual(converted.graph.initializer[0].data_type, TensorProto.INT32)
         self.assertEqual(_tensor_type(converted.graph.output[1]), TensorProto.INT32)
 
 

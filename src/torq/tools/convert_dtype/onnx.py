@@ -251,6 +251,26 @@ class OnnxDtypeConverterBase(ABC):
         node.inputs[idx] = new_const
         return new_const
 
+    def _export_constant_for_enforced_input_cast(
+        self,
+        tensor: gs.Constant,
+        graph: gs.Graph,
+    ) -> gs.Constant:
+        new_const_name = tensor.name + f"_{self._export_dtype_str}"
+        if new_const := graph.tensors().get(new_const_name):
+            return new_const
+        try:
+            np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+        cast_fn = getattr(self, "_cast_constant_values", None)
+        cast_values = (
+            cast_fn(tensor.values, np_type)
+            if cast_fn is not None
+            else tensor.values.astype(np_type)
+        )
+        return gs.Constant(new_const_name, cast_values)
+
     def _mark_enforced_input(
         self,
         node: gs.Node,
@@ -260,6 +280,26 @@ class OnnxDtypeConverterBase(ABC):
         tensor = node.inputs[idx]
         required_dtype, required_dtype_str = self._required_enforced_io_dtype()
         tensor_dtype = getattr(tensor, "export_dtype", None) or tensor.dtype
+        if self._cast_enforced_input_edges() and isinstance(tensor, gs.Constant):
+            cast_in = (
+                self._export_constant_for_enforced_input_cast(tensor, graph)
+                if self._is_original_dtype(tensor_dtype)
+                else tensor
+            )
+            cast_out: gs.Variable = graph.layer(
+                name=f"{node.name or node.op}_input_{idx}_cast_{required_dtype_str}",
+                op="Cast",
+                inputs=[cast_in],
+                outputs=[gs.Variable(
+                    f"{tensor.name}_{node.name or node.op}_input_{idx}_{required_dtype_str}",
+                    dtype=required_dtype,
+                    shape=tensor.shape,
+                )],
+                attrs={"to": required_dtype},
+            )[0]
+            node.inputs[idx] = cast_out
+            self._convert_exceptions[cast_out.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+            return
         if isinstance(tensor, gs.Constant):
             if not self._is_original_dtype(tensor_dtype):
                 dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
@@ -270,6 +310,13 @@ class OnnxDtypeConverterBase(ABC):
                 )
                 tensor = self._cast_constant_for_enforced_io(tensor, node, idx, required_dtype, required_dtype_str)
             self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+            return
+
+        if (
+            self._cast_enforced_input_edges()
+            and tensor.name in self._convert_exceptions
+            and is_same_dtype(tensor_dtype, required_dtype)
+        ):
             return
 
         if not self._cast_enforced_input_edges():
@@ -688,14 +735,28 @@ class Int64Converter(OnnxDtypeConverterBase):
 
     # as of onnx v1.21.0
     _ENFORCED_INT64_IO: Final[dict[str, _EnforcedIoSpec]] = {
+        "ArgMax": ((), (0,)),       # v13: outputs: (reduced, )
+        "ArgMin": ((), (0,)),       # v13: outputs: (reduced, )
         "ConstantOfShape": ((0,),), # v25: inputs: (input, )
         "Expand": ((1,),),          # v13: inputs: (shape, )
         "GatherND": ((1,),),        # v13: inputs: (indices, )
+        "NonZero": ((), (0,)),      # v13: outputs: (Y, )
         "Pad": ((1, 3),),           # v25: inputs: (pads, axes)
+        "ReduceL1": ((1,),),        # v18: inputs: (axes, )
+        "ReduceL2": ((1,),),        # v18: inputs: (axes, )
+        "ReduceLogSum": ((1,),),    # v18: inputs: (axes, )
+        "ReduceLogSumExp": ((1,),), # v18: inputs: (axes, )
+        "ReduceMax": ((1,),),       # v20: inputs: (axes, )
         "ReduceMean": ((1,),),      # v18: inputs: (axes, )
+        "ReduceMin": ((1,),),       # v20: inputs: (axes, )
+        "ReduceProd": ((1,),),      # v18: inputs: (axes, )
+        "ReduceSum": ((1,),),       # v13: inputs: (axes, )
+        "ReduceSumSquare": ((1,),), # v18: inputs: (axes, )
         "Reshape": ((1,),),         # v25: inputs: (shape, )
         "Resize": ((3,),),          # v19: inputs: (sizes, )
+        "Shape": ((), (0,)),        # v25: outputs: (shape, )
         "Slice": ((1, 2, 3, 4),),   # v13: inputs: (starts, ends, axes, steps)
+        "Size": ((), (0,)),         # v25: outputs: (size, )
         "Squeeze": ((1,),),         # v25: inputs: (axes, )
         "Tile": ((1,),),            # v13: inputs: (repeats, )
         "TopK": ((1,), (1,)),       # v24: inputs: (K, ), outputs: (I, )
@@ -733,10 +794,11 @@ class Int64Converter(OnnxDtypeConverterBase):
         return ("int32", "int16", "int8")
 
     def _required_enforced_io_dtype(self) -> tuple[onnx.TensorProto.DataType, str]:
+        self._set_dtypes(False)
         return onnx.TensorProto.INT64, "int64"
 
     def _cast_enforced_input_edges(self) -> bool:
-        return False
+        return True
 
     def _is_original_dtype(self, dtype) -> bool:
         return (
