@@ -12,6 +12,8 @@ import onnx_graphsurgeon as gs
 import numpy as np
 import ml_dtypes
 import torch
+from datasets import load_dataset, Audio
+from tokenizers import Tokenizer
 from transformers import AutoConfig
 from transformers.cache_utils import EncoderDecoderCache, DynamicCache
 
@@ -823,37 +825,49 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
     def validate_onnx(self, n_iters: int = 5):
         self._logger.info("Validating exported streaming ONNX models...")
         runner = MoonshineStreaming.from_onnx(
-            fused_encoder_model=self._export_dir / "encoder.onnx",
+            encoder_model=self._export_dir / "encoder.onnx",
             decoder_model=self._export_dir / "decoder.onnx",
             model_size=self._model_size,
         )
 
-        wav_path = Path(__file__).parent.parent / "moonshine_streaming" / "OSR_us_000_0010_8k.wav"
-        if wav_path.exists():
-            import soundfile as sf
-            from scipy.signal import resample_poly
-            from tokenizers import Tokenizer
+        tokenizer_path = self._export_dir / "tokenizer.json"
+        tokenizer = Tokenizer.from_file(str(tokenizer_path)) if tokenizer_path.exists() else None
 
-            self._logger.info("Loading test audio '%s' for validation...", wav_path.name)
-            data, sr = sf.read(wav_path, dtype="float32")
-            if data.ndim == 2:
-                data = data.mean(axis=1)
-            if sr != 16000:
-                data = resample_poly(data, up=16000, down=sr).astype(np.float32)
+        try:
+            dataset = load_dataset(
+                path="hf-internal-testing/librispeech_asr_dummy",
+                name="clean",
+                split="validation",
+            )
+            dataset = dataset.cast_column("audio", Audio(16_000))
+        except Exception as exc:  # offline / dataset unavailable
+            self._logger.warning(
+                "Could not load validation dataset (%s); using dummy audio", exc
+            )
+            dataset = None
 
-            tokens = runner.run(data[np.newaxis, :])
-            tokenizer_path = self._export_dir / "tokenizer.json"
-            if tokenizer_path.exists():
-                tokenizer = Tokenizer.from_file(str(tokenizer_path))
-                transcribed = tokenizer.decode_batch(tokens, skip_special_tokens=True)[0]
-                self._logger.info("Validation transcription: '%s'", transcribed)
+        for i in range(n_iters):
+            if dataset is not None and i < len(dataset):
+                audio = dataset[i]["audio"]["array"].astype(np.float32)[np.newaxis, :]
             else:
-                self._logger.info("Validation tokens: %s", str(tokens))
-        else:
-            self._logger.warning("Test audio not found — running validation with dummy audio")
-            dummy_audio = np.random.randn(1, 80000).astype(np.float32)
-            tokens = runner.run(dummy_audio)
-            self._logger.info("Dummy validation tokens: %s", str(tokens))
+                if dataset is not None:
+                    break
+                audio = np.random.randn(1, 80_000).astype(np.float32)
+
+            tokens = runner.run(audio)
+            if tokenizer is not None:
+                text = tokenizer.decode_batch(tokens, skip_special_tokens=True)[0]
+                self._logger.info(
+                    "(ONNX-validation) [iter %d, %.1f ms] '%s'",
+                    i, runner.last_infer_time * 1000, text,
+                )
+            else:
+                self._logger.info(
+                    "(ONNX-validation) [iter %d, %.1f ms] tokens=%s",
+                    i, runner.last_infer_time * 1000, tokens.tolist(),
+                )
+            if dataset is None:
+                break
 
 
 def export_moonshine_streaming_from_args(args: argparse.Namespace):

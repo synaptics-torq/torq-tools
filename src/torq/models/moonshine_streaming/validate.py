@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import os
 import numpy as np
+from tokenizers import Tokenizer
 
 try:
     from ._inference import MoonshineStreaming
@@ -29,40 +30,32 @@ def validate(models_dir: str, model_size: str = "tiny"):
 
     logger.info("Initialising MoonshineStreaming runner...")
     runner = MoonshineStreaming.from_onnx(
-        fused_encoder_model=fused_encoder,
+        encoder_model=fused_encoder,
         decoder_model=decoder,
         model_size=model_size,
     )
 
-    wav_path = Path(__file__).parent.parent / "moonshine_streaming" / "OSR_us_000_0010_8k.wav"
-    if wav_path.exists():
-        import soundfile as sf
-        from scipy.signal import resample_poly
-        from tokenizers import Tokenizer
+    tokenizer_path = p / "tokenizer.json"
+    tokenizer = Tokenizer.from_file(str(tokenizer_path)) if tokenizer_path.exists() else None
 
-        logger.info("Loading test audio '%s'...", wav_path.name)
-        data, sr = sf.read(wav_path, dtype="float32")
-        if data.ndim == 2:
-            data = data.mean(axis=1)
-        if sr != 16000:
-            data = resample_poly(data, up=16000, down=sr).astype(np.float32)
+    try:
+        from datasets import load_dataset, Audio
+        dataset = load_dataset(
+            "hf-internal-testing/librispeech_asr_dummy", "clean", split="validation"
+        ).cast_column("audio", Audio(16_000))
+        audio = dataset[0]["audio"]["array"].astype(np.float32)[np.newaxis, :]
+        logger.info("Loaded validation sample from librispeech_asr_dummy")
+    except Exception as exc:
+        logger.warning("Could not load validation dataset (%s); using dummy audio", exc)
+        audio = np.random.randn(1, 80_000).astype(np.float32)
 
-        tokens = runner.run(data[np.newaxis, :])
-        tokenizer_path = p / "tokenizer.json"
-        if tokenizer_path.exists():
-            tokenizer = Tokenizer.from_file(str(tokenizer_path))
-            transcribed = tokenizer.decode_batch(tokens, skip_special_tokens=True)[0]
-            logger.info("=" * 80)
-            logger.info("Validation successful!")
-            logger.info("Transcription: '%s'", transcribed)
-            logger.info("=" * 80)
-        else:
-            logger.info("Validation successful, tokens: %s", str(tokens))
+    tokens = runner.run(audio)
+    logger.info("=" * 80)
+    if tokenizer is not None:
+        logger.info("Transcription: '%s'", tokenizer.decode_batch(tokens, skip_special_tokens=True)[0])
     else:
-        logger.warning("Test audio not found — running with dummy audio...")
-        dummy_audio = np.random.randn(1, 80000).astype(np.float32)
-        tokens = runner.run(dummy_audio)
-        logger.info("Validation successful on dummy audio, tokens: %s", str(tokens))
+        logger.info("Tokens: %s", tokens.tolist())
+    logger.info("=" * 80)
 
 
 def parse_arguments():

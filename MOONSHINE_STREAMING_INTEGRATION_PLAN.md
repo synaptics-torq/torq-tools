@@ -12,8 +12,8 @@ framework, and aligning its outputs/dirs with the other model exporters.
 | 2 — Deduplicate against shared framework | ✅ done (regression PASS) |
 | 3 — New edits stay model-local | ✅ absorbed into Phase 2 |
 | 4 — Align dirs / component names / `convert_models` | ✅ done (regression PASS) |
-| 5 — Static-only inference + `infer.py` + wav-path fix | ⬜ next |
-| 6 — Register (export_model/infer_model) + packaging | ◐ packaging done; registration todo |
+| 5 — Static-only inference + `infer.py` + wav-path fix | ✅ done (real transcripts verified) |
+| 6 — Register (export_model/infer_model) + packaging | ◐ packaging done; registration **next** |
 | 7 — Cleanup & verify | ⬜ todo |
 
 Supporting facts: dependency blocker resolved (§1.3), baseline export verified working (§4),
@@ -214,14 +214,36 @@ content-equivalent to golden (weights equal). In `converted/`, the 3 **metadata*
 bit-identical to golden; the 2 **embedding LUTs** are intentionally **bf16** (golden = float32)
 per the dtype fix above — verified to be the byte-exact `astype(bfloat16)` of the float originals.
 
-### Phase 5 — Inference + entry points
-- Simplify `_inference.py` to **static-only** (remove the dynamic-decoder branch).
-- Derive `head_dim` / `hidden_size` from config or ONNX shapes instead of hardcoding per size.
-- Add `infer.py` with `infer_moonshine_streaming(args)` (mirror `moonshine/infer.py`'s
-  `_transcribe` shape). The folder currently has only `validate.py`.
-- Fix the hardcoded validation wav path (`../moonshine_streaming/OSR_us_000_0010_8k.wav`
-  becomes self-referential after the rename): use the librispeech dataset approach like
-  `moonshine`, or add the wav as a committed test asset.
+### Phase 5 — Inference + entry points — ✅ DONE
+- ✅ Simplified `_inference.py` to **static-only**: removed the dynamic-decoder branch and the
+  `_is_static_decoder` flag (the exporter always emits the static KV-cache decoder; the runner
+  now raises if `current_len` is absent).
+- ✅ **All dims derived from the ONNX graphs** (no per-size hardcoding): `n_layers`,
+  `n_kv_heads`, `head_dim`, `hidden_size`, `max_tokens`, `max_memory_len`, `chunk_len`, `F`,
+  `total_lookahead`, `c1_channels`, `enc_left_ctx`, and `extract_embeddings`. `model_size` is now
+  optional/informational.
+- ✅ **Dtype-aware feeds**: the runner reads the model's I/O dtype from the session and builds
+  all zero-buffers / casts feeds to match, so the same runner drives the float **and** bf16
+  exports (the host-side LUTs already carry the right dtype per export dir). Added a
+  `_ORT_TYPE_TO_NP` map (incl. `bfloat16`).
+- ✅ Renamed the runner's public ctor kwargs `encoder_model` / `decoder_model`; added a
+  `load_moonshine_streaming(model_dir, ...)` loader (ONNX now; VMFB raises a clear "not yet
+  wired" error).
+- ✅ Added **`infer.py`** with `infer_moonshine_streaming(args)` + `_transcribe` (loads WAV via
+  soundfile, resamples to 16 kHz, decodes with the model dir's `tokenizer.json`).
+- ✅ Fixed the self-referential wav path in **both** `export.validate_onnx` and `validate.py`:
+  they now pull samples from `hf-internal-testing/librispeech_asr_dummy` (dummy-audio fallback
+  when offline).
+
+**Verification (real audio, float export):**
+- `validate.py` → `'Mr. Quilter is the apostle of the middle classes…'` (correct LibriSpeech ref).
+- `infer.py` on a real WAV → `'Nor is Mr. Quilter's manner less interesting than his matter.'`
+- Integrated `export … validate_onnx` → 5/5 LibriSpeech samples transcribed correctly.
+- Graph regression: graphs **unchanged** vs golden (Phase 5 touched only inference/validation).
+
+> VMFB/Torq-runtime streaming inference is intentionally **deferred** — it needs richer config
+> than the VMFB exposes (the `streaming_config.json` sidecar plus decoder shapes). The bf16 LUT
+> dtype work (Phase 4) means the converted models + sidecars are already correct for that runtime.
 
 ### Phase 6 — Register & package
 - Add a `moonshine_streaming` subparser + dispatch branch in
@@ -297,9 +319,11 @@ dynamo `metadata_props` during export. **This comparison is the regression oracl
 ## 5. Execution order & progress
 
 1. ✅ Phase 1–2 (rename + dedup) — done; Phase 3 absorbed into Phase 2. Regression PASS.
-2. ⬜ Phase 4 (align dirs/component names, override `convert_models`) — **next**.
-3. ⬜ Phase 5–6 (static-only inference, `infer.py`, registration; packaging already done).
-4. ⬜ Phase 7 (dead-code prune + verify).
+2. ✅ Phase 4 (align dirs/component names, `convert_models` + bf16 LUTs). Regression PASS.
+3. ✅ Phase 5 (static-only inference, dim/dtype derivation, `infer.py`, wav-path) — real
+   transcripts verified.
+4. ⬜ Phase 6 registration (`export_model.py` / `infer_model.py` subparser + dispatch); packaging done.
+5. ⬜ Phase 7 (dead-code prune + verify).
 
 After each remaining phase, re-run the `-i 8` export and re-check against the golden baseline
 (§4.1) — graphs must stay equal modulo the cosmetic `producer_version` / dynamo `metadata_props`.
