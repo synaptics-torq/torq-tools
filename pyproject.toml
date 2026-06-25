@@ -53,7 +53,14 @@ moonshine = [
     "pandas",
     "tqdm",
 ]
-all = ["torq-tools[moonshine]"]
+moonshine-streaming = [
+    "transformers>=5.5.1",
+    "torch",
+    "onnxscript",
+    "soundfile",
+    "scipy",
+]
+all = ["torq-tools[moonshine]", "torq-tools[moonshine-streaming]"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
