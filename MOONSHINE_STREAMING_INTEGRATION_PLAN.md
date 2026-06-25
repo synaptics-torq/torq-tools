@@ -14,7 +14,7 @@ framework, and aligning its outputs/dirs with the other model exporters.
 | 4 — Align dirs / component names / `convert_models` | ✅ done (regression PASS) |
 | 5 — Static-only inference + `infer.py` + wav-path fix | ✅ done (real transcripts verified) |
 | 6 — Register (export_model/infer_model) + packaging + README | ✅ done |
-| 7 — Cleanup & verify | ⬜ next |
+| 7 — Cleanup & verify | ✅ done (regression PASS) |
 
 Supporting facts: dependency blocker resolved (§1.3), baseline export verified working (§4),
 and a golden-baseline byte comparison is the regression oracle for every later phase (§4.1).
@@ -262,10 +262,28 @@ per the dtype fix above — verified to be the byte-exact `astype(bfloat16)` of 
 `torq-export-model moonshine_streaming --skip-torq all --chunk-len 1280 -i 8 --skip-validation`
 runs end-to-end and writes `encoder.onnx`/`decoder.onnx`; the infer subparser `--help` resolves.
 
-### Phase 7 — Cleanup & verify
-- Run focused graph-edit tests, then broaden as needed.
-- Do a `--skip-torq` dry run against pre-exported source ONNX to confirm the static +
-  graph-edit pipeline works end-to-end (this venv's transformers cannot regenerate source).
+### Phase 7 — Cleanup & verify — ✅ DONE (regression PASS)
+- ✅ Pruned dead code from `_graph.py` (818 → 252 lines): removed the vestigial 5-split
+  IO-fixers `fix_preprocessor_io` / `fix_encoder_io` / `fix_decoder_io`, the superseded
+  `fix_decoder_kv_io`, and the unwired `decompose_reduce_sum`. Editor is now just the methods
+  the export path uses (+ the streaming-specialised wrappers).
+- ✅ Removed 3 unused imports from `export.py` (`onnx_graphsurgeon as gs`, `ONNX_DTYPES`,
+  `OPTIMUM_DTYPES`). A precise AST-based scan now reports **zero** unused imports across all 7
+  package files.
+- ✅ **Kept** `DecomposeLayerNormalizationMulReciprocal` (+ its `decompose_layer_normalization_mul_reciprocal`
+  wrapper) per the "keep the 4 new edits model-local" decision, even though it is not currently
+  wired into the export path. *Flagged for the user — remove if a strictly-used-only policy is
+  preferred.*
+- ✅ Kept `validate.py` (a quick model-dir smoke test; complementary to `infer.py`'s WAV demo).
+- ✅ Final full export (EXIT=0, 5/5 LibriSpeech validation transcripts correct) → **golden
+  regression PASS**: graphs content-equivalent, bf16 LUTs byte-exact, metadata sidecars
+  bit-identical. End-to-end `torq-infer-model moonshine_streaming <wav>` transcribes correctly.
+
+### Final package shape
+`src/torq/models/moonshine_streaming/`: `__init__.py` (136) · `_graph.py` (252) ·
+`_inference.py` (280) · `edits.py` (826) · `export.py` (909) · `infer.py` (61) ·
+`validate.py` (76) · `requirements.txt`. No forked framework code; reuses only the shared
+`src/torq` level; no sibling-model imports.
 
 ---
 

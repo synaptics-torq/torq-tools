@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Literal, Final
 
 import onnx
-import onnx_graphsurgeon as gs
 import numpy as np
 import ml_dtypes
 import torch
@@ -20,8 +19,6 @@ from transformers.cache_utils import EncoderDecoderCache, DynamicCache
 from ...utils.logging import configure_logging
 
 from . import (
-    ONNX_DTYPES,
-    OPTIMUM_DTYPES,
     STATIC_MODEL_COMPONENTS,
     add_moonshine_streaming_export_args,
 )
