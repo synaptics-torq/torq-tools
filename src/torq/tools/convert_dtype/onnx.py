@@ -719,8 +719,9 @@ class FP32Converter(OnnxDtypeConverterBase):
                 self._convert_random_like_dtype_attr(node)
 
             # special case: Resize -> only input and output can be cast to bf16
-            if node.op == "Resize" and node.inputs[0].name not in skip_names:
-                self._convert_tensor(node.inputs[0], node, graph, 0, is_attr=False)
+            if node.op == "Resize":
+                if node.inputs[0].name not in skip_names:
+                    self._convert_tensor(node.inputs[0], node, graph, 0, is_attr=False)
                 if self._is_original_dtype((out := node.outputs[0]).dtype) and out.name not in skip_names:
                     out.dtype = self._export_onnx_dtype
                 continue
