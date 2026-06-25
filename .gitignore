@@ -37,3 +37,4 @@ release/
 TODO*
 *.md
 !**/README.md
+!CONTRIBUTING.md
