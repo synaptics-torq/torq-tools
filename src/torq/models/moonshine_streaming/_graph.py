@@ -13,7 +13,6 @@ from .edits import (
     MaskFutureAttentionScores,
     AddCurrLenInput,
     DecomposeLayerNormalization,
-    DecomposeLayerNormalizationMulReciprocal,
     DecomposeGelu,
     DecomposeBooleanAnd,
 )
@@ -133,11 +132,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
     def decompose_layer_normalization(self):
         dim_map = getattr(self, "_dim_map", None)
         self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name, dim_map=dim_map))
-        return self
-
-    def decompose_layer_normalization_mul_reciprocal(self):
-        dim_map = getattr(self, "_dim_map", None)
-        self.apply_edit(DecomposeLayerNormalizationMulReciprocal(self._graph, self._graph_name, dim_map=dim_map))
         return self
 
     def decompose_gelu(self):

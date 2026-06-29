@@ -88,7 +88,6 @@ class MoonshineStreaming:
 
         self._start_token_id: int = 1
         self._end_token_id: int = 2
-        self._n_tokens_gen: int = 0
         self._infer_times: deque[float] = deque(maxlen=100)
 
         self._token_embeddings = self._find_token_embeddings()
@@ -109,10 +108,6 @@ class MoonshineStreaming:
     @property
     def last_infer_time(self) -> float:
         return self._infer_times[-1] if self._infer_times else 0.0
-
-    @property
-    def avg_infer_time(self) -> float:
-        return (sum(self._infer_times) / len(self._infer_times)) if self._infer_times else 0.0
 
     @classmethod
     def from_onnx(
@@ -155,7 +150,6 @@ class MoonshineStreaming:
         input_audio: np.ndarray,
         max_tokens: int | None = None,
     ) -> np.ndarray:
-        self._n_tokens_gen = 0
         st = time.time()
 
         audio_len = input_audio.shape[-1]
@@ -255,7 +249,6 @@ class MoonshineStreaming:
 
             next_token = int(np.asarray(logits, dtype=np.float32)[0, -1, :].argmax())
             tokens.append(next_token)
-            self._n_tokens_gen += 1
             if next_token == self._end_token_id:
                 break
 

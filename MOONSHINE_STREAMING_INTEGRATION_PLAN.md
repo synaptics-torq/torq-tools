@@ -270,20 +270,30 @@ runs end-to-end and writes `encoder.onnx`/`decoder.onnx`; the infer subparser `-
 - ✅ Removed 3 unused imports from `export.py` (`onnx_graphsurgeon as gs`, `ONNX_DTYPES`,
   `OPTIMUM_DTYPES`). A precise AST-based scan now reports **zero** unused imports across all 7
   package files.
-- ✅ **Kept** `DecomposeLayerNormalizationMulReciprocal` (+ its `decompose_layer_normalization_mul_reciprocal`
-  wrapper) per the "keep the 4 new edits model-local" decision, even though it is not currently
-  wired into the export path. *Flagged for the user — remove if a strictly-used-only policy is
-  preferred.*
+- ✅ Removed 3 unused imports from `export.py` (`onnx_graphsurgeon as gs`, `ONNX_DTYPES`,
+  `OPTIMUM_DTYPES`).
 - ✅ Kept `validate.py` (a quick model-dir smoke test; complementary to `infer.py`'s WAV demo).
 - ✅ Final full export (EXIT=0, 5/5 LibriSpeech validation transcripts correct) → **golden
   regression PASS**: graphs content-equivalent, bf16 LUTs byte-exact, metadata sidecars
   bit-identical. End-to-end `torq-infer-model moonshine_streaming <wav>` transcribes correctly.
 
+### Phase 7b — Further unused-code removal (2026-06-29) — ✅ DONE
+On a follow-up "remove unused code" pass:
+- ✅ Removed `DecomposeLayerNormalizationMulReciprocal` (the unwired 4th new edit) — class in
+  `edits.py` (-193 lines), its `__all__` entry, its `_graph.py` import and the
+  `decompose_layer_normalization_mul_reciprocal` wrapper. (Reverses the earlier "keep all 4"
+  decision now that a used-only policy was requested; the 3 still-used new edits remain.)
+- ✅ Removed the write-only `avg_infer_time` property and the dead `_n_tokens_gen` counter from
+  `_inference.py`. (`last_infer_time` and `_infer_times` are still used.)
+- ✅ Kept the `model_size` constructor/CLI parameter (legitimate interface, callers pass `-s`).
+- ✅ Re-verified: zero unused imports (AST scan), export EXIT=0 with 5/5 correct transcripts,
+  golden regression PASS, `torq-infer-model` transcribes correctly.
+
 ### Final package shape
-`src/torq/models/moonshine_streaming/`: `__init__.py` (136) · `_graph.py` (252) ·
-`_inference.py` (280) · `edits.py` (826) · `export.py` (909) · `infer.py` (61) ·
-`validate.py` (76) · `requirements.txt`. No forked framework code; reuses only the shared
-`src/torq` level; no sibling-model imports.
+`src/torq/models/moonshine_streaming/`: `__init__.py` (136) · `_graph.py` (246) ·
+`_inference.py` (273) · `edits.py` (632) · `export.py` (909) · `infer.py` (61) ·
+`validate.py` (76) · `requirements.txt` — **2,333 LOC**. No forked framework code; reuses only
+the shared `src/torq` level; no sibling-model imports; zero unused imports/dead methods.
 
 ---
 
