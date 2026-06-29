@@ -297,9 +297,7 @@ class DecoderKVWrapper(torch.nn.Module):
         # Cross-KV is input-only and unchanged by the decoder, so it is NOT
         # re-emitted as outputs — doing so was a wasteful per-token D2H copy that
         # every orchestrator discards. Outputs are logits + updated self-KV only
-        # (plus the optional cross_attn weights below). NOTE: any consumer that
-        # detected the cross_attn output by output *count* must use
-        # `len(out) > 1 + 2*depth` (was `1 + 4*depth`) — see full_streaming_demo.
+        # (plus the optional cross_attn weights below).
         outputs = (logits,
                    out_k_selves[0], out_v_selves[0],
                    out_k_selves[1], out_v_selves[1],
@@ -578,7 +576,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             ],
         )
 
-        # Export decoder.onnx (identical to 5-split streaming decoder)
+        # Export decoder.onnx
         self._logger.info(
             "Exporting DecoderKVWrapper to ONNX (max_tokens=%d, max_memory_len=%d)...",
             self._max_tokens, self._max_memory_len,
@@ -696,9 +694,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
                 ):
                     node.attrs["kernel_shape"] = [weight.shape[2]]
         editor._graph.cleanup().toposort()
-        # StaticStreamingFrontendWrapper uses explicit torch.cat for causal padding,
-        # so no Pad nodes exist in the graph — decompose_strided_conv1d is still
-        # needed since the hardware cannot execute strided Conv1D directly.
+        # decompose_strided_conv1d is needed since the hardware cannot execute strided Conv1D directly.
         editor.decompose_strided_conv1d()
         editor.decompose_gelu()
         editor.decompose_boolean_and()
@@ -793,9 +789,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         skip: list[str] | None = None,
     ):
         # The converted models take bf16 ``position_embeddings`` / ``inputs_embeds``,
-        # so the host-side LUTs must be bf16 too (the golden export left them float32,
-        # which would dtype-mismatch the converted graph at runtime). The base
-        # converter loads each .npy, casts to the target dtype, and writes it into the
+        # so the host-side LUTs must be bf16 too
+        # The base converter loads each .npy, casts to the target dtype, and writes it into the
         # converted dir. Unless ``--preserve-io-dtypes`` keeps the I/O float.
         external_data = []
         if not preserve_io:
