@@ -53,7 +53,7 @@ class MoonshineStreaming:
         self._encoder = encoder
         self._decoder = decoder
 
-        # ── Fused-encoder configuration (probed from the ONNX inputs) ─────────
+        # Fused-encoder configuration (probed from the ONNX inputs)
         enc_inputs = {inp.name: inp for inp in self._encoder._sess.get_inputs()}
         self._chunk_len: int = int(enc_inputs["audio_chunk"].shape[1])
         pos_emb_inp = enc_inputs["position_embeddings"]
@@ -71,7 +71,7 @@ class MoonshineStreaming:
         # ceil(total_la / F) warmup chunks before the encoder buffers are meaningful
         self._warmup_chunks: int = math.ceil(self._total_lookahead / self._feature_stride)
 
-        # ── Static-decoder configuration (probed from the ONNX inputs) ────────
+        # Static-decoder configuration (probed from the ONNX inputs)
         dec_inputs = {inp.name: inp for inp in self._decoder._sess.get_inputs()}
         if "current_len" not in dec_inputs:
             raise ValueError(
@@ -155,7 +155,7 @@ class MoonshineStreaming:
         audio_len = input_audio.shape[-1]
         F = self._feature_stride
 
-        # ── Fused-encoder state (encoder I/O dtype) ──────────────────────────
+        # Fused-encoder state (encoder I/O dtype)
         state = self._encoder_state()
         conv1_buf = state["conv1_buffer"]
         conv2_buf = state["conv2_buffer"]
@@ -170,7 +170,7 @@ class MoonshineStreaming:
         cross_kv_fill = 0
 
         pos_offset = 0
-        # ── Chunk loop ───────────────────────────────────────────────────────
+        # Chunk loop
         for chunk_idx, offset in enumerate(range(0, audio_len, self._chunk_len)):
             audio_chunk = input_audio[:, offset:offset + self._chunk_len]
             if audio_chunk.shape[-1] < self._chunk_len:
@@ -215,7 +215,7 @@ class MoonshineStreaming:
             max_tokens = int((audio_len / 16000) * 6)
         max_tokens = min(max_tokens, self._max_tokens)
 
-        # ── Decode (static pre-allocated self-KV cache) ──────────────────────
+        # Decode (static pre-allocated self-KV cache)
         k_self = np.zeros(
             (self._n_layers, 1, self._n_kv_heads, self._max_tokens, self._head_dim),
             dtype=self._dec_dtype,

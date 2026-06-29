@@ -60,7 +60,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         self._dim_map["batch"] = 1
         super().fix_io_dims(to_fix)
 
-    def fix_fused_encoder_io(
+    def fix_encoder_io(
         self,
         chunk_len: int,
         feat_len: int,
@@ -109,7 +109,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
                 t.shape = None
         return self
 
-    # ── Streaming-specialised overrides ──────────────────────────────────────
+    # Streaming-specialised overrides
     # These shadow CommonGraphEditsMixin so the local divergent edit variants
     # (tuned for the dynamo stacked-cache decoder export) are used instead of the
     # shared ones. ``decompose_strided_conv1d`` is intentionally NOT overridden —
@@ -127,7 +127,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         self.apply_edit(AddCurrLenInput(self._graph, self._graph_name, cur_len))
         return self
 
-    # ── New decompositions (model-local edits) ───────────────────────────────
+    # New decompositions (model-local edits)
 
     def decompose_layer_normalization(self):
         dim_map = getattr(self, "_dim_map", None)
@@ -143,7 +143,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         return self
 
     def remove_identity_gather_nd(self):
-        import numpy as np
         gather_nd_nodes = [node for node in self._graph.nodes if node.op == "GatherND"]
         for node in gather_nd_nodes:
             if len(node.inputs) == 2:
@@ -170,7 +169,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
 
     def decompose_asinh(self):
         """Find Asinh nodes and decompose them into Log, Sqrt, Mul, and Add nodes."""
-        import numpy as np
         asinh_nodes = [node for node in self._graph.nodes if node.op == "Asinh"]
         for node in asinh_nodes:
             if len(node.inputs) == 1:

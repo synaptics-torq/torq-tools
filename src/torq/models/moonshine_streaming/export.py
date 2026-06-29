@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
+import json
 import os
 import shutil
 from pathlib import Path
@@ -57,7 +58,7 @@ def _patched_asinh_forward(self, x):
 MoonshineStreamingAsinhCompression.forward = _patched_asinh_forward
 
 
-# ── Wrapper modules ──────────────────────────────────────────────────────────
+# Wrapper modules
 
 class StaticStreamingFrontendWrapper(torch.nn.Module):
     """Fixed-chunk frontend: audio_chunk + conv buffers → features + updated buffers."""
@@ -409,7 +410,7 @@ class StatefulFusedEncoderWrapper(torch.nn.Module):
         )
 
 
-# ── Model Exporter ───────────────────────────────────────────────────────────
+# Model Exporter
 
 class MoonshineStreamingExporter(OnnxModelExporterBase):
 
@@ -498,7 +499,6 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         return onnx_dir, export_dir, convert_dir, torq_dir
 
     def _generate_source_onnx(self):
-        import json
         from huggingface_hub import snapshot_download
         from transformers import MoonshineStreamingForConditionalGeneration
 
@@ -530,7 +530,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         shutil.copy2(local_dir / "tokenizer.json", self._onnx_dir / "tokenizer.json")
         shutil.copy2(local_dir / "config.json", self._onnx_dir / "config.json")
 
-        # ── Build fused wrapper (measures F internally) ──────────────────────
+        # Build fused wrapper (measures F internally)
         fused_dummy = StatefulFusedEncoderWrapper(model, self._chunk_len).eval()
         F        = fused_dummy.F         # actual output frames per chunk (post-conv)
         total_la = fused_dummy.total_la  # sum of per-layer right-context sizes
@@ -548,7 +548,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             self._chunk_len, F, total_la, (total_la + F - 1) // F,
         )
 
-        # ── Export encoder.onnx ────────────────────────────────────────
+        # Export encoder.onnx
         self._logger.info("Exporting StatefulFusedEncoderWrapper to ONNX ...")
         dummy_audio     = torch.zeros(1, self._chunk_len)
         dummy_conv1     = torch.zeros(1, enc_hidden, 4)
@@ -578,7 +578,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             ],
         )
 
-        # ── Export decoder.onnx (identical to 5-split streaming decoder) ──
+        # Export decoder.onnx (identical to 5-split streaming decoder)
         self._logger.info(
             "Exporting DecoderKVWrapper to ONNX (max_tokens=%d, max_memory_len=%d)...",
             self._max_tokens, self._max_memory_len,
@@ -626,7 +626,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             output_names=decoder_out_names,
         )
 
-        # ── streaming_config.json ────────────────────────────────────────────
+        # streaming_config.json
         warmup_chunks = (total_la + F - 1) // F
         config = {
             "chunk_len": self._chunk_len,
@@ -643,11 +643,9 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         self._logger.info("Streaming config: %s", config)
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
-        import json as _json
-
         source_files = {
             "encoder": self._onnx_dir / "encoder.onnx",
-            "decoder":    self._onnx_dir / "decoder.onnx",
+            "decoder": self._onnx_dir / "decoder.onnx",
         }
 
         any_missing = any(not path.exists() for path in source_files.values())
@@ -663,7 +661,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
                     "Delete cached ONNX files and re-export to regenerate."
                 )
             with open(config_path) as _f:
-                _cfg = _json.load(_f)
+                _cfg = json.load(_f)
             self._feature_stride  = _cfg["feature_stride"]
             self._total_lookahead = _cfg["total_lookahead"]
             self._max_memory_len  = _cfg["max_memory_len"]
@@ -674,15 +672,15 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
         return {comp: onnx.load(path) for comp, path in source_files.items()}
 
-    # ── Graph-edit helpers ───────────────────────────────────────────────────
+    # Graph-edit helpers
 
-    def _make_fused_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+    def _make_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
             model, "encoder", self._onnx_export_dtype
         )
         # Dynamo export produces concrete shapes; fix_io_dims handles any residual
         # symbolic dims on batch or seq axes.
-        editor.fix_fused_encoder_io(
+        editor.fix_encoder_io(
             chunk_len=self._chunk_len,
             feat_len=self._feature_stride,
         )
@@ -707,7 +705,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model, skip_data_prop=True)
 
-    def _make_decoder_kv_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+    def _make_decoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
             model, "decoder", self._onnx_export_dtype
         )
@@ -726,10 +724,10 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             "Applying streaming static graph edits (F=%d, max_tokens=%d)...",
             F, self._max_tokens,
         )
-        self._components["encoder"] = self._make_fused_encoder_static(
+        self._components["encoder"] = self._make_encoder_static(
             self._components["encoder"]
         )
-        self._components["decoder"] = self._make_decoder_kv_static(
+        self._components["decoder"] = self._make_decoder_static(
             self._components["decoder"]
         )
 
