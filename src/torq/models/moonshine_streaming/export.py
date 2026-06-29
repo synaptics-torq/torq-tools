@@ -694,10 +694,10 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
                 ):
                     node.attrs["kernel_shape"] = [weight.shape[2]]
         editor._graph.cleanup().toposort()
-        # decompose_strided_conv1d is needed since the hardware cannot execute strided Conv1D directly.
-        editor.decompose_strided_conv1d()
-        editor.decompose_gelu()
-        editor.decompose_boolean_and()
+        # Updated compiler handles these
+        # editor.decompose_strided_conv1d() 
+        editor.decompose_gelu() # required here for inference speed
+        # editor.decompose_boolean_and()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model, skip_data_prop=True)
 
@@ -707,8 +707,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         )
         editor.make_decoder_static(self._max_tokens)
         editor.decompose_layer_normalization()
-        editor.decompose_gelu()
-        editor.decompose_boolean_and()
+        # editor.decompose_gelu()
+        # editor.decompose_boolean_and()
         editor.clear_intermediate_shapes()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
@@ -739,7 +739,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
                 model_path, component, self._onnx_export_dtype
             )
-            editor.decompose_asinh()
+            # editor.decompose_asinh() #Currently using the polynomial fit
             editor.remove_identity_gather_nd()
             editor.eliminate_transposes()
             editor.collapse_reshape_chains()
