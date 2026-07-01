@@ -16,7 +16,10 @@ import numpy.typing as npt
 try:
     import ai_edge_litert.interpreter as lite_rt
 except ImportError:
-    import tensorflow.lite as lite_rt
+    try:
+        import tensorflow.lite as lite_rt
+    except ImportError:
+        lite_rt = None
 try:
     import iree.runtime as iree_rt
     IREE_RT_AVAILABLE = True
@@ -82,6 +85,11 @@ class TFLiteInferenceRunner(InferenceRunner):
         *,
         n_threads: int | None = None,
     ):
+        if lite_rt is None:
+            raise RuntimeError(
+                "TFLite python API not available in environment"
+            )
+
         super().__init__(model_path)
 
         self._interpreter = lite_rt.Interpreter(
