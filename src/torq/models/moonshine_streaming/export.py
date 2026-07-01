@@ -117,18 +117,12 @@ class StatefulEncoderWrapper(torch.nn.Module):
         self,
         stable_features: torch.Tensor,
         right_ctx: torch.Tensor,
-        buf_0: torch.Tensor,
-        buf_1: torch.Tensor,
-        buf_2: torch.Tensor,
-        buf_3: torch.Tensor,
-        buf_4: torch.Tensor,
-        buf_5: torch.Tensor,
+        *bufs: torch.Tensor,
     ) -> tuple:
         from transformers.models.moonshine_streaming.modeling_moonshine_streaming import (
             create_bidirectional_mask,
             sliding_window_mask_function,
         )
-        bufs = [buf_0, buf_1, buf_2, buf_3, buf_4, buf_5]
         bufs_out = []
         rc = self._total_lookahead
 
@@ -225,45 +219,42 @@ class DecoderKVWrapper(torch.nn.Module):
         self.decoder = self.base_model.decoder
         self._extract_embeddings = extract_embeddings
         self._output_attention = output_attention
-        assert self.n_layers == 6, f"DecoderKVWrapper expects 6 decoder layers, got {self.n_layers}"
 
-        self.decoder.pos_emb = ZeroEmbedding(self.decoder.pos_emb.embedding_dim)
+        # pos_emb is already applied host-side / in the adapter, so it is a no-op in the
+        # decoder. It is added to the (decoder-hidden-dim) memory, so the zeros must match
+        # the *decoder* hidden size — which differs from pos_emb.embedding_dim (the encoder
+        # width) on the larger sizes; they coincide only on tiny.
+        self.decoder.pos_emb = ZeroEmbedding(self.decoder.config.hidden_size)
         self.decoder.proj = torch.nn.Identity()
 
-    def forward(self, token_or_embed,
-                k_self_0, v_self_0,
-                k_self_1, v_self_1,
-                k_self_2, v_self_2,
-                k_self_3, v_self_3,
-                k_self_4, v_self_4,
-                k_self_5, v_self_5,
-                k_cross_0, v_cross_0,
-                k_cross_1, v_cross_1,
-                k_cross_2, v_cross_2,
-                k_cross_3, v_cross_3,
-                k_cross_4, v_cross_4,
-                k_cross_5, v_cross_5,
-                cross_attn_bias: torch.Tensor | None = None,
-                position_ids: torch.Tensor | None = None):
-        k_selves  = [k_self_0,  k_self_1,  k_self_2,  k_self_3,  k_self_4,  k_self_5]
-        v_selves  = [v_self_0,  v_self_1,  v_self_2,  v_self_3,  v_self_4,  v_self_5]
-        k_crosses = [k_cross_0, k_cross_1, k_cross_2, k_cross_3, k_cross_4, k_cross_5]
-        v_crosses = [v_cross_0, v_cross_1, v_cross_2, v_cross_3, v_cross_4, v_cross_5]
+    def forward(self, token_or_embed, *kv_and_extras):
+        # Flat inputs (in export order): 2*n self-KV, then 2*n cross-KV, then
+        # cross_attn_bias, position_ids. Each KV block is interleaved (k_i, v_i).
+        n = self.n_layers
+        self_kv  = kv_and_extras[:2 * n]
+        cross_kv = kv_and_extras[2 * n:4 * n]
+        cross_attn_bias = kv_and_extras[4 * n]
+        position_ids    = kv_and_extras[4 * n + 1]
+
+        k_selves  = list(self_kv[0::2])
+        v_selves  = list(self_kv[1::2])
+        k_crosses = list(cross_kv[0::2])
+        v_crosses = list(cross_kv[1::2])
 
         self_cache = DynamicCache()
         cross_cache = DynamicCache()
-        for i in range(self.n_layers):
+        for i in range(n):
             self_cache.layers.append(_layer_from_kv(k_selves[i], v_selves[i]))
             cross_cache.layers.append(_layer_from_kv(k_crosses[i], v_crosses[i]))
 
         pkv = EncoderDecoderCache(self_cache, cross_cache)
-        for i in range(self.n_layers):
+        for i in range(n):
             pkv.is_updated[i] = True
 
-        enc_seq_len = k_cross_0.shape[-2]
+        enc_seq_len = k_crosses[0].shape[-2]
         dummy_encoder_hidden = torch.zeros(
             1, enc_seq_len, self.decoder.config.hidden_size,
-            dtype=k_self_0.dtype, device=k_self_0.device,
+            dtype=k_selves[0].dtype, device=k_selves[0].device,
         )
 
         encoder_attention_mask = cross_attn_bias
@@ -298,13 +289,9 @@ class DecoderKVWrapper(torch.nn.Module):
         # re-emitted as outputs — doing so was a wasteful per-token D2H copy that
         # every orchestrator discards. Outputs are logits + updated self-KV only
         # (plus the optional cross_attn weights below).
-        outputs = (logits,
-                   out_k_selves[0], out_v_selves[0],
-                   out_k_selves[1], out_v_selves[1],
-                   out_k_selves[2], out_v_selves[2],
-                   out_k_selves[3], out_v_selves[3],
-                   out_k_selves[4], out_v_selves[4],
-                   out_k_selves[5], out_v_selves[5])
+        outputs = (logits,)
+        for i in range(n):
+            outputs = outputs + (out_k_selves[i], out_v_selves[i])
 
         if self._output_attention:
             # Per-layer decoder→memory cross-attention probabilities, already
@@ -376,7 +363,7 @@ class StatefulFusedEncoderWrapper(torch.nn.Module):
         conv2_buffer,
         features_buffer,
         position_embeddings,
-        buf_0, buf_1, buf_2, buf_3, buf_4, buf_5,
+        *bufs,
     ):
         # 1. Frontend feature extraction
         new_feats, conv1_buf_out, conv2_buf_out = self.frontend(
@@ -389,10 +376,8 @@ class StatefulFusedEncoderWrapper(torch.nn.Module):
         features_buffer_out = combined[:, self.F:, :]               # [1, total_la, hidden]
         right_ctx = features_buffer_out
 
-        # 3. Sliding-window stateful encoder
-        encoded, buf0_out, buf1_out, buf2_out, buf3_out, buf4_out, buf5_out = self.encoder(
-            stable_features, right_ctx, buf_0, buf_1, buf_2, buf_3, buf_4, buf_5
-        )
+        # 3. Sliding-window stateful encoder (one buffer per encoder layer)
+        encoded, *bufs_out = self.encoder(stable_features, right_ctx, *bufs)
 
         # 4. Adapter: position projection
         memory = self.adapter(encoded, position_embeddings)
@@ -404,7 +389,7 @@ class StatefulFusedEncoderWrapper(torch.nn.Module):
             k_cross, v_cross,
             conv1_buf_out, conv2_buf_out,
             features_buffer_out,
-            buf0_out, buf1_out, buf2_out, buf3_out, buf4_out, buf5_out,
+            *bufs_out,
         )
 
 
@@ -414,7 +399,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     def __init__(
         self,
-        model_size: Literal["tiny", "small"] = "tiny",
+        model_size: Literal["tiny", "small", "medium"] = "tiny",
         model_dtype: str = "float",
         *,
         extract_embeddings: bool = False,
@@ -453,7 +438,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
         dec_heads = getattr(self._config, "num_attention_heads", 8)
         self._num_kv_heads = getattr(self._config, "num_key_value_heads", 8)
-        self._head_dim = self._hidden_size // dec_heads
+        # Prefer an explicit config head_dim; fall back to hidden_size // heads.
+        self._head_dim = getattr(self._config, "head_dim", None) or self._hidden_size // dec_heads
 
         opt_configs = {
             comp: ORTOptimizerConfig(
@@ -475,13 +461,20 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
-        # Source ONNX is parameterised by (chunk_len, max_tokens) — the torch export
-        # bakes those into the graph shapes — so it keeps a config-specific subdir to
-        # avoid reusing a stale source across configs. The export/convert/torq dirs
-        # follow the shared convention used by the other model exporters.
+        # Source ONNX is parameterised by everything the torch export bakes into the
+        # graph: (chunk_len, max_tokens) shape the encoder/decoder caches, while
+        # extract_embeddings and export_attention change the decoder's I/O. All four go
+        # into the source-dir key so changing any of them forces a fresh export instead
+        # of silently reusing a stale source. The export/convert/torq dirs follow the
+        # shared convention used by the other model exporters.
+        source_tag = f"c{self._chunk_len}_t{self._max_tokens}"
+        if self._extract_embeddings:
+            source_tag += "_emb"
+        if self._export_attention:
+            source_tag += "_attn"
         onnx_dir = (
             self._models_dir / "source" / "onnx" / "merged" / self._model_size
-            / self._model_dtype / f"c{self._chunk_len}_t{self._max_tokens}"
+            / self._model_dtype / source_tag
         )
         export_dir = (
             self._models_dir / "export" / "onnx" / self._model_dtype / "static"
@@ -535,9 +528,12 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         self._feature_stride  = F
         self._total_lookahead = total_la
         self._max_memory_len  = self._enc_seq_len
-        enc_hidden   = self._hidden_size
         embedder     = model.model.encoder.embedder
-        c1           = int(embedder.conv1.out_channels)  # actual conv1 output channels
+        # Encoder hidden dim (features / position / left-context buffers + conv1 buffer).
+        # This is the *encoder* width, which differs from the decoder hidden_size on the
+        # larger sizes (e.g. small: encoder=620 vs decoder=512); they coincide only on tiny.
+        enc_hidden   = int(embedder.linear.out_features)
+        c1           = int(embedder.conv1.out_channels)  # conv1 output channels (conv2 buffer)
         left_ctxs    = fused_dummy.encoder._left_ctx
         n_enc_layers = len(fused_dummy.encoder.layers)
         self._logger.info(

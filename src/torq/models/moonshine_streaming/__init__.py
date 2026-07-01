@@ -40,7 +40,7 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         "-s",
         "--model-size",
         type=str,
-        choices=["tiny", "small"],
+        choices=["tiny", "small", "medium"],
         default=DEFAULT_MODEL_SIZE,
         help="Moonshine Streaming model size to export (default: %(default)s)",
     )
@@ -129,7 +129,7 @@ def add_moonshine_streaming_infer_args(parser: argparse.ArgumentParser):
         "-s", "--model-size",
         type=str,
         required=True,
-        choices=["tiny", "small"],
+        choices=["tiny", "small", "medium"],
         help="Moonshine Streaming model size",
     )
     add_common_args(parser)

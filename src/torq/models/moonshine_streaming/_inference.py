@@ -46,7 +46,7 @@ class MoonshineStreaming:
         self,
         encoder: InferenceRunner,
         decoder: InferenceRunner,
-        model_size: Literal["tiny", "small"] | None = None,
+        model_size: Literal["tiny", "small", "medium"] | None = None,
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._model_size = model_size
@@ -114,7 +114,7 @@ class MoonshineStreaming:
         cls,
         encoder_model: str | os.PathLike,
         decoder_model: str | os.PathLike,
-        model_size: Literal["tiny", "small"] | None = None,
+        model_size: Literal["tiny", "small", "medium"] | None = None,
         n_threads: int | None = None,
     ) -> "MoonshineStreaming":
         return cls(
@@ -258,7 +258,7 @@ class MoonshineStreaming:
 
 def load_moonshine_streaming(
     model_dir: str | os.PathLike,
-    model_size: Literal["tiny", "small"] | None = None,
+    model_size: Literal["tiny", "small", "medium"] | None = None,
     n_threads: int | None = None,
 ) -> MoonshineStreaming:
     """Load a streaming runner from a directory containing ``encoder`` + ``decoder`` models."""
