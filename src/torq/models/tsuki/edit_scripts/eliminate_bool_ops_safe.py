@@ -161,8 +161,14 @@ def _replace_comparison_single(model, name, op, a_name, b_name, final_output,
         new_nodes.append(sub_node)
         _add_vi(graph, sub_out, work_dtype, out_shape)
 
+    clip_neg1_name = f"__clip_neg1_{work_dtype}"
+    clip_pos1_name = f"__clip_pos1_{work_dtype}"
+    _ensure_const(graph, clip_neg1_name, -1, work_dtype)
+    _ensure_const(graph, clip_pos1_name, 1, work_dtype)
+
     sign_out = f"{name}__sign"
-    sign_node = helper.make_node("Sign", [sub_out], [sign_out], name=f"{name}__sign")
+    sign_node = helper.make_node("Clip", [sub_out, clip_neg1_name, clip_pos1_name],
+                                 [sign_out], name=f"{name}__sign")
     new_nodes.append(sign_node)
     _add_vi(graph, sign_out, work_dtype, out_shape)
 

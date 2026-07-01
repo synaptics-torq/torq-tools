@@ -6,10 +6,10 @@ downstream consumers (i8/bf16/i32), causing "Input strides must match" errors
 on torq_hl.elementwisebinary due to mixed element sizes.
 
 This script eliminates ALL i1 intermediates by replacing:
-  - Less(a, b)           → Clip(Sign(Sub(b, a)), 0, 1) → Cast(INT8)
-  - Greater(a, b)        → Clip(Sign(Sub(a, b)), 0, 1) → Cast(INT8)
-  - GreaterOrEqual(a, b) → Sub(1, Clip(Sign(Sub(b, a)), 0, 1)) → Cast(INT8)
-  - LessOrEqual(a, b)    → Sub(1, Clip(Sign(Sub(a, b)), 0, 1)) → Cast(INT8)
+  - Less(a, b)           → Clip(Clip(Sub(b, a), -1, 1), 0, 1) → Cast(INT8)
+  - Greater(a, b)        → Clip(Clip(Sub(a, b), -1, 1), 0, 1) → Cast(INT8)
+  - GreaterOrEqual(a, b) → Sub(1, Clip(Clip(Sub(b, a), -1, 1), 0, 1)) → Cast(INT8)
+  - LessOrEqual(a, b)    → Sub(1, Clip(Clip(Sub(a, b), -1, 1), 0, 1)) → Cast(INT8)
   - And(a_i8, b_i8)      → Mul(a, b)
   - Or(a_i8, b_i8)       → Max(a, b)
   - Not(a_i8)            → Sub(1, a)
@@ -147,7 +147,7 @@ def _replace_comparison_single(model, name, op, a_name, b_name, final_output,
     graph = model.graph
     new_nodes = []
 
-    if op in ("Less", "LessOrEqual"):
+    if op in ("Less", "GreaterOrEqual"):
         sub_out = f"{name}__diff"
         sub_node = helper.make_node("Sub", [b_name, a_name], [sub_out], name=f"{name}__sub")
         new_nodes.append(sub_node)
@@ -158,8 +158,16 @@ def _replace_comparison_single(model, name, op, a_name, b_name, final_output,
         new_nodes.append(sub_node)
         _add_vi(graph, sub_out, work_dtype, out_shape)
 
+    # Sign(x) is broken on the compiler for positive integers (returns 0 instead of 1).
+    # Use Clip(x, -1, 1) instead — equivalent for integer tensors.
+    clip_neg1_name = f"__clip_neg1_{work_dtype}"
+    clip_pos1_name = f"__clip_pos1_{work_dtype}"
+    _ensure_const(graph, clip_neg1_name, -1, work_dtype)
+    _ensure_const(graph, clip_pos1_name, 1, work_dtype)
+
     sign_out = f"{name}__sign"
-    sign_node = helper.make_node("Sign", [sub_out], [sign_out], name=f"{name}__sign")
+    sign_node = helper.make_node("Clip", [sub_out, clip_neg1_name, clip_pos1_name],
+                                 [sign_out], name=f"{name}__sign")
     new_nodes.append(sign_node)
     _add_vi(graph, sign_out, work_dtype, out_shape)
 

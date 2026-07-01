@@ -21,7 +21,7 @@ set -e
 # ============================================================================
 
 PARENT="/home/breidy/iree-local-dev"
-WD="$PARENT/torq-tools-dev/src/torq/models/tsuki"
+WD="$PARENT/torq-compiler-dev"
 DOCKER_TAG="profiler:5000/$(echo $PARENT | sed s/\\//_/g | cut -c2-)"
 DOCK="docker run --rm \
     --env PATH=$PARENT/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PARENT/iree-build/third_party/iree/tools \
@@ -32,7 +32,7 @@ DOCK="docker run --rm \
     --workdir $WD \
     -i $DOCKER_TAG"
 
-SRC="$WD/model/part_b_post_stft_4s.onnx"
+SRC="$WD/tests/testdata/onnx_models/tsuki_static_new_fp32_split_stft_final_s50_4s/part_b_post_stft_4s.onnx"
 STAGE="/tmp/tsuki_pipeline_golden_b"
 OUT_DIR=""
 START_FROM=0
@@ -66,31 +66,31 @@ run_step() {
 
 if run_step 1; then
 echo "=== Step 1: Decompose unsupported ops ==="
-$DOCK python3 edit_scripts/decompose_unsupported_ops.py \
+$DOCK python3 scripts/decompose_unsupported_ops.py \
     --input="$SRC" --output="$STAGE/step01.onnx"
 fi
 
 if run_step 2; then
 echo "=== Step 2: Fold constants ==="
-$DOCK python3 edit_scripts/fold_onnx_constants.py \
+$DOCK python3 scripts/fold_onnx_constants.py \
     --input="$STAGE/step01.onnx" --output="$STAGE/step02.onnx"
 fi
 
 if run_step 3; then
 echo "=== Step 3: Convert normalization ops ==="
-$DOCK python3 edit_scripts/convert_normalization_ops.py \
+$DOCK python3 scripts/convert_normalization_ops.py \
     --input="$STAGE/step02.onnx" --output="$STAGE/step03.onnx"
 fi
 
 if run_step 4; then
 echo "=== Step 4: Convert conv2d to conv1d ==="
-$DOCK python3 edit_scripts/convert_conv2d_to_conv1d.py \
+$DOCK python3 scripts/convert_conv2d_to_conv1d.py \
     --input="$STAGE/step03.onnx" --output="$STAGE/step04.onnx"
 fi
 
 if run_step 5; then
 echo "=== Step 5: Apply reducesum chunked mean mul ==="
-$DOCK python3 edit_scripts/apply_reducesum_chunked_mean_mul.py \
+$DOCK python3 tmp_conv_verify/apply_reducesum_chunked_mean_mul.py \
     --input="$STAGE/step04.onnx" --output="$STAGE/step05.onnx"
 
 echo "=== Step 5b: Decompose norm (torq-tools-dev) ==="
@@ -105,14 +105,14 @@ fi
 
 if run_step 6; then
 echo "=== Step 6: Apply convtranspose phase matmul ==="
-$DOCK python3 edit_scripts/apply_convtranspose_phase_matmul.py \
+$DOCK python3 tmp_conv_verify/apply_convtranspose_phase_matmul.py \
     --input="$STAGE/step05b.onnx" --output="$STAGE/step06.onnx" \
     --target-output convolution_1
 fi
 
 if run_step 7; then
 echo "=== Step 7: Compiler patches (stft replacement, ConvTranspose, IsNaN fold) ==="
-$DOCK python3 edit_scripts/compiler_patches.py \
+$DOCK python3 compiler_patches.py \
     "$STAGE/step06.onnx" "$STAGE/step07.onnx" --skip-json
 fi
 
@@ -147,7 +147,7 @@ fi
 
 if run_step 20; then
 echo "=== Step 20: Revert tanh→sigmoid decompositions ==="
-$DOCK python3 edit_scripts/revert_tanh_to_sigmoid.py \
+$DOCK python3 scripts/revert_tanh_to_sigmoid.py \
     --input="$STAGE/step07b.onnx" --output="$STAGE/step20.onnx"
 fi
 
@@ -157,13 +157,13 @@ fi
 
 if run_step 24; then
 echo "=== Step 24: Chunk attention Q dim (per-head + per-chunk) ==="
-python3 edit_scripts/chunk_attention.py \
+python3 scripts/chunk_attention.py \
     -i "$STAGE/step20.onnx" -o "$STAGE/step24.onnx" --num-chunks 8
 
 # Step 24b DISABLED — removing Unsqueeze ops changes fusion patterns and triggers
 # TileAndFuse assertion crash ("Unable to fuse a pattern fuse group member")
 # echo "=== Step 24b: Merge ReduceMean+Unsqueeze back to keepdims=1 ==="
-# python3 edit_scripts/merge_reducemean_unsqueeze.py \
+# python3 scripts/merge_reducemean_unsqueeze.py \
 #     -i "$STAGE/step24.onnx" -o "$STAGE/step24b.onnx"
 cp "$STAGE/step24.onnx" "$STAGE/step24b.onnx"
 fi
@@ -173,7 +173,7 @@ fi
 # ============================================================================
 
 echo "=== Split into B1/B2 ==="
-python3 edit_scripts/split_part_b.py \
+python3 scripts/split_part_b.py \
     -i "$STAGE/step24b.onnx" --output-dir "$OUT_DIR"
 
 # ============================================================================
