@@ -48,6 +48,7 @@ class OnnxDtypeConverterBase(ABC):
         convert_io: bool = False,
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
+        enforce_io_casts: bool = False,
     ):
         if export_dtype not in self.allowed_dtypes():
             raise ValueError(
@@ -57,6 +58,7 @@ class OnnxDtypeConverterBase(ABC):
         self._export_dtype_str = export_dtype
         self._convert_io = convert_io
         self._direct_cast = direct_cast
+        self._enforce_io_casts = enforce_io_casts
 
         self._original_onnx_dtype = self._validate_dtype(original_dtype)
         self._export_onnx_dtype = self._validate_dtype(export_dtype)
@@ -101,7 +103,7 @@ class OnnxDtypeConverterBase(ABC):
         return self._original_onnx_dtype, self._original_dtype_str
 
     def _cast_enforced_input_edges(self) -> bool:
-        return True
+        return self._enforce_io_casts
 
     @classmethod
     @abstractmethod
@@ -355,6 +357,9 @@ class OnnxDtypeConverterBase(ABC):
         required_dtype, required_dtype_str = self._required_enforced_io_dtype()
         tensor.dtype = required_dtype
         self._convert_exceptions[tensor.name] = f"{node.op} output {idx} requires {required_dtype_str}"
+
+        if not self._enforce_io_casts:
+            return
 
         consumer_edges = [
             (consumer, i)
@@ -621,6 +626,7 @@ class FP32Converter(OnnxDtypeConverterBase):
             convert_io,
             direct_cast,
             preserve_unused_node_outputs,
+            enforce_io_casts=True,
         )
 
     @classmethod
@@ -771,6 +777,7 @@ class Int64Converter(OnnxDtypeConverterBase):
         convert_io: bool = False,
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
+        enforce_io_casts: bool = False,
     ):
         super().__init__(
             "int64",
@@ -778,6 +785,7 @@ class Int64Converter(OnnxDtypeConverterBase):
             convert_io,
             direct_cast,
             preserve_unused_node_outputs,
+            enforce_io_casts=enforce_io_casts,
         )
 
         self._original_sdtype_str  = self._original_dtype_str
@@ -797,9 +805,6 @@ class Int64Converter(OnnxDtypeConverterBase):
     def _required_enforced_io_dtype(self) -> tuple[onnx.TensorProto.DataType, str]:
         self._set_dtypes(False)
         return onnx.TensorProto.INT64, "int64"
-
-    def _cast_enforced_input_edges(self) -> bool:
-        return True
 
     def _is_original_dtype(self, dtype) -> bool:
         return (
@@ -939,6 +944,7 @@ def _convert_internal(
     target_opset: int,
     preserve_unused_node_outputs: bool,
     bf16_rounding: str = "nearest",
+    enforce_io_casts: bool = False,
 ):
     model = onnx.load(input_model)
     model = upgrade_model(model, target_opset)
@@ -955,6 +961,7 @@ def _convert_internal(
             convert_dtype,
             convert_io=convert_io,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
+            enforce_io_casts=enforce_io_casts,
         )
     else:
         allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(
@@ -978,6 +985,7 @@ def convert_model(
     torq_onnx_finalize: bool = False,
     preserve_unused_node_outputs: bool = False,
     bf16_rounding: str = "nearest",
+    enforce_io_casts: bool = False,
 ):
     if use_modelopt:
         if bf16_rounding != "nearest":
@@ -996,6 +1004,7 @@ def convert_model(
             target_opset=target_opset,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
             bf16_rounding=bf16_rounding,
+            enforce_io_casts=enforce_io_casts,
         )
 
     export_dir = Path(output_model).parent
@@ -1059,6 +1068,16 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         help="Rounding mode for fp32→bf16 constants (default: %(default)s). 'truncate' drops the low 16 mantissa bits.",
     )
     parser.add_argument(
+        "--enforce-io-casts",
+        action="store_true",
+        default=False,
+        help=(
+            "Insert Cast nodes so ONNX spec-mandated int64 operator I/O (e.g. Reshape "
+            "shape, Slice params, Shape/Size outputs) stays int64. By default these "
+            "tensors are preserved as int64 in place without adding casts."
+        ),
+    )
+    parser.add_argument(
         "--torq-onnx-finalize",
         action="store_true",
         default=False,
@@ -1084,6 +1103,7 @@ def onnx_dtype_convert_from_args(args: argparse.Namespace):
         args.opset,
         torq_onnx_finalize=args.torq_onnx_finalize,
         bf16_rounding=args.bf16_rounding,
+        enforce_io_casts=args.enforce_io_casts,
     )
 
 

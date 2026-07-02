@@ -233,7 +233,7 @@ def test_enforced_reduce_axes_cast_from_exported_constant():
     reduce = helper.make_node("ReduceL2", ["data", "axes"], ["reduced"], name="reduce")
     model = _make_model([reduce], "reduce_graph", [data], [output], [axes])
 
-    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+    converted = Int64Converter("int32", convert_io=True, enforce_io_casts=True).convert_model(model)
 
     reduce = _node_by_name(converted, "reduce")
     axes_cast = next(
@@ -277,7 +277,7 @@ def test_enforced_reshape_shape_input_casts_after_concat_shape_builder():
         [dim],
     )
 
-    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+    converted = Int64Converter("int32", convert_io=True, enforce_io_casts=True).convert_model(model)
 
     shape = _node_by_name(converted, "shape")
     concat = _node_by_name(converted, "concat")
@@ -343,7 +343,7 @@ def test_enforced_topk_indices_output_stays_int64_and_casts_for_consumers():
         [k],
     )
 
-    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+    converted = Int64Converter("int32", convert_io=True, enforce_io_casts=True).convert_model(model)
 
     topk = next(node for node in converted.graph.node if node.op_type == "TopK")
     identity = _node_by_name(converted, "use_indices")
@@ -382,7 +382,7 @@ def test_int64_conversion_casts_all_slice_index_inputs_back_to_int64():
     )
     model = _make_model([slice_node], "slice_graph", [data], [output], initializers)
 
-    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+    converted = Int64Converter("int32", convert_io=True, enforce_io_casts=True).convert_model(model)
 
     slice_node = _node_by_name(converted, "slice")
     cast_by_output = {
@@ -406,3 +406,53 @@ def test_int64_conversion_updates_uint64_tensors_to_uint32():
 
     assert _tensor_type(converted.graph.input[0]) == TensorProto.UINT32
     assert _tensor_type(converted.graph.output[0]) == TensorProto.UINT32
+
+
+def test_int64_conversion_default_preserves_slice_index_initializers_without_casts():
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [4])
+    output = helper.make_tensor_value_info("sliced", TensorProto.FLOAT, [2])
+    initializers = [
+        helper.make_tensor("starts", TensorProto.INT64, [1], [1]),
+        helper.make_tensor("ends", TensorProto.INT64, [1], [3]),
+        helper.make_tensor("axes", TensorProto.INT64, [1], [0]),
+        helper.make_tensor("steps", TensorProto.INT64, [1], [1]),
+    ]
+    slice_node = helper.make_node(
+        "Slice",
+        ["data", "starts", "ends", "axes", "steps"],
+        ["sliced"],
+        name="slice",
+    )
+    model = _make_model([slice_node], "slice_graph", [data], [output], initializers)
+
+    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+
+    slice_node = _node_by_name(converted, "slice")
+
+    assert not any(node.op_type == "Cast" for node in converted.graph.node)
+    assert list(slice_node.input) == ["data", "starts", "ends", "axes", "steps"]
+    assert {init.data_type for init in converted.graph.initializer} == {TensorProto.INT64}
+
+
+def test_int64_conversion_default_keeps_shape_output_int64_without_casts():
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [6])
+    shape_source = helper.make_tensor_value_info("shape_source", TensorProto.FLOAT, [2, 3])
+    output = helper.make_tensor_value_info("reshaped", TensorProto.FLOAT, [2, 3])
+    shape = helper.make_node("Shape", ["shape_source"], ["shape"], name="shape")
+    reshape = helper.make_node("Reshape", ["data", "shape"], ["reshaped"], name="reshape")
+    model = _make_model(
+        [shape, reshape],
+        "reshape_graph",
+        [data, shape_source],
+        [output],
+    )
+
+    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+
+    shape = _node_by_name(converted, "shape")
+    reshape = _node_by_name(converted, "reshape")
+    value_info = _value_info_by_name(converted)
+
+    assert not any(node.op_type == "Cast" for node in converted.graph.node)
+    assert reshape.input[1] == shape.output[0]
+    assert _tensor_type(value_info[shape.output[0]]) == TensorProto.INT64
