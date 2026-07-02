@@ -671,6 +671,20 @@ class FP32Converter(OnnxDtypeConverterBase):
         if self._is_original_dtype(node.attrs.get("dtype")):
             node.attrs["dtype"] = self._export_onnx_dtype
 
+    def _convert_layer_normalization_stash_type(self, node: gs.Node):
+        if self._export_onnx_dtype != onnx.TensorProto.BFLOAT16:
+            return
+        if "stash_type" in node.attrs and not self._is_original_dtype(node.attrs["stash_type"]):
+            return
+
+        node.attrs["stash_type"] = onnx.TensorProto.BFLOAT16
+        logger.info(
+            "LayerNormalization op '%s': converting default/fp32 stash_type to bf16 for "
+            "Torq bf16 compatibility. This changes ONNX stage-one normalization compute "
+            "precision from fp32 to bf16; validate model accuracy on the target backend.",
+            node.name,
+        )
+
     def _convert_graph(
         self,
         graph: gs.Graph
@@ -723,6 +737,10 @@ class FP32Converter(OnnxDtypeConverterBase):
             # special case: Random*Like -> output dtype is controlled by an optional dtype attribute
             if node.op in {"RandomUniformLike", "RandomNormalLike"}:
                 self._convert_random_like_dtype_attr(node)
+
+            # special case: LayerNormalization -> stash_type controls stage-one compute dtype
+            if node.op == "LayerNormalization":
+                self._convert_layer_normalization_stash_type(node)
 
             # special case: Resize -> only input and output can be cast to bf16
             if node.op == "Resize":

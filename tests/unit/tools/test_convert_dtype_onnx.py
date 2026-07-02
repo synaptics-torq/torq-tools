@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import logging
+
 import numpy as np
 import pytest
 from onnx import TensorProto, helper, numpy_helper
@@ -60,6 +62,28 @@ def _make_einsum_model():
     return _make_model([einsum], "einsum_graph", inputs, [output])
 
 
+def _make_layernorm_model(stash_type: int | None = TensorProto.FLOAT):
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 4])
+    output = helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 2, 4])
+    scale = helper.make_tensor(
+        "scale",
+        TensorProto.FLOAT,
+        [4],
+        np.ones(4, dtype=np.float32),
+    )
+    attrs = {"axis": -1, "epsilon": 1e-5}
+    if stash_type is not None:
+        attrs["stash_type"] = stash_type
+    layernorm = helper.make_node(
+        "LayerNormalization",
+        ["x", "scale"],
+        ["out"],
+        name="layernorm",
+        **attrs,
+    )
+    return _make_model([layernorm], "layernorm_graph", [x], [output], [scale])
+
+
 def test_bf16_conversion_updates_constant_of_shape_default_value_dtype():
     shape = helper.make_tensor_value_info("shape", TensorProto.INT64, [2])
     output = helper.make_tensor_value_info("filled", TensorProto.FLOAT, [2, 3])
@@ -78,6 +102,33 @@ def test_bf16_conversion_updates_constant_of_shape_default_value_dtype():
 
     assert value.data_type == TensorProto.BFLOAT16
     assert _tensor_type(converted.graph.output[0]) == TensorProto.BFLOAT16
+
+
+@pytest.mark.parametrize("stash_type", [TensorProto.FLOAT, None])
+def test_bf16_conversion_updates_layernorm_fp32_stash_type(stash_type, caplog):
+    caplog.set_level(logging.INFO, logger="ONNX-Dtype-Converter")
+
+    converted = FP32Converter("bf16", convert_io=True).convert_model(
+        _make_layernorm_model(stash_type)
+    )
+
+    layernorm = _node_by_name(converted, "layernorm")
+    assert _attr_i(layernorm, "stash_type") == TensorProto.BFLOAT16
+    assert _tensor_type(converted.graph.input[0]) == TensorProto.BFLOAT16
+    assert _initializer_by_name(converted, "scale_bf16").data_type == TensorProto.BFLOAT16
+    assert _tensor_type(converted.graph.output[0]) == TensorProto.BFLOAT16
+    assert "changes ONNX stage-one normalization compute precision from fp32 to bf16" in caplog.text
+
+
+def test_fp16_conversion_preserves_layernorm_fp32_stash_type():
+    converted = FP32Converter("fp16", convert_io=True).convert_model(
+        _make_layernorm_model()
+    )
+
+    layernorm = _node_by_name(converted, "layernorm")
+    assert _attr_i(layernorm, "stash_type") == TensorProto.FLOAT
+    assert _tensor_type(converted.graph.input[0]) == TensorProto.FLOAT16
+    assert _tensor_type(converted.graph.output[0]) == TensorProto.FLOAT16
 
 
 @pytest.mark.parametrize("op_type", ["RandomUniformLike", "RandomNormalLike"])
