@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import flatbuffers
 import os
+from collections.abc import Iterable
 
 from . import schema_py_generated as schema_fb
 
@@ -33,11 +34,8 @@ def convert_model(
     converted = 0
     for subgraph in model_t.subgraphs:
         for tensor in subgraph.tensors:
-            if (
-                tensor.shapeSignature is not None
-                and len(tensor.shapeSignature) > 0 
-                and -1 in tensor.shapeSignature
-            ):
+            if isinstance(tensor.shapeSignature, Iterable) and -1 in tensor.shapeSignature:
+
                 tensor.shapeSignature = None
                 converted += 1
 
