@@ -97,7 +97,8 @@ This tool can also downcast int64 tensors to int32 or smaller integer data types
 python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.onnx
 ```
 > [!WARNING]
-> Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64. 
+> Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64.
+> By default these tensors are kept as int64 in place (no extra casts). Pass `--enforce-io-casts` to instead insert `Cast` nodes at these edges, which is needed for models where a spec-mandated int64 input is produced by a generic integer op (otherwise the resulting graph has mixed-type producers).
 > Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
 #### Quantize ONNX model weights
 Quantize MatMul weights in fp32 ONNX models to int4/int8 with optional per-layer sensitivity analysis.

@@ -7,6 +7,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
+from types import EllipsisType
 from typing import Final
 
 import numpy as np
@@ -31,8 +32,14 @@ _ONNX_DTYPE_MAPPING: Final[dict[str, onnx.TensorProto.DataType]] = {
     "uint8": onnx.TensorProto.UINT8,
 }
 
+_EnforcedIoIndices = tuple[int | EllipsisType, ...]
+_EnforcedIoSpec = tuple[_EnforcedIoIndices, ...]
+
 
 class OnnxDtypeConverterBase(ABC):
+
+    _ALL_IO_INDICES: Final = Ellipsis
+    _ENFORCED_IO: Final[dict[str, _EnforcedIoSpec]] = {}
 
     def __init__(
         self,
@@ -41,6 +48,7 @@ class OnnxDtypeConverterBase(ABC):
         convert_io: bool = False,
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
+        enforce_io_casts: bool = False,
     ):
         if export_dtype not in self.allowed_dtypes():
             raise ValueError(
@@ -50,6 +58,7 @@ class OnnxDtypeConverterBase(ABC):
         self._export_dtype_str = export_dtype
         self._convert_io = convert_io
         self._direct_cast = direct_cast
+        self._enforce_io_casts = enforce_io_casts
 
         self._original_onnx_dtype = self._validate_dtype(original_dtype)
         self._export_onnx_dtype = self._validate_dtype(export_dtype)
@@ -86,6 +95,15 @@ class OnnxDtypeConverterBase(ABC):
 
     def _is_original_dtype(self, dtype) -> bool:
         return is_same_dtype(dtype, self._original_onnx_dtype)
+
+    def _get_enforced_io(self, node: gs.Node) -> _EnforcedIoSpec | None:
+        return self._ENFORCED_IO.get(node.op)
+
+    def _required_enforced_io_dtype(self) -> tuple[onnx.TensorProto.DataType, str]:
+        return self._original_onnx_dtype, self._original_dtype_str
+
+    def _cast_enforced_input_edges(self) -> bool:
+        return self._enforce_io_casts
 
     @classmethod
     @abstractmethod
@@ -192,12 +210,195 @@ class OnnxDtypeConverterBase(ABC):
             if out.name in skip_names:
                 logger.debug("Skipping dtype conversion of graph output '%s'", out.name)
                 continue
+            if out.name in self._convert_exceptions:
+                logger.debug("Skipping dtype conversion of explicitly marked tensor '%s' (%s)",
+                             out.name, self._convert_exceptions[out.name])
+                continue
             if self._is_original_dtype(out.dtype):
                 out.dtype = self._export_onnx_dtype
                 if node.op == "Cast":
                     node.attrs["to"] = self._export_onnx_dtype
 
+    def _enforced_io_indices(
+        self,
+        indices: _EnforcedIoIndices,
+        tensors: Sequence[gs.Variable | gs.Constant],
+    ) -> tuple[int, ...]:
+        if self._ALL_IO_INDICES in indices:
+            assert len(indices) == 1, "Invalid tensor indices: all marker cannot be combined with specific indices"
+            return tuple(range(len(tensors)))
+        return tuple(idx for idx in indices if 0 <= idx < len(tensors))
+
+    def _is_enforced_input_index(self, node: gs.Node, idx: int) -> bool:
+        if not (enforced := self._get_enforced_io(node)):
+            return False
+        return idx in self._enforced_io_indices(enforced[0], node.inputs)
+
+    def _cast_constant_for_enforced_io(
+        self,
+        tensor: gs.Constant,
+        node: gs.Node,
+        idx: int,
+        required_dtype: onnx.TensorProto.DataType,
+        required_dtype_str: str,
+    ) -> gs.Constant:
+        try:
+            np_type = onnx.helper.tensor_dtype_to_np_dtype(required_dtype)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"Unsupported tensor datatype {required_dtype_str}")
+        new_const = gs.Constant(
+            tensor.name + f"_{required_dtype_str}",
+            tensor.values.astype(np_type),
+        )
+        node.inputs[idx] = new_const
+        return new_const
+
+    def _export_constant_for_enforced_input_cast(
+        self,
+        tensor: gs.Constant,
+        graph: gs.Graph,
+    ) -> gs.Constant:
+        new_const_name = tensor.name + f"_{self._export_dtype_str}"
+        if new_const := graph.tensors().get(new_const_name):
+            return new_const
+        try:
+            np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+        cast_fn = getattr(self, "_cast_constant_values", None)
+        cast_values = (
+            cast_fn(tensor.values, np_type)
+            if cast_fn is not None
+            else tensor.values.astype(np_type)
+        )
+        return gs.Constant(new_const_name, cast_values)
+
+    def _mark_enforced_input(
+        self,
+        node: gs.Node,
+        graph: gs.Graph,
+        idx: int,
+    ):
+        tensor = node.inputs[idx]
+        required_dtype, required_dtype_str = self._required_enforced_io_dtype()
+        tensor_dtype = getattr(tensor, "export_dtype", None) or tensor.dtype
+        if self._cast_enforced_input_edges() and isinstance(tensor, gs.Constant):
+            cast_in = (
+                self._export_constant_for_enforced_input_cast(tensor, graph)
+                if self._is_original_dtype(tensor_dtype)
+                else tensor
+            )
+            cast_out: gs.Variable = graph.layer(
+                name=f"{node.name or node.op}_input_{idx}_cast_{required_dtype_str}",
+                op="Cast",
+                inputs=[cast_in],
+                outputs=[gs.Variable(
+                    f"{tensor.name}_{node.name or node.op}_input_{idx}_{required_dtype_str}",
+                    dtype=required_dtype,
+                    shape=tensor.shape,
+                )],
+                attrs={"to": required_dtype},
+            )[0]
+            node.inputs[idx] = cast_out
+            self._convert_exceptions[cast_out.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+            return
+        if isinstance(tensor, gs.Constant):
+            if not self._is_original_dtype(tensor_dtype):
+                dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
+                    if isinstance(tensor_dtype, int) else str(tensor_dtype)
+                logger.warning(
+                    "Promoting to %s: tensor '%s' (dtype: %s), required for input %d of %s op '%s'",
+                    required_dtype_str, tensor.name, dtype_str, idx, node.op, node.name,
+                )
+                tensor = self._cast_constant_for_enforced_io(tensor, node, idx, required_dtype, required_dtype_str)
+            self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+            return
+
+        if (
+            self._cast_enforced_input_edges()
+            and tensor.name in self._convert_exceptions
+            and is_same_dtype(tensor_dtype, required_dtype)
+        ):
+            return
+
+        if not self._cast_enforced_input_edges():
+            if not self._is_original_dtype(tensor_dtype):
+                dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
+                    if isinstance(tensor_dtype, int) else str(tensor_dtype)
+                logger.warning(
+                    "Promoting to %s: tensor '%s' (dtype: %s), required for input %d of %s op '%s'",
+                    required_dtype_str, tensor.name, dtype_str, idx, node.op, node.name,
+                )
+                tensor.dtype = required_dtype
+            self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+            return
+
+        cast_out: gs.Variable = graph.layer(
+            name=f"{node.name or node.op}_input_{idx}_cast_{required_dtype_str}",
+            op="Cast",
+            inputs=[tensor],
+            outputs=[gs.Variable(
+                f"{tensor.name}_{node.name or node.op}_input_{idx}_{required_dtype_str}",
+                dtype=required_dtype,
+                shape=tensor.shape,
+            )],
+            attrs={"to": required_dtype},
+        )[0]
+        node.inputs[idx] = cast_out
+        self._convert_exceptions[cast_out.name] = f"{node.op} input {idx} requires {required_dtype_str}"
+
+    def _mark_enforced_output(
+        self,
+        node: gs.Node,
+        graph: gs.Graph,
+        idx: int,
+    ):
+        tensor = node.outputs[idx]
+        required_dtype, required_dtype_str = self._required_enforced_io_dtype()
+        tensor.dtype = required_dtype
+        self._convert_exceptions[tensor.name] = f"{node.op} output {idx} requires {required_dtype_str}"
+
+        if not self._enforce_io_casts:
+            return
+
+        consumer_edges = [
+            (consumer, i)
+            for consumer in list(tensor.outputs)
+            for i, inp in enumerate(consumer.inputs)
+            if inp is tensor and not self._is_enforced_input_index(consumer, i)
+        ]
+        if not consumer_edges:
+            return
+        cast_out: gs.Variable = graph.layer(
+            name=f"{node.name or node.op}_output_{idx}_cast_{self._export_dtype_str}",
+            op="Cast",
+            inputs=[tensor],
+            outputs=[gs.Variable(
+                f"{tensor.name}_{self._export_dtype_str}",
+                dtype=self._export_onnx_dtype,
+                shape=tensor.shape,
+            )],
+            attrs={"to": self._export_onnx_dtype},
+        )[0]
+        for consumer, i in consumer_edges:
+            consumer.inputs[i] = cast_out
+
+    def _apply_enforced_io_exclusions(self, node: gs.Node, graph: gs.Graph):
+        if not (enforced := self._get_enforced_io(node)):
+            return
+        assert len(enforced) >= 1, "Invalid enforced I/O tensor indices"
+        inp_indices = enforced[0]
+        out_indices = enforced[1] if len(enforced) > 1 else ()
+        for idx in self._enforced_io_indices(inp_indices, node.inputs):
+            self._mark_enforced_input(node, graph, idx)
+        for idx in self._enforced_io_indices(out_indices, node.outputs):
+            self._mark_enforced_output(node, graph, idx)
+
     def _update_input(self, graph: gs.Graph, inp: gs.Variable):
+        if inp.name in self._convert_exceptions:
+            logger.debug("Skipping dtype conversion of explicitly marked graph input '%s' (%s)",
+                         inp.name, self._convert_exceptions[inp.name])
+            return
         if self._convert_io:
             inp.dtype = self._export_onnx_dtype
             logger.debug("Set dtype to %s for input '%s'", self._export_dtype_str, inp.name)
@@ -221,6 +422,20 @@ class OnnxDtypeConverterBase(ABC):
             self._convert_exceptions[inp.name] = "graph input and convert_io=False"
 
     def _update_output(self, graph: gs.Graph, out: gs.Variable, out_idx: int):
+        if out.name in self._convert_exceptions:
+            logger.debug("Skipping dtype conversion of explicitly marked graph output '%s' (%s)",
+                         out.name, self._convert_exceptions[out.name])
+            if self._convert_io:
+                out_new = graph.layer(
+                    name=out.name + f"_to_{self._export_dtype_str}",
+                    op="Cast",
+                    inputs=[out],
+                    outputs=[gs.Variable(out.name + f"_{self._export_dtype_str}", dtype=self._export_onnx_dtype, shape=out.shape)],
+                    attrs={"to": self._export_onnx_dtype}
+                )[0]
+                graph.outputs[out_idx] = out_new
+                logger.debug("Add %s cast node for output '%s'", self._export_dtype_str, out.name)
+            return
         out.dtype = self._export_onnx_dtype
         logger.debug("Set dtype to %s for output '%s'", self._export_dtype_str, out.name)
         if not self._convert_io:
@@ -388,6 +603,10 @@ class FP32Converter(OnnxDtypeConverterBase):
 
     _ALLOWED_BF16_ROUNDING: Final[tuple[str, ...]] = ("nearest", "truncate")
 
+    _ENFORCED_FP32_IO: Final[dict[str, _EnforcedIoSpec]] = {
+        "Einsum": ((OnnxDtypeConverterBase._ALL_IO_INDICES,), (0,)), # v12: inputs: (<variadic>), outputs: (output, )
+    }
+
     def __init__(
         self,
         export_dtype: str,
@@ -407,11 +626,17 @@ class FP32Converter(OnnxDtypeConverterBase):
             convert_io,
             direct_cast,
             preserve_unused_node_outputs,
+            enforce_io_casts=True,
         )
 
     @classmethod
     def allowed_dtypes(cls) -> tuple[str, ...]:
         return ("bf16", "fp16")
+
+    def _get_enforced_io(self, node: gs.Node) -> _EnforcedIoSpec | None:
+        if self._export_onnx_dtype == onnx.TensorProto.BFLOAT16:
+            return self._ENFORCED_FP32_IO.get(node.op)
+        return None
 
     def _cast_constant_values(self, values: np.ndarray, np_type: np.dtype) -> np.ndarray:
         # Override fp32→bf16 cast when truncate-toward-zero is requested. Default astype
@@ -425,6 +650,40 @@ class FP32Converter(OnnxDtypeConverterBase):
             u16 = (u32 >> 16).astype(np.uint16)
             return u16.view(np_type).reshape(values.shape)
         return values.astype(np_type)
+
+    def _make_default_constant_of_shape_value(self, node: gs.Node) -> gs.Constant:
+        try:
+            np_type = onnx.helper.tensor_dtype_to_np_dtype(self._export_onnx_dtype)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"Unsupported tensor datatype {self._export_dtype_str}")
+        return gs.Constant(
+            f"{node.name or node.op}_value_{self._export_dtype_str}",
+            np.array([0], dtype=np_type),
+        )
+
+    def _convert_constant_of_shape_value(self, node: gs.Node, graph: gs.Graph):
+        if (val := node.attrs.get("value")) is not None:
+            self._convert_tensor(val, node, graph, "value", is_attr=True)
+        elif self._is_original_dtype(node.outputs[0].dtype):
+            node.attrs["value"] = self._make_default_constant_of_shape_value(node)
+
+    def _convert_random_like_dtype_attr(self, node: gs.Node):
+        if self._is_original_dtype(node.attrs.get("dtype")):
+            node.attrs["dtype"] = self._export_onnx_dtype
+
+    def _convert_layer_normalization_stash_type(self, node: gs.Node):
+        if self._export_onnx_dtype != onnx.TensorProto.BFLOAT16:
+            return
+        if "stash_type" in node.attrs and not self._is_original_dtype(node.attrs["stash_type"]):
+            return
+
+        node.attrs["stash_type"] = onnx.TensorProto.BFLOAT16
+        logger.info(
+            "LayerNormalization op '%s': converting default/fp32 stash_type to bf16 for "
+            "Torq bf16 compatibility. This changes ONNX stage-one normalization compute "
+            "precision from fp32 to bf16; validate model accuracy on the target backend.",
+            node.name,
+        )
 
     def _convert_graph(
         self,
@@ -471,17 +730,27 @@ class FP32Converter(OnnxDtypeConverterBase):
             if node.op == "Constant" and (val := node.attrs.get("value")) is not None:
                 self._convert_tensor(val, node, graph, "value", is_attr=True)
 
-            # special case: ConstantOfShape -> constant value stored as an attribute
-            if node.op == "ConstantOfShape" and (val := node.attrs.get("value")) is not None:
-                self._convert_tensor(val, node, graph, "value", is_attr=True)
+            # special case: ConstantOfShape -> output dtype is inferred from the value attribute
+            if node.op == "ConstantOfShape":
+                self._convert_constant_of_shape_value(node, graph)
+
+            # special case: Random*Like -> output dtype is controlled by an optional dtype attribute
+            if node.op in {"RandomUniformLike", "RandomNormalLike"}:
+                self._convert_random_like_dtype_attr(node)
+
+            # special case: LayerNormalization -> stash_type controls stage-one compute dtype
+            if node.op == "LayerNormalization":
+                self._convert_layer_normalization_stash_type(node)
 
             # special case: Resize -> only input and output can be cast to bf16
-            if node.op == "Resize" and node.inputs[0].name not in skip_names:
-                self._convert_tensor(node.inputs[0], node, graph, 0, is_attr=False)
+            if node.op == "Resize":
+                if node.inputs[0].name not in skip_names:
+                    self._convert_tensor(node.inputs[0], node, graph, 0, is_attr=False)
                 if self._is_original_dtype((out := node.outputs[0]).dtype) and out.name not in skip_names:
                     out.dtype = self._export_onnx_dtype
                 continue
 
+            self._apply_enforced_io_exclusions(node, graph)
             self._convert_node_io(node, graph, skip_names)
 
         logger.info("Updated graph '%s' dtypes to %s", graph.name, self._export_dtype_str)
@@ -490,20 +759,35 @@ class FP32Converter(OnnxDtypeConverterBase):
 class Int64Converter(OnnxDtypeConverterBase):
 
     # as of onnx v1.21.0
-    _ENFORCED_INT64_IO: Final[dict[str, tuple[tuple[int, ...], ...]]] = {
+    _ENFORCED_INT64_IO: Final[dict[str, _EnforcedIoSpec]] = {
+        "ArgMax": ((), (0,)),       # v13: outputs: (reduced, )
+        "ArgMin": ((), (0,)),       # v13: outputs: (reduced, )
         "ConstantOfShape": ((0,),), # v25: inputs: (input, )
         "Expand": ((1,),),          # v13: inputs: (shape, )
         "GatherND": ((1,),),        # v13: inputs: (indices, )
+        "NonZero": ((), (0,)),      # v13: outputs: (Y, )
         "Pad": ((1, 3),),           # v25: inputs: (pads, axes)
+        "ReduceL1": ((1,),),        # v18: inputs: (axes, )
+        "ReduceL2": ((1,),),        # v18: inputs: (axes, )
+        "ReduceLogSum": ((1,),),    # v18: inputs: (axes, )
+        "ReduceLogSumExp": ((1,),), # v18: inputs: (axes, )
+        "ReduceMax": ((1,),),       # v20: inputs: (axes, )
         "ReduceMean": ((1,),),      # v18: inputs: (axes, )
+        "ReduceMin": ((1,),),       # v20: inputs: (axes, )
+        "ReduceProd": ((1,),),      # v18: inputs: (axes, )
+        "ReduceSum": ((1,),),       # v13: inputs: (axes, )
+        "ReduceSumSquare": ((1,),), # v18: inputs: (axes, )
         "Reshape": ((1,),),         # v25: inputs: (shape, )
         "Resize": ((3,),),          # v19: inputs: (sizes, )
+        "Shape": ((), (0,)),        # v25: outputs: (shape, )
         "Slice": ((1, 2, 3, 4),),   # v13: inputs: (starts, ends, axes, steps)
+        "Size": ((), (0,)),         # v25: outputs: (size, )
         "Squeeze": ((1,),),         # v25: inputs: (axes, )
         "Tile": ((1,),),            # v13: inputs: (repeats, )
         "TopK": ((1,), (1,)),       # v24: inputs: (K, ), outputs: (I, )
         "Unsqueeze": ((1,),),       # v25: inputs: (axes, )
     }
+    _ENFORCED_IO: Final[dict[str, _EnforcedIoSpec]] = _ENFORCED_INT64_IO
 
     def __init__(
         self,
@@ -511,6 +795,7 @@ class Int64Converter(OnnxDtypeConverterBase):
         convert_io: bool = False,
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
+        enforce_io_casts: bool = False,
     ):
         super().__init__(
             "int64",
@@ -518,6 +803,7 @@ class Int64Converter(OnnxDtypeConverterBase):
             convert_io,
             direct_cast,
             preserve_unused_node_outputs,
+            enforce_io_casts=enforce_io_casts,
         )
 
         self._original_sdtype_str  = self._original_dtype_str
@@ -533,6 +819,10 @@ class Int64Converter(OnnxDtypeConverterBase):
     @classmethod
     def allowed_dtypes(cls) -> tuple[str, ...]:
         return ("int32", "int16", "int8")
+
+    def _required_enforced_io_dtype(self) -> tuple[onnx.TensorProto.DataType, str]:
+        self._set_dtypes(False)
+        return onnx.TensorProto.INT64, "int64"
 
     def _is_original_dtype(self, dtype) -> bool:
         return (
@@ -588,6 +878,10 @@ class Int64Converter(OnnxDtypeConverterBase):
             if out.name in skip_names:
                 logger.debug("Skipping dtype conversion of model output '%s'", out.name)
                 continue
+            if out.name in self._convert_exceptions:
+                logger.debug("Skipping dtype conversion of explicitly marked tensor '%s' (%s)",
+                             out.name, self._convert_exceptions[out.name])
+                continue
             if self._is_original_dtype(out.dtype):
                 self._set_dtypes(self._is_unsigned(out.dtype))
                 out.dtype = self._export_onnx_dtype
@@ -598,23 +892,6 @@ class Int64Converter(OnnxDtypeConverterBase):
         self,
         graph: gs.Graph
     ):
-
-        def _mark_no_convert(coll: Sequence[gs.Variable | gs.Constant], idx: int):
-            if idx >= len(coll):
-                return
-            tensor = coll[idx]
-            tensor_dtype = getattr(tensor, "export_dtype", None) or tensor.dtype
-            if not self._is_original_dtype(tensor_dtype):
-                # warn of ONNX spec mismatch
-                dtype_str = onnx.helper.tensor_dtype_to_string(tensor_dtype) \
-                    if isinstance (tensor_dtype, int) else str(tensor_dtype)
-                logger.warning(
-                    "Promoting to int64: tensor '%s' (dtype: %s), required for input %d of %s op '%s'",
-                    tensor.name, dtype_str, idx, node.op, node.name,
-                )
-                tensor.dtype = onnx.TensorProto.INT64
-            self._convert_exceptions[tensor.name] = f"{node.op} input {idx} requires int64"
-
         skip_names = {i.name for i in graph.inputs} | {o.name for o in graph.outputs}
         for node in list(graph.nodes):
             if node.op == "Cast" and self._is_original_dtype(node.outputs[0].dtype):
@@ -631,15 +908,7 @@ class Int64Converter(OnnxDtypeConverterBase):
                         "int64 output from unnamed Constant node"
                     continue
 
-            if enforced := self._ENFORCED_INT64_IO.get(node.op):
-                assert len(enforced) >= 1, "Invalid tensor indices for INT64 enforced I/O"
-                inp_indices = enforced[0]
-                out_indices = enforced[1] if len(enforced) > 1 else ()
-                for idx in inp_indices:
-                    _mark_no_convert(node.inputs, idx)
-                for idx in out_indices:
-                    _mark_no_convert(node.outputs, idx)
-
+            self._apply_enforced_io_exclusions(node, graph)
             self._convert_node_io(node, graph, skip_names)
 
         logger.info("Updated graph '%s' integer dtypes to %s", graph.name, self._export_dtype_str)
@@ -693,6 +962,7 @@ def _convert_internal(
     target_opset: int,
     preserve_unused_node_outputs: bool,
     bf16_rounding: str = "nearest",
+    enforce_io_casts: bool = False,
 ):
     model = onnx.load(input_model)
     model = upgrade_model(model, target_opset)
@@ -709,6 +979,7 @@ def _convert_internal(
             convert_dtype,
             convert_io=convert_io,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
+            enforce_io_casts=enforce_io_casts,
         )
     else:
         allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(
@@ -732,6 +1003,7 @@ def convert_model(
     torq_onnx_finalize: bool = False,
     preserve_unused_node_outputs: bool = False,
     bf16_rounding: str = "nearest",
+    enforce_io_casts: bool = False,
 ):
     if use_modelopt:
         if bf16_rounding != "nearest":
@@ -750,6 +1022,7 @@ def convert_model(
             target_opset=target_opset,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
             bf16_rounding=bf16_rounding,
+            enforce_io_casts=enforce_io_casts,
         )
 
     export_dir = Path(output_model).parent
@@ -813,6 +1086,16 @@ def add_onnx_dtype_convert_args(parser: argparse.ArgumentParser):
         help="Rounding mode for fp32→bf16 constants (default: %(default)s). 'truncate' drops the low 16 mantissa bits.",
     )
     parser.add_argument(
+        "--enforce-io-casts",
+        action="store_true",
+        default=False,
+        help=(
+            "Insert Cast nodes so ONNX spec-mandated int64 operator I/O (e.g. Reshape "
+            "shape, Slice params, Shape/Size outputs) stays int64. By default these "
+            "tensors are preserved as int64 in place without adding casts."
+        ),
+    )
+    parser.add_argument(
         "--torq-onnx-finalize",
         action="store_true",
         default=False,
@@ -838,6 +1121,7 @@ def onnx_dtype_convert_from_args(args: argparse.Namespace):
         args.opset,
         torq_onnx_finalize=args.torq_onnx_finalize,
         bf16_rounding=args.bf16_rounding,
+        enforce_io_casts=args.enforce_io_casts,
     )
 
 
