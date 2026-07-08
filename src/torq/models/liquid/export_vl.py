@@ -566,8 +566,17 @@ class LiquidVLModelExporter(LiquidModelExporter):
         out_prefix = str(self._convert_dir / f"vision_encoder_{self._vision_res}")
         self._logger.info("(vision) building static %d-res encoder from '%s'...",
                           self._vision_res, vision_src)
+        # split_matmul=512: chunk the wide (3072-output) SigLIP FFN/embed
+        # matmuls into [768,512] slices. Torq-compile funnels the encoder
+        # front-end into one fused dispatch that over-segments into ~100k NSS
+        # slice programs, sending SegmentNSSPrograms super-linear; splitting the
+        # matmuls cuts the slice count (284k->107k passes) and is bit-exact
+        # (validated, max abs diff ~0.002). NOTE: this only mitigates — the
+        # 256-res encoder is still compile-heavy on constrained hosts; always
+        # keep --torq-disable-slicing (slicing OOMs) and RAM-guard the compile.
         bf16 = build_static_vision_encoder(
             out_prefix, patches=patches, grid=grid, src=vision_src,
+            split_matmul=512,
         )
         self._export_paths[f"vision_encoder_{self._vision_res}"] = Path(bf16)
 
