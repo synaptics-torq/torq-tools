@@ -157,7 +157,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "fp32",
             static_models,
             self._config_dict,
-            Path(models_dir),
+            # Nest all artifacts under a per-model subdir (like gemma3 nests
+            # under its HF-repo dir). This must match download_source.py's
+            # `<models-dir>/liquid-2p5-<size>/` layout so a pre-fetched source
+            # is reused instead of re-downloaded, and matches the README paths.
+            Path(models_dir) / f"liquid-2p5-{model_size}",
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
             # LFM2's custom ops break the ORT bert optimizer; skip it.
