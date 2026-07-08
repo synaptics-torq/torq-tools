@@ -214,6 +214,16 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
+    parser.add_argument(
+        "--split-decoder",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit decoder_nolm.vmfb (decode body, hidden output) + "
+            "lm_head.vmfb (standalone hidden->logits) alongside the merged "
+            "decoder — the board's lower-TTFT split."
+        ),
+    )
     add_logging_args(parser)
     add_torq_args(parser)
 

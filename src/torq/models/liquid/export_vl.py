@@ -110,6 +110,9 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
         self._split_lm_head = edit_args.get("split_lm_head", False)
+        # Also emit decoder_nolm.vmfb (body) + lm_head.vmfb (the board's
+        # lower-TTFT split) alongside the merged decoder.
+        self._split_decoder = edit_args.get("split_decoder", False)
 
         # --- resolve the text-decoder architecture config -------------------
         self._config_dict = self._resolve_text_config(onnx_source_dir, models_dir)
@@ -495,6 +498,87 @@ class LiquidVLModelExporter(LiquidModelExporter):
             np.save(self._convert_dir / "token_embeddings.npy", emb)
             self._logger.info("(ONNX-convert) Wrote bf16 token_embeddings.npy")
 
+        if self._split_decoder:
+            self._make_decoder_split()
+
+    def _make_decoder_split(self):
+        """Split the converted bf16 decoder into ``decoder_nolm`` (body, hidden
+        output) + ``lm_head`` (standalone hidden->logits), and register both so
+        export_torq compiles ``decoder_nolm.vmfb`` + ``lm_head.vmfb`` — the
+        board's lower-TTFT deployment (decode body on NPU, lm_head applied only
+        when sampling).
+
+        Structure-based (no hard-coded names): the lm_head is the node that
+        produces the vocab-logits graph output; its activation input is the
+        split boundary. Works whether the lm_head is a folded single MatMul or
+        the 512-chunk split.
+        """
+        import copy
+        from onnx import helper, TensorProto
+
+        src_path = self._export_paths[DECODER]
+        model = onnx.load(src_path, load_external_data=True)
+        g = model.graph
+        bf16 = TensorProto.BFLOAT16
+
+        logits_name = "logits"
+        if not any(o.name == logits_name for o in g.output):
+            logits_name = next(
+                o.name for o in g.output
+                if o.type.tensor_type.shape.dim
+                and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
+            )
+        init_names = {i.name for i in g.initializer}
+        lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
+                    or (n.name and "lm_head" in n.name)]
+        # The activation feeding the lm_head (the final-norm hidden state): an
+        # lm_head input that no other lm_head node produces and isn't a weight.
+        lm_produced = {o for n in lm_nodes for o in n.output}
+        lm_inputs = {i for n in lm_nodes for i in n.input}
+        hidden_name = next(
+            i for i in lm_inputs
+            if i and i not in init_names and i not in lm_produced
+        )
+        lm_node_names = {n.name for n in lm_nodes}
+
+        # ---- decoder_nolm: drop lm_head node(s), expose hidden as output -----
+        body = onnx.ModelProto()
+        body.CopyFrom(model)
+        bg = body.graph
+        del bg.node[:]
+        bg.node.extend([n for n in g.node if n.name not in lm_node_names])
+        outs = [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])]
+        outs += [o for o in g.output if o.name != logits_name]
+        del bg.output[:]
+        bg.output.extend(outs)
+        used = {i for n in bg.node for i in n.input}
+        del bg.initializer[:]
+        bg.initializer.extend([i for i in g.initializer if i.name in used])
+        nolm_path = self._convert_dir / "decoder_nolm.onnx"
+        onnx.save(body, str(nolm_path), save_as_external_data=False)
+
+        # ---- lm_head: standalone hidden -> logits ---------------------------
+        weights = [copy.deepcopy(i) for i in g.initializer
+                   if i.name in (lm_inputs & init_names)]
+        lm_graph = helper.make_graph(
+            [copy.deepcopy(n) for n in lm_nodes],
+            "main",
+            [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])],
+            [helper.make_tensor_value_info(logits_name, bf16, [1, 1, self._vocab_size])],
+            weights,
+        )
+        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
+        lm_model.ir_version = model.ir_version
+        lmh_path = self._convert_dir / "lm_head.onnx"
+        onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
+
+        self._export_paths["decoder_nolm"] = nolm_path
+        self._export_paths["lm_head"] = lmh_path
+        self._logger.info(
+            "(split) derived decoder_nolm (%d nodes) + lm_head (%d node(s)) from '%s'",
+            len(bg.node), len(lm_nodes), src_path.name,
+        )
+
     # ------------------------------------------------------------------ compile
     def export_torq(self, *args, skip: list[str] | None = None, **kwargs):
         """Compile the decoder (and, if requested, the vision encoder)."""
@@ -588,6 +672,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
         split_lm_head=args.split_lm_head,
+        split_decoder=args.split_decoder,
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
