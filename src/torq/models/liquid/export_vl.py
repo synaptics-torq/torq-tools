@@ -435,10 +435,12 @@ class LiquidVLModelExporter(LiquidModelExporter):
             self._components[DECODER], skip_data_prop=True
         )
         # The image-prefill decoder is built from the custom-op-replaced *dynamic*
-        # decoder (different static shape: [1,64,1024], empty past), so capture it
-        # before it is static-ized for single-token decode.
+        # decoder (different static shape: [1,64,1024], empty past), so capture a
+        # copy before it is static-ized (and before later export steps can mutate
+        # the shared proto) for single-token decode.
         if self._image_decoder_parts:
-            self._dynamic_decoder = self._components[DECODER]
+            import copy
+            self._dynamic_decoder = copy.deepcopy(self._components[DECODER])
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):

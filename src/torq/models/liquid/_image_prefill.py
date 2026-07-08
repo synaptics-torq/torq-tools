@@ -85,11 +85,24 @@ def build_image_decoder(dynamic_decoder, replace_conv1d, propagate_shapes):
     # (and thus its conv Split) stays alive — otherwise the last part would lose
     # a Split output and fail shape inference.
     g2 = gs.import_onnx(m)
-    tmap = g2.tensors()
-    last_boundary = tmap.get(f"/model/layers.{NLAYERS - 1}/Add_2/output_0")
     g2.outputs = [o for o in g2.outputs if o.name != "logits"]
-    if last_boundary is not None and last_boundary not in g2.outputs:
-        g2.outputs.append(last_boundary)
+    # Keep the last decoder layer alive so its conv Split stays 3-output (else
+    # the last part loses a Split slice). Prefer the highest-index layer-boundary
+    # Add_2; fall back to the final-norm hidden (the lm_head's activation input).
+    tmap = g2.tensors()
+    boundaries = sorted(
+        (t for name, t in tmap.items()
+         if re.fullmatch(r"/model/layers\.\d+/Add_2/output_0", name)),
+        key=lambda t: int(re.search(r"layers\.(\d+)", t.name).group(1)))
+    keep_alive = boundaries[-1] if boundaries else None
+    if keep_alive is None:
+        logits_t = next((o for o in gs.import_onnx(m).outputs if o.name == "logits"), None)
+        if logits_t is not None and logits_t.inputs:
+            keep_alive = next((tmap.get(i.name) for i in logits_t.inputs[0].inputs
+                               if getattr(i, "name", None) in tmap
+                               and not isinstance(tmap.get(i.name), gs.Constant)), None)
+    if keep_alive is not None and keep_alive not in g2.outputs:
+        g2.outputs.append(keep_alive)
     g2.cleanup().toposort()
     m = onnx.shape_inference.infer_shapes(gs.export_onnx(g2))
     m.ir_version = 10
@@ -120,6 +133,7 @@ def split_image_decoder(full_model, nparts):
                          f"(supported: {sorted(PART_LAYER_RANGES)})")
     ranges = PART_LAYER_RANGES[nparts]
     all_out = [o.name for o in full_model.graph.output]
+
     parts = []
     for i, (a, b) in enumerate(ranges):
         g = gs.import_onnx(full_model)
@@ -130,12 +144,64 @@ def split_image_decoder(full_model, nparts):
         in_t.dtype = np.float32
         in_t.shape = [1, S_IMAGE, 1024]
 
-        # caches for the owned layers (in the full-decoder order), then the
-        # boundary hidden last (the runner reads outs[-1] as the next hidden).
+        # caches for the owned layers (in the full-decoder order). Intermediate
+        # parts also output the boundary hidden last — the runner reads outs[-1]
+        # as the next hidden. The LAST part emits caches only (the runner treats
+        # every output of the final part as a cache). remove_unused_node_outputs
+        # is off so the last layer's conv Split keeps all 3 outputs (its dead
+        # gating slices dangle harmlessly) rather than being trimmed to an
+        # invalid split-count / -outputs mismatch.
         caches = [o for o in all_out if (_layer_of(o) is not None and a <= _layer_of(o) <= b)]
-        out_names = caches + [f"/model/layers.{b}/Add_2/output_0"]
+        if b < NLAYERS - 1:
+            out_names = caches + [f"/model/layers.{b}/Add_2/output_0"]
+        else:
+            out_names = caches
         g.inputs = [in_t]
         g.outputs = [tmap[o] for o in out_names]
+        g.cleanup().toposort()
+
+        # In the last part the final layer's gating dies, leaving its conv Split
+        # with dead (dangling) output slices. A Split's output count must equal
+        # its `split` sizes, but the bf16 converter trims the dangling outputs
+        # and then shape inference fails. So replace any Split that has a dead
+        # output with a Slice per *live* output (correct byte range from the
+        # `/output_N` position) and drop the Split — the dead slices are simply
+        # never computed.
+        graph_out = {t.name for t in g.outputs}
+        for node in list(g.nodes):
+            if node.op != "Split":
+                continue
+            sizes = None
+            if len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+                sizes = [int(v) for v in node.inputs[1].values]
+            elif "split" in node.attrs:
+                sizes = [int(v) for v in node.attrs["split"]]
+            if not sizes:
+                continue
+            live = [o for o in node.outputs if o.outputs or o.name in graph_out]
+            if len(live) == len(node.outputs) == len(sizes):
+                continue  # well-formed and fully used
+            data = node.inputs[0]
+            axis = int(node.attrs.get("axis", 0))
+            off = [0]
+            for s in sizes:
+                off.append(off[-1] + s)
+            for o in live:
+                mm = re.search(r"/output_(\d+)$", o.name)
+                k = int(mm.group(1)) if mm else 0
+                sl = gs.Variable(o.name + "_sl", dtype=o.dtype or np.float32)
+                g.layer(
+                    op="Slice", name=o.name + "/slice",
+                    inputs=[data,
+                            gs.Constant(o.name + "_st", np.array([off[k]], np.int64)),
+                            gs.Constant(o.name + "_en", np.array([off[k + 1]], np.int64)),
+                            gs.Constant(o.name + "_ax", np.array([axis], np.int64))],
+                    outputs=[sl],
+                )
+                for c in g.nodes:
+                    c.inputs = [sl if x is o else x for x in c.inputs]
+            node.outputs.clear()
+            node.inputs.clear()
         g.cleanup().toposort()
         parts.append((chr(ord("A") + i), gs.export_onnx(g)))
     return parts
