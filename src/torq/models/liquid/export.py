@@ -1132,12 +1132,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
             self._simulate_bf16_precision(sim_path)
 
-    def _skip_static_shape_check(self) -> bool:
-        # LFM2.5 has internal shape inference quirks (cos/sin cache derived
-        # from the symbolic past_sequence_length).  Don't fail the export on
-        # these; the user can inspect manually.
-        return True
-
     def _simulate_bf16_precision(self, model_path: str | os.PathLike):
         """Round-trip fp32 weights and activations through bf16 in fp32 ops."""
         model = onnx.load(model_path)

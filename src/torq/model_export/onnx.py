@@ -135,9 +135,6 @@ class OnnxModelExporterBase(ABC):
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
 
-    def _skip_static_shape_check(self) -> bool:
-        return False
-
     def _export_path_for_component(self, component: str) -> Path:
         return self._export_dir / f"{component}.onnx"
 
@@ -201,14 +198,11 @@ class OnnxModelExporterBase(ABC):
             self.check_model(onnx.load(self._export_paths[comp]))
             if self._static_models:
                 self._logger.info("(%s) Verifying static shapes...", comp)
-                if not self._skip_static_shape_check():
-                    dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
-                    if dynamic_shapes:
-                        raise ValueError(
-                            f"Model '{comp}' still has dynamic shapes: {json.dumps(dynamic_shapes)}"
-                        )
-                else:
-                    self._logger.info("(%s) Skipping static shape verification (int4 model)", comp)
+                dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
+                if dynamic_shapes:
+                    raise ValueError(
+                        f"Model '{comp}' still has dynamic shapes: {json.dumps(dynamic_shapes)}"
+                    )
             if self._show_model_info:
                 print(f"\n\nInfo for model '{self._export_paths[comp]}':")
                 print_onnx_model_inputs_outputs_info(self._export_paths[comp])
