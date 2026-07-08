@@ -175,6 +175,21 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
+        "--image-decoder-parts",
+        type=int,
+        nargs="?",
+        const=2,
+        choices=[2, 3, 5],
+        default=None,
+        help=(
+            "Build + compile the one-shot image-prefill decoder, split into N "
+            "layer-boundary parts (decoder_image_<N>part_<A..>.vmfb). Bare flag "
+            "= 2-part (the shipping split on HuggingFace); 3 / 5 are alternates. "
+            "Runs all 64 image tokens through the decoder in one shot for lower "
+            "TTFT."
+        ),
+    )
+    parser.add_argument(
         "--skip-torq",
         action="store_true",
         default=False,

@@ -129,10 +129,12 @@ is reproducible from this command, one flag per artifact:
 | `decoder_model_merged.vmfb` (a.k.a. `decoder_main.vmfb`) | default (the merged decoder + lm_head) |
 | `decoder_nolm.vmfb` + `lm_head.vmfb` | `--split-decoder` (lower-TTFT body/lm_head split) |
 | `vision_encoder_256.vmfb` (64 tokens) / `vision_encoder.vmfb` (16 tokens) | `--vision-res 256` / `--vision-res 128` (static SigLIP encoder; compile is heavy but succeeds) |
+| `decoder_image_2part_A/B.vmfb` (one-shot image prefill) | `--image-decoder-parts` (bare = 2-part, the shipping split; `3` / `5` are alternates) |
 | `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically |
 
-Not reproducible from a flag: the one-shot image-prefill decoders
-(`decoder_image_*`) — see the last section.
+Every board artifact is now reproducible from one `torq-export-model liquid-vl`
+invocation. Compile is heavy for the vision encoder and the image-decoder parts
+(`--torq-max-nss-programs-size` is raised automatically for the image parts).
 
 ---
 
@@ -248,16 +250,17 @@ blanket … two remote controls"* — at ~0.54 s/decoder-call (TTFT ≈ 140 s fo
 
 ## What this exporter does *not* do (yet)
 
-- **Image-prefill decoders** (`decoder_image_{2,3,5}part_*.vmfb`,
-  `decoder_image_full.vmfb`). The board's one-shot image-prefill decoders have
-  no in-repo builder, and the deployed ones are numerically broken on the NPU
-  (NaN/overflow from layer 0 — see `torq-examples/RUN_ON_BOARD.md`). Reproducing
-  them needs dedicated work on the layer-split build plus a numerical fix; no
-  flag produces them.
 - **Image/text merge in the runner.** Running the full VL model end-to-end
-  (image → features → splice into the text embeds) needs runner changes in
-  `torq-examples`.
+  (image → features → splice into the text embeds, image-first cache relocation)
+  lives in the board runner (`torq-examples/liquidAI-VLM`), not this exporter.
 
 > The dynamic vision encoder is *not* chip-compilable, but `--vision-res
 > {128,256}` builds a **static** single-resolution encoder that is (see the
 > Artifacts table above). Its compile is heavy/slow but succeeds.
+>
+> The image-prefill decoder (`--image-decoder-parts`) is built in **3D**
+> (`[1,64,1024]`, cache-only, lm_head dropped) and split at layer boundaries.
+> The "numerically broken" note in `torq-examples/RUN_ON_BOARD.md` describes the
+> abandoned **rank-2** build; the 3D build this produces is numerically clean
+> (cos ≥ 0.9999 vs ORT). See `torq-compiler-dev/image_prefill.md` for the full
+> rationale.

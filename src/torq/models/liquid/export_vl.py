@@ -109,6 +109,10 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # Build + compile a static single-resolution vision encoder
         # (vision_encoder_<res>.vmfb) instead of the dynamic one. 128 or 256.
         self._vision_res = edit_args.get("vision_res", None)
+        # Also build + compile the one-shot image-prefill decoder, split into N
+        # layer-boundary parts (decoder_image_<N>part_<A..>.vmfb). 2, 3 or 5.
+        self._image_decoder_parts = edit_args.get("image_decoder_parts", None)
+        self._dynamic_decoder = None  # captured pre-static for the image build
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
@@ -430,6 +434,11 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._components[DECODER] = self.check_model(
             self._components[DECODER], skip_data_prop=True
         )
+        # The image-prefill decoder is built from the custom-op-replaced *dynamic*
+        # decoder (different static shape: [1,64,1024], empty past), so capture it
+        # before it is static-ized for single-token decode.
+        if self._image_decoder_parts:
+            self._dynamic_decoder = self._components[DECODER]
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
@@ -513,6 +522,37 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
         if self._split_decoder:
             self._make_decoder_split()
+
+        if self._image_decoder_parts:
+            self._make_image_decoder_parts()
+
+    def _make_image_decoder_parts(self):
+        """Build the one-shot image-prefill decoder + split into N layer parts,
+        registering each ``decoder_image_<N>part_<label>`` bf16 component so
+        export_torq compiles it. See :mod:`._image_prefill`."""
+        from ._image_prefill import build_image_decoder, split_image_decoder
+        from ...tools.convert_dtype.onnx import convert_model as _convert_dtype
+
+        n = self._image_decoder_parts
+        self._logger.info("(image-decoder) building cache-only image decoder + %d-part split...", n)
+        full = build_image_decoder(
+            self._dynamic_decoder,
+            LiquidModelExporter._replace_conv1d_with_matmul,
+            self._propagate_static_shapes,
+        )
+        for label, part in split_image_decoder(full, n):
+            name = f"decoder_image_{n}part_{label}"
+            fp32 = self._convert_dir / f"{name}.fp32.onnx"
+            onnx.save(part, str(fp32), save_as_external_data=True,
+                      location=fp32.name + "_data", size_threshold=1024)
+            bf16 = self._convert_dir / f"{name}.onnx"
+            _convert_dtype(str(fp32), str(bf16), "bf16", convert_io=True)
+            # Drop the large fp32 intermediate — only the bf16 part is compiled.
+            fp32.unlink(missing_ok=True)
+            (self._convert_dir / (fp32.name + "_data")).unlink(missing_ok=True)
+            self._export_paths[name] = bf16
+            self._logger.info("(image-decoder) part %s: %d outputs -> %s",
+                              label, len(part.graph.output), bf16.name)
 
     def _make_static_vision(self, vision_src: str):
         """Build a static single-resolution vision encoder and register it as a
@@ -608,12 +648,19 @@ class LiquidVLModelExporter(LiquidModelExporter):
         )
 
     # ------------------------------------------------------------------ compile
-    def export_torq(self, *args, skip: list[str] | None = None, **kwargs):
-        """Compile the decoder (and, if requested, the vision encoder)."""
+    def export_torq(self, *args, skip: list[str] | None = None,
+                    torq_compile_args: list[str] | None = None, **kwargs):
+        """Compile the decoder (and, if requested, the vision encoder / image
+        decoder parts)."""
         skip = list(skip or [])
         if not self._compile_vision and VISION not in skip:
             skip.append(VISION)
-        return super().export_torq(*args, skip=skip, **kwargs)
+        extra = list(torq_compile_args or [])
+        if self._image_decoder_parts and "--torq-max-nss-programs-size" not in extra:
+            # Image-decoder parts need a larger NSS-programs cap (image_prefill.md
+            # §3e; the 64 MB default is too small). Harmless for the others.
+            extra += ["--torq-max-nss-programs-size", "201326592"]
+        return super().export_torq(*args, skip=skip, torq_compile_args=extra, **kwargs)
 
     # ------------------------------------------------------- deployment assets
     def stage_deploy_assets(self):
@@ -702,6 +749,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         split_lm_head=args.split_lm_head,
         split_decoder=args.split_decoder,
         vision_res=args.vision_res,
+        image_decoder_parts=args.image_decoder_parts,
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
