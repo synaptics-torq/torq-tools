@@ -656,10 +656,12 @@ class LiquidVLModelExporter(LiquidModelExporter):
         if not self._compile_vision and VISION not in skip:
             skip.append(VISION)
         extra = list(torq_compile_args or [])
-        if self._image_decoder_parts and "--torq-max-nss-programs-size" not in extra:
-            # Image-decoder parts need a larger NSS-programs cap (image_prefill.md
-            # §3e; the 64 MB default is too small). Harmless for the others.
-            extra += ["--torq-max-nss-programs-size", "201326592"]
+        if (self._image_decoder_parts or self._vision_res) and \
+                "--torq-max-nss-programs-size" not in extra:
+            # The image-decoder parts and the materialized static vision encoder
+            # emit many NSS programs (~195-205 MB); the 8 MB default is far too
+            # small (image_prefill.md §3e). Harmless for the other components.
+            extra += ["--torq-max-nss-programs-size", "402653184"]
         return super().export_torq(*args, skip=skip, torq_compile_args=extra, **kwargs)
 
     # ------------------------------------------------------- deployment assets
