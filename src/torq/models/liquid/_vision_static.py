@@ -200,6 +200,57 @@ def split_large_matmuls(graph, shape_of, max_out=512):
     return n
 
 
+def split_ln_token_dim(graph, shape_of, poison=256, chunk=128):
+    """Work around a torq-compile tiler crash on LayerNorm at exactly 256 tokens.
+
+    torq-compile aborts ('linalg.generic op unhandled tiled implementation ...
+    result is not accessed using a permuted projection') on a LayerNorm whose
+    token axis is exactly ``poison`` (256) — the same op compiles fine at 64,
+    128, 512, 1024. (Only the LN reduction hits it; attention/matmul at 256 are
+    fine.) Slice that axis into ``chunk``-sized (<=128) pieces, LayerNorm each,
+    then Concat back. LN is per-token so this is numerically exact. No-op unless
+    a LN's token axis is exactly ``poison`` (so the 1024-token path is untouched).
+    """
+    n = 0
+    for node in list(graph.nodes):
+        if node.op != "LayerNormalization":
+            continue
+        X = node.inputs[0]
+        full = shape_of(X.name)
+        if not full:
+            continue
+        ax = int(node.attrs.get("axis", -1)) % len(full)
+        tax = next((i for i, d in enumerate(full)
+                    if d == poison and i != ax and i != 0), None)
+        if tax is None:
+            continue
+        out = node.outputs[0]
+        b = node.name
+        parts = []
+        for ci, s in enumerate(range(0, poison, chunk)):
+            e = min(s + chunk, poison)
+            sl = gs.Variable(f"{b}/sl{ci}", dtype=np.float32)
+            graph.layer(
+                op="Slice", name=f"{b}/slc{ci}",
+                inputs=[X,
+                        gs.Constant(f"{b}/s{ci}", np.array([s], np.int64)),
+                        gs.Constant(f"{b}/e{ci}", np.array([e], np.int64)),
+                        gs.Constant(f"{b}/a{ci}", np.array([tax], np.int64))],
+                outputs=[sl])
+            ln = gs.Variable(f"{b}/ln{ci}", dtype=np.float32)
+            graph.layer(op="LayerNormalization", name=f"{b}/lnc{ci}",
+                        inputs=[sl] + list(node.inputs[1:]), outputs=[ln],
+                        attrs=dict(node.attrs))
+            parts.append(ln)
+        graph.layer(op="Concat", name=f"{b}/cat", inputs=parts, outputs=[out],
+                    attrs={"axis": tax})
+        node.outputs.clear()
+        node.inputs.clear()
+        n += 1
+    graph.cleanup().toposort()
+    return n
+
+
 def const_of(t):
     return t.values if isinstance(t, gs.Constant) else None
 
@@ -228,8 +279,11 @@ def remove_identity_masking(graph):
     return rew
 
 
-# Resolution -> (patches, grid) for the LFM2-VL SigLIP tower.
-VISION_RES = {128: (256, (16, 16)), 256: (1024, (32, 32))}
+# Image resolution -> (num_patches, grid) for the LFM2-VL SigLIP tower
+# (patch_size 16: pixel_values is [1, N, 3*16*16=768]). A 256x256 image is
+# 16x16=256 patches -> 64 image tokens (the board's image-decoder path, i.e.
+# vision_encoder_256.vmfb); 128x128 is 8x8=64 patches -> 16 tokens.
+VISION_RES = {128: (64, (8, 8)), 256: (256, (16, 16))}
 
 
 def build_static_vision_encoder(
@@ -248,7 +302,7 @@ def build_static_vision_encoder(
     ``<out_prefix>_bf16.onnx``; returns the bf16 path.
 
     ``patches``/``grid`` select the resolution — see :data:`VISION_RES`
-    (256-res -> 1024/(32,32); 128-res -> 256/(16,16))."""
+    (256-res -> 256/(16,16) -> 64 tokens; 128-res -> 64/(8,8) -> 16 tokens)."""
     S, (GH, GW) = patches, tuple(grid)
 
     g = gs.import_onnx(onnx.load(src))
@@ -299,6 +353,21 @@ def build_static_vision_encoder(
     g = gs.import_onnx(m)
     print("masking nodes removed:", remove_identity_masking(g))
     g.cleanup().toposort()
+    # Dodge the token=256 LayerNorm tiler crash (no-op unless a LN is 256-token).
+    # Refresh shape_of afterwards so decompose_ln sees the post-split (128-token)
+    # LN shapes for its broadcast materialization.
+    ns = split_ln_token_dim(g, shape_of)
+    if ns:
+        print(f"LN token-split ({256}->2x128):", ns)
+        mm = onnx.shape_inference.infer_shapes(gs.export_onnx(g))
+        vi = {v.name: v for v in list(mm.graph.value_info)
+              + list(mm.graph.input) + list(mm.graph.output)}
+
+        def shape_of(name):
+            v = vi.get(name)
+            return [d.dim_value for d in v.type.tensor_type.shape.dim] if v else None
+
+        g = gs.import_onnx(mm)
     print("LN decomposed:", decompose_ln(g, shape_of, materialize=ln_expand))
     if gemm_to_matmul_pass:
         print("Gemm->MatMul:", gemm_to_matmul(g))
