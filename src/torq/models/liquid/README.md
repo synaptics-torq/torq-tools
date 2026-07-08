@@ -8,6 +8,10 @@ This page covers **export** and **compile** only. For running the resulting
 vmfb on the board (interactive chat, hybrid CPU lm_head mode, perf
 measurement), see `torq-examples/liquid/README.md`.
 
+> For the vision-language model **LFM2-VL-450M** (three ONNX components:
+> decoder + vision encoder + embed_tokens), see [`README_VL.md`](README_VL.md).
+> Its `torq-export-model liquid-vl` subcommand reuses this decoder pipeline.
+
 ---
 
 ## 0. Source model

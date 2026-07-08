@@ -36,5 +36,5 @@ release/
 .test
 TODO*
 *.md
-!**/README.md
+!**/README*.md
 !CONTRIBUTING.md
