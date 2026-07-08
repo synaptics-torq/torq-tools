@@ -106,6 +106,9 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._hf_repo = HF_REPO_VL
         self._hf_repo_onnx = HF_REPO_VL
         self._compile_vision = compile_vision
+        # Build + compile a static single-resolution vision encoder
+        # (vision_encoder_<res>.vmfb) instead of the dynamic one. 128 or 256.
+        self._vision_res = edit_args.get("vision_res", None)
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
@@ -483,6 +486,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
 
+        # The static vision encoder has its own build+bf16 pipeline, so pull the
+        # dynamic vision component out of the plain bf16-convert loop.
+        vision_src = None
+        if self._vision_res:
+            vp = self._export_paths.pop(VISION, None)
+            vision_src = str(vp) if vp else None
+
         for comp, model_path in list(self._export_paths.items()):
             if comp == VISION and not self._compile_vision:
                 self._logger.info("(ONNX-convert) Skipping vision encoder (fp32 only)")
@@ -498,8 +508,26 @@ class LiquidVLModelExporter(LiquidModelExporter):
             np.save(self._convert_dir / "token_embeddings.npy", emb)
             self._logger.info("(ONNX-convert) Wrote bf16 token_embeddings.npy")
 
+        if self._vision_res and vision_src:
+            self._make_static_vision(vision_src)
+
         if self._split_decoder:
             self._make_decoder_split()
+
+    def _make_static_vision(self, vision_src: str):
+        """Build a static single-resolution vision encoder and register it as a
+        ``vision_encoder_<res>`` component so export_torq compiles it. Reuses
+        the (validated) transforms in :mod:`._vision_static`."""
+        from ._vision_static import build_static_vision_encoder, VISION_RES
+
+        patches, grid = VISION_RES[self._vision_res]
+        out_prefix = str(self._convert_dir / f"vision_encoder_{self._vision_res}")
+        self._logger.info("(vision) building static %d-res encoder from '%s'...",
+                          self._vision_res, vision_src)
+        bf16 = build_static_vision_encoder(
+            out_prefix, patches=patches, grid=grid, src=vision_src,
+        )
+        self._export_paths[f"vision_encoder_{self._vision_res}"] = Path(bf16)
 
     def _make_decoder_split(self):
         """Split the converted bf16 decoder into ``decoder_nolm`` (body, hidden
@@ -673,6 +701,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         keep_conv1d=args.keep_conv1d,
         split_lm_head=args.split_lm_head,
         split_decoder=args.split_decoder,
+        vision_res=args.vision_res,
     )
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:

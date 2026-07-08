@@ -164,6 +164,17 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
+        "--vision-res",
+        type=int,
+        choices=[128, 256],
+        default=None,
+        help=(
+            "Build + compile a static single-resolution SigLIP vision encoder "
+            "(vision_encoder_<res>.vmfb): 128 -> 16 image tokens, 256 -> 64. "
+            "Replaces the dynamic encoder with the board's static build."
+        ),
+    )
+    parser.add_argument(
         "--skip-torq",
         action="store_true",
         default=False,

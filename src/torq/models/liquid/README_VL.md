@@ -119,6 +119,21 @@ bf16 cannot be validated through onnxruntime (no CPU bf16 MatMul kernel), so
 the exporter skips automatic validation; sanity-check the fp32 decoder via the
 runner in `torq-examples` with `token_embeddings.npy`.
 
+### Artifacts (what each flag produces)
+
+The board's deployment bundle (downloaded from `Synaptics/liquidAI-LFM2-VLM`)
+is reproducible from this command, one flag per artifact:
+
+| board vmfb / file | produced by |
+|---|---|
+| `decoder_model_merged.vmfb` (a.k.a. `decoder_main.vmfb`) | default (the merged decoder + lm_head) |
+| `decoder_nolm.vmfb` + `lm_head.vmfb` | `--split-decoder` (lower-TTFT body/lm_head split) |
+| `vision_encoder_256.vmfb` (64 tokens) / `vision_encoder.vmfb` (16 tokens) | `--vision-res 256` / `--vision-res 128` (static SigLIP encoder; compile is heavy but succeeds) |
+| `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically |
+
+Not reproducible from a flag: the one-shot image-prefill decoders
+(`decoder_image_*`) — see the last section.
+
 ---
 
 ## 2. Deploy to the board (text decoder)
@@ -233,10 +248,16 @@ blanket … two remote controls"* — at ~0.54 s/decoder-call (TTFT ≈ 140 s fo
 
 ## What this exporter does *not* do (yet)
 
-- **Vision encoder on chip.** It has dynamic `num_patches`, `MultiHeadAttention`,
-  `Resize`, `Compress`, and `ScatterND` — none of which go through the LFM2.5
-  rewrite pipeline. `--compile-vision` attempts it but is not expected to
-  succeed without dedicated work.
+- **Image-prefill decoders** (`decoder_image_{2,3,5}part_*.vmfb`,
+  `decoder_image_full.vmfb`). The board's one-shot image-prefill decoders have
+  no in-repo builder, and the deployed ones are numerically broken on the NPU
+  (NaN/overflow from layer 0 — see `torq-examples/RUN_ON_BOARD.md`). Reproducing
+  them needs dedicated work on the layer-split build plus a numerical fix; no
+  flag produces them.
 - **Image/text merge in the runner.** Running the full VL model end-to-end
   (image → features → splice into the text embeds) needs runner changes in
   `torq-examples`.
+
+> The dynamic vision encoder is *not* chip-compilable, but `--vision-res
+> {128,256}` builds a **static** single-resolution encoder that is (see the
+> Artifacts table above). Its compile is heavy/slow but succeeds.
