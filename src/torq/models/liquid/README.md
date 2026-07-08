@@ -12,9 +12,15 @@ measurement), see `torq-examples/liquid/README.md`.
 
 ## 0. Source model
 
-The source is the official ONNX export `LiquidAI/LFM2.5-350M-ONNX` on
-HuggingFace. The exporter downloads it automatically on first run, so you do
-not normally need to fetch it yourself.
+The source is the LFM2.5-350M ONNX export. The exporter downloads it
+automatically on first run, so you do not normally need to fetch it yourself.
+It tries the Synaptics-hosted mirror
+[`Synaptics/LiquidAI-LFM2p5-350M-LLM`](https://huggingface.co/Synaptics/LiquidAI-LFM2p5-350M-LLM)
+first — so the pipeline does not break if the upstream repo is renamed or
+removed — then falls back to the upstream `LiquidAI/LFM2.5-350M-ONNX`. The
+Synaptics repo is **private**, so set `HF_TOKEN` (or run `huggingface-cli
+login`) to use it; without a token the exporter falls through to the public
+upstream repo.
 
 If you want it on disk ahead of time (offline export, inspection, or to
 avoid a re-download), place it at the canonical source location the exporter

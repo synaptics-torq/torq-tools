@@ -55,8 +55,16 @@ from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 HF_REPO_BASE: dict[str, str] = {
     "350m": "LiquidAI/LFM2.5-350M",
 }
-HF_REPO_ONNX: dict[str, str] = {
-    "350m": "LiquidAI/LFM2.5-350M-ONNX",
+# Source ONNX repos, tried in order. The Synaptics-hosted mirror is primary so
+# the pipeline keeps working if the upstream LiquidAI repo is renamed/removed;
+# the upstream repo is the fallback. The Synaptics repo is private, so fetching
+# from it needs an HF token (HF_TOKEN env or `huggingface-cli login`); without
+# one, that repo 401s and we fall through to the public upstream repo.
+HF_REPO_ONNX: dict[str, tuple[str, ...]] = {
+    "350m": (
+        "Synaptics/LiquidAI-LFM2p5-350M-LLM",
+        "LiquidAI/LFM2.5-350M-ONNX",
+    ),
 }
 
 # Full torq-compile flag set LFM2.5 needs — the validated set the legacy
@@ -204,24 +212,43 @@ class LiquidModelExporter(OnnxModelExporterBase):
         import shutil
 
         target_dir.mkdir(parents=True, exist_ok=True)
-        self._logger.info("Downloading source ONNX from '%s'...", self._hf_repo_onnx)
-        for filename in ["onnx/model.onnx", "onnx/model.onnx_data"]:
+        repos = self._hf_repo_onnx
+        if isinstance(repos, str):
+            repos = (repos,)
+
+        required = ["onnx/model.onnx", "onnx/model.onnx_data"]
+        optional = ["config.json", "tokenizer.json", "tokenizer_config.json"]
+
+        last_err: Exception | None = None
+        for repo in repos:
+            self._logger.info("Downloading source ONNX from '%s'...", repo)
             try:
-                p = hf_hub_download(self._hf_repo_onnx, filename)
-                dest = target_dir / Path(filename).name
-                if not dest.exists():
-                    shutil.copy(p, dest)
+                for filename in required:
+                    p = hf_hub_download(repo, filename)
+                    dest = target_dir / Path(filename).name
+                    if not dest.exists():
+                        shutil.copy(p, dest)
             except Exception as e:
-                self._logger.warning("  failed %s: %s", filename, e)
-        for filename in ["config.json", "tokenizer.json", "tokenizer_config.json"]:
-            try:
-                p = hf_hub_download(self._hf_repo_onnx, filename)
-                dest = target_dir / filename
-                if not dest.exists():
-                    shutil.copy(p, dest)
-            except Exception as e:
-                self._logger.debug("  optional file %s not available: %s", filename, e)
-        self._logger.info("Download complete: %s", target_dir)
+                # Repo missing / renamed / private-without-token: try the next.
+                last_err = e
+                self._logger.warning(
+                    "  source repo '%s' unavailable (%s); trying next", repo, e
+                )
+                continue
+            # Required files came from this repo; pull the optional ones too.
+            for filename in optional:
+                try:
+                    p = hf_hub_download(repo, filename)
+                    dest = target_dir / filename
+                    if not dest.exists():
+                        shutil.copy(p, dest)
+                except Exception as e:
+                    self._logger.debug("  optional file %s not in %s: %s", filename, repo, e)
+            self._logger.info("Download complete from '%s': %s", repo, target_dir)
+            return
+        raise RuntimeError(
+            f"Failed to download source ONNX from any of {list(repos)}: {last_err}"
+        )
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         from onnx.external_data_helper import (
