@@ -72,4 +72,5 @@ markers = [
     "rnn: recurrent graph edit tests",
     "transformer: transformer graph edit tests",
     "artifacts: artifact graph edit tests",
+    "custom_ops: LFM2.5 custom-op replacement graph edit tests",
 ]
