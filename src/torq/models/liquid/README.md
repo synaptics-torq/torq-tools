@@ -174,12 +174,12 @@ lm_head, ~258 MB without FFN).
 
 The runner loads `model.vmfb`, `token_embeddings.npy`, `config.json` and
 `tokenizer.json` from a single directory (`Path(model.vmfb).parent`). After
-export these live in **two** places, so the scp pulls from both:
+export these live in several places, so the scp pulls from each:
 
 | file | source path (under `models/liquid-2p5-350m/`) |
 |---|---|
 | `model.vmfb` | `export/iree/bf16/static/` |
-| `token_embeddings.npy` | `export/iree/bf16/static/` (also in `export/onnx/bf16/static/`) |
+| `token_embeddings.npy` | `export/onnx/bf16/static/` |
 | `config.json` | `source/onnx/fp32/` |
 | `tokenizer.json` | `source/onnx/fp32/` |
 
@@ -187,16 +187,16 @@ export these live in **two** places, so the scp pulls from both:
 M=/home/kshanmug/torq/torq-tools-dev/models/liquid-2p5-350m
 scp \
   $M/export/iree/bf16/static/model.vmfb \
-  $M/export/iree/bf16/static/token_embeddings.npy \
+  $M/export/onnx/bf16/static/token_embeddings.npy \
   $M/source/onnx/fp32/config.json \
   $M/source/onnx/fp32/tokenizer.json \
-  root@10.3.10.55:/home/root/torq-examples/models/Synaptics/LFM2.5-350M-torq/
+  root@10.3.10.56:/home/root/torq/torq-examples/models/Synaptics/LFM2.5-350M-torq/
 ```
 
 Then on the board:
 
 ```sh
-cd ~/torq-examples/liquid
+cd ~/torq/torq-examples/liquidAI-LLM
 python src/infer.py \
   -m ../models/Synaptics/LFM2.5-350M-torq/model.vmfb \
   --instruct-model
