@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +31,7 @@ class Gemma3TrimVocabTests(unittest.TestCase):
             "?": 6,
             "こんにちは": 7,
             "<0x41>": 8,
+            "¢": 9,
         }
         tokenizer = Tokenizer(BPE(vocab=vocab, merges=[], unk_token="<unk>"))
         tokenizer.post_processor = TemplateProcessing(
@@ -69,13 +73,14 @@ class Gemma3TrimVocabTests(unittest.TestCase):
             byte_fallback=True,
         )
 
-        self.assertEqual(spec.model_vocab_size, 9)
+        self.assertEqual(spec.model_vocab_size, 10)
         self.assertEqual(spec.extra_token_ids, (extra_token_id,))
         # Latin token
         self.assertIn(4, spec.kept_model_ids)
         # Punct tokens
         self.assertIn(5, spec.kept_model_ids)
         self.assertIn(6, spec.kept_model_ids)
+        self.assertIn(9, spec.kept_model_ids)
         # Byte fallback token
         self.assertIn(8, spec.kept_model_ids)
         # Non-latin, non-punct token excluded

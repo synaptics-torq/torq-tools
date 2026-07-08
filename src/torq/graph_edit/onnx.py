@@ -134,7 +134,7 @@ class OnnxGraphEditor:
 
     @staticmethod
     def restore_rnn_output_arity(graph: gs.Graph) -> None:
-        from .edits import DecomposeBidirectionalRnn
+        from .edits.rnn import DecomposeBidirectionalRnn
 
         DecomposeBidirectionalRnn.restore_output_arity(graph)
 

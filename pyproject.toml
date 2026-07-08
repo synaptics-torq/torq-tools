@@ -54,3 +54,22 @@ moonshine = [
     "tqdm",
 ]
 all = ["torq-tools[moonshine]"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src", "tests"]
+testpaths = ["tests/unit", "tests/integration"]
+markers = [
+    "graph_edit: graph_edit test suite",
+    "unit: unit tests",
+    "integration: integration tests",
+    "ort: tests that execute ONNX Runtime",
+    "core: graph editor and import surface tests",
+    "arithmetic: arithmetic graph edit tests",
+    "shape: shape graph edit tests",
+    "padding: padding graph edit tests",
+    "conv: convolution graph edit tests",
+    "rnn: recurrent graph edit tests",
+    "transformer: transformer graph edit tests",
+    "artifacts: artifact graph edit tests",
+]

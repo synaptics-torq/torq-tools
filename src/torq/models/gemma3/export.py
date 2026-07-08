@@ -5,7 +5,7 @@ import argparse
 import os
 import shutil
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 from collections.abc import Sequence
 
 import numpy as np
@@ -30,6 +30,12 @@ from ...model_export.hf import optimum_export_onnx, hf_download_source_model
 
 from ...utils.logging import (
     configure_logging,
+)
+
+
+_GEMMA3_MODEL_FILENAMES: Final[tuple[tuple[str, ...], tuple[str, ...]]] = (
+    ("transformer.onnx", "lm_head.onnx"),
+    ("model.onnx",),
 )
 
 
@@ -63,6 +69,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._onnx_source_dir = onnx_source_dir
         self._trim_vocab = trim_vocab
         self._split_lm_head = split_lm_head
+        self._export_model_filenames = _GEMMA3_MODEL_FILENAMES[0 if split_lm_head else 1]
         self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct", "digits"))
         self._trim_byte_fallback = trim_byte_fallback
         self._hf_repo_subdir = hf_repo_subdir
@@ -193,6 +200,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model = gs.export_onnx(graph)
         model.ir_version = orig_ir
         return {"model": model}
+
+    def _export_path_for_component(self, component: str) -> Path:
+        if component == "model":
+            return self._export_dir / self._export_model_filenames[0]
+        return super()._export_path_for_component(component)
 
     def _resolve_source_asset_path(self, asset_name: str) -> Path:
         for asset_dir in self._source_asset_dirs:
@@ -414,7 +426,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         editor.reorder_graph_input("position_ids", 1)
 
         if self._split_lm_head:
-            lm_head_path = Path(model_path).parent / "lm_head.onnx"
+            lm_head_path = Path(model_path).parent / self._export_model_filenames[1]
             editor.split_lm_head(lm_head_path)
             lm_head_model = onnx.load(lm_head_path)
             lm_head_model.ir_version = model.ir_version
@@ -432,6 +444,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, _):
         self._patch_static_model(model_path)
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
 
     def validate_onnx(self, n_iters: int = 5):
         # simple dataset to test functional equivalence

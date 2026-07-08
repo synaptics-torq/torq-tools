@@ -13,7 +13,7 @@ from ...graph_edit import (
     FixedDimMapping,
     OnnxGraphEditor,
 )
-from ...graph_edit.edits import *
+from ...graph_edit.edits import CombineKVCacheMixin, CommonGraphEditsMixin
 
 
 class SmolLM2OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):

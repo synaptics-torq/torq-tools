@@ -291,6 +291,18 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         onnx.save(new_model, model_path)
 
+    def _patch_static_gen_encoder_cache(self, model_path: str | os.PathLike):
+        model = onnx.load(model_path)
+        editor = MoonshineOnnxGraphEditor.from_onnx(model, "gen_encoder_cache", self._onnx_export_dtype)
+
+        # Emit cross-attn key cache in [B, H, D, L] so the decoder can drop its
+        # matching re-transpose (incompatible with combined KV I/O)
+        if self._keep_individual_kv_io:
+            editor.retarget_cross_attn_key_layout()
+
+        new_model = editor.to_onnx(override_ir=model.ir_version)
+        onnx.save(new_model, model_path)
+
     def _patch_static_encoder(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)        # Decompose large strided Conv1D into im2col + MatMul
@@ -305,6 +317,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         editor.eliminate_transposes()
         # Collapse consecutive Reshape chains
         editor.collapse_reshape_chains()
+        # Emit folded cross-attn key cache in [B, H, D, L] so the decoder can drop
+        # its matching re-transpose (incompatible with combined KV I/O, see below)
+        if self._keep_individual_kv_io:
+            editor.retarget_cross_attn_key_layout()
         # Broadcast op inputs to match output shape
         if self._broadcast_ops is not None:
             editor.broadcast_op_inputs(
@@ -320,6 +336,11 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
         # Eliminate data-preserving Transpose ops (head reshape transposes, K^T when seq==head_dim)
         editor.eliminate_transposes()
+        # Drop the cross-attn key cache re-transpose; the encoder now emits the
+        # key cache pre-transposed to [B, H, D, L]. Mutually exclusive with the
+        # combined KV I/O path below (keys/values would no longer share a layout).
+        if self._keep_individual_kv_io:
+            editor.retarget_cross_attn_key_layout()
         # Collapse consecutive Reshape chains
         editor.collapse_reshape_chains()
         # Fold MatMul A @ B where B is a scalar into Mul
@@ -639,7 +660,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         elif component == "encoder":
             self._patch_static_encoder(model_path)
         elif component == "gen_encoder_cache":
-            pass  # No post-static patches needed for encoder cache
+            self._patch_static_gen_encoder_cache(model_path)
         elif component == "decoder":
             self._patch_static_decoder(model_path, component)
 

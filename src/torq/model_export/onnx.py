@@ -138,6 +138,9 @@ class OnnxModelExporterBase(ABC):
     def _skip_static_shape_check(self) -> bool:
         return False
 
+    def _export_path_for_component(self, component: str) -> Path:
+        return self._export_dir / f"{component}.onnx"
+
     @staticmethod
     def sanitize_onnx_names(model: onnx.ModelProto) -> onnx.ModelProto:
         """Replace characters illegal in MLIR identifiers in all tensor names."""
@@ -184,7 +187,7 @@ class OnnxModelExporterBase(ABC):
             if comp in self._skip_export:
                 self._logger.info("Skipping export of component %s", comp)
                 continue
-            self._export_paths[comp] = self._export_dir / f"{comp}.onnx"
+            self._export_paths[comp] = self._export_path_for_component(comp)
             self._logger.info("(%s) Checking model...", comp)
             model = self.sanitize_onnx_names(model)
             model = self.check_model(model)
