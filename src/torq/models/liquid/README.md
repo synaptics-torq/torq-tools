@@ -4,9 +4,8 @@ End-to-end recipe to take the `LiquidAI/LFM2.5-350M-ONNX` source model from
 HuggingFace, produce a Torq-ready bf16 ONNX, and compile it to a vmfb for the
 SL2610.
 
-This page covers **export** and **compile** only. For running the resulting
-vmfb on the board (interactive chat, hybrid CPU lm_head mode, perf
-measurement), see `torq-examples/liquid/README.md`.
+This page covers **export** and **compile**, plus deploying the resulting vmfb
+to the board and a basic on-board run (see the end).
 
 ---
 
@@ -173,42 +172,5 @@ Notes:
 
 Output: `model.vmfb` (~712 MB for the full bf16 build, ~553 MB without
 lm_head, ~258 MB without FFN).
-
----
-
-## 3. Deploy to the board
-
-The runner loads `model.vmfb`, `token_embeddings.npy`, `config.json` and
-`tokenizer.json` from a single directory (`Path(model.vmfb).parent`). After
-export these live in several places, so the scp pulls from each:
-
-| file | source path (under `models/liquid-2p5-350m/`) |
-|---|---|
-| `model.vmfb` | `export/iree/bf16/static/` |
-| `token_embeddings.npy` | `export/onnx/bf16/static/` |
-| `config.json` | `source/onnx/fp32/` |
-| `tokenizer.json` | `source/onnx/fp32/` |
-
-```sh
-M=/home/kshanmug/torq/torq-tools-dev/models/liquid-2p5-350m
-scp \
-  $M/export/iree/bf16/static/model.vmfb \
-  $M/export/onnx/bf16/static/token_embeddings.npy \
-  $M/source/onnx/fp32/config.json \
-  $M/source/onnx/fp32/tokenizer.json \
-  root@10.3.10.56:/home/root/torq/torq-examples/models/Synaptics/LFM2.5-350M-torq/
-```
-
-Then on the board:
-
-```sh
-cd ~/torq/torq-examples/liquidAI-LLM
-python src/infer.py \
-  -m ../models/Synaptics/LFM2.5-350M-torq/model.vmfb \
-  --instruct-model
-```
-
-See `torq-examples/liquid/README.md` for chat usage, the hybrid VMFB+ORT
-lm_head mode, and sampling options.
 
 ---
