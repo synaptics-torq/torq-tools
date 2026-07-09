@@ -50,6 +50,17 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           df -h /
 
+      - name: Add swap space
+        run: |
+          # The static shape-propagation pass constant-folds a ~1 GB ONNX graph
+          # and peaks above the 7 GB runner RAM (OOM shows up as a job
+          # cancellation). Extra swap gives it headroom.
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
