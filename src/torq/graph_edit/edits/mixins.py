@@ -31,6 +31,11 @@ from .transformer import (
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
+from .custom_ops import (
+    ReplaceGroupQueryAttention,
+    ReplaceSimplifiedLayerNorm,
+    ReplaceSkipSimplifiedLayerNorm,
+)
 
 
 class CommonGraphEditsMixin:
@@ -55,6 +60,18 @@ class CommonGraphEditsMixin:
 
     def convert_to_static_index(self):
         self.apply_edit(ConvertToStaticIndex(self._graph, self._graph_name))
+        return self
+
+    def replace_simplified_layer_norm(self):
+        self.apply_edit(ReplaceSimplifiedLayerNorm(self._graph, self._graph_name))
+        return self
+
+    def replace_skip_simplified_layer_norm(self):
+        self.apply_edit(ReplaceSkipSimplifiedLayerNorm(self._graph, self._graph_name))
+        return self
+
+    def replace_group_query_attention(self, num_heads, kv_num_heads, head_dim):
+        self.apply_edit(ReplaceGroupQueryAttention(self._graph, self._graph_name, num_heads, kv_num_heads, head_dim))
         return self
 
     def dequantize_projections_matmul(self, hidden_size, vocab_size):

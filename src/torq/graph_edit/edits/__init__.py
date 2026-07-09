@@ -32,6 +32,11 @@ from .transformer import (
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
+from .custom_ops import (
+    ReplaceGroupQueryAttention,
+    ReplaceSimplifiedLayerNorm,
+    ReplaceSkipSimplifiedLayerNorm,
+)
 
 __all__ = [
     "ReplaceDynamicKVCache",
@@ -64,4 +69,7 @@ __all__ = [
     "DecomposeBidirectionalRnn",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
+    "ReplaceSimplifiedLayerNorm",
+    "ReplaceSkipSimplifiedLayerNorm",
+    "ReplaceGroupQueryAttention",
 ]

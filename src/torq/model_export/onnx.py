@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -137,6 +138,44 @@ class OnnxModelExporterBase(ABC):
     def _export_path_for_component(self, component: str) -> Path:
         return self._export_dir / f"{component}.onnx"
 
+    @staticmethod
+    def sanitize_onnx_names(model: onnx.ModelProto) -> onnx.ModelProto:
+        """Replace characters illegal in MLIR identifiers in all tensor names."""
+        _illegal = re.compile(r'[^a-zA-Z0-9_./]+')
+
+        def _clean(name: str) -> str:
+            return _illegal.sub('_', name).strip('_')
+
+        rename_map: dict[str, str] = {}
+        for init in model.graph.initializer:
+            clean = _clean(init.name)
+            if clean != init.name:
+                rename_map[init.name] = clean
+        for node in model.graph.node:
+            for out in node.output:
+                clean = _clean(out)
+                if clean != out:
+                    rename_map[out] = clean
+        if not rename_map:
+            return model
+        for init in model.graph.initializer:
+            if init.name in rename_map:
+                init.name = rename_map[init.name]
+        for node in model.graph.node:
+            for i, inp in enumerate(node.input):
+                if inp in rename_map:
+                    node.input[i] = rename_map[inp]
+            for i, out in enumerate(node.output):
+                if out in rename_map:
+                    node.output[i] = rename_map[out]
+        for io in list(model.graph.input) + list(model.graph.output):
+            if io.name in rename_map:
+                io.name = rename_map[io.name]
+        for vi in model.graph.value_info:
+            if vi.name in rename_map:
+                vi.name = rename_map[vi.name]
+        return model
+
     def export_onnx(self, validate: bool = True):
         if self._static_models:
             self.make_static()
@@ -147,6 +186,7 @@ class OnnxModelExporterBase(ABC):
                 continue
             self._export_paths[comp] = self._export_path_for_component(comp)
             self._logger.info("(%s) Checking model...", comp)
+            model = self.sanitize_onnx_names(model)
             model = self.check_model(model)
             onnx.save(model, self._export_paths[comp])
             self._logger.info("(%s) Optimizing model...", comp)
