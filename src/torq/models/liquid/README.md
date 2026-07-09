@@ -7,6 +7,10 @@ SL2610.
 This page covers **export** and **compile**, plus deploying the resulting vmfb
 to the board and a basic on-board run (see the end).
 
+> For the vision-language model **LFM2-VL-450M** (three ONNX components:
+> decoder + vision encoder + embed_tokens), see [`README_VL.md`](README_VL.md).
+> Its `torq-export-model liquid-vl` subcommand reuses this decoder pipeline.
+
 ---
 
 ## 0. Source model
