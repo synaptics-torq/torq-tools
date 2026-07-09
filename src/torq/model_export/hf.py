@@ -3,6 +3,7 @@
 
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -43,6 +44,13 @@ def hf_download_source_model(
 ) -> Path:
     """Download an ONNX model and peripheral files from a HF repo.
 
+    Each file is located independently: the requested ``subfolder`` is preferred
+    but the repo root is used as a fallback, so repos that keep the model under
+    ``onnx/`` while leaving config/tokenizer at the root (e.g. the onnx-community
+    mirrors) work. Every file — including the model's external-data sidecar
+    (``<model_filename>_data``) — is flattened into ``local_dir`` by basename so
+    the model and its metadata sit together.
+
     Returns the path to the downloaded model file.
 
     Raises:
@@ -50,30 +58,41 @@ def hf_download_source_model(
     """
     api = HfApi()
     repo_files = set(api.list_repo_files(repo))
-
-    def _repo_path(filename: str) -> str:
-        return f"{subfolder}/{filename}" if subfolder else filename
-
-    model_filepath = _repo_path(model_filename)
-    if model_filepath not in repo_files:
-        raise FileNotFoundError(
-            f"'{model_filepath}' not found in repo '{repo}'"
-        )
-
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    hf_hub_download(repo, model_filename, subfolder=subfolder, local_dir=local_dir)
+    def _locate(filename: str) -> str | None:
+        """Repo subfolder holding ``filename`` (preferred subfolder, else root),
+        or None if the file is absent from the repo."""
+        if subfolder and f"{subfolder}/{filename}" in repo_files:
+            return subfolder
+        if filename in repo_files:
+            return ""
+        return None
 
+    def _fetch(filename: str, *, required: bool) -> Path | None:
+        found_in = _locate(filename)
+        if found_in is None:
+            if required:
+                raise FileNotFoundError(
+                    f"'{filename}' not found in repo '{repo}' (subfolder={subfolder!r})"
+                )
+            _logger.warning("File '%s' not found in repo %s", filename, repo)
+            return None
+        _logger.debug("Downloading file '%s' from repo %s", filename, repo)
+        cached = Path(hf_hub_download(repo, filename, subfolder=found_in or None))
+        dest = local_dir / Path(filename).name
+        if cached.resolve() != dest.resolve():
+            shutil.copy2(cached, dest)
+        return dest
+
+    model_dest = _fetch(model_filename, required=True)
+    # ONNX external-data sidecar (e.g. model.onnx_data), present for larger models.
+    _fetch(f"{model_filename}_data", required=False)
     for filename in (peripheral_files or []):
-        full_filepath = _repo_path(filename)
-        if full_filepath not in repo_files:
-            _logger.warning("Peripheral file '%s' not found in repo %s", full_filepath, repo)
-            continue
-        _logger.debug("Downloading file '%s' from repo %s", full_filepath, repo)
-        hf_hub_download(repo, filename, subfolder=subfolder, local_dir=local_dir)
+        _fetch(filename, required=False)
 
-    return local_dir / model_filename
+    return model_dest
 
 
 def optimum_export_onnx(

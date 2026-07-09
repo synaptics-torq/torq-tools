@@ -54,6 +54,11 @@ class Gemma3OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCac
             FixedDimMapping(batch_dim, DimMatchType.EXACT, 1),
             FixedDimMapping(seq_len_dim, DimMatchType.EXACT, 1),
             FixedDimMapping(past_seq_len_dim, DimMatchType.CONTAINS, seq_len),
+            # GQA-style exports (e.g. the onnx-community gemma-3-*-it mirror) key
+            # the attention mask on total_sequence_length; the static KV cache is
+            # `seq_len` long, so the mask spans the same. Unused on decomposed
+            # exports that lack this dim.
+            FixedDimMapping("total_sequence_length", DimMatchType.EXACT, seq_len),
         ]
         to_fix.extend(dims or [])
         self.fix_io_dims(to_fix)

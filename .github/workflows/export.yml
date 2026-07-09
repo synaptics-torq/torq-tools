@@ -6,9 +6,10 @@
 # downloads) is per-model and one failure doesn't hide the others
 # (fail-fast: false).
 #
-# gemma3 pulls the gated google/gemma-3-* repos and the private Synaptics liquid
-# ONNX mirror, so an HF_TOKEN secret (with the Gemma license accepted) is
-# required for gemma3; the other three fall back to public repos.
+# All sources are public: gemma3 uses the onnx-community mirror (base + IT, both
+# with --trim-vocab) and liquid falls back to the public LiquidAI ONNX repo, so
+# no HF_TOKEN is required. HF_TOKEN is still passed through if set (e.g. to reach
+# the private Synaptics mirrors) but nothing here depends on it.
 name: Export models
 
 on:
@@ -35,7 +36,9 @@ jobs:
           - model: smollm2
             args: smollm2 -s 135M --skip-torq --skip-validation
           - model: gemma3
-            args: gemma3 -s 270m --skip-torq --skip-validation
+            args: gemma3 -s 270m --trim-vocab --skip-torq --skip-validation
+          - model: gemma3-it
+            args: gemma3 -s 270m --instruct-model --trim-vocab --skip-torq --skip-validation
           - model: liquid
             args: liquid -s 230m --skip-torq --skip-validation
 

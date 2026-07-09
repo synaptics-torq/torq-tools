@@ -76,9 +76,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if hf_repo:
             self._hf_repo = hf_repo
         else:
-            self._hf_repo = f"google/gemma-3-{model_size}"
+            # Public onnx-community mirror (not gated, no HF token needed). It
+            # keeps model.onnx under onnx/ with config/tokenizer at the repo root;
+            # hf_download_source_model resolves each file and flattens them.
+            self._hf_repo = f"onnx-community/gemma-3-{model_size}"
             if self._instruct_model:
                 self._hf_repo += "-it"
+            self._hf_repo += "-ONNX"
+            if self._hf_repo_subdir is None:
+                self._hf_repo_subdir = "onnx"
         self._source_asset_dirs = [
             path
             for path in (
@@ -150,11 +156,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"], opt_level=None
                 )
                 self._logger.info("Exported %s to ONNX @ '%s' via optimum-cli", self._hf_repo, onnx_dir)
-            if self._hf_repo_subdir:
-                onnx_dir /= Path(self._hf_repo_subdir)
-                self._config = AutoConfig.from_pretrained(onnx_dir / "config.json")
-                self._hidden_size = int(self._config.hidden_size)
-                self._vocab_size = int(self._config.vocab_size)
+            # hf_download_source_model flattens model.onnx (+ external data) and
+            # the metadata into onnx_dir regardless of the repo's subfolder layout,
+            # so there is no per-subfolder path to descend into here.
         model_type = "trim" if self._trim_vocab else "full"
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
         export_dir = (
@@ -194,11 +198,42 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         orig_ir = model.ir_version
         graph = gs.import_onnx(model)
         graph.name = "main"
+
+        # Some public mirrors ship the ORT fused com.microsoft ops
+        # (SimplifiedLayerNormalization, GroupQueryAttention) instead of standard
+        # ONNX — e.g. the onnx-community gemma-3-*-it export (the base export is
+        # already decomposed). Decompose them into standard ops so the graph
+        # validates and the Torq compiler can lower it. No-op on decomposed inputs.
+        if any(node.domain == "com.microsoft" for node in model.graph.node):
+            head_dim = int(
+                getattr(self._config, "head_dim", 0)
+                or self._hidden_size // self._config.num_attention_heads
+            )
+            editor = Gemma3OnnxGraphEditor(graph, self._onnx_export_dtype)
+            self._logger.info("Replacing SimplifiedLayerNormalization ops...")
+            editor.replace_simplified_layer_norm()
+            self._logger.info("Replacing SkipSimplifiedLayerNormalization ops...")
+            editor.replace_skip_simplified_layer_norm()
+            self._logger.info("Replacing GroupQueryAttention ops...")
+            editor.replace_group_query_attention(
+                num_heads=self._config.num_attention_heads,
+                kv_num_heads=self._config.num_key_value_heads,
+                head_dim=head_dim,
+            )
+            graph = editor.graph
+
         graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
         ).toposort()
         model = gs.export_onnx(graph)
         model.ir_version = orig_ir
+
+        # Drop the now-unused com.microsoft opset import once fused ops are gone.
+        if not any(node.domain == "com.microsoft" for node in model.graph.node):
+            for opset in list(model.opset_import):
+                if opset.domain == "com.microsoft":
+                    model.opset_import.remove(opset)
+
         return {"model": model}
 
     def _export_path_for_component(self, component: str) -> Path:
