@@ -16,7 +16,7 @@ DEFAULT_MODEL_SIZE: Final[str] = "350m"
 DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
-MODEL_SIZES: Final[list[str]] = ["350m"]
+MODEL_SIZES: Final[list[str]] = ["350m", "230m"]
 MODEL_DTYPES: Final[list[str]] = ["fp32"]
 
 

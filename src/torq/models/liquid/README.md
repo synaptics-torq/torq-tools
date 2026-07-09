@@ -1,8 +1,10 @@
 # LFM2.5 (Liquid) export and compile
 
-End-to-end recipe to take the `LiquidAI/LFM2.5-350M-ONNX` source model from
-HuggingFace, produce a Torq-ready bf16 ONNX, and compile it to a vmfb for the
-SL2610.
+End-to-end recipe to take an `LiquidAI/LFM2.5-*-ONNX` source model — **350M**
+(default) or **230M** — from HuggingFace, produce a Torq-ready bf16 ONNX, and
+compile it to a vmfb for the SL2610. Pass `--model-size 230m` for the smaller
+model; everything else is identical (the exporter reads the architecture —
+layer count, hidden size, layer types — from the model's `config.json`).
 
 This page covers **export** and **compile**, plus deploying the resulting vmfb
 to the board and a basic on-board run (see the end).
@@ -98,7 +100,8 @@ Flag breakdown:
 | flag | meaning |
 |---|---|
 | `liquid` | subcommand (registered in [`models/export_model.py`](../export_model.py)) |
-| `--models-dir` | base dir; the exporter reads from `<dir>/liquid-2p5-350m/source/` and writes to `<dir>/liquid-2p5-350m/export/` |
+| `-s, --model-size {350m,230m}` | which LFM2.5 size to export (default: `350m`). `230m` pulls from `LiquidAI/LFM2.5-230M-ONNX` and reads/writes under `<dir>/liquid-2p5-230m/` |
+| `--models-dir` | base dir; the exporter reads from `<dir>/liquid-2p5-<size>/source/` and writes to `<dir>/liquid-2p5-<size>/export/` |
 | `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
 | `--instruct-model` | use the instruction-tuned variant (this is what enables ChatML at inference) |
 | `--convert-dtypes` | emit bf16 alongside fp32 (driven by the `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py`) |

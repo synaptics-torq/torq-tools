@@ -163,7 +163,9 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
             op="Where",
             inputs=[mask_lte, attn_mask_keep, attn_mask_block],
             outputs=[
-                gs.Variable(node.name + "_where", dtype=node.inputs[0].dtype, shape=mask_shape)
+                gs.Variable(node.name + "_where",
+                            dtype=node.inputs[0].dtype or self.export_dtype,
+                            shape=mask_shape)
             ],
         )[0]
 
