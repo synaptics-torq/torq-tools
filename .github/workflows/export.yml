@@ -53,12 +53,16 @@ jobs:
       - name: Add swap space
         run: |
           # The static shape-propagation pass constant-folds a ~1 GB ONNX graph
-          # and peaks above the 7 GB runner RAM (OOM shows up as a job
-          # cancellation). Extra swap gives it headroom.
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          # and peaks above the 7 GB runner RAM (OOM surfaces as a job
+          # cancellation). ubuntu-latest already ships an active /swapfile that
+          # can't be resized in place ("fallocate: Text file busy"), so disable
+          # existing swap and create a larger file on the big ephemeral /mnt disk.
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
           free -h
 
       - name: Setup Python
