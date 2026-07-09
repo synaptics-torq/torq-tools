@@ -11,8 +11,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 import ml_dtypes
-from datasets import load_dataset, Audio
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoConfig
 
 from . import (
     ONNX_DTYPES,
@@ -25,7 +24,6 @@ from . import (
 )
 
 from ._graph import MoonshineOnnxGraphEditor
-from ._inference import MoonshineDynamic, MoonshineStatic
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import hf_download_models, optimum_export_onnx
 
@@ -665,6 +663,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._patch_static_decoder(model_path, component)
 
     def validate_onnx(self, n_iters: int = 5):
+        # Imported lazily: these pull in torq.runtime (present only with a
+        # compiler build) and the audio-validation stack. ONNX-only export
+        # (--skip-torq / --skip-validation) must not require them.
+        from datasets import load_dataset, Audio
+        from transformers import AutoProcessor
+
+        from ._inference import MoonshineDynamic, MoonshineStatic
 
         def _sample_input(idx: int) -> np.ndarray:
             sample = dataset[idx]["audio"]

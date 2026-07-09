@@ -46,7 +46,6 @@ _patch_gs_bf16_converter()
 
 from . import add_liquid_export_args
 from ._graph import LiquidOnnxGraphEditor
-from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 
@@ -1239,6 +1238,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
         bf16 cannot be validated under onnxruntime; the user must use the
         compiled .vmfb via VMFBInferenceRunner for end-to-end bf16 testing.
         """
+        # Imported lazily: this pulls in torq.runtime, which is only present with
+        # a compiler build. ONNX-only export (--skip-torq / --skip-validation)
+        # must not require the runtime.
+        from ._inference import LiquidDynamic, LiquidStatic
+
         prompts = [
             "Hello",
             "The quick brown fox jumps over the lazy dog.",
