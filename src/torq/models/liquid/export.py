@@ -54,6 +54,7 @@ from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 # HuggingFace repos containing LFM2.5 model + tokenizer
 HF_REPO_BASE: dict[str, str] = {
     "350m": "LiquidAI/LFM2.5-350M",
+    "230m": "LiquidAI/LFM2.5-230M",
 }
 # Source ONNX repos, tried in order. The Synaptics-hosted mirror is primary so
 # the pipeline keeps working if the upstream LiquidAI repo is renamed/removed;
@@ -64,6 +65,10 @@ HF_REPO_ONNX: dict[str, tuple[str, ...]] = {
     "350m": (
         "Synaptics/LiquidAI-LFM2p5-350M-LLM",
         "LiquidAI/LFM2.5-350M-ONNX",
+    ),
+    "230m": (
+        "Synaptics/LiquidAI-LFM2p5-230M-LLM",
+        "LiquidAI/LFM2.5-230M-ONNX",
     ),
 }
 
@@ -104,7 +109,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def __init__(
         self,
-        model_size: Literal["350m"] = "350m",
+        model_size: Literal["350m", "230m"] = "350m",
         instruct_model: bool = False,
         extract_embeddings: bool = False,
         keep_individual_kv_io: bool = False,
@@ -276,6 +281,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         editor.replace_simplified_layer_norm()
         self._logger.info("Replacing SkipSimplifiedLayerNormalization ops...")
         editor.replace_skip_simplified_layer_norm()
+        self._logger.info("Folding external RotaryEmbedding ops into GQA...")
+        self._fold_external_rotary_into_gqa(editor.graph)
         self._logger.info("Replacing GroupQueryAttention ops...")
         editor.replace_group_query_attention(
             num_heads=self._num_attention_heads,
@@ -415,6 +422,48 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("ONNX checker reported issues; continuing: %s", e)
         return model
+
+    def _fold_external_rotary_into_gqa(self, graph) -> int:
+        """Fold standalone ``com.microsoft.RotaryEmbedding`` ops into the GQA.
+
+        Some LFM2.5 exports (e.g. 230M) apply rotary via separate q/k
+        ``RotaryEmbedding`` ops *before* each ``GroupQueryAttention`` (the GQA
+        has ``do_rotary=0`` and empty cos/sin cache inputs). Those contrib ops
+        block ``onnx.shape_inference`` (no shape function) — leaving the whole
+        downstream graph shapeless — and torq-compile can't lower them. Rewire
+        the pre-rotary Q/K straight into the GQA, attach the rotary's cos/sin
+        caches to the GQA's cache inputs, and set ``do_rotary=1`` so the
+        (already validated) GQA decomposition applies the rotary itself. No-op
+        for exports that already rotate inside the GQA (e.g. 350M)."""
+        folded = 0
+        for node in list(graph.nodes):
+            if node.op != "GroupQueryAttention":
+                continue
+            if int(node.attrs.get("do_rotary", 0)) != 0:
+                continue  # already does rotary internally — nothing to fold
+            ins = list(node.inputs)
+            q_in = ins[0] if len(ins) > 0 else None
+            k_in = ins[1] if len(ins) > 1 else None
+            q_rot = q_in.inputs[0] if (q_in is not None and q_in.inputs) else None
+            k_rot = k_in.inputs[0] if (k_in is not None and k_in.inputs) else None
+            if not (q_rot is not None and q_rot.op == "RotaryEmbedding"
+                    and k_rot is not None and k_rot.op == "RotaryEmbedding"):
+                continue
+            # RotaryEmbedding inputs: [0]=x [1]=position_ids [2]=cos_cache [3]=sin_cache
+            pre_q, pre_k = q_rot.inputs[0], k_rot.inputs[0]
+            cos_cache, sin_cache = q_rot.inputs[2], q_rot.inputs[3]
+            while len(ins) < 9:            # ensure slots [7]=cos, [8]=sin exist
+                ins.append(gs.Variable(""))
+            ins[0], ins[1] = pre_q, pre_k
+            ins[7], ins[8] = cos_cache, sin_cache
+            node.inputs = ins
+            node.attrs["do_rotary"] = 1
+            q_rot.outputs.clear(); q_rot.inputs.clear()
+            k_rot.outputs.clear(); k_rot.inputs.clear()
+            folded += 1
+        graph.cleanup().toposort()
+        self._logger.info("Folded %d external RotaryEmbedding pair(s) into GQA", folded)
+        return folded
 
     def _make_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph: gs.Graph = gs.import_onnx(model)

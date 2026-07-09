@@ -25,7 +25,7 @@ logger = logging.getLogger("Liquid.download")
 # Kept self-contained (no package imports) so downloading the source never
 # requires the compiler toolchain. Keep in sync with the maps in `export.py`.
 DEFAULT_MODEL_SIZE = "350m"
-MODEL_SIZES = ["350m"]
+MODEL_SIZES = ["350m", "230m"]
 # Tried in order: Synaptics-hosted mirror first (so this keeps working if the
 # upstream LiquidAI repo is renamed/removed), then upstream as fallback. The
 # Synaptics repo is private — set HF_TOKEN (or `huggingface-cli login`) to use
@@ -34,6 +34,10 @@ HF_REPO_ONNX = {
     "350m": (
         "Synaptics/LiquidAI-LFM2p5-350M-LLM",
         "LiquidAI/LFM2.5-350M-ONNX",
+    ),
+    "230m": (
+        "Synaptics/LiquidAI-LFM2p5-230M-LLM",
+        "LiquidAI/LFM2.5-230M-ONNX",
     ),
 }
 
