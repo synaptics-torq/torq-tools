@@ -118,6 +118,17 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
+    parser.add_argument(
+        "--split-decoder",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit body.vmfb (decoder minus lm_head, hidden output) + "
+            "lm_head.vmfb (standalone hidden->logits) alongside the fused "
+            "model.vmfb — the lower-TTFT split where the lm_head is skipped "
+            "during prefill. Requires --convert-dtypes."
+        ),
+    )
     add_logging_args(parser)
     add_torq_args(parser)
 

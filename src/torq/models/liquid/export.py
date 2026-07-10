@@ -1365,6 +1365,82 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
                 np.save(self._convert_dir / emb_src.name, emb_data)
 
+    def make_decoder_split(self):
+        """Split the (bf16) decoder into ``body`` (decoder minus lm_head, hidden
+        output) + ``lm_head`` (standalone hidden->logits), registering both so
+        ``export_torq`` also compiles ``body.vmfb`` + ``lm_head.vmfb``.
+
+        This is the lower-TTFT deployment: the body runs every step, and the
+        ``[hidden, vocab]`` lm_head MatMul (~134 MB bf16) runs only when a token
+        is actually sampled — so it is **skipped during prefill** (every prefill
+        token except the last needs no logits). Requires ``--convert-dtypes``
+        (splits the converted bf16 model). Structure-based: the lm_head is the
+        node(s) producing the vocab-logits graph output, and its non-weight
+        activation input is the split boundary."""
+        import copy
+        from onnx import helper, TensorProto
+
+        src_path = self._export_paths["model"]
+        model = onnx.load(str(src_path), load_external_data=True)
+        g = model.graph
+        bf16 = TensorProto.BFLOAT16
+
+        logits_name = "logits"
+        if not any(o.name == logits_name for o in g.output):
+            logits_name = next(
+                o.name for o in g.output
+                if o.type.tensor_type.shape.dim
+                and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
+            )
+        init_names = {i.name for i in g.initializer}
+        lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
+                    or (n.name and "lm_head" in n.name)]
+        lm_produced = {o for n in lm_nodes for o in n.output}
+        lm_inputs = {i for n in lm_nodes for i in n.input}
+        hidden_name = next(
+            i for i in lm_inputs
+            if i and i not in init_names and i not in lm_produced
+        )
+        lm_node_names = {n.name for n in lm_nodes}
+
+        # ---- body: drop lm_head node(s), expose the hidden state as output ----
+        body = onnx.ModelProto()
+        body.CopyFrom(model)
+        bg = body.graph
+        del bg.node[:]
+        bg.node.extend([n for n in g.node if n.name not in lm_node_names])
+        outs = [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])]
+        outs += [o for o in g.output if o.name != logits_name]
+        del bg.output[:]
+        bg.output.extend(outs)
+        used = {i for n in bg.node for i in n.input}
+        del bg.initializer[:]
+        bg.initializer.extend([i for i in g.initializer if i.name in used])
+        body_path = self._convert_dir / "body.onnx"
+        onnx.save(body, str(body_path), save_as_external_data=False)
+
+        # ---- lm_head: standalone hidden -> logits -----------------------------
+        weights = [copy.deepcopy(i) for i in g.initializer
+                   if i.name in (lm_inputs & init_names)]
+        lm_graph = helper.make_graph(
+            [copy.deepcopy(n) for n in lm_nodes],
+            "main",
+            [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])],
+            [helper.make_tensor_value_info(logits_name, bf16, [1, 1, self._vocab_size])],
+            weights,
+        )
+        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
+        lm_model.ir_version = model.ir_version
+        lmh_path = self._convert_dir / "lm_head.onnx"
+        onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
+
+        self._export_paths["body"] = body_path
+        self._export_paths["lm_head"] = lmh_path
+        self._logger.info(
+            "(split) derived body (%d nodes) + lm_head (%d node(s)) from '%s'",
+            len(bg.node), len(lm_nodes), src_path.name,
+        )
+
 
 def export_liquid_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
@@ -1388,6 +1464,8 @@ def export_liquid_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
+        if getattr(args, "split_decoder", False):
+            exporter.make_decoder_split()
     if not args.skip_torq:
         exporter.export_torq(
             torq_compile_args=args.compile_flags or [],
