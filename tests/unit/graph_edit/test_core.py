@@ -155,6 +155,7 @@ class DelegatingEditor(OnnxGraphEditor, CommonGraphEditsMixin):
         ("replace_dynamic_kv_cache", (gs.Variable("cur", dtype=np.int64, shape=[1]), 8), "ReplaceDynamicKVCache"),
         ("mask_future_attn_scores", (gs.Variable("cur", dtype=np.int64, shape=[1]), 8), "MaskFutureAttentionScores"),
         ("add_curr_len_input", (gs.Variable("cur", dtype=np.int64, shape=[1]),), "AddCurrLenInput"),
+        ("decompose_layer_normalization", (), "DecomposeLayerNormalization"),
         ("convert_to_static_index", (), "ConvertToStaticIndex"),
         ("dequantize_projections_matmul", (2, 4), "DequantizeProjectionsMatMul"),
         ("remove_isNaN", (), "RemoveIsNaN"),

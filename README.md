@@ -70,6 +70,7 @@ The project ships with optional extras for specific export and validation workfl
 | extra | purpose |
 | :---: | ------------ |
 | "moonshine" | Install dependencies for Moonshine export and validation |
+| "moonshine-streaming" | Install dependencies for Moonshine Streaming export and validation (requires `transformers>=5.5.1`) |
 | "all" | Install dependencies for all extras |
 
 You can install these extras alongside the base package:
@@ -141,7 +142,16 @@ python3 -m src.torq.models.<model>.export
 For example, to export a static bf16 Moonshine model:
 ```bash
 python3 -m src.torq.models.moonshine.export --convert-dtype bf16
-``` 
+```
+To export a static Moonshine Streaming model (fixed audio chunk, with dtype conversion):
+```bash
+python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280 --convert-dtypes
+```
+> [!NOTE]
+> Moonshine Streaming requires the `moonshine-streaming` extra (`transformers>=5.5.1`). The
+> exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
+> e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side
+> `*.npy` LUTs and a `streaming_config.json`.
 
 #### Convert TFLite models to static shapes
 Converts dynamic TFLite models to static by removing `shapeSignature` metadata from tensors, forcing the runtime to use the concrete dimensions already present in the `shape` field. This works for most dynamic models whose default shapes are valid.
@@ -165,6 +175,12 @@ Example: run Moonshine inference with ONNX and VMFB backends:
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_iree_onnx/ -s tiny --max-inp-len 80000 --max-dec-len 30
 ```
+Example: run Moonshine Streaming inference (point `-m` at an export dir containing
+`encoder.onnx`, `decoder.onnx`, the `*.npy` LUTs and `tokenizer.json`):
+```bash
+python -m src.torq.models.moonshine_streaming.infer apostle.wav \
+  -m models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/static -s tiny
+```
 
 ### CLI usage
 If `torq-tools` was installed as a Python package, all major tools are also exposed as CLI commands.
@@ -179,10 +195,12 @@ torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config qua
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
+torq-export-model moonshine_streaming --chunk-len 1280 --convert-dtypes
 
 # run inference
 torq-infer-model moonshine apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
 torq-infer-model moonshine apostle.wav -m models/moonshine_iree_onnx/ -s tiny --max-inp-len 80000 --max-dec-len 30
+torq-infer-model moonshine_streaming apostle.wav -m models/moonshine_streaming_static/ -s tiny
 ```
 
 ### Using in code

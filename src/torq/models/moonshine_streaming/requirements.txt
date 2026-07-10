@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
+# Moonshine Streaming requires the `moonshine_streaming` model class, which was added to
+# Hugging Face Transformers in the 5.5.x series (the 4.x line does not ship it).
+transformers>=5.5.1
+# Source export builds PyTorch wrapper modules and uses torch.onnx (dynamo) export.
+# For a CPU-only install: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch
+# Required by torch.onnx.export(dynamo=True).
+onnxscript
+# Validation: audio loading + resampling to 16 kHz.
+soundfile
+scipy

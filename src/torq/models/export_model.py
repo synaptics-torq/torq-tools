@@ -4,6 +4,7 @@
 import argparse
 
 from .moonshine import add_moonshine_export_args
+from .moonshine_streaming import add_moonshine_streaming_export_args
 from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
@@ -15,6 +16,9 @@ def main():
 
     moonshine = model.add_parser("moonshine", help="Export moonshine to Torq")
     add_moonshine_export_args(moonshine)
+
+    moonshine_streaming = model.add_parser("moonshine_streaming", help="Export Moonshine Streaming to Torq")
+    add_moonshine_streaming_export_args(moonshine_streaming)
 
     smollm2 = model.add_parser("smollm2", help="Export SmolLM2 to Torq")
     add_smollm2_export_args(smollm2)
@@ -33,6 +37,9 @@ def main():
     if args.model_name == "moonshine":
         from .moonshine.export import export_moonshine_from_args
         export_moonshine_from_args(args)
+    elif args.model_name == "moonshine_streaming":
+        from .moonshine_streaming.export import export_moonshine_streaming_from_args
+        export_moonshine_streaming_from_args(args)
     elif args.model_name == "smollm2":
         from .smollm2.export import export_smollm2_from_args
         export_smollm2_from_args(args)

@@ -59,6 +59,25 @@ def test_mask_future_attention_scores_inserts_bias_add_when_producer_is_not_add(
     assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
 
 
+def test_mask_future_attention_scores_shape_fallback_requires_opt_in():
+    scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
+    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 1, 4])
+    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[gs.Variable("pre", dtype=np.float32, shape=[1, 1, 1, 4])])
+    softmax = gs.Node("Softmax", "decoder/layer0/Softmax_5", inputs=[identity.outputs[0]], outputs=[probs])
+    g = graph(nodes=[identity, softmax], inputs=[scores], outputs=[probs])
+    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1])
+
+    default_edit = MaskFutureAttentionScores(g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT)
+    assert not default_edit.match(softmax)
+
+    opted_in_edit = MaskFutureAttentionScores(
+        g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT, match_shape_fallback=True,
+    )
+    assert opted_in_edit.match(softmax)
+    opted_in_edit.transform(softmax)
+    assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
+
+
 def test_add_curr_len_input_rewires_shape_gather_consumers():
     pkv = gs.Variable("past_key_values.0.key", dtype=np.float32, shape=[1, 1, 4, 2])
     shape_out = gs.Variable("shape_out", dtype=np.int64, shape=[4])

@@ -41,7 +41,11 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        return node.op == "Concat" and node.outputs[0].name in self.output_names
+        return (
+            node.op == "Concat"
+            and node.attrs.get("axis") == -2
+            and node.outputs[0].name in self.output_names
+        )
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Concat")
@@ -108,11 +112,20 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         - Creates a mask that is only true for positions <= cur_len
         - Rewires the attention score producer to use this mask
         - Optimizers may CSE-deduplicate identical masks into one shared tensor
+
+    Args (extra):
+        match_shape_fallback (bool): Also match self-attention Softmax nodes
+            whose name doesn't end in ``self_attn/Softmax`` (as in a dynamo
+            export where node names differ), by checking whether the input
+            shape's last dim is ``max_tokens``/``max_tokens + 1``. Off by
+            default to preserve exact matching for existing (non-dynamo)
+            exports.
     """
 
     cur_len: gs.Variable
     max_tokens: int
     export_dtype: onnx.TensorProto.DataType
+    match_shape_fallback: bool = False
 
     def __post_init__(self):
         if self.export_dtype not in onnx.TensorProto.DataType.values():
@@ -120,8 +133,15 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
-            return isinstance(node.i(), gs.Node)
+        if node.op == "Softmax":
+            is_self_attn = node.name.endswith("self_attn/Softmax")
+            if not is_self_attn and self.match_shape_fallback and node.inputs:
+                inp_shape = getattr(node.inputs[0], "shape", None)
+                if inp_shape and len(inp_shape) >= 1:
+                    # Accept max_tokens (after KV replacement) or max_tokens+1 (traced shape)
+                    is_self_attn = inp_shape[-1] in (self.max_tokens, self.max_tokens + 1)
+            if is_self_attn:
+                return isinstance(node.i(), gs.Node)
         return False
 
     def transform(self, node: gs.Node):
