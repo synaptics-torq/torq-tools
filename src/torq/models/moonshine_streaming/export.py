@@ -28,6 +28,9 @@ from ._graph import MoonshineStreamingOnnxGraphEditor
 from ._inference import MoonshineStreaming
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 
+# TODO: drop once the target compiler natively supports LayerNormalization.
+_DECOMPOSE_LAYERNORM: Final[bool] = True
+
 
 def _layer_from_kv(k, v):
     from transformers.cache_utils import DynamicLayer
@@ -678,7 +681,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             chunk_len=self._chunk_len,
             feat_len=self._feature_stride,
         )
-        editor.decompose_layer_normalization()
+        editor.decompose_layer_normalization(enabled=_DECOMPOSE_LAYERNORM)
         # Ensure kernel_shape is present on all 1-D Conv nodes (dynamo may omit it).
         for node in list(editor._graph.nodes):
             if node.op == "Conv":
@@ -691,9 +694,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
                     node.attrs["kernel_shape"] = [weight.shape[2]]
         editor._graph.cleanup().toposort()
         # Updated compiler handles these
-        # editor.decompose_strided_conv1d() 
+        # editor.decompose_strided_conv1d()
         editor.decompose_gelu() # required here for inference speed
-        # editor.decompose_boolean_and()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model, skip_data_prop=True)
 
@@ -702,9 +704,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             model, "decoder", self._onnx_export_dtype
         )
         editor.make_decoder_static(self._max_tokens)
-        editor.decompose_layer_normalization()
+        editor.decompose_layer_normalization(enabled=_DECOMPOSE_LAYERNORM)
         # editor.decompose_gelu()
-        # editor.decompose_boolean_and()
         editor.clear_intermediate_shapes()
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)

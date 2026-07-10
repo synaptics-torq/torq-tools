@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 from .arithmetic import (
+    DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
     FoldScalarMatMul,
     RemoveIsNaN,
@@ -39,6 +40,7 @@ __all__ = [
     "AddCurrLenInput",
     "ConvertToStaticIndex",
     "DequantizeProjectionsMatMul",
+    "DecomposeLayerNormalization",
     "RemoveIsNaN",
     "RemoveRedundantCasts",
     "FoldScalarMatMul",

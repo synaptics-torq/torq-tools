@@ -8,6 +8,7 @@ import pytest
 
 from support.graph_edit import graph
 from torq.graph_edit.edits.arithmetic import (
+    DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
     FoldScalarMatMul,
     RemoveIsNaN,
@@ -149,3 +150,29 @@ def test_replace_int64_float_cast_skips_non_static_input_shape():
     cast = gs.Node("Cast", "cast", inputs=[idx], outputs=[out], attrs={"to": onnx.TensorProto.FLOAT})
 
     assert not ReplaceInt64FloatCast(graph(nodes=[cast], inputs=[idx], outputs=[out]), "unit", max_int=8).match(cast)
+
+
+def test_decompose_layer_normalization_replaces_node_with_arithmetic_ops():
+    x = gs.Variable("x", dtype=np.float32, shape=[1, 3])
+    scale = gs.Constant("scale", np.ones(3, dtype=np.float32))
+    bias = gs.Constant("bias", np.zeros(3, dtype=np.float32))
+    y = gs.Variable("y", dtype=np.float32, shape=[1, 3])
+    ln = gs.Node("LayerNormalization", "ln", inputs=[x, scale, bias], outputs=[y], attrs={"axis": -1, "epsilon": 1e-5})
+    g = graph(nodes=[ln], inputs=[x], outputs=[y])
+
+    edit = DecomposeLayerNormalization(g, "unit")
+    assert edit.match(ln)
+    edit.transform(ln)
+
+    assert ln.outputs == []
+    assert {"ReduceMean", "Sub", "Pow", "Sqrt", "Div", "Mul", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
+
+
+def test_decompose_layer_normalization_disabled_flag_skips_match():
+    x = gs.Variable("x", dtype=np.float32, shape=[1, 3])
+    scale = gs.Constant("scale", np.ones(3, dtype=np.float32))
+    y = gs.Variable("y", dtype=np.float32, shape=[1, 3])
+    ln = gs.Node("LayerNormalization", "ln", inputs=[x, scale], outputs=[y])
+    g = graph(nodes=[ln], inputs=[x], outputs=[y])
+
+    assert not DecomposeLayerNormalization(g, "unit", enabled=False).match(ln)

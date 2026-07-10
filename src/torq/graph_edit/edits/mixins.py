@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 from .arithmetic import (
+    DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
     FoldScalarMatMul,
     RemoveIsNaN,
@@ -51,6 +52,12 @@ class CommonGraphEditsMixin:
 
     def add_curr_len_input(self, cur_len):
         self.apply_edit(AddCurrLenInput(self._graph, self._graph_name, cur_len))
+        return self
+
+    def decompose_layer_normalization(self, enabled: bool = True):
+        self.apply_edit(
+            DecomposeLayerNormalization(self._graph, self._graph_name, enabled=enabled)
+        )
         return self
 
     def convert_to_static_index(self):

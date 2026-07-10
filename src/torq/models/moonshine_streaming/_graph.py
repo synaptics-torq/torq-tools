@@ -1,21 +1,102 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+from dataclasses import dataclass
 import os
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
-from ...graph_edit import OnnxGraphEditor, FixedDimMapping, DimMatchType
+from ...graph_edit import OnnxGraphEdit, OnnxGraphEditor, FixedDimMapping, DimMatchType
 from ...graph_edit.edits import CommonGraphEditsMixin, CombineKVCacheMixin
-from .edits import (
-    ReplaceDynamicKVCache,
-    MaskFutureAttentionScores,
-    AddCurrLenInput,
-    DecomposeLayerNormalization,
-    DecomposeGelu,
-    DecomposeBooleanAnd,
-)
+from ...graph_edit.edits.transformer import MaskFutureAttentionScores
+from ...graph_edit.edits.arithmetic import DecomposeLayerNormalization
+
+
+@dataclass
+class DecomposeGelu(OnnxGraphEdit):
+    """
+    Decompose ONNX Gelu into basic arithmetic operations (Mul, Add, Erf).
+    Formula: Gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "Gelu"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Gelu")
+        X = node.inputs[0]
+        Y = node.outputs[0]
+
+        # Resolve correct numpy dtype matching X.dtype
+        if isinstance(X.dtype, int):
+            try:
+                import onnx.helper
+                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(X.dtype)
+            except Exception:
+                np_dtype = np.float32
+        else:
+            np_dtype = X.dtype if X.dtype is not None else np.float32
+
+        # Create constant values
+        const_half = gs.Constant(
+            name=node.name + "_gelu_half",
+            values=np.array(0.5, dtype=np_dtype)
+        )
+        const_one = gs.Constant(
+            name=node.name + "_gelu_one",
+            values=np.array(1.0, dtype=np_dtype)
+        )
+        const_inv_sqrt2 = gs.Constant(
+            name=node.name + "_gelu_inv_sqrt2",
+            values=np.array(1.0 / np.sqrt(2.0), dtype=np_dtype)
+        )
+
+        # 1. Mul: x_scaled = Mul(X, 1 / sqrt(2))
+        x_scaled = self.graph.layer(
+            name=node.name + "_scale",
+            op="Mul",
+            inputs=[X, const_inv_sqrt2],
+            outputs=[gs.Variable(name=node.name + "_scaled_val", dtype=X.dtype)]
+        )[0]
+
+        # 2. Erf: erf_val = Erf(x_scaled)
+        erf_val = self.graph.layer(
+            name=node.name + "_erf",
+            op="Erf",
+            inputs=[x_scaled],
+            outputs=[gs.Variable(name=node.name + "_erf_val", dtype=X.dtype)]
+        )[0]
+
+        # 3. Add: erf_plus_1 = Add(erf_val, 1)
+        erf_plus_1 = self.graph.layer(
+            name=node.name + "_add_one",
+            op="Add",
+            inputs=[erf_val, const_one],
+            outputs=[gs.Variable(name=node.name + "_plus_one_val", dtype=X.dtype)]
+        )[0]
+
+        # 4. Mul: x_half = Mul(X, 0.5)
+        x_half = self.graph.layer(
+            name=node.name + "_half",
+            op="Mul",
+            inputs=[X, const_half],
+            outputs=[gs.Variable(name=node.name + "_half_val", dtype=X.dtype)]
+        )[0]
+
+        # 5. Mul: Y = Mul(x_half, erf_plus_1)
+        self.graph.layer(
+            name=node.name + "_mul_final",
+            op="Mul",
+            inputs=[x_half, erf_plus_1],
+            outputs=[Y]
+        )
+
+        # Disconnect node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Decomposed Gelu node '%s'", node.name)
 
 
 class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
@@ -47,18 +128,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
             component,
             export_dtype
         )
-
-    def fix_io_dims(self, to_fix: list[FixedDimMapping] | None = None):
-        """Fix dynamic I/O dims, additionally recording a ``name -> value`` map.
-
-        The shared ``OnnxGraphEditor.fix_io_dims`` does not expose this map, but the
-        streaming-local ``DecomposeLayerNormalization`` edits need it to resolve the
-        normalized (symbolic) dimension to a concrete size.
-        """
-        to_fix = list(to_fix or [])
-        self._dim_map = {m.match_name: m.value for m in to_fix}
-        self._dim_map["batch"] = 1
-        super().fix_io_dims(to_fix)
 
     def fix_encoder_io(
         self,
@@ -94,7 +163,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
             self
             .replace_dynamic_kv_cache(cur_len, max_tokens)
             .mask_future_attn_scores(cur_len, max_tokens)
-            .add_curr_len_input(cur_len)
         )
 
     def clear_intermediate_shapes(self):
@@ -110,36 +178,40 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         return self
 
     # Streaming-specialised overrides
-    # These shadow CommonGraphEditsMixin so the local divergent edit variants
-    # (tuned for the dynamo stacked-cache decoder export) are used instead of the
-    # shared ones. ``decompose_strided_conv1d`` is intentionally NOT overridden —
-    # the shared edit is functionally identical and is inherited from the mixin.
-
-    def replace_dynamic_kv_cache(self, cur_len, max_tokens):
-        self.apply_edit(ReplaceDynamicKVCache(self._graph, self._graph_name, cur_len, max_tokens))
-        return self
+    # This shadows CommonGraphEditsMixin so the shared edit is instantiated with
+    # its opt-in shape-based fallback matching: dynamo doesn't preserve
+    # hierarchical node names, so the name-based primary match the shared
+    # (non-streaming) class relies on never fires here — confirmed empirically
+    # against real decoder exports; see duplicated.md. ``replace_dynamic_kv_cache``
+    # and ``decompose_strided_conv1d`` are intentionally NOT overridden — the
+    # shared edits are functionally identical here and are inherited from the
+    # mixin.
 
     def mask_future_attn_scores(self, cur_len, max_tokens):
-        self.apply_edit(MaskFutureAttentionScores(self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype))
-        return self
-
-    def add_curr_len_input(self, cur_len):
-        self.apply_edit(AddCurrLenInput(self._graph, self._graph_name, cur_len))
+        self.apply_edit(
+            MaskFutureAttentionScores(
+                self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype,
+                match_shape_fallback=True,
+            )
+        )
         return self
 
     # New decompositions (model-local edits)
 
-    def decompose_layer_normalization(self):
-        dim_map = getattr(self, "_dim_map", None)
-        self.apply_edit(DecomposeLayerNormalization(self._graph, self._graph_name, dim_map=dim_map))
+    def decompose_layer_normalization(self, enabled: bool = True):
+        """Apply the shared LayerNormalization decomposition.
+
+        ``enabled`` is a temporary workaround switch — flip to False once the
+        target compiler natively supports LayerNormalization, without having
+        to remove call sites.
+        """
+        self.apply_edit(
+            DecomposeLayerNormalization(self._graph, self._graph_name, enabled=enabled)
+        )
         return self
 
     def decompose_gelu(self):
         self.apply_edit(DecomposeGelu(self._graph, self._graph_name))
-        return self
-
-    def decompose_boolean_and(self):
-        self.apply_edit(DecomposeBooleanAnd(self._graph, self._graph_name))
         return self
 
     def remove_identity_gather_nd(self):

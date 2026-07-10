@@ -8,12 +8,14 @@ import pytest
 
 from support.graph_edit import assert_model_outputs_close, clone_graph, graph
 from torq.graph_edit.edits.arithmetic import (
+    DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
     FoldScalarMatMul,
     RemoveRedundantCasts,
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
+from torq.utils.ort import make_cpu_session
 
 
 pytestmark = [pytest.mark.arithmetic, pytest.mark.ort]
@@ -94,3 +96,32 @@ def test_dequantized_projection_matmul_is_numerically_equivalent():
 
     feeds = {"hidden": np.array([[[1.0, 2.0]]], dtype=np.float32)}
     assert_model_outputs_close(original, edited, feeds)
+
+
+def test_decompose_layer_normalization_is_numerically_equivalent():
+    # The decomposition passes ReduceMean's axes as a tensor input, which is
+    # only valid from opset 18 (matching real exports, e.g. opset 22 in
+    # torq.model_export.hf). The shared `graph()`/`run_model()` test helpers
+    # cap execution to opset 17 for broad ORT compatibility, so this test
+    # builds and runs the opset-18+ models directly instead.
+    x = gs.Variable("x", dtype=np.float32, shape=[1, 4])
+    scale = gs.Constant("scale", np.array([1.0, 1.5, 0.5, 2.0], dtype=np.float32))
+    bias = gs.Constant("bias", np.array([0.1, -0.2, 0.3, 0.0], dtype=np.float32))
+    y = gs.Variable("y", dtype=np.float32, shape=[1, 4])
+    ln = gs.Node(
+        "LayerNormalization", "ln", inputs=[x, scale, bias], outputs=[y],
+        attrs={"axis": -1, "epsilon": 1e-5},
+    )
+    original = gs.Graph(name="original", nodes=[ln], inputs=[x], outputs=[y], opset=18)
+    edited = gs.import_onnx(gs.export_onnx(original.copy()))
+    DecomposeLayerNormalization(edited, "integration").transform(edited.nodes[0])
+    edited.cleanup(remove_unused_graph_inputs=True, remove_unused_node_outputs=True).toposort()
+
+    feeds = {"x": np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)}
+    expected_model = gs.export_onnx(original)
+    edited_model = gs.export_onnx(edited)
+    onnx.checker.check_model(expected_model)
+    onnx.checker.check_model(edited_model)
+    expected = make_cpu_session(expected_model.SerializeToString()).run(None, feeds)
+    actual = make_cpu_session(edited_model.SerializeToString()).run(None, feeds)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-5, atol=1e-6)
