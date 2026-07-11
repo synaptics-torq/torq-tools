@@ -16,7 +16,7 @@ DEFAULT_MODEL_SIZE: Final[str] = "350m"
 DEFAULT_GEN_TOKENS: Final[int] = 256
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
-MODEL_SIZES: Final[list[str]] = ["350m"]
+MODEL_SIZES: Final[list[str]] = ["350m", "230m"]
 MODEL_DTYPES: Final[list[str]] = ["fp32"]
 
 
@@ -116,6 +116,17 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         help=(
             "Split the lm_head MatMul into 512 chunks of [1024, 128] (default: "
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
+        ),
+    )
+    parser.add_argument(
+        "--split-decoder",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit body.vmfb (decoder minus lm_head, hidden output) + "
+            "lm_head.vmfb (standalone hidden->logits) alongside the fused "
+            "model.vmfb — the lower-TTFT split where the lm_head is skipped "
+            "during prefill. Requires --convert-dtypes."
         ),
     )
     add_logging_args(parser)

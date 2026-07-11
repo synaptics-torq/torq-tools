@@ -54,6 +54,7 @@ from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 # HuggingFace repos containing LFM2.5 model + tokenizer
 HF_REPO_BASE: dict[str, str] = {
     "350m": "LiquidAI/LFM2.5-350M",
+    "230m": "LiquidAI/LFM2.5-230M",
 }
 # Source ONNX repos, tried in order. The Synaptics-hosted mirror is primary so
 # the pipeline keeps working if the upstream LiquidAI repo is renamed/removed;
@@ -64,6 +65,10 @@ HF_REPO_ONNX: dict[str, tuple[str, ...]] = {
     "350m": (
         "Synaptics/LiquidAI-LFM2p5-350M-LLM",
         "LiquidAI/LFM2.5-350M-ONNX",
+    ),
+    "230m": (
+        "Synaptics/LiquidAI-LFM2p5-230M-LLM",
+        "LiquidAI/LFM2.5-230M-ONNX",
     ),
 }
 
@@ -104,7 +109,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def __init__(
         self,
-        model_size: Literal["350m"] = "350m",
+        model_size: Literal["350m", "230m"] = "350m",
         instruct_model: bool = False,
         extract_embeddings: bool = False,
         keep_individual_kv_io: bool = False,
@@ -276,6 +281,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         editor.replace_simplified_layer_norm()
         self._logger.info("Replacing SkipSimplifiedLayerNormalization ops...")
         editor.replace_skip_simplified_layer_norm()
+        self._logger.info("Folding external RotaryEmbedding ops into GQA...")
+        self._fold_external_rotary_into_gqa(editor.graph)
         self._logger.info("Replacing GroupQueryAttention ops...")
         editor.replace_group_query_attention(
             num_heads=self._num_attention_heads,
@@ -415,6 +422,48 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("ONNX checker reported issues; continuing: %s", e)
         return model
+
+    def _fold_external_rotary_into_gqa(self, graph) -> int:
+        """Fold standalone ``com.microsoft.RotaryEmbedding`` ops into the GQA.
+
+        Some LFM2.5 exports (e.g. 230M) apply rotary via separate q/k
+        ``RotaryEmbedding`` ops *before* each ``GroupQueryAttention`` (the GQA
+        has ``do_rotary=0`` and empty cos/sin cache inputs). Those contrib ops
+        block ``onnx.shape_inference`` (no shape function) — leaving the whole
+        downstream graph shapeless — and torq-compile can't lower them. Rewire
+        the pre-rotary Q/K straight into the GQA, attach the rotary's cos/sin
+        caches to the GQA's cache inputs, and set ``do_rotary=1`` so the
+        (already validated) GQA decomposition applies the rotary itself. No-op
+        for exports that already rotate inside the GQA (e.g. 350M)."""
+        folded = 0
+        for node in list(graph.nodes):
+            if node.op != "GroupQueryAttention":
+                continue
+            if int(node.attrs.get("do_rotary", 0)) != 0:
+                continue  # already does rotary internally — nothing to fold
+            ins = list(node.inputs)
+            q_in = ins[0] if len(ins) > 0 else None
+            k_in = ins[1] if len(ins) > 1 else None
+            q_rot = q_in.inputs[0] if (q_in is not None and q_in.inputs) else None
+            k_rot = k_in.inputs[0] if (k_in is not None and k_in.inputs) else None
+            if not (q_rot is not None and q_rot.op == "RotaryEmbedding"
+                    and k_rot is not None and k_rot.op == "RotaryEmbedding"):
+                continue
+            # RotaryEmbedding inputs: [0]=x [1]=position_ids [2]=cos_cache [3]=sin_cache
+            pre_q, pre_k = q_rot.inputs[0], k_rot.inputs[0]
+            cos_cache, sin_cache = q_rot.inputs[2], q_rot.inputs[3]
+            while len(ins) < 9:            # ensure slots [7]=cos, [8]=sin exist
+                ins.append(gs.Variable(""))
+            ins[0], ins[1] = pre_q, pre_k
+            ins[7], ins[8] = cos_cache, sin_cache
+            node.inputs = ins
+            node.attrs["do_rotary"] = 1
+            q_rot.outputs.clear(); q_rot.inputs.clear()
+            k_rot.outputs.clear(); k_rot.inputs.clear()
+            folded += 1
+        graph.cleanup().toposort()
+        self._logger.info("Folded %d external RotaryEmbedding pair(s) into GQA", folded)
+        return folded
 
     def _make_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph: gs.Graph = gs.import_onnx(model)
@@ -1316,6 +1365,82 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
                 np.save(self._convert_dir / emb_src.name, emb_data)
 
+    def make_decoder_split(self):
+        """Split the (bf16) decoder into ``body`` (decoder minus lm_head, hidden
+        output) + ``lm_head`` (standalone hidden->logits), registering both so
+        ``export_torq`` also compiles ``body.vmfb`` + ``lm_head.vmfb``.
+
+        This is the lower-TTFT deployment: the body runs every step, and the
+        ``[hidden, vocab]`` lm_head MatMul (~134 MB bf16) runs only when a token
+        is actually sampled — so it is **skipped during prefill** (every prefill
+        token except the last needs no logits). Requires ``--convert-dtypes``
+        (splits the converted bf16 model). Structure-based: the lm_head is the
+        node(s) producing the vocab-logits graph output, and its non-weight
+        activation input is the split boundary."""
+        import copy
+        from onnx import helper, TensorProto
+
+        src_path = self._export_paths["model"]
+        model = onnx.load(str(src_path), load_external_data=True)
+        g = model.graph
+        bf16 = TensorProto.BFLOAT16
+
+        logits_name = "logits"
+        if not any(o.name == logits_name for o in g.output):
+            logits_name = next(
+                o.name for o in g.output
+                if o.type.tensor_type.shape.dim
+                and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
+            )
+        init_names = {i.name for i in g.initializer}
+        lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
+                    or (n.name and "lm_head" in n.name)]
+        lm_produced = {o for n in lm_nodes for o in n.output}
+        lm_inputs = {i for n in lm_nodes for i in n.input}
+        hidden_name = next(
+            i for i in lm_inputs
+            if i and i not in init_names and i not in lm_produced
+        )
+        lm_node_names = {n.name for n in lm_nodes}
+
+        # ---- body: drop lm_head node(s), expose the hidden state as output ----
+        body = onnx.ModelProto()
+        body.CopyFrom(model)
+        bg = body.graph
+        del bg.node[:]
+        bg.node.extend([n for n in g.node if n.name not in lm_node_names])
+        outs = [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])]
+        outs += [o for o in g.output if o.name != logits_name]
+        del bg.output[:]
+        bg.output.extend(outs)
+        used = {i for n in bg.node for i in n.input}
+        del bg.initializer[:]
+        bg.initializer.extend([i for i in g.initializer if i.name in used])
+        body_path = self._convert_dir / "body.onnx"
+        onnx.save(body, str(body_path), save_as_external_data=False)
+
+        # ---- lm_head: standalone hidden -> logits -----------------------------
+        weights = [copy.deepcopy(i) for i in g.initializer
+                   if i.name in (lm_inputs & init_names)]
+        lm_graph = helper.make_graph(
+            [copy.deepcopy(n) for n in lm_nodes],
+            "main",
+            [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])],
+            [helper.make_tensor_value_info(logits_name, bf16, [1, 1, self._vocab_size])],
+            weights,
+        )
+        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
+        lm_model.ir_version = model.ir_version
+        lmh_path = self._convert_dir / "lm_head.onnx"
+        onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
+
+        self._export_paths["body"] = body_path
+        self._export_paths["lm_head"] = lmh_path
+        self._logger.info(
+            "(split) derived body (%d nodes) + lm_head (%d node(s)) from '%s'",
+            len(bg.node), len(lm_nodes), src_path.name,
+        )
+
 
 def export_liquid_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
@@ -1339,6 +1464,8 @@ def export_liquid_from_args(args: argparse.Namespace):
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
+        if getattr(args, "split_decoder", False):
+            exporter.make_decoder_split()
     if not args.skip_torq:
         exporter.export_torq(
             torq_compile_args=args.compile_flags or [],

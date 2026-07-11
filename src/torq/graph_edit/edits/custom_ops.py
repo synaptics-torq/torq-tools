@@ -301,6 +301,15 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         scale = node.attrs.get("scale", 1.0 / (self.head_dim ** 0.5))
         prefix = node.name
 
+        # Some LFM2.5 exports apply rotary via separate q_rotary/k_rotary
+        # RotaryEmbedding ops *before* the GQA op (do_rotary=0, empty cos/sin
+        # cache inputs) — so the Q/K arriving here are already rotated. Only
+        # build+apply RoPE in this decomposition when the GQA op does rotary
+        # itself (do_rotary=1, real cos/sin caches); otherwise applying it would
+        # double-rotate and building cos_full from an empty cache leaves the
+        # cos/sin tensors with dynamic (None) shapes.
+        do_rotary = int(node.attrs.get("do_rotary", 1))
+
         # Disconnect the old GQA node immediately so that the original output
         # variables can be reused without creating duplicate-name warnings.
         node.inputs.clear()
@@ -375,7 +384,8 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         else:
             inv_freq_const = None
 
-        if inv_freq_const is not None and seqlen_k is not None:
+        cos_unsq = sin_unsq = None
+        if do_rotary and inv_freq_const is not None and seqlen_k is not None:
             # Runtime RoPE computation: cos(position * inv_freq), sin(position * inv_freq)
             # Cast position (int32 scalar) to float32 and reshape to (1, 1, 1) for MatMul
             pos_float = self.graph.layer(
@@ -431,7 +441,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
                 inputs=[sin_val, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0], dtype=np.int64))],
                 outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
             )[0]
-        elif seqlen_k is not None:
+        elif do_rotary and seqlen_k is not None:
             # Fallback: use original cos/sin cache with Gather
             cos_full = self.graph.layer(
                 name=f"{prefix}/cos_dup", op="Concat",
@@ -467,7 +477,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
                 inputs=[sin_pos, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0, 1], dtype=np.int64))],
                 outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
             )[0]
-        else:
+        elif do_rotary:
             # No seqlen_k: use full cos/sin cache directly (e.g. multi-token prefill)
             cos_full = self.graph.layer(
                 name=f"{prefix}/cos_dup", op="Concat",
@@ -492,8 +502,13 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
                 outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
             )[0]
 
-        q_rope = self._apply_rope(q_transposed, cos_unsq, sin_unsq, None, f"{prefix}/q")
-        k_rope = self._apply_rope(k_transposed, cos_unsq, sin_unsq, None, f"{prefix}/k")
+        if do_rotary:
+            q_rope = self._apply_rope(q_transposed, cos_unsq, sin_unsq, None, f"{prefix}/q")
+            k_rope = self._apply_rope(k_transposed, cos_unsq, sin_unsq, None, f"{prefix}/k")
+        else:
+            # Q/K already rotated by the external q_rotary/k_rotary ops.
+            q_rope = q_transposed
+            k_rope = k_transposed
 
         # KV cache concat: concat past with new along sequence dim (axis=2)
         # Reuse original output variables directly to avoid duplicate-name warnings
