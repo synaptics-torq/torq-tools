@@ -1,17 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
-ai-edge-litert
-datasets
-huggingface_hub
-numpy
-nvidia-modelopt
-ml_dtypes
-onnx
-onnxruntime
-onnx_graphsurgeon
-optimum[onnxruntime]
-polygraphy
-tokenizers
-transformers
-flatbuffers
+# Base environment for the optimum-based exporters (gemma3, smollm2, liquid,
+# siglip2) and Moonshine (non-streaming). optimum-onnx caps transformers at
+# <4.58, so this environment CANNOT host moonshine_streaming, which needs
+# transformers 5.x. See src/torq/models/moonshine_streaming/requirements.txt
+# for its separate, dedicated environment.
+ai-edge-litert==2.1.5
+datasets==4.8.5
+huggingface_hub==0.36.2
+numpy==2.5.1
+nvidia-modelopt==0.44.0
+ml_dtypes==0.5.4
+onnx==1.21.0
+onnxruntime==1.26.0
+onnx_graphsurgeon==0.6.1
+optimum[onnxruntime]==2.1.0
+# optimum-onnx provides the ONNX export CLI used by optimum_export_onnx. Pinned
+# explicitly to match optimum 2.1.0 and avoid the optimum vs optimum-onnx
+# version mismatch.
+optimum-onnx==0.1.0
+polygraphy==0.50.3
+tokenizers==0.22.2
+transformers==4.57.6
+flatbuffers==25.12.19
