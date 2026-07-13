@@ -43,6 +43,9 @@ torq-infer-model   = "torq.models.infer_model:main"
 torq-quantize-model = "torq.tools.quantization.weight_quantization.__main__:main"
 torq-synaptics-audio = "torq.models.synaptics_audio.__main__:main"
 
+# NOTE: moonshine_streaming is intentionally NOT declared as an extra here. It
+# requires transformers 5.x, which conflicts with the base `optimum[onnxruntime]`
+# dependency (optimum-onnx caps transformers <4.58).
 [project.optional-dependencies]
 moonshine = [
     "soundfile",
@@ -53,14 +56,7 @@ moonshine = [
     "pandas",
     "tqdm",
 ]
-moonshine-streaming = [
-    "transformers>=5.5.1",
-    "torch",
-    "onnxscript",
-    "soundfile",
-    "scipy",
-]
-all = ["torq-tools[moonshine]", "torq-tools[moonshine-streaming]"]
+all = ["torq-tools[moonshine]"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
