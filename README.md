@@ -70,7 +70,6 @@ The project ships with optional extras for specific export and validation workfl
 | extra | purpose |
 | :---: | ------------ |
 | "moonshine" | Install dependencies for Moonshine export and validation |
-| "moonshine-streaming" | Install dependencies for Moonshine Streaming export and validation (requires `transformers>=5.5.1`) |
 | "all" | Install dependencies for all extras |
 
 You can install these extras alongside the base package:
