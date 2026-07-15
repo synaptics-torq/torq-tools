@@ -605,6 +605,7 @@ class FP32Converter(OnnxDtypeConverterBase):
 
     _ENFORCED_FP32_IO: Final[dict[str, _EnforcedIoSpec]] = {
         "Einsum": ((OnnxDtypeConverterBase._ALL_IO_INDICES,), (0,)), # v12: inputs: (<variadic>), outputs: (output, )
+        "TopK": ((0,), (0,)),   # v13: inputs: (X, K), outputs: (Values, Indices)
     }
 
     def __init__(
