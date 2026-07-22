@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
+# Gemma4 requires the `Gemma4ForCausalLM` model class, added to Hugging Face
+# Transformers in the 5.5.x series (config.json on the source repo pins
+# "transformers_version": "5.5.0"). This conflicts with the base env's
+# transformers==4.57.6 pin (see requirements.txt at repo root, which caps
+# transformers <4.58 to match optimum-onnx), so use a dedicated virtual
+# environment for this model -- same reason moonshine_streaming has its own
+# requirements.txt.
+transformers==5.5.0
+huggingface_hub>=0.26
+
+# Source export loads the safetensors checkpoint directly and uses
+# torch.onnx (dynamo) export -- optimum-onnx caps transformers <4.58, so
+# optimum-cli cannot be used for this architecture.
+# For a CPU-only install:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0
+# Required by torch.onnx.export(dynamo=True).
+onnxscript==0.7.1
+onnx==1.21.0
+onnxruntime==1.26.0
