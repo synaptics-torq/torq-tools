@@ -25,6 +25,7 @@ __all__ = [
     "smollm2",
     "gemma3",
     "liquid",
+    "rtmo",
     "synaptics_audio",
 ]
 
