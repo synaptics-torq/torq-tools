@@ -7,6 +7,7 @@ from .moonshine import add_moonshine_export_args
 from .moonshine_streaming import add_moonshine_streaming_export_args
 from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
+from .gemma4 import add_gemma4_export_args, add_gemma4_int4_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
 
 
@@ -25,6 +26,14 @@ def main():
 
     gemma3 = model.add_parser("gemma3", help="Export Gemma3 to Torq")
     add_gemma3_export_args(gemma3)
+
+    gemma4 = model.add_parser("gemma4", help="Export Gemma4 to ONNX (dynamic, no Torq compile yet)")
+    add_gemma4_export_args(gemma4)
+
+    gemma4_int4 = model.add_parser(
+        "gemma4-int4", help="Export Gemma4-E2B (int4 quantized source) to a static ONNX graph"
+    )
+    add_gemma4_int4_export_args(gemma4_int4)
 
     liquid = model.add_parser("liquid", help="Export LFM2.5 (Liquid) to Torq")
     add_liquid_export_args(liquid)
@@ -46,6 +55,12 @@ def main():
     elif args.model_name == "gemma3":
         from .gemma3.export import export_gemma3_from_args
         export_gemma3_from_args(args)
+    elif args.model_name == "gemma4":
+        from .gemma4.export import export_gemma4_from_args
+        export_gemma4_from_args(args)
+    elif args.model_name == "gemma4-int4":
+        from .gemma4.export_int4 import export_gemma4_int4_from_args
+        export_gemma4_int4_from_args(args)
     elif args.model_name == "liquid":
         from .liquid.export import export_liquid_from_args
         export_liquid_from_args(args)

@@ -1,4 +1,5 @@
 *.onnx
+*.onnx_data
 *.tflite
 *.vmfb
 *.mlir

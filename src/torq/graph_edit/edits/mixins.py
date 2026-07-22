@@ -34,6 +34,7 @@ from .transformer import (
 )
 from .custom_ops import (
     ReplaceGroupQueryAttention,
+    ReplaceRotaryEmbedding,
     ReplaceSimplifiedLayerNorm,
     ReplaceSkipSimplifiedLayerNorm,
 )
@@ -79,6 +80,10 @@ class CommonGraphEditsMixin:
 
     def replace_group_query_attention(self, num_heads, kv_num_heads, head_dim):
         self.apply_edit(ReplaceGroupQueryAttention(self._graph, self._graph_name, num_heads, kv_num_heads, head_dim))
+        return self
+
+    def replace_rotary_embedding(self):
+        self.apply_edit(ReplaceRotaryEmbedding(self._graph, self._graph_name))
         return self
 
     def dequantize_projections_matmul(self, hidden_size, vocab_size):

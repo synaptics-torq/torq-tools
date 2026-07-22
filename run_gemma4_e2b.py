@@ -34,6 +34,7 @@ import sys
 import time
 
 from llama_cpp import Llama
+from llama_cpp import llama_cpp as llama_cpp_lib
 
 
 def rss_mb() -> float:
@@ -57,7 +58,10 @@ def load_model(
     n_ctx: int, n_gpu_layers: int, n_threads: int | None = None,
     repo_id: str = None, filename: str = None, model_path: str = None,
 ) -> Llama:
-    kwargs = dict(n_ctx=n_ctx, n_gpu_layers=n_gpu_layers, verbose=False, flash_attn=True)
+    kwargs = dict(
+        n_ctx=n_ctx, n_gpu_layers=n_gpu_layers, verbose=False, flash_attn=True, swa_full=False,
+        type_k=llama_cpp_lib.GGML_TYPE_Q8_0, type_v=llama_cpp_lib.GGML_TYPE_Q8_0,
+    )
     if n_threads:
         kwargs["n_threads"] = n_threads
         kwargs["n_threads_batch"] = n_threads

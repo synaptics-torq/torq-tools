@@ -35,6 +35,7 @@ from .transformer import (
 )
 from .custom_ops import (
     ReplaceGroupQueryAttention,
+    ReplaceRotaryEmbedding,
     ReplaceSimplifiedLayerNorm,
     ReplaceSkipSimplifiedLayerNorm,
 )
@@ -74,4 +75,5 @@ __all__ = [
     "ReplaceSimplifiedLayerNorm",
     "ReplaceSkipSimplifiedLayerNorm",
     "ReplaceGroupQueryAttention",
+    "ReplaceRotaryEmbedding",
 ]

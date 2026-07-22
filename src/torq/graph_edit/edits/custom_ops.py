@@ -646,3 +646,175 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         # so no rewiring or graph output update is needed for them.
 
         self._logger.debug("Replaced GroupQueryAttention '%s'", node.name)
+
+
+@dataclass
+class ReplaceRotaryEmbedding(OnnxGraphEdit):
+    """
+    Replace a standalone (non-fused) ``com.microsoft.RotaryEmbedding`` node
+    with standard ONNX ops.
+
+    Some exports apply RoPE to Q/K via a separate ``RotaryEmbedding`` node
+    *before* feeding them into an attention op (as opposed to the attention
+    op doing rotary internally, e.g. ``GroupQueryAttention`` with
+    ``do_rotary=1`` -- see ``ReplaceGroupQueryAttention``). This edit handles
+    that standalone case: ``x*cos + rotate_half(x)*sin``, non-interleaved
+    (GPT-NeoX style), matching ``ReplaceGroupQueryAttention._apply_rope``'s
+    convention.
+
+    Unlike ``ReplaceGroupQueryAttention``, this edit takes no constructor
+    params -- ``head_dim``/``num_heads`` are derived per-node from that
+    node's own ``cos_cache`` shape and the input tensor's (by then static)
+    hidden size, since a single graph can legitimately mix multiple RoPE
+    configurations (e.g. Gemma-4's local/sliding layers at head_dim=256
+    alongside global/full-attention layers at head_dim=512, both using this
+    same op).
+
+    Raises:
+        ValueError: If ``interleaved=1`` or a non-default
+            ``rotary_embedding_dim`` is requested (unsupported -- no known
+            export uses them yet) -- or if ``cos_cache``/``sin_cache`` aren't
+            constants, or the input's hidden dim isn't statically known
+            (this edit must run after `fix_io_dims`).
+    """
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "RotaryEmbedding"
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "RotaryEmbedding")
+
+        if int(node.attrs.get("interleaved", 0)) != 0:
+            raise ValueError(
+                f"'{node.name}': interleaved RotaryEmbedding is not supported by this edit"
+            )
+
+        x, position_ids, cos_cache, sin_cache = node.inputs[:4]
+        if not (isinstance(cos_cache, gs.Constant) and isinstance(sin_cache, gs.Constant)):
+            raise ValueError(
+                f"'{node.name}': cos_cache/sin_cache must be constants for this edit"
+            )
+        half_dim = int(cos_cache.values.shape[-1])
+        head_dim = 2 * half_dim
+        rotary_dim = int(node.attrs.get("rotary_embedding_dim", 0) or head_dim)
+        if rotary_dim != head_dim:
+            raise ValueError(
+                f"'{node.name}': partial rotation (rotary_embedding_dim={rotary_dim} != "
+                f"head_dim={head_dim}) is not supported by this edit"
+            )
+
+        x_shape = getattr(x, "shape", None)
+        if not x_shape or not isinstance(x_shape[-1], int):
+            raise ValueError(
+                f"'{node.name}': input's hidden dim must be statically known -- "
+                "run `fix_io_dims` before this edit"
+            )
+        hidden = int(x_shape[-1])
+        num_heads = int(node.attrs.get("num_heads", 0)) or hidden // head_dim
+
+        out_var = node.outputs[0]
+        prefix = node.name
+        node.inputs.clear()
+        node.outputs.clear()
+
+        # (B, S, H) -> (B, S, nh, hd)
+        x_heads = self.graph.layer(
+            name=f"{prefix}/split_heads", op="Reshape",
+            inputs=[x, gs.Constant(f"{prefix}/split_heads_shape", np.array([0, 0, num_heads, head_dim], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/x_heads")],
+        )[0]
+
+        # cos/sin: gather by position_ids (B, S) along axis 0 -> (B, S, hd/2),
+        # duplicate to full head_dim, then unsqueeze a heads axis to broadcast
+        # against (B, S, nh, hd).
+        cos_pos = self.graph.layer(
+            name=f"{prefix}/cos_gather", op="Gather",
+            inputs=[cos_cache, position_ids],
+            outputs=[gs.Variable(f"{prefix}/cos_at_pos")],
+            attrs={"axis": 0},
+        )[0]
+        sin_pos = self.graph.layer(
+            name=f"{prefix}/sin_gather", op="Gather",
+            inputs=[sin_cache, position_ids],
+            outputs=[gs.Variable(f"{prefix}/sin_at_pos")],
+            attrs={"axis": 0},
+        )[0]
+        cos_full = self.graph.layer(
+            name=f"{prefix}/cos_dup", op="Concat",
+            inputs=[cos_pos, cos_pos],
+            outputs=[gs.Variable(f"{prefix}/cos_full")],
+            attrs={"axis": -1},
+        )[0]
+        sin_full = self.graph.layer(
+            name=f"{prefix}/sin_dup", op="Concat",
+            inputs=[sin_pos, sin_pos],
+            outputs=[gs.Variable(f"{prefix}/sin_full")],
+            attrs={"axis": -1},
+        )[0]
+        cos_unsq = self.graph.layer(
+            name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+            inputs=[cos_full, gs.Constant(f"{prefix}/cos_unsq_axes", np.array([2], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+        )[0]
+        sin_unsq = self.graph.layer(
+            name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+            inputs=[sin_full, gs.Constant(f"{prefix}/sin_unsq_axes", np.array([2], dtype=np.int64))],
+            outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+        )[0]
+
+        # x*cos + rotate_half(x)*sin, rotate_half = concat(-x[..., hd/2:], x[..., :hd/2])
+        mul_cos = self.graph.layer(
+            name=f"{prefix}/rope_mul_cos", op="Mul",
+            inputs=[x_heads, cos_unsq],
+            outputs=[gs.Variable(f"{prefix}/rope_mul_cos_out")],
+        )[0]
+        x_first = self.graph.layer(
+            name=f"{prefix}/rope_slice_first", op="Slice",
+            inputs=[
+                x_heads,
+                gs.Constant(f"{prefix}/rope_start_0", np.array([0], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_end_half", np.array([half_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_axis_neg1", np.array([-1], dtype=np.int64)),
+            ],
+            outputs=[gs.Variable(f"{prefix}/rope_first_half")],
+        )[0]
+        x_second = self.graph.layer(
+            name=f"{prefix}/rope_slice_second", op="Slice",
+            inputs=[
+                x_heads,
+                gs.Constant(f"{prefix}/rope_start_half", np.array([half_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_end_full", np.array([head_dim], dtype=np.int64)),
+                gs.Constant(f"{prefix}/rope_axis_neg1b", np.array([-1], dtype=np.int64)),
+            ],
+            outputs=[gs.Variable(f"{prefix}/rope_second_half")],
+        )[0]
+        neg_second = self.graph.layer(
+            name=f"{prefix}/rope_neg", op="Neg",
+            inputs=[x_second],
+            outputs=[gs.Variable(f"{prefix}/rope_neg_out")],
+        )[0]
+        rotated = self.graph.layer(
+            name=f"{prefix}/rope_concat", op="Concat",
+            inputs=[neg_second, x_first],
+            outputs=[gs.Variable(f"{prefix}/rope_rotated")],
+            attrs={"axis": -1},
+        )[0]
+        mul_sin = self.graph.layer(
+            name=f"{prefix}/rope_mul_sin", op="Mul",
+            inputs=[rotated, sin_unsq],
+            outputs=[gs.Variable(f"{prefix}/rope_mul_sin_out")],
+        )[0]
+        rope_out = self.graph.layer(
+            name=f"{prefix}/rope_add", op="Add",
+            inputs=[mul_cos, mul_sin],
+            outputs=[gs.Variable(f"{prefix}/rope_out")],
+        )[0]
+
+        # (B, S, nh, hd) -> (B, S, H), restoring the original op's output contract.
+        merged = self.graph.layer(
+            name=f"{prefix}/merge_heads", op="Reshape",
+            inputs=[rope_out, gs.Constant(f"{prefix}/merge_heads_shape", np.array([0, 0, -1], dtype=np.int64))],
+            outputs=[out_var],
+        )[0]
+
+        self._logger.debug("Replaced standalone RotaryEmbedding '%s'", node.name)
