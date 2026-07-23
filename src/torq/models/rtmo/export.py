@@ -62,8 +62,10 @@ def export_rtmo(
         _validate_onnxruntime(stripped, input_size, batch)
 
     if convert_bf16:
-        bf16_path = output_dir / "model_nopost_bf16.onnx"
-        logger.info("Converting to bf16: %s", bf16_path)
+        # Distinct filename so the bf16-I/O variant coexists with the fp32-I/O one.
+        io_suffix = "_io" if bf16_convert_io else ""
+        bf16_path = output_dir / f"model_nopost_bf16{io_suffix}.onnx"
+        logger.info("Converting to bf16 (io=%s): %s", "bf16" if bf16_convert_io else "fp32", bf16_path)
         convert_model(
             fp32_path,
             bf16_path,
@@ -71,7 +73,7 @@ def export_rtmo(
             convert_io=bf16_convert_io,
             torq_onnx_finalize=True,
         )
-        written["bf16"] = bf16_path
+        written["bf16_io" if bf16_convert_io else "bf16"] = bf16_path
 
     return written
 

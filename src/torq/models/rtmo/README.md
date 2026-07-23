@@ -33,15 +33,27 @@ ascending (stride 16 then stride 32) — mirroring mmpose `head_module.forward`:
 | `pose_feats_s16` | `[B, 192, 20, 20]` | pose features (DCC input), stride 16     |
 | `pose_feats_s32` | `[B, 192, 10, 10]` | pose features (DCC input), stride 32     |
 
-All outputs are logits/raw features — no `Sigmoid` is applied on-chip. I/O stays
-fp32; the bf16 conversion only touches the weights (the compile flow converts
-I/O with `--torq-convert-io-dtype`).
+All outputs are logits/raw features — no `Sigmoid` is applied on-chip. By
+default I/O stays fp32 (the bf16 conversion only touches the weights, and the
+compile flow converts I/O with `--torq-convert-io-dtype`). Pass
+`--bf16-convert-io` for a variant whose input + eight outputs are bf16 too.
+
+## Artifacts
+
+| File                        | Weights | I/O   | Produced by            |
+|-----------------------------|---------|-------|------------------------|
+| `model_nopost_fp32.onnx`    | fp32    | fp32  | always                 |
+| `model_nopost_bf16.onnx`    | bf16    | fp32  | default                |
+| `model_nopost_bf16_io.onnx` | bf16    | bf16  | `--bf16-convert-io`    |
 
 ## Usage
 
 ```sh
-# CLI (default: source models/rtmo/model.onnx, 320x320, bf16)
+# CLI (default: source models/rtmo/model.onnx, 320x320, bf16 weights / fp32 I/O)
 torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export
+
+# bf16 weights AND bf16 I/O
+torq-export-model rtmo --bf16-convert-io
 
 # fp32 only, custom size
 torq-export-model rtmo --input-size 416 --no-bf16
@@ -52,6 +64,9 @@ from torq.models.rtmo import export_rtmo
 
 export_rtmo("models/rtmo/model.onnx", "models/rtmo/export", input_size=320)
 # -> model_nopost_fp32.onnx, model_nopost_bf16.onnx
+
+export_rtmo("models/rtmo/model.onnx", "models/rtmo/export", bf16_convert_io=True)
+# -> model_nopost_fp32.onnx, model_nopost_bf16_io.onnx
 ```
 
 ## Host-side post-processing (what was removed)
