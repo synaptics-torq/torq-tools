@@ -129,6 +129,12 @@ The float conversion is essentially exact. Full int8 holds up on detection
 known int8 limit for attention. `--scheme int16x8` (int8 weights, int16
 activations) recovers to ≈ 0.99 where the backend supports int16 activations.
 
+`--scheme int16x8_int8in` gives the int16×8 accuracy (≈ 0.99) with an **int8
+image input** and int16 outputs — TFLite forbids int8 I/O in the int16×8 mode,
+so an int8 → `DEQUANTIZE` → `QUANTIZE` → int16 boundary is spliced on. The int8
+input uses scale 1.0 / zp −128 (`pixel-128` → `[0,255]`), matching the full-int8
+model so the two are input-interchangeable.
+
 ### Running it (needs a dedicated venv)
 
 The pipeline needs `onnx2tf` + `tensorflow` + `onnxsim`, which are **not** in the

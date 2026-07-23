@@ -282,17 +282,76 @@ def compare_onnx_tflite(onnx_results, tflite_results) -> dict[str, tuple[float, 
 # --------------------------------------------------------------------------- #
 # PTQ
 # --------------------------------------------------------------------------- #
+def _add_int8_input(model_bytes: bytes, in_scale: float = 1.0, in_zp: int = -128) -> bytes:
+    """Splice an int8 graph input onto a TFLite model with an int16 input.
+
+    TFLite forbids an int8 I/O type in the int16×8 activation mode, so we build
+    the model with an int16 input and prepend ``int8 →DEQUANTIZE→ float32
+    →QUANTIZE→ int16`` (QUANTIZE cannot go int8→int16 directly). The int8 input
+    carries ``(in_scale, in_zp)`` — default ``(1.0, -128)`` maps ``pixel-128`` to
+    the model's ``[0,255]`` range, matching the full-int8 model's input.
+    """
+    from tensorflow.lite.tools import flatbuffer_utils as fu
+    from tensorflow.lite.python import schema_py_generated as fb
+
+    m = fu.convert_bytearray_to_object(model_bytes)
+    sg = m.subgraphs[0]
+
+    def opcode(builtin_code):
+        for i, oc in enumerate(m.operatorCodes):
+            if oc.builtinCode == builtin_code:
+                return i
+        oc = fb.OperatorCodeT()
+        oc.builtinCode = builtin_code
+        oc.deprecatedBuiltinCode = min(builtin_code, 127)
+        oc.version = 1
+        m.operatorCodes.append(oc)
+        return len(m.operatorCodes) - 1
+
+    deq_op, qua_op = opcode(fb.BuiltinOperator.DEQUANTIZE), opcode(fb.BuiltinOperator.QUANTIZE)
+    orig_in = sg.inputs[0]
+    t16 = sg.tensors[orig_in]
+    name = t16.name if isinstance(t16.name, str) else t16.name.decode()
+
+    m.buffers.append(fb.BufferT())
+    t8 = fb.TensorT()
+    t8.shape, t8.type, t8.buffer, t8.name = list(t16.shape), fb.TensorType.INT8, len(m.buffers) - 1, name + "_int8"
+    q = fb.QuantizationParametersT()
+    q.scale, q.zeroPoint = [float(in_scale)], [int(in_zp)]
+    t8.quantization = q
+    sg.tensors.append(t8)
+    t8_idx = len(sg.tensors) - 1
+
+    m.buffers.append(fb.BufferT())
+    tf32 = fb.TensorT()
+    tf32.shape, tf32.type, tf32.buffer, tf32.name = list(t16.shape), fb.TensorType.FLOAT32, len(m.buffers) - 1, name + "_f32"
+    sg.tensors.append(tf32)
+    tf32_idx = len(sg.tensors) - 1
+
+    deq, qua = fb.OperatorT(), fb.OperatorT()
+    deq.opcodeIndex, deq.inputs, deq.outputs = deq_op, [t8_idx], [tf32_idx]
+    qua.opcodeIndex, qua.inputs, qua.outputs = qua_op, [tf32_idx], [orig_in]
+    sg.operators.insert(0, qua)
+    sg.operators.insert(0, deq)
+    sg.inputs = [t8_idx]
+    return bytes(fu.convert_object_to_bytearray(m))
+
+
 def quantize_int8(
     saved_model_dir: str | Path,
     calibration_set: list[np.ndarray],
     out_path: str | Path,
     scheme: str = "int8",
+    int8_input_scale: float = 1.0,
+    int8_input_zp: int = -128,
 ) -> Path:
     """PTQ from a SavedModel using a representative dataset.
 
-    ``scheme='int8'`` -> full-integer int8 (int8 weights + activations + I/O).
-    ``scheme='int16x8'`` -> int8 weights + int16 activations (float I/O); much
-    more accurate on the transformer neck where the backend supports it.
+    - ``scheme='int8'``: full-integer int8 (int8 weights + activations + I/O).
+    - ``scheme='int16x8'``: int8 weights + int16 activations (int16 I/O); much
+      more accurate on the transformer neck where the backend supports int16.
+    - ``scheme='int16x8_int8in'``: as int16x8 but with an int8 image input
+      (int16 outputs), via a spliced ``DEQUANTIZE→QUANTIZE`` at the boundary.
     """
     import tensorflow as tf
 
@@ -307,14 +366,22 @@ def quantize_int8(
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
-    elif scheme == "int16x8":
+    elif scheme in ("int16x8", "int16x8_int8in"):
         converter.target_spec.supported_ops = [
             tf.lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
         ]
+        if scheme == "int16x8_int8in":
+            converter.inference_input_type = tf.int16
+            converter.inference_output_type = tf.int16
     else:
         raise ValueError(f"unknown scheme {scheme!r}")
+
+    model_bytes = converter.convert()
+    if scheme == "int16x8_int8in":
+        model_bytes = _add_int8_input(model_bytes, int8_input_scale, int8_input_zp)
+
     out_path = Path(out_path)
-    out_path.write_bytes(converter.convert())
+    out_path.write_bytes(model_bytes)
     logger.info("Wrote %s TFLite: %s", scheme, out_path)
     return out_path
 
@@ -379,7 +446,7 @@ def add_rtmo_quantize_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-verify", type=int, default=16, help="Accuracy-check sample count")
     parser.add_argument("--mean", type=float, default=0.0, help="Input normalisation mean")
     parser.add_argument("--std", type=float, default=1.0, help="Input normalisation std")
-    parser.add_argument("--scheme", choices=["int8", "int16x8"], default="int8",
+    parser.add_argument("--scheme", choices=["int8", "int16x8", "int16x8_int8in"], default="int8",
                         help="Quantization scheme (default: %(default)s)")
 
 
