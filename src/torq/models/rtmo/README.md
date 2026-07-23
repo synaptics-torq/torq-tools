@@ -97,5 +97,56 @@ constants there are tied to the input size and are rewritten by
 - the encoder "unflatten" `Reshape` target `[-1, 256, s32, s32]`.
 
 `--input-size` must be divisible by 32. Correctness of the strip + re-target is
-covered by `tests/unit/models/test_rtmo.py`, which checks the 320/416 output
+covered by `tests/unit/rtmo/test_rtmo.py`, which checks the 320/416 output
 shapes and that the stripped model at 416 reproduces the original head taps.
+
+## int8 TFLite quantization ([`quantize.py`](./quantize.py))
+
+Takes the stripped fp32 ONNX (`model_nopost_fp32.onnx`) to a full-integer int8
+TFLite for the NPU (int8 TFLite → TOSA → vmfb). Steps, each verified against the
+source ONNX:
+
+1. **Prepare** — onnx-simplifier folds the neck's dynamic-shape reshape guards
+   (otherwise onnx2tf emits `Shape`/`Equal`/`Select` clusters that block
+   full-integer quantization), and the FFN's exact GELU `0.5·y·(1+erf(y/√2))` is
+   replaced with the int8-friendly quick-GELU `y·sigmoid(1.702·y)` — only
+   Mul+Sigmoid, no Flex `Erf`, and it lowers as a scaled SiLU on-chip.
+2. **Convert** ONNX → TF (SavedModel + float32 TFLite) via `onnx2tf` with the
+   `tf_converter` backend (NCHW→NHWC). The default flatbuffer_direct backend's
+   strict quantizer can't handle the attention's activation×activation MatMul.
+3. **PTQ** — TFLite `TFLiteConverter` calibrated on ~200 COCO images →
+   full-integer int8 (int8 I/O, per-channel weights).
+
+### Accuracy (cosine vs fp32 ONNX, 16 held-out images)
+
+| Output branch | float TFLite | int8 | int16-act/int8-wt |
+|---|---|---|---|
+| cls_scores / bbox_preds | ~1.0000 | 0.96–0.98 | 0.998 |
+| kpt_vis / pose_feats    | ~1.0000 | **0.90** | 0.991 |
+
+The float conversion is essentially exact. Full int8 holds up on detection
+(cls/bbox ≈ 0.97) but the transformer neck + keypoint head drop to ≈ 0.90 — a
+known int8 limit for attention. `--scheme int16x8` (int8 weights, int16
+activations) recovers to ≈ 0.99 where the backend supports int16 activations.
+
+### Running it (needs a dedicated venv)
+
+The pipeline needs `onnx2tf` + `tensorflow` + `onnxsim`, which are **not** in the
+main tools venv (they'd downgrade shared deps). Use a dedicated venv:
+
+```sh
+python3 -m venv ~/torq/.venv-rtmo-quant
+~/torq/.venv-rtmo-quant/bin/pip install onnx2tf tensorflow-cpu onnxsim \
+    onnxruntime opencv-python-headless tf_keras
+
+# run as a standalone script (the package __init__ pulls LLM deps not in this venv)
+~/torq/.venv-rtmo-quant/bin/python src/torq/models/rtmo/quantize.py \
+    -i models/rtmo/export/rtmo_nopost_fp32.onnx \
+    -o models/rtmo/export/int8 --images-dir models/rtmo/calib
+# -> rtmo_prepared.onnx, tf/<...>_float32.tflite, rtmo_int8.tflite
+```
+
+Input preprocessing: resize to `input_size`, RGB, `[0,255]` (`--mean/--std` to
+override); the same tensors are fed to ONNX and TFLite so the comparisons are
+apples-to-apples. The calibration set is any directory of natural images
+(`--images-dir`); COCO val images work well.

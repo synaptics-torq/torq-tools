@@ -22,9 +22,12 @@ for an ``S x S`` input:
 from __future__ import annotations
 
 from .export import add_rtmo_export_args, export_rtmo, export_rtmo_from_args
+from .quantize import add_rtmo_quantize_args, quantize_rtmo
 
 __all__ = [
     "add_rtmo_export_args",
     "export_rtmo",
     "export_rtmo_from_args",
+    "add_rtmo_quantize_args",
+    "quantize_rtmo",
 ]
