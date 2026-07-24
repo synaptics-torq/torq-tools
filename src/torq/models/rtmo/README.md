@@ -156,3 +156,67 @@ Input preprocessing: resize to `input_size`, RGB, `[0,255]` (`--mean/--std` to
 override); the same tensors are fed to ONNX and TFLite so the comparisons are
 apples-to-apples. The calibration set is any directory of natural images
 (`--images-dir`); COCO val images work well.
+
+## Hybrid quantization — int8 convs + int16 transformer ([`_hybrid.py`](./_hybrid.py))
+
+The neck's AIFI transformer (attention + 2 LayerNorms + FFN) is the one
+non-convolutional block. A natural idea is to spend int16 activations only there
+and keep every conv at int8, hoping to buy most of the int16x8-everywhere
+accuracy at a fraction of its cost. [`quantize_hybrid`](./_hybrid.py) builds and
+**measures** exactly that. It:
+
+1. **Auto-detects** the transformer boundaries (anchored on the single neck
+   `Softmax`) and splits the prepared fp32 ONNX with `onnx.utils.extract_model`
+   into three parts:
+   `backbone` (image → P5, plus the P3/P4 FPN-skip taps) · `transformer`
+   (P5 → P5′) · `head` (P5′ + P3/P4 skips → the eight dense outputs). The FPN
+   lateral-projection convs land in the (int8) head, so *every* conv is int8.
+2. Converts each part with the same `onnx2tf` + TFLite PTQ path as above —
+   `int8` for backbone/head, `int16x8` (or a `bf16`/float reference) for the
+   transformer — calibrating each part on the matching **fp32 intermediate
+   activations** from the representative set.
+3. **Chains** the three parts (dequantise → requantise at each int8↔int16 seam,
+   layout-reconciled to canonical NCHW) and reports per-output cosine vs the fp32
+   ONNX. An all-float chain scores 1.0000, confirming the split/seam handling is
+   itself lossless.
+
+### Accuracy (cosine vs fp32 ONNX, 16 held-out images, 100-image calibration)
+
+| Scheme | cls / bbox | kpt_vis / pose_feats | mean (8 outputs) |
+|---|---|---|---|
+| int8 everywhere | 0.96–0.98 | **~0.90** | 0.938 |
+| **hybrid: int8 conv + int16 transformer** | ~0.98 | **~0.94** | **0.962** |
+| int16x8 everywhere | ~0.998 | ~0.99 | 0.995 |
+
+The hybrid lands **between** the two: clearly above all-int8 (keypoints 0.90 →
+0.94) but well short of int16x8-everywhere (0.99). Per-part attribution
+(swapping one part to float at a time) explains why — **the int16 transformer is
+already near-lossless; the residual keypoint error is dominated by the int8
+*conv backbone*, not the transformer**:
+
+| backbone / transformer / head | kpt_vis+pose mean |
+|---|---|
+| float / **int16** / float | 1.0000 |
+| **int8** / float / float | 0.9514 |
+| float / float / **int8** | 0.9899 |
+| int8 / int16 / int8 (**hybrid**) | 0.9425 |
+
+So keeping only the transformer high-precision cannot reach the 0.99 of
+int16x8-everywhere for RTMO: reaching it needs int16 activations on the convs
+(chiefly the backbone) too. `--transformer-scheme int16x8` vs `bf16` differ by
+<0.001, confirming int16 suffices for the attention block itself.
+
+### Running it
+
+```sh
+~/torq/.venv-rtmo-quant/bin/python src/torq/models/rtmo/_hybrid.py \
+    -i models/rtmo/export/rtmo_nopost_fp32.onnx \
+    -o models/rtmo/export/hybrid --images-dir models/rtmo/calib \
+    --transformer-scheme int16x8
+# -> rtmo_part_{backbone,transformer,head}.onnx,
+#    rtmo_hybrid_{backbone_int8,transformer_int16x8,head_int8}.tflite,
+#    per-output cosine printed (hybrid vs fp32)
+```
+
+Pass `--already-prepared` if the source ONNX is already simplified + quick-GELU'd
+(e.g. a `rtmo_prepared.onnx` from the int8 run).
