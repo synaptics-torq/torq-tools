@@ -1,275 +1,101 @@
-# RTMO tiny (pose) export for Torq
+# RTMO tiny pose — Torq
 
 RTMO is a one-stage multi-person pose estimator. The upstream ONNX
-(`models/rtmo/model.onnx`) is an mmdeploy export with the whole detection tail
-baked in: it takes an image and returns `dets` / `keypoints` with
-**data-dependent shapes**, produced by `TopK`, `NonMaxSuppression`, `NonZero`,
-`Range`, dynamic `Reshape`/`Gather`, and the DCC pose decoder. None of that is
-NPU-friendly.
+([`Synaptics/RTMO_pose`](https://huggingface.co/Synaptics/RTMO_pose) on Hugging
+Face) bakes the mmdeploy decode/NMS tail in (`TopK`/`NonMaxSuppression`/`NonZero`
++ the DCC pose decoder → data-dependent shapes, not NPU-friendly). This package:
 
-This package does two things:
+1. **Strips the post-processing** — cuts at the eight dense head convolutions,
+   exposing fixed-shape outputs; the decode/NMS runs host-side.
+2. **Builds the deployable hybrid** — int8 conv backbone + **bf16** AIFI
+   transformer neck + int8 head, compiled to three NSS-only vmfbs. This keeps
+   int8 speed while the bf16 transformer removes the full-int8 false positives
+   (~56 ms on the SL2619 board, matching fp32/bf16 detections).
 
-1. **Removes the post-processing** — cuts the graph at the eight dense head
-   convolutions and exposes them as fixed-shape outputs.
-2. **Re-targets the input size** (default **320×320**, was 416×416) and converts
-   the result to **bf16**.
+## Quickstart
 
-Everything after the cut (bbox decode, DCC keypoint decode, NMS) is expected to
-run **host-side** on the eight dense outputs.
-
-## Outputs
-
-For a square input of side `S` (default 320), grouped by branch, feature level
-ascending (stride 16 then stride 32) — mirroring mmpose `head_module.forward`:
-
-| Output           | Shape (S=320)      | Meaning                                  |
-|------------------|--------------------|------------------------------------------|
-| `cls_scores_s16` | `[B, 1,   20, 20]` | person logits, stride 16                 |
-| `cls_scores_s32` | `[B, 1,   10, 10]` | person logits, stride 32                 |
-| `bbox_preds_s16` | `[B, 4,   20, 20]` | bbox regression (l,t,r,b), stride 16     |
-| `bbox_preds_s32` | `[B, 4,   10, 10]` | bbox regression, stride 32               |
-| `kpt_vis_s16`    | `[B, 17,  20, 20]` | per-keypoint visibility logits, stride 16|
-| `kpt_vis_s32`    | `[B, 17,  10, 10]` | per-keypoint visibility logits, stride 32|
-| `pose_feats_s16` | `[B, 192, 20, 20]` | pose features (DCC input), stride 16     |
-| `pose_feats_s32` | `[B, 192, 10, 10]` | pose features (DCC input), stride 32     |
-
-All outputs are logits/raw features — no `Sigmoid` is applied on-chip. By
-default I/O stays fp32 (the bf16 conversion only touches the weights, and the
-compile flow converts I/O with `--torq-convert-io-dtype`). Pass
-`--bf16-convert-io` for a variant whose input + eight outputs are bf16 too.
-
-## Artifacts
-
-| File                        | Weights | I/O   | Produced by            |
-|-----------------------------|---------|-------|------------------------|
-| `model_nopost_fp32.onnx`    | fp32    | fp32  | always                 |
-| `model_nopost_bf16.onnx`    | bf16    | fp32  | default                |
-| `model_nopost_bf16_io.onnx` | bf16    | bf16  | `--bf16-convert-io`    |
-
-## Usage
-
-The source `model.onnx` (with post-processing) and a small COCO `calib/` set
-live on Hugging Face at [`Synaptics/RTMO_pose`](https://huggingface.co/Synaptics/RTMO_pose).
-The export/quantize/hybrid pipeline needs some heavy TensorFlow-side deps beyond
-the torq-tools core (`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`,
-`opencv-python`, …) — install [`requirements.txt`](./requirements.txt) into a
-dedicated venv.
+The pipeline needs heavy TensorFlow-side deps beyond the torq-tools core
+(`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`, `opencv-python`) — install
+[`requirements.txt`](./requirements.txt) into a dedicated venv.
 
 ```sh
-# 0. extra deps (dedicated venv recommended)
+# 0. deps (dedicated venv recommended)
 python -m pip install -r src/torq/models/rtmo/requirements.txt
 
-# 1. fetch source model + calib from HF (Synaptics/RTMO_pose)
+# 1. source model + calib images from HF (Synaptics/RTMO_pose)
 python -m torq.models.rtmo.download_source -o models/rtmo
 
-# 2. export: strip post-processing + retarget (auto-downloads with --download)
-torq-export-model rtmo --download -o models/rtmo/export
-# (or, with a local source: torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export)
+# 2. strip post-processing + retarget -> model_nopost_fp32.onnx
+torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export
 
-# bf16 weights AND bf16 I/O
-torq-export-model rtmo --bf16-convert-io
-
-# fp32 only, custom size
-torq-export-model rtmo --input-size 416 --no-bf16
-```
-
-```python
-from torq.models.rtmo import export_rtmo
-
-export_rtmo("models/rtmo/model.onnx", "models/rtmo/export", input_size=320)
-# -> model_nopost_fp32.onnx, model_nopost_bf16.onnx
-
-export_rtmo("models/rtmo/model.onnx", "models/rtmo/export", bf16_convert_io=True)
-# -> model_nopost_fp32.onnx, model_nopost_bf16_io.onnx
-```
-
-## Host-side post-processing (what was removed)
-
-To turn the eight outputs back into detections + keypoints:
-
-1. **Scores**: `sigmoid(cls_scores)`; flatten each level to `[H*W]` and
-   concatenate → per-anchor person confidence.
-2. **Boxes**: decode `bbox_preds` against the anchor-point grid and the level
-   stride (`ltrb` distances scaled by stride, offset by the cell centre).
-3. **DCC keypoints**: gather `pose_feats` for the surviving instances and run
-   the DCC (a small GAU + SimCC-style x/y coordinate classifier). The DCC
-   weights (`head.dcc.*`) live in the original ONNX and were dropped by the cut,
-   so re-implement it host-side or extract it as a separate small graph.
-4. **Visibility**: `sigmoid(kpt_vis)`, gathered per instance.
-5. **NMS** over the decoded boxes/scores.
-
-## How the re-targeting works
-
-The backbone + neck + head is fully convolutional except for the neck
-transformer (AIFI), which runs only on the smallest (stride-32) level. Two
-constants there are tied to the input size and are rewritten by
-[`_surgery.py`](./_surgery.py):
-
-- `neck.pos_enc_0` — the 2D sin-cos positional encoding, regenerated for the new
-  stride-32 grid ([`_pos_enc.py`](./_pos_enc.py); validated to reproduce the
-  baked 13×13 constant to ~1e-3, below bf16 rounding).
-- the encoder "unflatten" `Reshape` target `[-1, 256, s32, s32]`.
-
-`--input-size` must be divisible by 32. Correctness of the strip + re-target is
-covered by `tests/unit/rtmo/test_rtmo.py`, which checks the 320/416 output
-shapes and that the stripped model at 416 reproduces the original head taps.
-
-## int8 TFLite quantization ([`quantize.py`](./quantize.py))
-
-Takes the stripped fp32 ONNX (`model_nopost_fp32.onnx`) to a full-integer int8
-TFLite for the NPU (int8 TFLite → TOSA → vmfb). Steps, each verified against the
-source ONNX:
-
-1. **Prepare** — onnx-simplifier folds the neck's dynamic-shape reshape guards
-   (otherwise onnx2tf emits `Shape`/`Equal`/`Select` clusters that block
-   full-integer quantization), and the FFN's exact GELU `0.5·y·(1+erf(y/√2))` is
-   replaced with the int8-friendly quick-GELU `y·sigmoid(1.702·y)` — only
-   Mul+Sigmoid, no Flex `Erf`, and it lowers as a scaled SiLU on-chip.
-2. **Convert** ONNX → TF (SavedModel + float32 TFLite) via `onnx2tf` with the
-   `tf_converter` backend (NCHW→NHWC). The default flatbuffer_direct backend's
-   strict quantizer can't handle the attention's activation×activation MatMul.
-3. **PTQ** — TFLite `TFLiteConverter` calibrated on ~200 COCO images →
-   full-integer int8 (int8 I/O, per-channel weights).
-
-### Accuracy (cosine vs fp32 ONNX, 16 held-out images)
-
-| Output branch | float TFLite | int8 | int16-act/int8-wt |
-|---|---|---|---|
-| cls_scores / bbox_preds | ~1.0000 | 0.96–0.98 | 0.998 |
-| kpt_vis / pose_feats    | ~1.0000 | **0.90** | 0.991 |
-
-The float conversion is essentially exact. Full int8 holds up on detection
-(cls/bbox ≈ 0.97) but the transformer neck + keypoint head drop to ≈ 0.90 — a
-known int8 limit for attention. `--scheme int16x8` (int8 weights, int16
-activations) recovers to ≈ 0.99 where the backend supports int16 activations.
-
-`--scheme int16x8_int8in` gives the int16×8 accuracy (≈ 0.99) with an **int8
-image input** and int16 outputs — TFLite forbids int8 I/O in the int16×8 mode,
-so an int8 → `DEQUANTIZE` → `QUANTIZE` → int16 boundary is spliced on. The int8
-input uses scale 1.0 / zp −128 (`pixel-128` → `[0,255]`), matching the full-int8
-model so the two are input-interchangeable.
-
-### Running it (needs a dedicated venv)
-
-The pipeline needs `onnx2tf` + `tensorflow` + `onnxsim`, which are **not** in the
-main tools venv (they'd downgrade shared deps). Use a dedicated venv:
-
-```sh
-python3 -m venv ~/torq/.venv-rtmo-quant
-~/torq/.venv-rtmo-quant/bin/pip install onnx2tf tensorflow-cpu onnxsim \
-    onnxruntime opencv-python-headless tf_keras
-
-# run as a standalone script (the package __init__ pulls LLM deps not in this venv)
-~/torq/.venv-rtmo-quant/bin/python src/torq/models/rtmo/quantize.py \
-    -i models/rtmo/export/rtmo_nopost_fp32.onnx \
-    -o models/rtmo/export/int8 --images-dir models/rtmo/calib
-# -> rtmo_prepared.onnx, tf/<...>_float32.tflite, rtmo_int8.tflite
-```
-
-Input preprocessing: resize to `input_size`, RGB, `[0,255]` (`--mean/--std` to
-override); the same tensors are fed to ONNX and TFLite so the comparisons are
-apples-to-apples. The calibration set is any directory of natural images
-(`--images-dir`); COCO val images work well.
-
-## Hybrid quantization — int8 convs + int16 transformer ([`_hybrid.py`](./_hybrid.py))
-
-The neck's AIFI transformer (attention + 2 LayerNorms + FFN) is the one
-non-convolutional block. A natural idea is to spend int16 activations only there
-and keep every conv at int8, hoping to buy most of the int16x8-everywhere
-accuracy at a fraction of its cost. [`quantize_hybrid`](./_hybrid.py) builds and
-**measures** exactly that. It:
-
-1. **Auto-detects** the transformer boundaries (anchored on the single neck
-   `Softmax`) and splits the prepared fp32 ONNX with `onnx.utils.extract_model`
-   into three parts:
-   `backbone` (image → P5, plus the P3/P4 FPN-skip taps) · `transformer`
-   (P5 → P5′) · `head` (P5′ + P3/P4 skips → the eight dense outputs). The FPN
-   lateral-projection convs land in the (int8) head, so *every* conv is int8.
-2. Converts each part with the same `onnx2tf` + TFLite PTQ path as above —
-   `int8` for backbone/head, `int16x8` (or a `bf16`/float reference) for the
-   transformer — calibrating each part on the matching **fp32 intermediate
-   activations** from the representative set.
-3. **Chains** the three parts (dequantise → requantise at each int8↔int16 seam,
-   layout-reconciled to canonical NCHW) and reports per-output cosine vs the fp32
-   ONNX. An all-float chain scores 1.0000, confirming the split/seam handling is
-   itself lossless.
-
-### Accuracy (cosine vs fp32 ONNX, 16 held-out images, 100-image calibration)
-
-| Scheme | cls / bbox | kpt_vis / pose_feats | mean (8 outputs) |
-|---|---|---|---|
-| int8 everywhere | 0.96–0.98 | **~0.90** | 0.938 |
-| **hybrid: int8 conv + int16 transformer** | ~0.98 | **~0.94** | **0.962** |
-| int16x8 everywhere | ~0.998 | ~0.99 | 0.995 |
-
-The hybrid lands **between** the two: clearly above all-int8 (keypoints 0.90 →
-0.94) but well short of int16x8-everywhere (0.99). Per-part attribution
-(swapping one part to float at a time) explains why — **the int16 transformer is
-already near-lossless; the residual keypoint error is dominated by the int8
-*conv backbone*, not the transformer**:
-
-| backbone / transformer / head | kpt_vis+pose mean |
-|---|---|
-| float / **int16** / float | 1.0000 |
-| **int8** / float / float | 0.9514 |
-| float / float / **int8** | 0.9899 |
-| int8 / int16 / int8 (**hybrid**) | 0.9425 |
-
-So keeping only the transformer high-precision cannot reach the 0.99 of
-int16x8-everywhere for RTMO: reaching it needs int16 activations on the convs
-(chiefly the backbone) too. `--transformer-scheme int16x8` vs `bf16` differ by
-<0.001, confirming int16 suffices for the attention block itself.
-
-### Running it
-
-```sh
-~/torq/.venv-rtmo-quant/bin/python src/torq/models/rtmo/_hybrid.py \
-    -i models/rtmo/export/rtmo_nopost_fp32.onnx \
-    -o models/rtmo/export/hybrid --images-dir models/rtmo/calib \
-    --transformer-scheme int16x8
-# -> rtmo_part_{backbone,transformer,head}.onnx,
-#    rtmo_hybrid_{backbone_int8,transformer_int16x8,head_int8}.tflite,
-#    per-output cosine printed (hybrid vs fp32)
-```
-
-Pass `--already-prepared` if the source ONNX is already simplified + quick-GELU'd
-(e.g. a `rtmo_prepared.onnx` from the int8 run).
-
-## Deployable hybrid vmfbs + pose demo
-
-The shipped RTMO variant is the **bf16-transformer** hybrid: int8 conv backbone +
-**bf16** AIFI transformer + int8 head, compiled to three NSS-only vmfbs. Keeping
-the transformer at bf16 (rather than int8) removes the full-int8 false positives
-while staying at int8 speed; the int16-transformer path is unused (its NSS
-ACT-LUT is not numerically functional). On the SL2619 board the chained hybrid
-runs at **~56 ms** and matches the fp32/bf16 detections (vs ~60 ms full-int8 with
-spurious boxes).
-
-### Build ([`build_hybrid.sh`](./build_hybrid.sh))
-
-```sh
+# 3. build: ONNX -> 3 TFLite parts -> 3 NSS-only vmfbs
 TORQC=/path/to/torq-compile-built-from-main \
-ONNX=models/rtmo/export/rtmo_nopost_fp32.onnx \
+ONNX=models/rtmo/export/model_nopost_fp32.onnx \
 IMAGES=models/rtmo/calib \
 PY=~/torq/.venv-rtmo-quant/bin/python \
-src/torq/models/rtmo/build_hybrid.sh ./hybrid_vmfb
-# -> ./hybrid_vmfb/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
+src/torq/models/rtmo/build_hybrid.sh ./hybrid_out
+#  -> hybrid_out/tflite/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
+#  -> hybrid_out/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
+
+# 4. run the pose demo (boxes + 17-keypoint skeletons drawn on the image)
+python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_out
 ```
 
-`_hybrid.py --transformer-scheme bf16` writes a float32 transformer TFLite;
-torq-compile converts it to bf16 on the NPU (`--torq-convert-dtypes`), so the
-part is `..._bf16.vmfb` (int8 parts compile unsliced, the bf16 transformer
-sliced).
+`build_hybrid.sh` does both stages (`[1/2]` ONNX→TFLite via `_hybrid.py`, `[2/2]`
+TFLite→vmfb via `tosa-converter` + `torq-compile`). Required env: **`TORQC`** (a
+`torq-compile` built from `main`), **`ONNX`** (the nopost fp32), **`IMAGES`**
+(calib dir). Optional: `PY` (default `python`, needs the deps), `TOSA` (default
+`tosa-converter-for-tflite` on PATH), `N_CALIB` (default 100). Steps 1–2 can be
+folded in with `torq-export-model rtmo --download` (auto-fetches the source).
 
-### Pose demo ([`infer.py`](./infer.py))
+## Outputs (the eight head tensors)
 
-[`RTMOHybrid`](./_inference.py) chains the three vmfbs (requantizing at the
-seams), dequantizes the eight int8 head outputs, and runs the host-side decode
-([`_postprocess.py`](./_postprocess.py)) into boxes + 17-keypoint poses, drawn on
-the image.
+For a square input of side `S` (default 320), grouped by branch, level ascending
+(stride 16 then 32). Raw logits/features — no on-chip `Sigmoid`.
 
-```sh
-python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_vmfb
-# or directly:
-python -m torq.models.rtmo.infer person.jpg -m ./hybrid_vmfb -o out.jpg
-```
+| Output | Shape s16 / s32 | Meaning |
+|---|---|---|
+| `cls_scores`  | `[B,1,20,20]` / `[B,1,10,10]`     | person logits |
+| `bbox_preds`  | `[B,4,20,20]` / `[B,4,10,10]`     | bbox regression (l,t,r,b) |
+| `kpt_vis`     | `[B,17,20,20]` / `[B,17,10,10]`   | per-keypoint visibility |
+| `pose_feats`  | `[B,192,20,20]` / `[B,192,10,10]` | pose features (DCC input) |
+
+The host-side decode (NMS + the DCC GAU/SimCC pose classifier) is in
+[`_postprocess.py`](./_postprocess.py) and runs automatically in the demo.
+
+## How the hybrid runs ([`_inference.py`](./_inference.py))
+
+`RTMOHybrid` chains the three vmfbs — **backbone (int8) → transformer (bf16) →
+head (int8)** — requantizing at the seams as it would on-device, dequantizes the
+eight int8 head outputs, and runs `_postprocess` to boxes + keypoints. The FPN
+P3/P4 skip connections pass straight through (identical backbone-out/head-in
+scales); only the neck-transformed P5 is requantized.
+
+> The seam/head dequant scales in `_inference.py` are baked to the reference
+> 100-image calibration. A rebuild with different calibration produces different
+> scales — regenerate them from the TFLite parts' I/O quantization if you rebuild.
+
+## Reference
+
+**Export options** — `--input-size` (must be ÷32, default 320), `--bf16-convert-io`
+(cast I/O to bf16 too), `--no-bf16` (stop at fp32), `--download` (fetch source
+from HF if missing). Retargeting rewrites the two input-size-tied neck constants
+(the AIFI positional encoding + the encoder unflatten `Reshape`) via
+[`_surgery.py`](./_surgery.py) / [`_pos_enc.py`](./_pos_enc.py).
+
+**Why bf16 for the transformer** — full int8 keeps detection accurate (cls/bbox
+cosine ≈ 0.97) but drops the neck + keypoint head to ≈ 0.90, producing spurious
+low-confidence boxes. Higher precision *only* on the small transformer removes
+them; int16 there is near-lossless but its NSS ACT-LUT is not numerically
+functional, so the deployed path uses **bf16** (fp32-level, compiles clean).
+
+**Modules**
+
+| File | Role |
+|---|---|
+| [`download_source.py`](./download_source.py) | fetch `model.onnx` + `calib/` from HF |
+| [`export.py`](./export.py) | strip post-processing + retarget → `model_nopost_*.onnx` |
+| [`_hybrid.py`](./_hybrid.py) | split at the transformer boundary + per-part PTQ → 3 TFLite |
+| [`quantize.py`](./quantize.py) | whole-model int8 / int16x8 TFLite (non-hybrid) |
+| [`build_hybrid.sh`](./build_hybrid.sh) | ONNX → 3 TFLite → 3 NSS-only vmfbs |
+| [`_inference.py`](./_inference.py), [`_postprocess.py`](./_postprocess.py), [`infer.py`](./infer.py) | chained runtime + host decode + demo |
