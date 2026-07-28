@@ -10,7 +10,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ExtractConstantLUT, ExtractGatherBlockQuantizedLUT, SplitLMHead, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
 from .mixins import CommonGraphEditsMixin
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
@@ -34,6 +34,7 @@ from .transformer import (
     RetargetCrossAttnKeyLayout,
 )
 from .custom_ops import (
+    DecomposeMatMulNBits,
     ReplaceGroupQueryAttention,
     ReplaceRotaryEmbedding,
     ReplaceSimplifiedLayerNorm,
@@ -55,6 +56,7 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "ExtractGatherBlockQuantizedLUT",
     "EliminateExpand",
     "EliminateTranspose",
     "RetargetCrossAttnKeyLayout",
@@ -76,4 +78,5 @@ __all__ = [
     "ReplaceSkipSimplifiedLayerNorm",
     "ReplaceGroupQueryAttention",
     "ReplaceRotaryEmbedding",
+    "DecomposeMatMulNBits",
 ]

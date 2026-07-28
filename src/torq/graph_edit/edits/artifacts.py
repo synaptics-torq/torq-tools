@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import os
 
 import numpy as np
@@ -11,6 +12,215 @@ import onnx_graphsurgeon as gs
 
 from ..onnx import OnnxGraphEdit, rewire_consumers
 from ...utils.onnx import normalize_layer_name
+
+
+@dataclass
+class ExtractGatherBlockQuantizedLUT(OnnxGraphEdit):
+    """
+    Lift a `com.microsoft.GatherBlockQuantized` embedding table (`bits=4`,
+    blockwise scale/zero_point) out of the graph *still packed/quantized* --
+    saved as a **directory** of `data_quant.npy`/`scales.npy`/
+    `zero_points.npy` plus a `meta.json` carrying the
+    `bits`/`block_size`/`per_row_shape` needed to dequantize a row
+    host-side -- and replace the *graph output* it eventually feeds -- not
+    just the Gather node's own output -- with a graph input of the same
+    name.
+
+    Deliberately does NOT eagerly dequantize the whole table: only 1-2 rows
+    are ever gathered per inference step, so a full fp32 dequant would be
+    pure waste -- for gemma4's two tables, ~1.76GB packed would balloon to
+    ~11GB dequantized (confirmed: an earlier version of this edit did
+    exactly that, and needed a chunked/memmap'd write + an OOM-debugging
+    detour to make the write itself survive a memory cap -- switching to
+    packed extraction sidesteps needing any of that, since the packed data
+    is roughly the same size as the source graph's own weights and doesn't
+    need chunking to write out). The (cheap, host-side) block-dequant math
+    to reconstruct a row lives next to whatever reads this file (see
+    `_dequant_row`/`_PackedEmbeddingLUT` in `models/gemma4/export_int4.py`
+    for the reference implementation and its validation against the
+    original op's onnxruntime output).
+
+    Unlike `ExtractConstantLUT` (which lifts a plain float `Gather`'s
+    constant table straight out), real usage here has a downstream
+    elementwise `Mul` (embedding scale) and optionally a `Reshape` between
+    the Gather and the actual graph output; the `Mul`'s scalar is folded
+    directly into the saved `scales` array (cheap: shape is `[rows,
+    n_blocks]`, not `[rows, k]`) and the `Reshape`'s per-row shape is saved
+    as `per_row_shape` metadata, both pruned from the graph the same way any
+    other now-dead subgraph is (via the normal `graph.cleanup()` that
+    already runs after every edit) -- so the resulting graph has *no nodes
+    left* for this embedding, not just a smaller one. Anything upstream of
+    the Gather (e.g. an index-redirect `Where` chain for out-of-vocab
+    special tokens) is pruned the same way, since nothing consumes it once
+    the Gather node is disconnected -- that logic, if present, must be
+    replicated by whatever host-side code drives the extracted lookup at
+    inference time.
+
+    Args:
+        save_to: destination **directory** for the packed table. Written as
+            individual `.npy` arrays + `meta.json` rather than one `.npz`
+            so the large arrays can be memory-mapped by the reader (numpy
+            cannot mmap a `.npz` -- it is a zip container).
+        inp_name: name for the new graph input. Defaults to the traced
+            graph output's own name (i.e. the input directly replaces the
+            output -- literally zero nodes needed).
+        node_name: exact `GatherBlockQuantized` node name to target. Graphs
+            can contain more than one such node (e.g. gemma4's main
+            embedding + per-layer embedding), and `OnnxGraphEditor.apply_edit`
+            runs one edit instance across *every* matching node in a single
+            pass -- without this filter, one `save_to`/`inp_name` would be
+            forced onto all of them. Leave `None` only when the graph is
+            known to contain exactly one `GatherBlockQuantized` node.
+
+    Raises:
+        ValueError: if the node's `bits != 4`, or if the path from the
+            Gather node to a graph output contains anything other than a
+            single elementwise `Mul` by a scalar/broadcastable constant
+            and/or a single `Reshape` -- this edit only folds *that*
+            specific, verified real-usage pattern; anything else needs a
+            human to check the math before it's silently baked into the
+            saved `scales`/metadata.
+    """
+
+    save_to: os.PathLike | str
+    inp_name: str | None = None
+    node_name: str | None = None
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "GatherBlockQuantized":
+            return False
+        return self.node_name is None or node.name == self.node_name
+
+    def _trace_to_graph_output(self, node: gs.Node):
+        """Follow the single-consumer chain from `node`'s output forward,
+        folding any Mul (by a constant) / Reshape encountered, until a
+        tensor that is itself a graph output is reached. Returns
+        (graph_output_tensor, post_scale: float | None, post_reshape_dims:
+        tuple | None).
+        """
+        var = node.outputs[0]
+        post_scale = None
+        post_reshape = None
+        visited = 0
+        while var not in self.graph.outputs:
+            visited += 1
+            if visited > 4:
+                raise ValueError(
+                    f"'{node.name}': path to a graph output is too long / "
+                    "not the expected Gather->[Mul]->[Reshape]->output pattern"
+                )
+            consumers = list(var.outputs)
+            if len(consumers) != 1:
+                raise ValueError(
+                    f"'{node.name}': expected exactly one consumer between "
+                    f"the Gather and the graph output, found {len(consumers)}"
+                )
+            consumer = consumers[0]
+            if consumer.op == "Mul":
+                const = next((i for i in consumer.inputs if isinstance(i, gs.Constant)), None)
+                if const is None:
+                    raise ValueError(f"'{consumer.name}': Mul has no constant operand to fold")
+                if post_scale is not None:
+                    raise ValueError(f"'{node.name}': more than one Mul in the path, unsupported")
+                post_scale = float(np.asarray(const.values).reshape(-1)[0])
+            elif consumer.op == "Reshape":
+                shape_const = next((i for i in consumer.inputs if isinstance(i, gs.Constant)), None)
+                if shape_const is None:
+                    raise ValueError(f"'{consumer.name}': Reshape has no constant target shape")
+                if post_reshape is not None:
+                    raise ValueError(f"'{node.name}': more than one Reshape in the path, unsupported")
+                post_reshape = tuple(int(d) for d in np.asarray(shape_const.values))
+            else:
+                raise ValueError(
+                    f"'{node.name}': unsupported op '{consumer.op}' between Gather and graph output "
+                    "-- only a single Mul and/or Reshape are folded"
+                )
+            var = consumer.outputs[0]
+        return var, post_scale, post_reshape
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "GatherBlockQuantized")
+        bits = int(node.attrs.get("bits", 4))
+        if bits != 4:
+            raise ValueError(f"'{node.name}': only bits=4 is handled, got bits={bits}")
+        block_size = int(node.attrs.get("block_size", 32))
+        quantize_axis = int(node.attrs.get("quantize_axis", 1))
+        if quantize_axis != 1:
+            raise ValueError(f"'{node.name}': only quantize_axis=1 is handled, got {quantize_axis}")
+
+        data_quant, _indices, scales, zero_points = node.inputs[:4]
+        for t, label in ((data_quant, "data"), (scales, "scales"), (zero_points, "zero_points")):
+            if not isinstance(t, gs.Constant):
+                raise ValueError(f"'{node.name}': '{label}' input must be a constant to extract")
+
+        graph_out, post_scale, post_reshape = self._trace_to_graph_output(node)
+
+        rows, packed_k = data_quant.values.shape
+        k = packed_k * 2
+        n_blocks = k // block_size
+
+        per_row_shape = ()
+        if post_reshape is not None:
+            # post_reshape includes the (dynamic, now-fixed) leading dims;
+            # only the LUT's own per-row shape (everything after the row
+            # dim) is meaningful once extracted -- e.g. real usage reshapes
+            # [batch,seq,K] -> [batch,seq,35,256]; the saved table becomes
+            # [rows, 35, 256] and the caller reshapes to [1,1,35,256] after
+            # indexing a single row.
+            candidate = tuple(d for d in post_reshape if d not in (0, -1))[-(len(post_reshape) - 2):] \
+                if len(post_reshape) > 2 else ()
+            if candidate and int(np.prod(candidate)) == k:
+                per_row_shape = candidate
+
+        # Save the table still packed/quantized -- weights, scales,
+        # zero_points -- rather than dequantizing all `rows` up front (see
+        # class docstring for why: only 1-2 rows are ever gathered per
+        # inference step, so a full dequant is pure size blowup). The
+        # post-Gather `Mul` scale (if any) is folded directly into `scales`
+        # here since that array is tiny (`[rows, n_blocks]`, not `[rows,
+        # k]`) -- cheap regardless of table size, so host code doesn't need
+        # to separately track it.
+        w_packed = np.asarray(data_quant.values)
+        zp_packed = np.asarray(zero_points.values)
+        scale_vals = np.asarray(scales.values).astype(np.float32)
+        if post_scale is not None:
+            scale_vals = scale_vals * np.float32(post_scale)
+
+        # Saved as a directory of individual `.npy` arrays plus a small
+        # `meta.json`, NOT a single `.npz`: only 1-2 rows are ever read per
+        # inference step, and numpy cannot memory-map a `.npz` (it is a zip
+        # container, so `mmap_mode` silently has no effect on the members).
+        # Keeping these tables resident is a large, pure waste -- measured
+        # ~314MB + ~1435MB of RSS for gemma4's two tables before this
+        # change. See `_PackedEmbeddingLUT` in `models/gemma4/export_int4.py`
+        # for the memory-mapped reader.
+        self.save_to = Path(self.save_to)
+        self.save_to.mkdir(parents=True, exist_ok=True)
+        np.save(self.save_to / "data_quant.npy", w_packed)
+        np.save(self.save_to / "scales.npy", scale_vals)
+        np.save(self.save_to / "zero_points.npy", zp_packed)
+        (self.save_to / "meta.json").write_text(json.dumps({
+            "bits": int(bits),
+            "block_size": int(block_size),
+            "per_row_shape": [int(d) for d in per_row_shape],
+        }))
+
+        inp_name = self.inp_name or graph_out.name
+        new_inp = gs.Variable(name=inp_name, dtype=graph_out.dtype, shape=graph_out.shape)
+        consumers = list(graph_out.outputs)
+        rewire_consumers(consumers, graph_out, new_inp)
+        for i, go in enumerate(self.graph.outputs):
+            if go is graph_out:
+                self.graph.outputs[i] = new_inp
+        self.graph.inputs.append(new_inp)
+
+        node.inputs.clear()
+        node.outputs.clear()
+        self._logger.info(
+            "Extracted packed GatherBlockQuantized LUT from '%s' -> '%s' (rows=%d, k=%d, "
+            "block_size=%d, per_row_shape=%s); graph output '%s' replaced by graph input '%s'",
+            node.name, str(self.save_to), rows, k, block_size, per_row_shape, graph_out.name, inp_name,
+        )
 
 
 @dataclass

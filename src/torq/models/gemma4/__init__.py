@@ -100,4 +100,18 @@ def add_gemma4_int4_export_args(parser: argparse.ArgumentParser):
         default=False,
         help="Skip schema/shape validation of the exported static ONNX",
     )
+    parser.add_argument(
+        "--convert-dtypes",
+        action="store_true",
+        default=False,
+        help="Convert the exported static ONNX to bf16 then int32 (mirrors gemma3's "
+             "conversion step; runs after export, before --skip-torq would apply)",
+    )
+    parser.add_argument(
+        "--preserve-io-dtypes",
+        action="store_true",
+        default=False,
+        help="Preserve model input/output dtypes by adding runtime casts (only "
+             "relevant with --convert-dtypes)",
+    )
     add_logging_args(parser)

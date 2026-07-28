@@ -10,7 +10,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ExtractConstantLUT, ExtractGatherBlockQuantizedLUT, SplitLMHead, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
@@ -33,6 +33,7 @@ from .transformer import (
     RetargetCrossAttnKeyLayout,
 )
 from .custom_ops import (
+    DecomposeMatMulNBits,
     ReplaceGroupQueryAttention,
     ReplaceRotaryEmbedding,
     ReplaceSimplifiedLayerNorm,
@@ -82,8 +83,12 @@ class CommonGraphEditsMixin:
         self.apply_edit(ReplaceGroupQueryAttention(self._graph, self._graph_name, num_heads, kv_num_heads, head_dim))
         return self
 
-    def replace_rotary_embedding(self):
-        self.apply_edit(ReplaceRotaryEmbedding(self._graph, self._graph_name))
+    def replace_rotary_embedding(self, save_to):
+        self.apply_edit(ReplaceRotaryEmbedding(self._graph, self._graph_name, save_to))
+        return self
+
+    def decompose_matmul_nbits(self):
+        self.apply_edit(DecomposeMatMulNBits(self._graph, self._graph_name))
         return self
 
     def dequantize_projections_matmul(self, hidden_size, vocab_size):
@@ -118,6 +123,14 @@ class CommonGraphEditsMixin:
 
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
+        return self
+
+    def extract_gather_block_quantized_lut(self, save_to, inp_name=None, node_name=None):
+        self.apply_edit(
+            ExtractGatherBlockQuantizedLUT(
+                self._graph, self._graph_name, save_to, inp_name=inp_name, node_name=node_name
+            )
+        )
         return self
 
     def eliminate_expands(self, ops: list[str]):

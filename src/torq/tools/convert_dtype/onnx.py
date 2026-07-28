@@ -49,6 +49,7 @@ class OnnxDtypeConverterBase(ABC):
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
         enforce_io_casts: bool = False,
+        large_model: bool = False,
     ):
         if export_dtype not in self.allowed_dtypes():
             raise ValueError(
@@ -59,6 +60,20 @@ class OnnxDtypeConverterBase(ABC):
         self._convert_io = convert_io
         self._direct_cast = direct_cast
         self._enforce_io_casts = enforce_io_casts
+        # Opt-in, default-off: skips the (correctness, not memory-touching)
+        # pre/post `onnx.shape_inference.infer_shapes(strict_mode=True)` +
+        # `onnx.checker.check_model(full_check=True)` pairs in
+        # `convert_model()` below. Those were measured to cost 7-9GB of peak
+        # RSS EACH on a ~1300-node graph with GB-scale external weight data,
+        # regardless of `data_prop`/`check_type` settings -- i.e. the cost is
+        # from running the checks at all on a graph this size with real data
+        # materialized, not from any particular flag. Existing callers are
+        # completely unaffected (default False preserves the exact prior
+        # behavior); this is meant for callers who already know their model
+        # is well-formed (e.g. just produced by a careful static-export
+        # pipeline) and would rather validate more cheaply themselves
+        # afterward. See gemma4's STATIC_EXPORT_PLAN.md for the full story.
+        self._large_model = large_model
 
         self._original_onnx_dtype = self._validate_dtype(original_dtype)
         self._export_onnx_dtype = self._validate_dtype(export_dtype)
@@ -524,30 +539,31 @@ class OnnxDtypeConverterBase(ABC):
         self,
         input_model: onnx.ModelProto
     ) -> onnx.ModelProto:
-        try:
-            input_model = onnx.shape_inference.infer_shapes(
-                input_model,
-                check_type=True,
-                strict_mode=True,
-            )
-        except onnx.shape_inference.InferenceError as e:
-            logger.warning(
-                "ONNX shape inference failed; proceeding with original model: %s",
-                e,
-                exc_info=True,
-            )
-        try:
-            onnx.checker.check_model(input_model, full_check=True)
-        except (onnx.checker.ValidationError, Exception) as e:
-            if "InferenceError" in type(e).__name__ or isinstance(
-                e, onnx.checker.ValidationError
-            ):
-                logger.warning(
-                    "ONNX model validation failed; model may be malformed: %s",
-                    e,
+        if not self._large_model:
+            try:
+                input_model = onnx.shape_inference.infer_shapes(
+                    input_model,
+                    check_type=True,
+                    strict_mode=True,
                 )
-            else:
-                raise
+            except onnx.shape_inference.InferenceError as e:
+                logger.warning(
+                    "ONNX shape inference failed; proceeding with original model: %s",
+                    e,
+                    exc_info=True,
+                )
+            try:
+                onnx.checker.check_model(input_model, full_check=True)
+            except (onnx.checker.ValidationError, Exception) as e:
+                if "InferenceError" in type(e).__name__ or isinstance(
+                    e, onnx.checker.ValidationError
+                ):
+                    logger.warning(
+                        "ONNX model validation failed; model may be malformed: %s",
+                        e,
+                    )
+                else:
+                    raise
 
         root, *subgraphs = self._collect_all_graphs(gs.import_onnx(input_model))
         all_tensors: list[str] = []
@@ -572,11 +588,15 @@ class OnnxDtypeConverterBase(ABC):
         all_tensors += conv_info[0]
         not_converted += conv_info[1]
 
-        new_model = onnx.shape_inference.infer_shapes(
-            gs.export_onnx(root), check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
-        )
+        if self._large_model:
+            new_model = gs.export_onnx(root)
+        else:
+            new_model = onnx.shape_inference.infer_shapes(
+                gs.export_onnx(root), check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
+            )
         new_model.ir_version = input_model.ir_version
-        onnx.checker.check_model(new_model, full_check=True)
+        if not self._large_model:
+            onnx.checker.check_model(new_model, full_check=True)
 
         all_tensors = set(all_tensors)
         not_converted = set(not_converted)
@@ -614,6 +634,7 @@ class FP32Converter(OnnxDtypeConverterBase):
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
         bf16_rounding: str = "nearest",
+        large_model: bool = False,
     ):
         if bf16_rounding not in self._ALLOWED_BF16_ROUNDING:
             raise ValueError(
@@ -627,6 +648,7 @@ class FP32Converter(OnnxDtypeConverterBase):
             direct_cast,
             preserve_unused_node_outputs,
             enforce_io_casts=True,
+            large_model=large_model,
         )
 
     @classmethod
@@ -796,6 +818,7 @@ class Int64Converter(OnnxDtypeConverterBase):
         direct_cast: bool = True,
         preserve_unused_node_outputs: bool = False,
         enforce_io_casts: bool = False,
+        large_model: bool = False,
     ):
         super().__init__(
             "int64",
@@ -804,6 +827,7 @@ class Int64Converter(OnnxDtypeConverterBase):
             direct_cast,
             preserve_unused_node_outputs,
             enforce_io_casts=enforce_io_casts,
+            large_model=large_model,
         )
 
         self._original_sdtype_str  = self._original_dtype_str
@@ -963,8 +987,16 @@ def _convert_internal(
     preserve_unused_node_outputs: bool,
     bf16_rounding: str = "nearest",
     enforce_io_casts: bool = False,
+    large_model: bool = False,
 ):
-    model = onnx.load(input_model)
+    # `load_external_data=False` when `large_model`: none of the converters
+    # touch a tensor's `.values` unless its dtype matches what's being
+    # converted (see `OnnxDtypeConverterBase._convert_tensor`) -- for a
+    # weight-quantized graph (e.g. MatMulNBits/GatherBlockQuantized), that's
+    # never the multi-GB packed weight blobs, only small fp32 scales / int64
+    # shape tensors. Eagerly materializing everything up front (the default)
+    # costs GB for no benefit in that case.
+    model = onnx.load(input_model, load_external_data=not large_model)
     model = upgrade_model(model, target_opset)
 
     if convert_dtype in FP32Converter.allowed_dtypes():
@@ -973,6 +1005,7 @@ def _convert_internal(
             convert_io=convert_io,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
             bf16_rounding=bf16_rounding,
+            large_model=large_model,
         )
     elif convert_dtype in Int64Converter.allowed_dtypes():
         converter = Int64Converter(
@@ -980,6 +1013,7 @@ def _convert_internal(
             convert_io=convert_io,
             preserve_unused_node_outputs=preserve_unused_node_outputs,
             enforce_io_casts=enforce_io_casts,
+            large_model=large_model,
         )
     else:
         allowed_dtypes = list(FP32Converter.allowed_dtypes()) + list(
@@ -989,7 +1023,54 @@ def _convert_internal(
             f"Invalid convert dtype '{convert_dtype}', choose from {allowed_dtypes}"
         )
 
-    return converter.convert_model(model)
+    if not large_model:
+        return converter.convert_model(model)
+
+    # `onnx_graphsurgeon`'s lazy external-data loader resolves a tensor's
+    # relative `location` against the process cwd, not the model's own
+    # directory (a real bug, not hypothetical). `load_external_data=False`
+    # above means any tensor the converter *does* decide to touch gets
+    # lazily loaded somewhere inside `convert_model()` below, so the cwd
+    # must be correct for its whole duration.
+    prev_cwd = os.getcwd()
+    os.chdir(Path(input_model).resolve().parent)
+    try:
+        return converter.convert_model(model)
+    finally:
+        os.chdir(prev_cwd)
+
+
+def _copy_referenced_external_data(
+    model: onnx.ModelProto, src_dir: str | os.PathLike, dst_dir: str | os.PathLike
+):
+    """Copy every external-data file `model` still references from `src_dir`
+    to `dst_dir`, so a subsequent plain `onnx.save()` of `model` there
+    resolves correctly -- needed when large tensors were deliberately left
+    external/unmaterialized (see `_convert_internal`'s `large_model` path)
+    rather than round-tripped through this process's memory.
+    """
+    import shutil
+    from onnx.external_data_helper import uses_external_data, ExternalDataInfo
+
+    src_dir = Path(src_dir)
+    dst_dir = Path(dst_dir)
+    locations = set()
+    for tensor in model.graph.initializer:
+        if uses_external_data(tensor):
+            locations.add(ExternalDataInfo(tensor).location)
+
+    for location in locations:
+        src = src_dir / location
+        dst = dst_dir / location
+        if not src.exists() or dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        if dst.stat().st_size != src.stat().st_size:
+            raise RuntimeError(
+                f"Copied external data '{dst}' size {dst.stat().st_size} != "
+                f"source size {src.stat().st_size} -- truncated copy"
+            )
 
 
 def convert_model(
@@ -1004,10 +1085,28 @@ def convert_model(
     preserve_unused_node_outputs: bool = False,
     bf16_rounding: str = "nearest",
     enforce_io_casts: bool = False,
+    large_model: bool = False,
 ):
+    """
+    Args (new):
+        large_model: skips the expensive pre/post shape-inference + full
+            checker validation inside the converter, avoids eagerly
+            materializing external weight data, and keeps untouched large
+            tensors external on save (copying their backing data file next
+            to `output_model` instead of inlining everything into one
+            file -- which also sidesteps protobuf's 2GB single-message
+            limit for models whose weights alone exceed that). Default
+            False preserves the exact prior behavior for existing callers.
+            Meant for models with GB-scale (typically weight-quantized)
+            external data where the default path is impractical -- see
+            gemma4's STATIC_EXPORT_PLAN.md for the numbers that motivated
+            this (>12GB peak RSS / hitting the 2GB limit without it).
+    """
     if use_modelopt:
         if bf16_rounding != "nearest":
             raise ValueError("bf16_rounding is only supported with the internal converter (--modelopt is incompatible)")
+        if large_model:
+            raise ValueError("large_model=True is not supported with use_modelopt=True")
         converted_model = _convert_modelopt(
             input_model,
             convert_dtype=convert_dtype,
@@ -1023,12 +1122,17 @@ def convert_model(
             preserve_unused_node_outputs=preserve_unused_node_outputs,
             bf16_rounding=bf16_rounding,
             enforce_io_casts=enforce_io_casts,
+            large_model=large_model,
         )
 
     export_dir = Path(output_model).parent
     export_dir.mkdir(parents=True, exist_ok=True)
     if torq_onnx_finalize:
         converted_model = finalize_torq_ready_onnx(converted_model)
+    if large_model:
+        _copy_referenced_external_data(
+            converted_model, Path(input_model).resolve().parent, export_dir
+        )
     onnx.save(converted_model, output_model)
     logger.info("Saved converted model to '%s'", str(output_model))
 

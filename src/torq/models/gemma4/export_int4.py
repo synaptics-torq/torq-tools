@@ -14,20 +14,54 @@ against.
 """
 
 import argparse
+import json
 import os
 import shutil
 from pathlib import Path
 from typing import Final
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
 from . import add_gemma4_int4_export_args
 from ._graph import Gemma4OnnxGraphEditor
+from ...graph_edit.edits import ConstantBroadcastPolicy
 from ...model_export.onnx import OnnxModelExporterBase
+from ...tools.convert_dtype.onnx import convert_model as _convert_dtype
 from ...utils.logging import configure_logging
-from ...utils.onnx import check_dynamic_shapes, propagate_static_shapes
+from ...utils.onnx import check_dynamic_shapes, get_model_opset, propagate_static_shapes
+
+
+def _patch_gs_bf16_converter():
+    """onnx_graphsurgeon's bf16 exporter relies on
+    `onnx.helper.float32_to_bfloat16`, removed in onnx>=1.20 -- without this,
+    exporting a graph containing a bf16 `gs.Constant` (as
+    `DecomposeMatMulNBits`'s dequant scale is) asserts out. Same patch used
+    in `src/torq/models/liquid/export.py`; needed here because
+    `_decompose_decoder_matmul_nbits` calls `editor.to_onnx()` on a graph
+    with bf16 constants for the first time in this file.
+    """
+    try:
+        from onnx_graphsurgeon.exporters import onnx_exporter as _gs_export
+    except Exception:
+        return
+    if _gs_export._NUMPY_ARRAY_CONVERTERS:
+        return
+
+    def _f32_to_bf16_uint16(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float32)
+        return arr.astype(ml_dtypes.bfloat16).view(np.uint16)
+
+    _gs_export._NUMPY_ARRAY_CONVERTERS = {
+        onnx.TensorProto.BFLOAT16: _gs_export.NumpyArrayConverter(
+            np.uint16, _f32_to_bf16_uint16
+        ),
+    }
+
+
+_patch_gs_bf16_converter()
 
 DEFAULT_HF_REPO_INT4: Final[str] = "tss-deposium/gemma-4-E2B-text-only-onnx-int4"
 # The int4 repo doesn't ship a chat template; pull it from a sibling ONNX
@@ -36,6 +70,28 @@ DEFAULT_TEMPLATE_REPO: Final[str] = "onnx-community/gemma-4-E2B-it-qat-mobile-ON
 
 _DECODER_FILENAME: Final[str] = "decoder_model_merged_q4.onnx"
 _EMBED_FILENAME: Final[str] = "embed_tokens_q4.onnx"
+
+# Fixed node names for the two `com.microsoft.GatherBlockQuantized` embedding
+# lookups in `embed_tokens_q4.onnx` -- verified against the actual source
+# graph (see STATIC_EXPORT_PLAN.md). `_make_embed_tokens_static` extracts
+# each one individually by name; a single unscoped
+# `extract_gather_block_quantized_lut` call would apply the same
+# `save_to`/`inp_name` to BOTH nodes, since `OnnxGraphEditor.apply_edit` runs
+# one edit instance across every matching node in the graph.
+_EMBED_TOKENS_GATHER_NODE: Final[str] = "/model/embed_tokens/Gather_Quant"
+_EMBED_TOKENS_PER_LAYER_GATHER_NODE: Final[str] = "/model/embed_tokens_per_layer/Gather_Quant"
+# Directories (not single files): each holds `data_quant.npy`/`scales.npy`/
+# `zero_points.npy` + `meta.json`, so the big arrays can be memory-mapped.
+# A `.npz` cannot be mmap'd (zip container), and these tables are read a
+# row at a time -- see `_PackedEmbeddingLUT`.
+_TOKEN_EMBEDDINGS_FILENAME: Final[str] = "token_embeddings"
+_PER_LAYER_EMBEDDINGS_FILENAME: Final[str] = "per_layer_embeddings"
+# Directory holding one `<variant>.npy` per distinct RoPE cos/sin cache
+# (`cos_full_local`/`sin_full_local`/`cos_full_global`/`sin_full_global`),
+# already gathered/duplicated to full head_dim by `ReplaceRotaryEmbedding`
+# (see `custom_ops.py`). Memory-mapped by `_RopeCacheLUT`, whose host-side
+# lookups replace the in-graph Gather this exporter no longer emits.
+_ROPE_CACHES_FILENAME: Final[str] = "rope_caches"
 
 # GQA-fused (sliding-window) layer config -- confirmed uniform across all 12
 # fused GroupQueryAttention nodes in the source graph (see STATIC_EXPORT_PLAN.md).
@@ -53,6 +109,140 @@ _GQA_HEAD_DIM: Final[int] = 256
 _ROPE_CACHE_NAMES: Final[frozenset[str]] = frozenset(
     {"cos_cache_local", "sin_cache_local", "cos_cache_global", "sin_cache_global"}
 )
+
+
+def _unpack_nibbles(packed: np.ndarray) -> np.ndarray:
+    """[..., n_bytes] uint8, 2 packed 4-bit values/byte (low nibble = even
+    index, high nibble = odd index) -> [..., 2*n_bytes] uint8 unpacked.
+    Convention verified empirically against a real MatMulNBits node's
+    onnxruntime output (see gemma4's op_repros/decompose_matmul_nbits.py);
+    the same convention holds for GatherBlockQuantized's packed weight/
+    zero_point (confirmed via the bit-exact validation described in
+    STATIC_EXPORT_PLAN.md).
+    """
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 2,), dtype=np.uint8)
+    out[..., 0::2] = low
+    out[..., 1::2] = high
+    return out
+
+
+class _PackedEmbeddingLUT:
+    """Holds one `ExtractGatherBlockQuantizedLUT`-produced table (packed
+    int4 weights + scales + zero_points + dequant metadata) and dequantizes
+    single rows on demand.
+
+    **Memory-mapped, not resident.** Only 1-2 rows are ever read per
+    inference step, so keeping the whole table in RAM is pure waste.
+    Measured on gemma4 before this was mmap'd: `token_embeddings` cost
+    ~314MB and `per_layer_embeddings` ~1435MB of *resident* RSS, ~1.7GB
+    combined for data that is touched a few KB at a time. With
+    `mmap_mode="r"` the pages are file-backed and evictable, so resident
+    cost is roughly the handful of pages actually indexed.
+
+    This is why the on-disk format is a **directory of individual `.npy`
+    files** rather than a single `.npz`: numpy cannot mmap a `.npz` at all
+    (it is a zip container, so `np.load(..., mmap_mode=...)` silently has no
+    effect on the members). Legacy `.npz` files are still accepted for
+    backwards compatibility, but load fully resident -- re-export to get the
+    mmap benefit.
+    """
+
+    _ARRAYS = ("data_quant", "scales", "zero_points")
+
+    def __init__(self, path: str | os.PathLike):
+        path = Path(path)
+        if path.is_dir():
+            self._data_quant, self._scales, self._zero_points = (
+                np.load(path / f"{n}.npy", mmap_mode="r") for n in self._ARRAYS
+            )
+            meta = json.loads((path / "meta.json").read_text())
+            self._bits = int(meta["bits"])
+            self._block_size = int(meta["block_size"])
+            self._per_row_shape = tuple(int(d) for d in meta["per_row_shape"])
+        else:
+            # Legacy single-`.npz` layout: cannot be memory-mapped.
+            with np.load(path) as npz:
+                self._data_quant = npz["data_quant"]
+                self._scales = npz["scales"]
+                self._zero_points = npz["zero_points"]
+                self._bits = int(npz["bits"])
+                self._block_size = int(npz["block_size"])
+                self._per_row_shape = tuple(int(d) for d in npz["per_row_shape"])
+
+    def dequant_row(self, token_id: int) -> np.ndarray:
+        """Same block-dequant math as the original `GatherBlockQuantized`
+        op (unpack nibbles -> subtract zero_point -> multiply by scale),
+        computed for a single row instead of the whole table -- cheap
+        (microseconds), since `block_size`-sized chunks are tiny.
+        """
+        k = self._data_quant.shape[-1] * (8 // self._bits)
+        n_blocks = k // self._block_size
+        w = _unpack_nibbles(self._data_quant[token_id : token_id + 1])[0, :k].astype(np.float32)
+        zp = _unpack_nibbles(self._zero_points[token_id : token_id + 1])[0, :n_blocks].astype(np.float32)
+        scale = self._scales[token_id].astype(np.float32)
+        dq = (w.reshape(n_blocks, self._block_size) - zp[:, None]) * scale[:, None]
+        dq = dq.reshape(k)
+        if self._per_row_shape:
+            dq = dq.reshape(self._per_row_shape)
+        return dq
+
+
+def _lookup_embeddings(
+    token_lut: "_PackedEmbeddingLUT", per_layer_lut: "_PackedEmbeddingLUT", token_id: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Token ID -> (inputs_embeds, per_layer_inputs), dequantized on the fly
+    from the extracted packed `.npz` LUTs (see `_make_embed_tokens_static`)
+    instead of running `embed_tokens.onnx` -- post-extraction that graph is
+    a 0-node passthrough with no computation left to run for this. Shapes
+    match what the decoder's `inputs_embeds`/`per_layer_inputs` inputs
+    expect for a single-token step: `[1, 1, hidden]` / `[1, 1, 35, 256]`.
+    """
+    inputs_embeds = token_lut.dequant_row(token_id)[None, None, :]
+    per_layer_inputs = per_layer_lut.dequant_row(token_id)[None, None, ...]
+    return inputs_embeds, per_layer_inputs
+
+
+class _RopeCacheLUT:
+    """Holds the `ReplaceRotaryEmbedding`-produced RoPE caches (one array per
+    distinct variant this component uses, e.g. `cos_full_local`/
+    `sin_full_local`, each already gathered/duplicated to full head_dim) and
+    returns the row for a given position, keyed by the same names the
+    decoder's graph inputs expect.
+
+    **Memory-mapped, not resident** -- exactly one row per variant is read
+    per inference step, but the tables are sized for the source model's full
+    131072-token context (~768MB combined for gemma4, measured resident
+    before this was mmap'd). Stored as a **directory of `.npy` files** for
+    the same reason as `_PackedEmbeddingLUT`: `.npz` cannot be mmap'd.
+    Legacy `.npz` files still load (fully resident).
+
+    A no-op (empty `variants()`) if the path doesn't exist, so callers don't
+    need to special-case components that have no `RotaryEmbedding` nodes at
+    all (e.g. post-`SplitLMHead` components).
+    """
+
+    def __init__(self, path: str | os.PathLike):
+        self._tables: dict[str, np.ndarray] = {}
+        path = Path(path)
+        if path.is_dir():
+            self._tables = {
+                p.stem: np.load(p, mmap_mode="r") for p in sorted(path.glob("*.npy"))
+            }
+        elif path.exists():
+            # Legacy single-`.npz` layout: cannot be memory-mapped.
+            with np.load(path) as npz:
+                self._tables = {name: npz[name] for name in npz.files}
+
+    def variants(self) -> frozenset[str]:
+        return frozenset(self._tables)
+
+    def lookup(self, position_id: int) -> dict[str, np.ndarray]:
+        """position_id -> {variant_name: row}, each shaped `[1, 1, head_dim]`
+        -- matching the graph input `ReplaceRotaryEmbedding` creates.
+        """
+        return {name: table[position_id][None, None, :] for name, table in self._tables.items()}
 
 
 def _preload_small_external_initializers(model: onnx.ModelProto, base_dir: Path) -> None:
@@ -79,37 +269,67 @@ def _preload_small_external_initializers(model: onnx.ModelProto, base_dir: Path)
         del tensor.external_data[:]
 
 
-def _fix_gather_block_quantized_shapes(model: onnx.ModelProto) -> onnx.ModelProto:
-    """Correct `SymbolicShapeInference`'s `GatherBlockQuantized` output shape.
+def decompose_matmul_nbits_in_file(model_path: str | os.PathLike) -> None:
+    """Decompose every `MatMulNBits` node in a single ONNX file into
+    standard ops (`DequantizeLinear -> MatMul`, see `DecomposeMatMulNBits`)
+    in place, so the saved model has no custom `com.microsoft` ops left at
+    all. Standalone (no `Gemma4Int4ModelExporter` instance needed) so it can
+    run per split component from `split_decoder.py`, not just from this
+    module -- decomposing the *whole* ~3713-node, ~242-MatMulNBits decoder
+    in one pass needs to hold all ~3.7GB of newly-unpacked int8 weight data
+    simultaneously, which OOM'd repeatedly even under an 8G cap on this dev
+    machine; running it per (much smaller, ~500MB-600MB) component instead
+    keeps peak memory bounded.
 
-    Confirmed empirically (see STATIC_EXPORT_PLAN.md): `SymbolicShapeInference`
-    declares this op's output last dim as the *packed* (quantized) weight's
-    last dim, not the unpacked (logical) one -- e.g. a `bits=4` weight packs
-    2 values/byte, so the real output dim is 2x what gets declared (a
-    `[262144, 768]` packed weight really produces a 1536-wide embedding,
-    not 768). Onnxruntime tolerates the mismatch at load/run time via a
-    "lenient merge" (a warning, not an error) and computes the correct
-    value regardless -- this fix is cosmetic (removes log noise) and
-    precautionary (a future consumer that trusts declared shapes strictly,
-    e.g. a torq-compile attempt, shouldn't have to also tolerate it).
+    Runs under `os.chdir(model_path.parent)`: loaded with
+    `load_external_data=False`, so `DecomposeMatMulNBits` lazily
+    materializes each node's packed weight/scale/zero_point on demand via
+    onnx_graphsurgeon's lazy loader, which resolves external-data locations
+    against the process cwd (the same bug documented elsewhere in this
+    file).
+
+    Before saving, every remaining external tensor is explicitly
+    materialized via `onnx.load_external_data_for_model` (mirrors
+    `split_decoder.py`'s `split_decoder()`) -- required, not optional:
+    tensors `DecomposeMatMulNBits` never touches (e.g. plain LayerNorm
+    weights) keep carrying their *original* external-data offsets, which
+    onnx's own `save_as_external_data=True` leaves untouched for any tensor
+    already marked external (it assumes an existing external reference is
+    already valid and doesn't rewrite it). Since the original data file is
+    about to be deleted and replaced by a same-named file with a totally
+    different layout, those stale offsets would silently point at wrong (or
+    out-of-range) bytes in the new file -- confirmed: this exact bug
+    produced a `TensorProto ... should contain one and only one value
+    field` checker error downstream, traced to an offset exceeding the new
+    file's actual size. Materializing first sidesteps this by ensuring
+    every tensor's data is fresh, in-memory bytes at save time, not a
+    reference into a soon-to-be-replaced file.
+
+    Saved with `save_as_external_data=True`: decomposed weights are
+    unpacked from int4 nibbles to one-byte-per-value int8, doubling their
+    size (0.5 -> 1 byte/value). The original external data file is removed
+    only after the new model's data has been fully materialized in memory.
     """
-    graph = gs.import_onnx(model)
-    fixed = 0
-    for node in graph.nodes:
-        if node.op != "GatherBlockQuantized":
-            continue
-        bits = int(node.attrs.get("bits", 4))
-        packed_last_dim = int(node.inputs[0].shape[-1])
-        unpacked_last_dim = packed_last_dim * (8 // bits)
-        out = node.outputs[0]
-        if out.shape and int(out.shape[-1]) != unpacked_last_dim:
-            out.shape[-1] = unpacked_last_dim
-            fixed += 1
-    if not fixed:
-        return model
-    fixed_model = gs.export_onnx(graph)
-    fixed_model.ir_version = model.ir_version
-    return fixed_model
+    model_path = Path(model_path)
+    prev_cwd = os.getcwd()
+    os.chdir(model_path.parent)
+    try:
+        model = onnx.load(model_path.name, load_external_data=False)
+        graph = gs.import_onnx(model)
+        editor = Gemma4OnnxGraphEditor(graph, "fp32")
+        editor.decompose_matmul_nbits()
+        new_model = editor.to_onnx(
+            check_type=False, strict_mode=False, data_prop=False, override_ir=model.ir_version
+        )
+        onnx.load_external_data_for_model(new_model, ".")
+        old_data = Path(f"{model_path.name}_data")
+        old_data.unlink(missing_ok=True)
+        onnx.save(
+            new_model, model_path.name,
+            save_as_external_data=True, location=f"{model_path.name}_data", size_threshold=1024,
+        )
+    finally:
+        os.chdir(prev_cwd)
 
 
 class Gemma4Int4ModelExporter(OnnxModelExporterBase):
@@ -336,19 +556,50 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
     def _make_embed_tokens_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph = gs.import_onnx(model)
         editor = Gemma4OnnxGraphEditor(graph, self._onnx_export_dtype)
-        editor.fix_io(self._max_kv_len)  # only batch_size/sequence_length appear here
-        static_model = editor.to_onnx(
-            check_type=False, strict_mode=False, data_prop=False, override_ir=model.ir_version
-        )
-        # Resolve custom-op (GatherBlockQuantized) shapes here, on the graph
-        # continuously held in memory since `gs.import_onnx` -- NOT after a
-        # save/reload round-trip. Measured empirically to matter a lot:
-        # running this same call after `onnx.save()` + `onnx.load()` cost
-        # several GB more peak RSS than running it directly on the in-memory
-        # `editor`/`gs` state, for reasons not fully root-caused (suspected
-        # onnx_graphsurgeon re-parsing overhead) -- see STATIC_EXPORT_PLAN.md.
-        static_model = self._resolve_custom_op_shapes(static_model)
-        return _fix_gather_block_quantized_shapes(static_model)
+        editor.fix_io(self._max_kv_len)  # only batch_size/sequence_length appear here;
+        # do this BEFORE extraction so the traced graph outputs (and thus the
+        # new passthrough inputs replacing them) already carry static shapes.
+
+        # Both embedding tables are `com.microsoft.GatherBlockQuantized`
+        # lookups over a constant int4 table. Mirroring gemma3's
+        # `extract_token_embeddings` (which lifts its plain, unquantized
+        # embedding table out of the graph entirely so it runs host-side,
+        # not on the NPU): fully dequantize each table to a standalone
+        # `.npy` and replace its graph output with a plain graph input of
+        # the same name. The resulting component ends up with zero compute
+        # nodes -- nothing here needs torq-compile at all.
+        #
+        # Runs under `os.chdir(self._onnx_dir)`: unlike the RoPE caches
+        # (preloaded by name in `_load_onnx`), these two tables' `data_quant`/
+        # `scales`/`zero_points` initializers are deliberately left external/
+        # unmaterialized until now (~1.76GB combined) -- extraction lazily
+        # accesses their `.values` for the first time here, and
+        # onnx_graphsurgeon's lazy loader resolves external-data locations
+        # against the process cwd, not the model's directory (same bug
+        # documented on `_preload_small_external_initializers`).
+        prev_cwd = os.getcwd()
+        os.chdir(self._onnx_dir)
+        try:
+            editor.extract_gather_block_quantized_lut(
+                save_to=self._export_dir / _TOKEN_EMBEDDINGS_FILENAME,
+                inp_name="inputs_embeds",
+                node_name=_EMBED_TOKENS_GATHER_NODE,
+            )
+            editor.extract_gather_block_quantized_lut(
+                save_to=self._export_dir / _PER_LAYER_EMBEDDINGS_FILENAME,
+                inp_name="per_layer_inputs",
+                node_name=_EMBED_TOKENS_PER_LAYER_GATHER_NODE,
+            )
+            static_model = editor.to_onnx(
+                check_type=False, strict_mode=False, data_prop=False, override_ir=model.ir_version
+            )
+        finally:
+            os.chdir(prev_cwd)
+        # No custom-op shape resolution needed anymore: both
+        # GatherBlockQuantized nodes were fully extracted above, so this
+        # component is now a trivial passthrough (0 compute nodes, plain
+        # float32 I/O) with nothing left for SymbolicShapeInference to do.
+        return static_model
 
     def _make_decoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph = gs.import_onnx(model)
@@ -357,7 +608,7 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
         editor.fix_io(self._max_kv_len)
         editor.normalize_kv_concat_axis()
         editor.replace_simplified_layer_norm()
-        editor.replace_rotary_embedding()
+        editor.replace_rotary_embedding(save_to=self._export_dir / _ROPE_CACHES_FILENAME)
         editor.replace_group_query_attention(
             num_heads=_GQA_NUM_HEADS, kv_num_heads=_GQA_KV_NUM_HEADS, head_dim=_GQA_HEAD_DIM
         )
@@ -395,7 +646,65 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
         # `_make_embed_tokens_static` for why NOT to defer this to a
         # save/reload round-trip in `apply_post_static_patches`.
         static_model = propagate_static_shapes(static_model)
-        return self._resolve_custom_op_shapes(static_model)
+        static_model = self._resolve_custom_op_shapes(static_model)
+        return self._broadcast_where_value_operands(static_model)
+
+    @staticmethod
+    def _broadcast_where_value_operands(model: onnx.ModelProto) -> onnx.ModelProto:
+        """Rank-match the *value* operands (inputs 1/2) of every `Where` to
+        the op's output shape, materializing constant operands rather than
+        deferring to a runtime `Expand`.
+
+        Required for `torq-compile` to lower these ops at all. The static
+        KV-cache/mask edits above (`replace_dynamic_kv_cache`,
+        `mask_future_attn_scores`, and the source graph's own shared-donor /
+        manual-attention masks) emit `Where`s whose fill value is a rank-0
+        scalar while the condition broadcasts against a larger score tensor,
+        e.g.:
+
+            cond=[1,1,1,256]  X=[1,8,1,256]  Y=scalar  ->  [1,8,1,256]
+
+        That exact combination aborts the compiler in `SelectPattern`'s
+        dimension fusion:
+
+            Kernel.cpp:3370: void mlir::syna::torq::fuse(LData &, int):
+            Assertion `fused >= count && "Could not fuse the requested number
+            of dimensions"' failed.
+
+        `SelectPattern.cpp:72` fuses both operands to
+        `min(input.denseDims(), output.denseDims())`; a stride-0 broadcast
+        condition together with a rank-0 operand cannot supply that many
+        dense dims. Isolated to a single synthetic `Where` -- **both**
+        ingredients are needed, either alone compiles fine -- see
+        `models/gemma4-e2b-int4/export/onnx/op_repros/
+        select_broadcast_scalar_repro.py` for the 4-variant control matrix.
+
+        Broadcasting the *value* operands (rather than the condition) is
+        deliberate: for the mask `Where`s the fill value is a constant, so
+        `MATERIALIZE` pre-broadcasts it at export time and adds **no**
+        runtime op. Broadcasting the condition instead would need a real
+        `Expand` on every forward pass.
+
+        Runs after shape resolution, not immediately after the edits that
+        create these nodes: `BroadcastOpInputs` skips any op whose output
+        shape isn't fully static, which is only guaranteed once
+        `propagate_static_shapes`/`_resolve_custom_op_shapes` have run.
+
+        Verified: with this edit all 9 split components compile to `.vmfb`
+        (9/9); without it, 7 of 9 abort with the assertion above. Note it
+        also needs the sub-byte tile-size fix on the compiler side (see
+        STATIC_EXPORT_PLAN.md) -- the two are independent and both required.
+        """
+        graph = gs.import_onnx(model)
+        editor = Gemma4OnnxGraphEditor(graph, "fp32")
+        editor.broadcast_op_inputs(
+            ops=["Where"],
+            inputs_idx=[1, 2],
+            constants_policy=ConstantBroadcastPolicy.MATERIALIZE,
+        )
+        return editor.to_onnx(
+            check_type=False, strict_mode=False, data_prop=False, override_ir=model.ir_version
+        )
 
     # -- apply_post_static_patches: no-op. All structural/shape work already
     # happened in `make_static()`, on the in-memory graph; the external-data
@@ -408,6 +717,75 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         pass
+
+    def convert_models(
+        self,
+        convert_dir: str | os.PathLike | None = None,
+        preserve_io: bool = False,
+    ):
+        """Converts each exported static component to bf16, then int32 --
+        the same two-step conversion the base class's `convert_models()`
+        does (and gemma3 inherits unchanged), just invoked with
+        `large_model=True` throughout (see `convert_dtype.onnx.convert_model`'s
+        docstring for what that changes).
+
+        The base class's own default-settings path was measured needing
+        >14GB peak RSS for just the *smaller* component's int32 step on
+        this model -- more than this dev machine's 15GB total, and it
+        writes everything inline into a single file (no external data),
+        which independently risks exceeding protobuf's 2GB message limit
+        for the decoder. `large_model=True` keeps the untouched GB-scale
+        weight tensors external throughout instead of materializing them.
+        See STATIC_EXPORT_PLAN.md for the numbers.
+        """
+        if not self._convert_dtypes:
+            self._logger.warning("Skipping conversion as convert_dtypes==False")
+            return
+        self._convert_dir = Path(convert_dir or self._convert_dir)
+        if self._convert_dir.exists():
+            shutil.rmtree(self._convert_dir, ignore_errors=True)
+        self._convert_dir.mkdir(parents=True, exist_ok=True)
+
+        for comp, model_path in list(self._export_paths.items()):
+            # Pin target_opset to the model's own opset so `upgrade_model`
+            # inside `convert_model()` is a no-op -- the version converter
+            # is untested against this graph and no upgrade is needed here.
+            source_opset = get_model_opset(onnx.load(model_path, load_external_data=False))
+
+            self._logger.info("(ONNX-convert) '%s': converting to bf16...", model_path)
+            bf16_path = self._convert_dir / model_path.name
+            _convert_dtype(
+                model_path, bf16_path, "bf16",
+                convert_io=not preserve_io, target_opset=source_opset, large_model=True,
+            )
+            self._logger.info("(ONNX-convert) '%s': converting to int32...", bf16_path)
+            _convert_dtype(
+                bf16_path, bf16_path, "int32",
+                convert_io=not preserve_io, target_opset=source_opset, large_model=True,
+            )
+            self._export_paths[comp] = bf16_path
+            self._logger.info("(ONNX-convert) '%s' -> '%s'", comp, bf16_path)
+
+            # `MatMulNBits` decomposition is deliberately NOT run here
+            # anymore: decomposing the whole ~3713-node, ~242-MatMulNBits
+            # decoder in one pass needs to hold all ~3.7GB of newly-unpacked
+            # int8 weight data simultaneously, which OOM'd repeatedly on
+            # this dev machine even under an 8G cap. Split the converted
+            # decoder into smaller components first (see
+            # `models/gemma4-e2b-int4/export/onnx/split_decoder.py`) and
+            # decompose each one individually instead -- same
+            # `decompose_matmul_nbits_in_file` helper below, just invoked
+            # per component so peak memory stays bounded to one component's
+            # weight data (~500MB-600MB) at a time.
+
+    def _decompose_decoder_matmul_nbits(self, model_path: Path) -> None:
+        """Instance-method wrapper around `decompose_matmul_nbits_in_file`
+        (kept for this class's own internal use); see that function for
+        what it actually does and why it's no longer auto-invoked on the
+        whole decoder from `convert_models`.
+        """
+        decompose_matmul_nbits_in_file(model_path)
+        self._logger.info("(ONNX-convert) '%s': MatMulNBits decomposition complete", model_path)
 
     def _resolve_custom_op_shapes(self, model: onnx.ModelProto) -> onnx.ModelProto:
         """Resolve MatMulNBits/GatherBlockQuantized output shapes via ORT's
@@ -466,7 +844,11 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
         # `shutil.copy2` competing with that processing's memory usage was
         # observed to produce a silently-truncated copy at least once.
         # Only copies files for components that will actually be exported.
-        for comp, fname in (("embed_tokens", _EMBED_FILENAME), ("decoder", _DECODER_FILENAME)):
+        # `embed_tokens` is deliberately excluded: `_make_embed_tokens_static`
+        # always fully extracts both `GatherBlockQuantized` embedding tables
+        # to `.npy`, leaving a 0-initializer graph that never references its
+        # original ~1.76GB external data -- copying it would be pure waste.
+        for comp, fname in (("decoder", _DECODER_FILENAME),):
             if comp in self._skip_export:
                 continue
             src = self._onnx_dir / f"{fname}_data"
@@ -541,20 +923,31 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
             return
 
         session_kwargs = dict(providers=["CPUExecutionProvider"])
-        embed_session = ort.InferenceSession(str(self._export_paths["embed_tokens"]), **session_kwargs)
         decoder_session = ort.InferenceSession(str(self._export_paths["decoder"]), **session_kwargs)
+        # `embed_tokens.onnx` is a 0-node passthrough post-extraction (both
+        # `GatherBlockQuantized` tables were lifted out, still packed, to
+        # `.npz` -- see `_make_embed_tokens_static`/STATIC_EXPORT_PLAN.md),
+        # so there's no computation left in it to run via onnxruntime for a
+        # token -> embedding lookup; dequantize directly from the packed
+        # LUTs instead.
+        token_lut = _PackedEmbeddingLUT(self._export_dir / _TOKEN_EMBEDDINGS_FILENAME)
+        per_layer_lut = _PackedEmbeddingLUT(self._export_dir / _PER_LAYER_EMBEDDINGS_FILENAME)
+        rope_lut = _RopeCacheLUT(self._export_dir / _ROPE_CACHES_FILENAME)
 
-        input_ids = np.array([[2]], dtype=np.int64)  # <bos>
-        inputs_embeds, per_layer_inputs = embed_session.run(
-            None, {"input_ids": input_ids}
-        )
+        inputs_embeds, per_layer_inputs = _lookup_embeddings(token_lut, per_layer_lut, 2)  # <bos>
         # Build feeds from whatever inputs the static graph actually has --
         # `attention_mask`/`num_logits_to_keep` are gone (dead-input-eliminated
         # after `replace_dynamic_kv_cache`/`mask_future_attn_scores` replaced
         # their role with a `position_ids`-derived `cur_len`, and
         # `fold_num_logits_to_keep` folded the other to a constant), unlike
         # the pre-edit graph -- don't assume the original I/O signature.
-        available = {"inputs_embeds": inputs_embeds, "per_layer_inputs": per_layer_inputs}
+        # `cos_full_*`/`sin_full_*` (see `_RopeCacheLUT`) are likewise looked
+        # up host-side rather than computed in-graph.
+        available = {
+            "inputs_embeds": inputs_embeds,
+            "per_layer_inputs": per_layer_inputs,
+            **rope_lut.lookup(0),
+        }
         feeds = {}
         for i in decoder_session.get_inputs():
             if i.name in available:
@@ -574,9 +967,9 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
             "(validate) One-step onnxruntime smoke test passed; logits shape=%s", logits.shape
         )
 
-        self._validate_generation_matches_dynamic(n_iters, embed_session)
+        self._validate_generation_matches_dynamic(n_iters, token_lut, per_layer_lut, rope_lut)
 
-    def _validate_generation_matches_dynamic(self, n_iters: int, embed_session):
+    def _validate_generation_matches_dynamic(self, n_iters: int, token_lut, per_layer_lut, rope_lut):
         """Multi-token, teacher-forced comparison: does the static decoder's
         per-step greedy (argmax) prediction match the original, unmodified
         dynamic `decoder_model_merged_q4.onnx` (naturally-growing KV cache
@@ -655,13 +1048,13 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
                     gen_ref.append(ref_next)
                     gen_static.append(static_next)
 
-                input_ids = np.array([[tok]], dtype=np.int64)
-                inputs_embeds, per_layer_inputs = embed_session.run(None, {"input_ids": input_ids})
+                inputs_embeds, per_layer_inputs = _lookup_embeddings(token_lut, per_layer_lut, tok)
 
                 static_feeds = {
                     "inputs_embeds": inputs_embeds,
                     "position_ids": np.array([[step]], dtype=np.int64),
                     "per_layer_inputs": per_layer_inputs,
+                    **rope_lut.lookup(step),
                     **static_kv,
                 }
                 static_logits, *static_present = static_decoder.run(None, static_feeds)
@@ -717,8 +1110,11 @@ def export_gemma4_int4_from_args(args: argparse.Namespace):
         max_kv_len=args.max_kv_len,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
+        convert_dtypes=args.convert_dtypes,
     )
     exporter.export_onnx(validate=not args.skip_validation)
+    if args.convert_dtypes:
+        exporter.convert_models(preserve_io=args.preserve_io_dtypes)
 
 
 def main():
