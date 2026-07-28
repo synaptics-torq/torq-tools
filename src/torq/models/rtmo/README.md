@@ -14,12 +14,12 @@ Face) bakes the mmdeploy decode/NMS tail in (`TopK`/`NonMaxSuppression`/`NonZero
 
 ## Quickstart
 
-The pipeline needs heavy TensorFlow-side deps beyond the torq-tools core
-(`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`, `opencv-python`) — install
-[`requirements.txt`](./requirements.txt) into a dedicated venv.
+Beyond a torq-tools env (with the Torq compiler wheel), the pipeline needs some
+heavy TensorFlow-side deps (`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`,
+`opencv-python`) — install [`requirements.txt`](./requirements.txt) into it.
 
 ```sh
-# 0. deps (dedicated venv recommended)
+# 0. deps (into a venv that has the torq compiler wheel installed)
 python -m pip install -r src/torq/models/rtmo/requirements.txt
 
 # 1. source model + calib images from HF (Synaptics/RTMO_pose)
@@ -28,25 +28,25 @@ python -m torq.models.rtmo.download_source -o models/rtmo
 # 2. strip post-processing + retarget -> model_nopost_fp32.onnx
 torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export
 
-# 3. build: ONNX -> 3 TFLite parts -> 3 NSS-only vmfbs
-TORQC=/path/to/torq-compile-built-from-main \
-ONNX=models/rtmo/export/model_nopost_fp32.onnx \
-IMAGES=models/rtmo/calib \
-PY=~/torq/.venv-rtmo-quant/bin/python \
-src/torq/models/rtmo/build_hybrid.sh ./hybrid_out
-#  -> hybrid_out/tflite/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
+# 3. hybrid: ONNX -> 3 TFLite parts -> 3 NSS-only vmfbs  (Python API, no binaries)
+python -m torq.models.rtmo._hybrid \
+    -i models/rtmo/export/model_nopost_fp32.onnx \
+    -o hybrid_out --images-dir models/rtmo/calib \
+    --transformer-scheme bf16 --compile
+#  -> hybrid_out/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
 #  -> hybrid_out/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
 
 # 4. run the pose demo (boxes + 17-keypoint skeletons drawn on the image)
 python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_out
 ```
 
-`build_hybrid.sh` does both stages (`[1/2]` ONNX→TFLite via `_hybrid.py`, `[2/2]`
-TFLite→vmfb via `tosa-converter` + `torq-compile`). Required env: **`TORQC`** (a
-`torq-compile` built from `main`), **`ONNX`** (the nopost fp32), **`IMAGES`**
-(calib dir). Optional: `PY` (default `python`, needs the deps), `TOSA` (default
-`tosa-converter-for-tflite` on PATH), `N_CALIB` (default 100). Steps 1–2 can be
-folded in with `torq-export-model rtmo --download` (auto-fetches the source).
+`_hybrid.py` quantizes the three parts (int8 backbone/head + bf16 transformer)
+and, with `--compile`, compiles each to an NSS-only vmfb through the **Torq
+compiler Python API** (`torq.utils.compile` — same path as the other models, no
+`torq-compile`/`tosa-converter` binaries). It compiles the int8 parts unsliced
+and the bf16 transformer sliced. Standard `--use-binary` / `--compiler-path` /
+`--compile-flags` (from `add_torq_args`) are accepted for the binary fallback.
+Steps 1–2 can be folded into the export with `torq-export-model rtmo --download`.
 
 ## Outputs (the eight head tensors)
 
@@ -95,7 +95,6 @@ functional, so the deployed path uses **bf16** (fp32-level, compiles clean).
 |---|---|
 | [`download_source.py`](./download_source.py) | fetch `model.onnx` + `calib/` from HF |
 | [`export.py`](./export.py) | strip post-processing + retarget → `model_nopost_*.onnx` |
-| [`_hybrid.py`](./_hybrid.py) | split at the transformer boundary + per-part PTQ → 3 TFLite |
+| [`_hybrid.py`](./_hybrid.py) | split at the transformer + per-part PTQ → 3 TFLite; `--compile` → 3 NSS-only vmfbs (`compile_hybrid`, via the compiler Python API) |
 | [`quantize.py`](./quantize.py) | whole-model int8 / int16x8 TFLite (non-hybrid) |
-| [`build_hybrid.sh`](./build_hybrid.sh) | ONNX → 3 TFLite → 3 NSS-only vmfbs |
 | [`_inference.py`](./_inference.py), [`_postprocess.py`](./_postprocess.py), [`infer.py`](./infer.py) | chained runtime + host decode + demo |

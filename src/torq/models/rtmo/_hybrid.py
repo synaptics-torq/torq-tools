@@ -487,8 +487,62 @@ def quantize_hybrid(
     }
 
 
+# Torq compiler flags for the NSS-only hybrid parts (no CSS/host ops).
+_HYBRID_TORQ_FLAGS = [
+    "--torq-hw=SL2610",
+    "--torq-disable-css",
+    "--torq-disable-host",
+    "--torq-convert-dtypes",
+    "--torq-convert-io-dtype",
+]
+
+
+def compile_hybrid(parts, out_dir, *, extra_flags=None, local_compile=False,
+                   use_binary=False, compiler_path=None):
+    """Compile the three hybrid TFLite parts to NSS-only vmfbs.
+
+    Uses the Torq compiler **Python API** via ``torq.utils.compile`` — the same
+    path as the other models (moonshine/gemma), so no ``torq-compile`` /
+    ``tosa-converter`` binaries are required. int8 parts compile unsliced; the
+    bf16 transformer sliced (slicing helps bf16, hurts int8).
+
+    ``parts`` is the ``{"backbone","transformer","head"}`` TFLite-path dict from
+    :func:`quantize_hybrid`. Returns ``{name: vmfb Path}``. Falls back to the
+    ``torq-compile`` binary only if ``use_binary`` is set or the Python API is
+    unavailable.
+    """
+    import tempfile
+
+    from ...utils.compile import compile_mlir_for_vm, export_tflite_to_mlir
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    spec = [
+        ("backbone", "rtmo_hyb_backbone_int8.vmfb", True),
+        ("transformer", "rtmo_hyb_transformer_bf16.vmfb", False),
+        ("head", "rtmo_hyb_head_int8.vmfb", True),
+    ]
+    vmfbs = {}
+    for key, vmfb_name, no_slice in spec:
+        tfl = Path(parts[key])
+        flags = list(_HYBRID_TORQ_FLAGS)
+        if no_slice:
+            flags.append("--torq-disable-slicing")
+        flags += list(extra_flags or [])
+        with tempfile.TemporaryDirectory() as td:
+            mlir = Path(td) / f"{tfl.stem}.mlir"
+            export_tflite_to_mlir(tfl, mlir)          # tflite -> tosa MLIR (Python API)
+            vmfb = out_dir / vmfb_name
+            compile_mlir_for_vm(mlir, vmfb, target="torq", compiler_args=flags,
+                                local_compile=local_compile, use_binary=use_binary,
+                                compiler_path=compiler_path)   # MLIR -> vmfb (Python API)
+        logger.info("Compiled %s -> %s", key, vmfb)
+        vmfbs[key] = vmfb
+    return vmfbs
+
+
 def add_rtmo_hybrid_args(parser):
-    parser.add_argument("-i", "--onnx", default="models/rtmo/export/rtmo_nopost_fp32.onnx",
+    parser.add_argument("-i", "--onnx", default="models/rtmo/export/model_nopost_fp32.onnx",
                         help="Source fp32 ONNX (post-processing stripped) (default: %(default)s)")
     parser.add_argument("-o", "--out-dir", default="models/rtmo/export/hybrid",
                         help="Output directory (default: %(default)s)")
@@ -499,10 +553,15 @@ def add_rtmo_hybrid_args(parser):
     parser.add_argument("--n-verify", type=int, default=16)
     parser.add_argument("--mean", type=float, default=0.0)
     parser.add_argument("--std", type=float, default=1.0)
-    parser.add_argument("--transformer-scheme", choices=["int16x8", "bf16"], default="int16x8",
+    parser.add_argument("--transformer-scheme", choices=["int16x8", "bf16"], default="bf16",
                         help="Precision for the transformer part (default: %(default)s)")
     parser.add_argument("--already-prepared", action="store_true",
                         help="Source ONNX is already simplified + quick-GELU'd")
+    parser.add_argument("--compile", action="store_true",
+                        help="Also compile the three TFLite parts to NSS-only vmfbs "
+                             "(Torq compiler Python API; --use-binary to force the binary)")
+    from ...utils.compile import add_torq_args
+    add_torq_args(parser)
 
 
 def main():
@@ -519,6 +578,17 @@ def main():
     print("transformer:", res["parts"]["transformer"])
     print("head       :", res["parts"]["head"])
     print(f"hybrid mean cosine: {res['mean_cosine']:.5f}  min: {res['min_cosine']:.5f}")
+
+    if args.compile:
+        vmfbs = compile_hybrid(
+            res["parts"], args.out_dir,
+            extra_flags=args.compile_flags,
+            local_compile=args.local_compile,
+            use_binary=args.use_binary,
+            compiler_path=args.compiler_path,
+        )
+        for key, vmfb in vmfbs.items():
+            print(f"{key + ' vmfb':<15}: {vmfb}")
 
 
 if __name__ == "__main__":
