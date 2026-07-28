@@ -103,6 +103,13 @@ def add_rtmo_export_args(parser: argparse.ArgumentParser) -> None:
         help="Source RTMO ONNX (with post-processing) (default: %(default)s)",
     )
     parser.add_argument(
+        "--download",
+        action="store_true",
+        default=False,
+        help="Download the source model + calib images from Hugging Face "
+             "(Synaptics/RTMO_pose); also happens automatically if --source is missing",
+    )
+    parser.add_argument(
         "-o", "--output-dir",
         type=str,
         default="models/rtmo/export",
@@ -144,8 +151,12 @@ def add_rtmo_export_args(parser: argparse.ArgumentParser) -> None:
 
 def export_rtmo_from_args(args: argparse.Namespace) -> None:
     configure_logging(args.logging)
+    source = args.source
+    if getattr(args, "download", False) or not Path(source).exists():
+        from .download_source import download_source
+        source = str(download_source(Path(source).parent))
     written = export_rtmo(
-        source=args.source,
+        source=source,
         output_dir=args.output_dir,
         input_size=args.input_size,
         batch=args.batch,

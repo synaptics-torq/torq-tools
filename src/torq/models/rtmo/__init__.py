@@ -26,6 +26,7 @@ import argparse
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
 from ._hybrid import add_rtmo_hybrid_args, quantize_hybrid, split_rtmo
+from .download_source import download_source
 from .export import add_rtmo_export_args, export_rtmo, export_rtmo_from_args
 from .quantize import add_rtmo_quantize_args, quantize_rtmo
 
@@ -64,4 +65,5 @@ __all__ = [
     "quantize_hybrid",
     "split_rtmo",
     "add_rtmo_infer_args",
+    "download_source",
 ]

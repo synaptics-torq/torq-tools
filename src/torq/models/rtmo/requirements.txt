@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+#
+# Extra dependencies for the RTMO export / quantize / hybrid pipeline, on top of
+# the torq-tools core requirements.txt (which already provides onnx, onnxruntime,
+# onnx-graphsurgeon, ml_dtypes, ai-edge-litert, huggingface_hub, numpy, ...).
+#
+# These are the heavy TensorFlow-side quantization deps — install into a
+# dedicated venv:  python -m pip install -r requirements.txt
+
+onnx2tf            # ONNX -> TF SavedModel / TFLite (tf_converter backend)
+tensorflow         # tf.lite PTQ converter
+tf_keras           # REQUIRED by onnx2tf's tf_converter backend (separate wheel)
+sng4onnx           # onnx2tf helper
+onnxsim            # simplify (fold dynamic-shape guards before quantization)
+opencv-python      # image preprocessing + drawing (cv2)

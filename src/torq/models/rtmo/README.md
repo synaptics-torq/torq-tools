@@ -48,9 +48,23 @@ compile flow converts I/O with `--torq-convert-io-dtype`). Pass
 
 ## Usage
 
+The source `model.onnx` (with post-processing) and a small COCO `calib/` set
+live on Hugging Face at [`Synaptics/RTMO_pose`](https://huggingface.co/Synaptics/RTMO_pose).
+The export/quantize/hybrid pipeline needs some heavy TensorFlow-side deps beyond
+the torq-tools core (`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`,
+`opencv-python`, …) — install [`requirements.txt`](./requirements.txt) into a
+dedicated venv.
+
 ```sh
-# CLI (default: source models/rtmo/model.onnx, 320x320, bf16 weights / fp32 I/O)
-torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export
+# 0. extra deps (dedicated venv recommended)
+python -m pip install -r src/torq/models/rtmo/requirements.txt
+
+# 1. fetch source model + calib from HF (Synaptics/RTMO_pose)
+python -m torq.models.rtmo.download_source -o models/rtmo
+
+# 2. export: strip post-processing + retarget (auto-downloads with --download)
+torq-export-model rtmo --download -o models/rtmo/export
+# (or, with a local source: torq-export-model rtmo -i models/rtmo/model.onnx -o models/rtmo/export)
 
 # bf16 weights AND bf16 I/O
 torq-export-model rtmo --bf16-convert-io
