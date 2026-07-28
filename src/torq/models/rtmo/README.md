@@ -220,3 +220,42 @@ int16x8-everywhere for RTMO: reaching it needs int16 activations on the convs
 
 Pass `--already-prepared` if the source ONNX is already simplified + quick-GELU'd
 (e.g. a `rtmo_prepared.onnx` from the int8 run).
+
+## Deployable hybrid vmfbs + pose demo
+
+The shipped RTMO variant is the **bf16-transformer** hybrid: int8 conv backbone +
+**bf16** AIFI transformer + int8 head, compiled to three NSS-only vmfbs. Keeping
+the transformer at bf16 (rather than int8) removes the full-int8 false positives
+while staying at int8 speed; the int16-transformer path is unused (its NSS
+ACT-LUT is not numerically functional). On the SL2619 board the chained hybrid
+runs at **~56 ms** and matches the fp32/bf16 detections (vs ~60 ms full-int8 with
+spurious boxes).
+
+### Build ([`build_hybrid.sh`](./build_hybrid.sh))
+
+```sh
+TORQC=/path/to/torq-compile-built-from-main \
+ONNX=models/rtmo/export/rtmo_nopost_fp32.onnx \
+IMAGES=models/rtmo/calib \
+PY=~/torq/.venv-rtmo-quant/bin/python \
+src/torq/models/rtmo/build_hybrid.sh ./hybrid_vmfb
+# -> ./hybrid_vmfb/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
+```
+
+`_hybrid.py --transformer-scheme bf16` writes a float32 transformer TFLite;
+torq-compile converts it to bf16 on the NPU (`--torq-convert-dtypes`), so the
+part is `..._bf16.vmfb` (int8 parts compile unsliced, the bf16 transformer
+sliced).
+
+### Pose demo ([`infer.py`](./infer.py))
+
+[`RTMOHybrid`](./_inference.py) chains the three vmfbs (requantizing at the
+seams), dequantizes the eight int8 head outputs, and runs the host-side decode
+([`_postprocess.py`](./_postprocess.py)) into boxes + 17-keypoint poses, drawn on
+the image.
+
+```sh
+python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_vmfb
+# or directly:
+python -m torq.models.rtmo.infer person.jpg -m ./hybrid_vmfb -o out.jpg
+```

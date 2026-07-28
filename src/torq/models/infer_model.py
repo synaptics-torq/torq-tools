@@ -8,6 +8,7 @@ from .moonshine_streaming import add_moonshine_streaming_infer_args
 from .smollm2 import add_smollm2_infer_args
 from .gemma3 import add_gemma3_infer_args
 from .liquid import add_liquid_infer_args
+from .rtmo import add_rtmo_infer_args
 
 
 def main():
@@ -29,6 +30,9 @@ def main():
     liquid = model.add_parser("liquid", help="Run LFM2.5 (Liquid) inference")
     add_liquid_infer_args(liquid)
 
+    rtmo = model.add_parser("rtmo", help="Run RTMO tiny pose inference")
+    add_rtmo_infer_args(rtmo)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -46,6 +50,9 @@ def main():
     elif args.model_name == "liquid":
         from .liquid.infer import infer_liquid
         infer_liquid(args)
+    elif args.model_name == "rtmo":
+        from .rtmo.infer import infer_rtmo
+        infer_rtmo(args)
 
 
 if __name__ == "__main__":
