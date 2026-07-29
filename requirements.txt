@@ -24,3 +24,7 @@ polygraphy==0.50.3
 tokenizers==0.22.2
 transformers==4.57.6
 flatbuffers==25.12.19
+# TFLite -> TOSA MLIR importer for torq-compile (self-contained; avoids the
+# broken tensorflow pywrap_mlir path). Pinned to match the compiler build (the
+# same pin as torq-compiler's `tflite` extra).
+tosa-converter-for-tflite==2026.2.0
