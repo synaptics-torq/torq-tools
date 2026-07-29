@@ -69,7 +69,11 @@ For a square input of side `S` (default 320), grouped by branch, level ascending
 | `pose_feats`  | `[B,192,20,20]` / `[B,192,10,10]` | pose features (DCC input) |
 
 These are raw tensors. The host-side decode (NMS + the DCC GAU/SimCC pose
-classifier) consumes them off-device — it is not part of the vmfbs.
+classifier) in [`_postprocess.py`](./_postprocess.py) consumes them off-device —
+it is not part of the vmfbs. The build also runs it during verification: the
+`[6/6]` step decodes both the fp32-ONNX heads and the quantized-hybrid heads and
+compares the results *after* post-processing (detection-count agreement, matched
+box IoU, keypoint pixel error, score MAE) — not just the per-head cosine.
 
 ## Deployment
 
@@ -109,5 +113,6 @@ functional, so the deployed path uses **bf16** (fp32-level, compiles clean).
 | [`export.py`](./export.py) | strip post-processing + retarget → `model_nopost_*.onnx` |
 | [`_hybrid.py`](./_hybrid.py) | split at the transformer + per-part PTQ → 3 TFLite; `--compile` → 3 NSS-only vmfbs (`compile_hybrid`, via the compiler Python API) |
 | [`_compile_worker.py`](./_compile_worker.py) | TF-free subprocess that compiles the parts (LLVM isolation from TensorFlow) |
+| [`_postprocess.py`](./_postprocess.py) | host-side decode (NMS + DCC GAU/SimCC pose); used by the build's post-processing comparison |
 | [`quantize.py`](./quantize.py) | whole-model int8 / int16x8 TFLite (non-hybrid) |
 | [`_surgery.py`](./_surgery.py), [`_pos_enc.py`](./_pos_enc.py) | input-size retargeting of the neck constants |

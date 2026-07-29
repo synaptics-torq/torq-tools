@@ -10,10 +10,13 @@ NPU-friendly. :func:`~torq.models.rtmo.export.export_rtmo` cuts the graph at the
 eight dense head convolutions, re-targets it to a chosen square input size, and
 converts it to bf16; the decode/NMS is expected to run host-side.
 
-This package covers the build pipeline only — export, quantize, and the hybrid
-int8/bf16 compile to three NSS-only vmfbs. Deployment (chaining the vmfbs on a
-Torq device + host-side decode/draw) lives with the on-device runner, since the
-NSS-only vmfbs need the Torq HAL and cannot run on the host.
+This package covers the build pipeline — export, quantize, and the hybrid
+int8/bf16 compile to three NSS-only vmfbs — plus the host-side decode
+(:mod:`._postprocess`), which the build uses to compare the quantized pipeline to
+the fp32 ONNX *after* post-processing (decoded detections/keypoints, not just the
+raw head tensors). Deployment (running the vmfbs on a Torq device) lives with the
+on-device runner, since the NSS-only vmfbs need the Torq HAL and cannot run on
+the host.
 
 Eight fp32 outputs (grouped by branch, level ascending — stride 16 then 32),
 for an ``S x S`` input:
@@ -26,7 +29,14 @@ for an ``S x S`` input:
 
 from __future__ import annotations
 
-from ._hybrid import add_rtmo_hybrid_args, compile_hybrid, quantize_hybrid, split_rtmo
+from ._hybrid import (
+    add_rtmo_hybrid_args,
+    compare_postprocess,
+    compile_hybrid,
+    quantize_hybrid,
+    split_rtmo,
+)
+from ._postprocess import model_postprocess
 from .download_source import download_source
 from .export import add_rtmo_export_args, export_rtmo, export_rtmo_from_args
 from .quantize import add_rtmo_quantize_args, quantize_rtmo
@@ -40,6 +50,8 @@ __all__ = [
     "add_rtmo_hybrid_args",
     "quantize_hybrid",
     "compile_hybrid",
+    "compare_postprocess",
+    "model_postprocess",
     "split_rtmo",
     "download_source",
 ]

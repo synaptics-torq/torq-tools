@@ -477,6 +477,17 @@ def quantize_hybrid(
     cosines = [c for c, _ in acc.values()]
     logger.info("  hybrid MEAN cos=%.5f  MIN cos=%.5f", float(np.mean(cosines)), float(np.min(cosines)))
 
+    # Post-processing-level comparison: decode both the fp32-ONNX heads and the
+    # hybrid-TFLite heads to detections/keypoints and compare the decoded output,
+    # not just the raw head tensors.
+    pp = compare_postprocess(onnx_res, hybrid_res)
+    logger.info(
+        "  postproc: dets onnx=%d hybrid=%d matched=%d (%d/%d imgs same count) | "
+        "IoU=%.4f  kptdelta=%.2fpx  scoreMAE=%.4f",
+        pp["n_onnx"], pp["n_hybrid"], pp["matched"], pp["count_agree"], pp["n_images"],
+        pp["mean_iou"], pp["mean_kpt_px"], pp["mean_score_mae"],
+    )
+
     return {
         "prepared_onnx": prepared,
         "split": split,
@@ -484,6 +495,79 @@ def quantize_hybrid(
         "accuracy": acc,
         "mean_cosine": float(np.mean(cosines)),
         "min_cosine": float(np.min(cosines)),
+        "postprocess": pp,
+    }
+
+
+def _box_iou(a, b):
+    """IoU of two xyxy boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def compare_postprocess(onnx_res, hybrid_res, score_thr=0.30, iou_thr=0.5):
+    """Compare fp32-ONNX vs hybrid-TFLite *after* RTMO post-processing.
+
+    Decodes both sets of heads with :func:`._postprocess.model_postprocess`,
+    thresholds detections at ``score_thr``, greedily matches ONNX->hybrid boxes
+    by IoU, and reports detection-count agreement plus mean box IoU, keypoint
+    pixel error, and score MAE over the matched detections. Complements the
+    per-head cosine (raw tensors) with a decoded-output metric.
+
+    ``onnx_res`` / ``hybrid_res`` are the per-image ``{head_name: array}`` lists
+    from the ``[6/6]`` step. Returns an aggregate summary dict.
+    """
+    from ._postprocess import model_postprocess
+
+    ious, kpt_px, score_ae = [], [], []
+    tot_o = tot_h = matched = count_agree = 0
+    for ro, rh in zip(onnx_res, hybrid_res):
+        # hybrid_res is keyed by TFLite output names; re-key it to the canonical
+        # head names by (unique) NCHW shape, using the correctly-named ONNX dict
+        # as reference -- the same shape-based pairing compare_onnx_tflite uses.
+        shape_to_name = {np.asarray(v).shape: k for k, v in ro.items()}
+        rh = {shape_to_name[np.asarray(v).shape]: v for v in rh.values()}
+        do, ko = model_postprocess(ro)
+        dh, kh = model_postprocess(rh)
+        do, ko, dh, kh = do[0], ko[0], dh[0], kh[0]      # drop the batch dim
+        mo, mh = do[:, 4] > score_thr, dh[:, 4] > score_thr
+        do, ko, dh, kh = do[mo], ko[mo], dh[mh], kh[mh]  # keep confident dets
+        tot_o += len(do)
+        tot_h += len(dh)
+        count_agree += int(len(do) == len(dh))
+        used = set()
+        for j in range(len(do)):
+            best, bj = 0.0, -1
+            for k in range(len(dh)):
+                if k in used:
+                    continue
+                iou = _box_iou(do[j, :4], dh[k, :4])
+                if iou > best:
+                    best, bj = iou, k
+            if bj >= 0 and best >= iou_thr:
+                used.add(bj)
+                matched += 1
+                ious.append(best)
+                score_ae.append(abs(float(do[j, 4]) - float(dh[bj, 4])))
+                vis = ko[j, :, 2] > score_thr
+                if vis.any():
+                    d = np.linalg.norm(ko[j, vis, :2] - kh[bj, vis, :2], axis=1)
+                    kpt_px.append(float(d.mean()))
+    _mean = lambda xs: float(np.mean(xs)) if xs else float("nan")
+    return {
+        "n_images": len(onnx_res),
+        "n_onnx": tot_o,
+        "n_hybrid": tot_h,
+        "matched": matched,
+        "count_agree": count_agree,
+        "mean_iou": _mean(ious),
+        "mean_kpt_px": _mean(kpt_px),
+        "mean_score_mae": _mean(score_ae),
     }
 
 
