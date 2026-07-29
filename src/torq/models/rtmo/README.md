@@ -44,9 +44,6 @@ python -m torq.models.rtmo._hybrid \
     --transformer-scheme bf16 --compile
 #  -> hybrid_out/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
 #  -> hybrid_out/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
-
-# 4. run the pose demo (boxes + 17-keypoint skeletons drawn on the image)
-python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_out
 ```
 
 `_hybrid.py` quantizes the three parts (int8 backbone/head + bf16 transformer)
@@ -71,20 +68,24 @@ For a square input of side `S` (default 320), grouped by branch, level ascending
 | `kpt_vis`     | `[B,17,20,20]` / `[B,17,10,10]`   | per-keypoint visibility |
 | `pose_feats`  | `[B,192,20,20]` / `[B,192,10,10]` | pose features (DCC input) |
 
-The host-side decode (NMS + the DCC GAU/SimCC pose classifier) is in
-[`_postprocess.py`](./_postprocess.py) and runs automatically in the demo.
+These are raw tensors. The host-side decode (NMS + the DCC GAU/SimCC pose
+classifier) consumes them off-device — it is not part of the vmfbs.
 
-## How the hybrid runs ([`_inference.py`](./_inference.py))
+## Deployment
 
-`RTMOHybrid` chains the three vmfbs — **backbone (int8) → transformer (bf16) →
-head (int8)** — requantizing at the seams as it would on-device, dequantizes the
-eight int8 head outputs, and runs `_postprocess` to boxes + keypoints. The FPN
-P3/P4 skip connections pass straight through (identical backbone-out/head-in
-scales); only the neck-transformed P5 is requantized.
+This package builds the artifacts; deployment (chaining the vmfbs + host decode)
+lives with the on-device runner. The three vmfbs are **NSS-only** (compiled
+`--torq-disable-css --torq-disable-host`), so they run on a Torq device via the
+Torq HAL — not on the host CPU. The runner chains them **backbone (int8) →
+transformer (bf16) → head (int8)**, requantizing at the seams as on-device (the
+FPN P3/P4 skips pass straight through — identical backbone-out/head-in scales —
+only the neck-transformed P5 is requantized), then dequantizes the eight int8
+heads and runs the host-side decode.
 
-> The seam/head dequant scales in `_inference.py` are baked to the reference
-> 100-image calibration. A rebuild with different calibration produces different
-> scales — regenerate them from the TFLite parts' I/O quantization if you rebuild.
+> The seam and head (scale, zero_point) constants belong to a specific
+> calibration (the reference 100-image set). A rebuild with different calibration
+> produces different scales — read them back from the TFLite parts' I/O
+> quantization (`tf.lite.Interpreter(...).get_{input,output}_details()`).
 
 ## Reference
 
@@ -107,5 +108,6 @@ functional, so the deployed path uses **bf16** (fp32-level, compiles clean).
 | [`download_source.py`](./download_source.py) | fetch `model.onnx` + `calib/` from HF |
 | [`export.py`](./export.py) | strip post-processing + retarget → `model_nopost_*.onnx` |
 | [`_hybrid.py`](./_hybrid.py) | split at the transformer + per-part PTQ → 3 TFLite; `--compile` → 3 NSS-only vmfbs (`compile_hybrid`, via the compiler Python API) |
+| [`_compile_worker.py`](./_compile_worker.py) | TF-free subprocess that compiles the parts (LLVM isolation from TensorFlow) |
 | [`quantize.py`](./quantize.py) | whole-model int8 / int16x8 TFLite (non-hybrid) |
-| [`_inference.py`](./_inference.py), [`_postprocess.py`](./_postprocess.py), [`infer.py`](./infer.py) | chained runtime + host decode + demo |
+| [`_surgery.py`](./_surgery.py), [`_pos_enc.py`](./_pos_enc.py) | input-size retargeting of the neck constants |
