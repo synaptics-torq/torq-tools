@@ -497,19 +497,14 @@ _HYBRID_TORQ_FLAGS = [
 ]
 
 
-def compile_hybrid(parts, out_dir, *, extra_flags=None, local_compile=False,
+def _compile_parts(parts, out_dir, *, extra_flags=None, local_compile=False,
                    use_binary=False, compiler_path=None):
-    """Compile the three hybrid TFLite parts to NSS-only vmfbs.
+    """In-process compile of the three TFLite parts to NSS-only vmfbs.
 
-    Uses the Torq compiler **Python API** via ``torq.utils.compile`` — the same
-    path as the other models (moonshine/gemma), so no ``torq-compile`` /
-    ``tosa-converter`` binaries are required. int8 parts compile unsliced; the
-    bf16 transformer sliced (slicing helps bf16, hurts int8).
-
-    ``parts`` is the ``{"backbone","transformer","head"}`` TFLite-path dict from
-    :func:`quantize_hybrid`. Returns ``{name: vmfb Path}``. Falls back to the
-    ``torq-compile`` binary only if ``use_binary`` is set or the Python API is
-    unavailable.
+    Must run in a **TensorFlow-free** process: TF and the ``torq.compiler`` wheel
+    each statically link their own copy of LLVM, and having both live in one
+    process aborts with "Option 'remarks-section' registered more than once".
+    Call :func:`compile_hybrid` (which guarantees that), not this directly.
     """
     import tempfile
 
@@ -539,6 +534,61 @@ def compile_hybrid(parts, out_dir, *, extra_flags=None, local_compile=False,
         logger.info("Compiled %s -> %s", key, vmfb)
         vmfbs[key] = vmfb
     return vmfbs
+
+
+def compile_hybrid(parts, out_dir, *, extra_flags=None, local_compile=False,
+                   use_binary=False, compiler_path=None):
+    """Compile the three hybrid TFLite parts to NSS-only vmfbs.
+
+    Uses the Torq compiler **Python API** via ``torq.utils.compile`` — the same
+    path as the other models (moonshine/gemma), so no ``torq-compile`` /
+    ``tosa-converter`` binaries are required. int8 parts compile unsliced; the
+    bf16 transformer sliced (slicing helps bf16, hurts int8).
+
+    ``parts`` is the ``{"backbone","transformer","head"}`` TFLite-path dict from
+    :func:`quantize_hybrid`. Returns ``{name: vmfb Path}``. Falls back to the
+    ``torq-compile`` binary only if ``use_binary`` is set or the Python API is
+    unavailable.
+
+    If TensorFlow is already imported in this process (e.g. right after
+    :func:`quantize_hybrid`), the compile is run in a fresh **subprocess**: TF and
+    the ``torq.compiler`` wheel each statically link a copy of LLVM, and both in
+    one process aborts with "Option 'remarks-section' registered more than once".
+    The subprocess (:mod:`torq.models.rtmo._compile_worker`) never imports TF, so
+    the two never coexist. The TFLite parts are already on disk, so it only needs
+    their paths.
+    """
+    import sys
+
+    if "tensorflow" not in sys.modules:
+        return _compile_parts(parts, out_dir, extra_flags=extra_flags,
+                              local_compile=local_compile, use_binary=use_binary,
+                              compiler_path=compiler_path)
+
+    import json
+    import subprocess
+    import tempfile
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("TensorFlow is loaded; compiling in a fresh subprocess (LLVM isolation)")
+    with tempfile.TemporaryDirectory() as td:
+        job = Path(td) / "job.json"
+        res = Path(td) / "vmfbs.json"
+        job.write_text(json.dumps({
+            "parts": {k: str(v) for k, v in parts.items()},
+            "out_dir": str(out_dir),
+            "extra_flags": list(extra_flags or []),
+            "local_compile": local_compile,
+            "use_binary": use_binary,
+            "compiler_path": str(compiler_path) if compiler_path else None,
+            "result": str(res),
+        }))
+        subprocess.run(
+            [sys.executable, "-m", "torq.models.rtmo._compile_worker", str(job)],
+            check=True,
+        )
+        return {k: Path(v) for k, v in json.loads(res.read_text()).items()}
 
 
 def add_rtmo_hybrid_args(parser):

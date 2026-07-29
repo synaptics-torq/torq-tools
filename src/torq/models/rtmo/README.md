@@ -42,7 +42,7 @@ python -m torq.models.rtmo._hybrid \
     -i models/rtmo/export/model_nopost_fp32.onnx \
     -o hybrid_out --images-dir models/rtmo/calib \
     --transformer-scheme bf16 --compile
-#  -> hybrid_out/tflite/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
+#  -> hybrid_out/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
 #  -> hybrid_out/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
 
 # 4. run the pose demo (boxes + 17-keypoint skeletons drawn on the image)
