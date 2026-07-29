@@ -14,12 +14,21 @@ Face) bakes the mmdeploy decode/NMS tail in (`TopK`/`NonMaxSuppression`/`NonZero
 
 ## Quickstart
 
-Beyond a torq-tools env (with the Torq compiler wheel), the pipeline needs some
-heavy TensorFlow-side deps (`onnx2tf`, `tensorflow`, `tf_keras`, `onnxsim`,
-`opencv-python`) — install [`requirements.txt`](./requirements.txt) into it.
+The build runs **entirely through the Torq compiler Python API** — no
+`torq-compile` / `tosa-converter` binaries. On top of the torq-tools core
+requirements, one env needs:
+
+- the **Torq compiler wheel** (`torq.compiler`) — build it from `torq-compiler-dev`
+  with `scripts/build_compiler_wheel.sh <host-build-dir>`, then
+  `pip install torq-compiler-dev/dist/torq_compiler-*.whl`;
+- **`tosa-converter-for-tflite`** — the self-contained TFLite→TOSA MLIR importer
+  (already pinned in the torq-tools core `requirements.txt`);
+- the heavy TensorFlow-side quantization deps (`onnx2tf`, `tensorflow`,
+  `tf_keras`, `onnxsim`, `opencv-python`) from this dir's
+  [`requirements.txt`](./requirements.txt).
 
 ```sh
-# 0. deps (into a venv that has the torq compiler wheel installed)
+# 0. TF-side quant deps (into the torq-tools env that has the compiler wheel installed)
 python -m pip install -r src/torq/models/rtmo/requirements.txt
 
 # 1. source model + calib images from HF (Synaptics/RTMO_pose)
@@ -33,7 +42,7 @@ python -m torq.models.rtmo._hybrid \
     -i models/rtmo/export/model_nopost_fp32.onnx \
     -o hybrid_out --images-dir models/rtmo/calib \
     --transformer-scheme bf16 --compile
-#  -> hybrid_out/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
+#  -> hybrid_out/tflite/rtmo_hybrid_{backbone_int8,transformer_bf16,head_int8}.tflite
 #  -> hybrid_out/rtmo_hyb_{backbone_int8,transformer_bf16,head_int8}.vmfb
 
 # 4. run the pose demo (boxes + 17-keypoint skeletons drawn on the image)
@@ -42,11 +51,13 @@ python -m torq.models.infer_model rtmo person.jpg -m ./hybrid_out
 
 `_hybrid.py` quantizes the three parts (int8 backbone/head + bf16 transformer)
 and, with `--compile`, compiles each to an NSS-only vmfb through the **Torq
-compiler Python API** (`torq.utils.compile` — same path as the other models, no
-`torq-compile`/`tosa-converter` binaries). It compiles the int8 parts unsliced
-and the bf16 transformer sliced. Standard `--use-binary` / `--compiler-path` /
-`--compile-flags` (from `add_torq_args`) are accepted for the binary fallback.
-Steps 1–2 can be folded into the export with `torq-export-model rtmo --download`.
+compiler Python API** (`torq.utils.compile`): TFLite→TOSA MLIR in-process via
+`tosa-converter-for-tflite`, then MLIR→vmfb via the `torq.compiler` wheel — the
+same path as the other models, no `torq-compile`/`tosa-converter` binaries. It
+compiles the int8 parts unsliced and the bf16 transformer sliced. Standard
+`--use-binary` / `--compiler-path` / `--compile-flags` (from `add_torq_args`)
+force the binary fallback. Steps 1–2 fold into the export with
+`torq-export-model rtmo --download`.
 
 ## Outputs (the eight head tensors)
 
