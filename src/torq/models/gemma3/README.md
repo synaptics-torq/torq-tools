@@ -172,9 +172,9 @@ Or via the tools' compile helper:
 ```sh
 python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb \
     --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
-    --torq-enable-transpose-optimization --torq-convert-dtypes \
-    --torq-enable-annotate-tied-operands --torq-convert-io-dtype \
-    --torq-enable-split-constants-optimization
+    --torq-enable-annotate-tied-operands \
+    --torq-enable-split-constants-optimization \
+    --iree-flow-inline-constants-max-byte-length=300000000
 ```
 
 > Do **not** pass `--torq-enable-torq-hl-tiling` — that flag was removed from
