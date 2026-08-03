@@ -63,9 +63,8 @@ def _patch_gs_bf16_converter():
 
 _patch_gs_bf16_converter()
 
-DEFAULT_HF_REPO_INT4: Final[str] = "tss-deposium/gemma-4-E2B-text-only-onnx-int4"
-# The int4 repo doesn't ship a chat template; pull it from a sibling ONNX
-# export of the same underlying checkpoint that does.
+DEFAULT_HF_REPO_INT4: Final[str] = "onnx-community/gemma-4-E2B-it-ONNX"
+# The multimodal repo also carries a chat template directly.
 DEFAULT_TEMPLATE_REPO: Final[str] = "onnx-community/gemma-4-E2B-it-qat-mobile-ONNX"
 
 _DECODER_FILENAME: Final[str] = "decoder_model_merged_q4.onnx"
