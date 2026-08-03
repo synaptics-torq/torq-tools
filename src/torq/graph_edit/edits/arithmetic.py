@@ -403,6 +403,88 @@ class ReplaceConstantDivWithMul(OnnxGraphEdit):
         self._logger.debug("Replaced Div @ '%s' by constant '%s' with Mul by reciprocal", node.name, divisor.name)
 
 @dataclass
+class FoldConstantSubBeforeCompare(OnnxGraphEdit):
+    """
+    Fold `Compare(Sub(X, C1), C2)` into `Compare(X, C1 + C2)` for
+    `Compare` in {Less, LessOrEqual, Greater, GreaterOrEqual}, when both
+    `C1` (the Sub's second operand) and `C2` (the Compare's second operand)
+    are compile-time constants.
+
+    The target compiler has no NSS-only (host/CSS-free) lowering for
+    integer `Sub`, broadcast or not -- confirmed via an isolated repro where
+    every comparison op and every float `Sub` tested does have one, but
+    `si32` `Sub` never does (`op_repros/sub_i32_nss_only_repro.py`). Real
+    instance: the sliding-window bound in the source model's reused
+    donor-layer attention mask (`shared_donor.{13,14}/mask/slide_diff`),
+    which silently falls back to host/CSS execution rather than aborting,
+    so it only shows up when testing `--torq-disable-host
+    --torq-disable-css`.
+
+    Since one operand of the `Sub` is always constant here, the
+    subtraction can be absorbed into the comparison threshold at export
+    time instead of computed at runtime, removing the op entirely.
+
+    Verified against the real `group_15-19` component (after
+    `_broadcast_where_value_operands` has already run): compiles under both
+    normal and `--torq-disable-host --torq-disable-css` flags, byte-identical
+    output either way. An earlier round of testing wrongly attributed a
+    `Kernel.cpp:3370` `fuse()` crash to this edit -- that crash was actually
+    caused by testing against a stale component that was missing the
+    `_broadcast_where_value_operands` fix entirely (unbroadcast scalar
+    `Where` fill), unrelated to this edit. Ordering relative to
+    `_broadcast_where_value_operands` doesn't affect correctness (the two
+    touch disjoint node patterns), but wiring this in after it kept the
+    verified-working test configuration.
+    """
+
+    _COMPARE_OPS = ("Less", "LessOrEqual", "Greater", "GreaterOrEqual")
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op not in self._COMPARE_OPS or len(node.inputs) != 2:
+            return False
+        lhs, rhs = node.inputs
+        if not isinstance(rhs, gs.Constant):
+            return False
+        if not isinstance(lhs, gs.Variable) or len(lhs.inputs) != 1:
+            return False
+        sub_node = lhs.inputs[0]
+        if sub_node.op != "Sub" or len(sub_node.inputs) != 2:
+            return False
+        if not isinstance(sub_node.inputs[1], gs.Constant):
+            return False
+        # Only fold if nothing else consumes the Sub's output.
+        return len(lhs.outputs) == 1
+
+    def transform(self, node: gs.Node):
+        if node.op not in self._COMPARE_OPS:
+            raise ValueError(
+                f"Expected one of {self._COMPARE_OPS} for constant-Sub folding, got '{node.op}'"
+            )
+        lhs, rhs = node.inputs
+        if not isinstance(rhs, gs.Constant):
+            raise TypeError("Expected constant second operand on compare node for constant-Sub folding")
+        sub_node: gs.Node = lhs.inputs[0]
+        dynamic, sub_const = sub_node.inputs
+        if not isinstance(sub_const, gs.Constant):
+            raise TypeError("Expected constant second operand on Sub node for constant-Sub folding")
+
+        folded_values = (sub_const.values.astype(np.int64) + rhs.values.astype(np.int64)).astype(sub_const.values.dtype)
+        folded_const = gs.Constant(
+            f"{sub_const.name}_plus_{rhs.name}_folded",
+            folded_values,
+            export_dtype=getattr(sub_const, "export_dtype", None),
+        )
+
+        node.inputs[0] = dynamic
+        node.inputs[1] = folded_const
+        sub_node.outputs.clear()
+
+        self._logger.debug(
+            "Folded constant Sub '%s' into %s threshold on '%s'",
+            sub_node.name, node.op, node.name,
+        )
+
+@dataclass
 class ReplaceInt64FloatCast(OnnxGraphEdit):
     """
     Replace int64 -> float casts with a look-up table: `output<fp32|fp16|bf16> = LUT[input<int64>]`

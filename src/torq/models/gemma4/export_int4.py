@@ -647,7 +647,46 @@ class Gemma4Int4ModelExporter(OnnxModelExporterBase):
         # save/reload round-trip in `apply_post_static_patches`.
         static_model = propagate_static_shapes(static_model)
         static_model = self._resolve_custom_op_shapes(static_model)
-        return self._broadcast_where_value_operands(static_model)
+        static_model = self._broadcast_where_value_operands(static_model)
+        return self._fold_constant_sub_before_compare(static_model)
+
+    @staticmethod
+    def _fold_constant_sub_before_compare(model: onnx.ModelProto) -> onnx.ModelProto:
+        """Fold `Compare(Sub(X, C1), C2)` into `Compare(X, C1 + C2)` wherever
+        both `C1`/`C2` are compile-time constants.
+
+        `torq-compile` has no NSS-only (host/CSS-free) lowering for integer
+        `Sub` -- confirmed via an isolated repro where every comparison op
+        and every float `Sub` tested does have one, but `si32` `Sub` never
+        does (`models/gemma4-e2b-int4/export/onnx/op_repros/
+        sub_i32_nss_only_repro.py`). It's not fatal in a normal compile --
+        the compiler silently routes it to host/CSS -- so it only surfaces
+        when testing `--torq-disable-host --torq-disable-css`, which is how
+        this was found: 4 of 9 components (the donor/shared-attention layer
+        groups 15-19/20-24/25-29/30-34) failed that flag combination while
+        the other 5 didn't.
+
+        The source model's own donor-layer sliding-window mask
+        (`shared_donor.{13,14}/mask/slide_diff`) hits this:
+        `Less(Sub(pos, range), 512)`. `range` starts life as a real `Range`
+        op (dynamic in general), which is why this can't run until *after*
+        `propagate_static_shapes` has folded it to a `Constant` -- before
+        that, `FoldConstantSubBeforeCompare.match()` correctly no-ops since
+        the Sub's second operand isn't a `gs.Constant` yet.
+
+        Runs after `_broadcast_where_value_operands`: verified in that order
+        against the real `group_15-19` component (compiles under both normal
+        and `--torq-disable-host --torq-disable-css` flags, byte-identical
+        output either way) -- ordering doesn't affect correctness since the
+        two edits touch disjoint node patterns, but this is the configuration
+        that's actually been tested.
+        """
+        graph = gs.import_onnx(model)
+        editor = Gemma4OnnxGraphEditor(graph, "fp32")
+        editor.fold_constant_sub_before_compare()
+        return editor.to_onnx(
+            check_type=False, strict_mode=False, data_prop=False, override_ir=model.ir_version
+        )
 
     @staticmethod
     def _broadcast_where_value_operands(model: onnx.ModelProto) -> onnx.ModelProto:

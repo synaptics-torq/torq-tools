@@ -4,6 +4,7 @@
 from .arithmetic import (
     DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
+    FoldConstantSubBeforeCompare,
     FoldScalarMatMul,
     RemoveIsNaN,
     RemoveRedundantCasts,
@@ -51,6 +52,7 @@ __all__ = [
     "RemoveIsNaN",
     "RemoveRedundantCasts",
     "FoldScalarMatMul",
+    "FoldConstantSubBeforeCompare",
     "ReplaceConstantDivWithMul",
     "ReplaceInt64FloatCast",
     "ConstantBroadcastPolicy",
