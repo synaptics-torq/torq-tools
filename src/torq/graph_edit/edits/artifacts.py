@@ -9,6 +9,8 @@ import os
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+from onnx import numpy_helper
+from onnx_graphsurgeon.importers.onnx_importer import OnnxImporter
 
 from ..onnx import OnnxGraphEdit, rewire_consumers
 from ...utils.onnx import normalize_layer_name
@@ -295,6 +297,17 @@ class TrimLMHeadVocab(OnnxGraphEdit):
     The caller is responsible for mapping compact_idx -> original token ID via
     kept_token_ids[compact_idx].
 
+    Handles two weight forms for the matched `MatMul`'s second operand:
+
+    - A dense `gs.Constant` (e.g. gemma3's fp32/bf16 lm_head): sliced directly.
+    - A `DequantizeLinear -> MatMul` pair (e.g. gemma4's int4-packed lm_head,
+      post `DecomposeMatMulNBits`): the `DequantizeLinear`'s three constant
+      inputs (packed data / scale / zero_point) are sliced instead, along
+      whichever axis its `axis` attribute does *not* block-quantize -- the
+      vocab dimension is never the blocked axis (block-quantization blocks
+      the hidden/reduction dimension), so this is always a safe, block-
+      aligned slice, never splitting a block across kept/dropped tokens.
+
     Args:
         kept_token_ids (np.ndarray): 1-D array of original token IDs to keep, in the
             order they should appear in the trimmed weight (sorted recommended).
@@ -312,40 +325,99 @@ class TrimLMHeadVocab(OnnxGraphEdit):
         self.kept_token_ids = np.asarray(self.kept_token_ids, dtype=np.int64)
         if self.kept_token_ids.ndim != 1 or len(self.kept_token_ids) == 0:
             raise ValueError("kept_token_ids must be a non-empty 1-D array")
+        self.requires_shape_inference = True
         return super().__post_init__()
 
+    @staticmethod
+    def _dequant_producer(weight_inp) -> "gs.Node | None":
+        if not isinstance(weight_inp, gs.Variable) or not weight_inp.inputs:
+            return None
+        producer = weight_inp.inputs[0]
+        if producer.op != "DequantizeLinear" or len(producer.inputs) < 3:
+            return None
+        if not all(isinstance(i, gs.Constant) for i in producer.inputs[:3]):
+            return None
+        return producer
+
     def match(self, node: gs.Node) -> bool:
-        if node.op != "MatMul" or not node.outputs:
+        if node.op != "MatMul" or not node.outputs or len(node.inputs) < 2:
             return False
-        return node.outputs[0].name == self.output_name
+        if node.outputs[0].name != self.output_name:
+            return False
+        weight_inp = node.inputs[1]
+        return isinstance(weight_inp, gs.Constant) or self._dequant_producer(weight_inp) is not None
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "MatMul")
         weight_inp = node.inputs[1]
-        if not isinstance(weight_inp, gs.Constant):
-            raise ValueError(
-                f"Expected constant weight for LM head MatMul, got {type(weight_inp).__name__}"
+        dql_node = self._dequant_producer(weight_inp)
+
+        if dql_node is None:
+            if not isinstance(weight_inp, gs.Constant):
+                raise ValueError(
+                    f"Expected constant weight for LM head MatMul, got {type(weight_inp).__name__}"
+                )
+            W = weight_inp.values
+            if W.ndim != 2:
+                raise ValueError(f"Expected 2-D weight matrix, got shape {W.shape}")
+
+            hidden_size, vocab_size = W.shape
+            if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
+                raise ValueError(
+                    f"kept_token_ids contains values outside [0, {vocab_size})"
+                )
+            kept_count = len(self.kept_token_ids)
+
+            W_trimmed = W[:, self.kept_token_ids]
+            trimmed_weight = gs.Constant(
+                name=weight_inp.name + "_trimmed",
+                values=W_trimmed,
+                export_dtype=getattr(weight_inp, "export_dtype", None),
             )
+            node.inputs[1] = trimmed_weight
+        else:
+            data_c, scale_c, zp_c = dql_node.inputs[:3]
+            if data_c.values.ndim != 2:
+                raise ValueError(f"Expected 2-D packed weight, got shape {data_c.values.shape}")
+            block_axis = int(dql_node.attrs.get("axis", 0))
+            vocab_axis = 1 - block_axis  # the non-block-quantized axis
 
-        W = weight_inp.values
-        if W.ndim != 2:
-            raise ValueError(f"Expected 2-D weight matrix, got shape {W.shape}")
+            hidden_size, vocab_size = data_c.values.shape if vocab_axis == 1 else data_c.values.shape[::-1]
+            if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
+                raise ValueError(
+                    f"kept_token_ids contains values outside [0, {vocab_size})"
+                )
+            kept_count = len(self.kept_token_ids)
 
-        hidden_size, vocab_size = W.shape
-        if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
-            raise ValueError(
-                f"kept_token_ids contains values outside [0, {vocab_size})"
-            )
-        kept_count = len(self.kept_token_ids)
+            def _trim(c: gs.Constant) -> gs.Constant:
+                idx = [slice(None)] * c.values.ndim
+                idx[vocab_axis] = self.kept_token_ids
+                sliced = c.values[tuple(idx)]
+                # Not `gs.Constant(..., values=sliced, ...)`: onnx_graphsurgeon's
+                # own export path for a *newly constructed* Constant just does
+                # `values.tobytes()` (see `constant_to_onnx_tensor`), which for
+                # sub-byte dtypes (int4/uint4) writes the unpacked (1
+                # byte/element) buffer instead of ONNX's packed (2/byte) raw
+                # format -- verified to corrupt-or-fail on round-trip (`onnx.
+                # helper.make_tensor` rejects it: "Raw data size does not
+                # match"). It only works for *unmodified* Constants because
+                # those keep a `LazyValues` reference to the original,
+                # already-correctly-packed `TensorProto` and never touch this
+                # path at all. Building through `onnx.numpy_helper.from_array`
+                # (which packs correctly) and re-importing via `OnnxImporter.
+                # import_tensor` gives the new Constant that same `LazyValues`
+                # wrapping, sidestepping the bug entirely. Verified round-trip
+                # byte-exact for both int4 and bf16.
+                tensor_proto = numpy_helper.from_array(sliced, name=c.name + "_trimmed")
+                return OnnxImporter.import_tensor(tensor_proto)
 
-        W_trimmed = W[:, self.kept_token_ids]
-        trimmed_weight = gs.Constant(
-            name=weight_inp.name + "_trimmed",
-            values=W_trimmed,
-            export_dtype=getattr(weight_inp, "export_dtype", None),
-        )
-
-        node.inputs[1] = trimmed_weight
+            dql_node.inputs[0] = _trim(data_c)
+            dql_node.inputs[1] = _trim(scale_c)
+            dql_node.inputs[2] = _trim(zp_c)
+            if weight_inp.shape:
+                new_shape = list(weight_inp.shape)
+                new_shape[vocab_axis] = kept_count
+                weight_inp.shape = new_shape
 
         logits_out = node.outputs[0]
         old_shape = list(logits_out.shape) if logits_out.shape else None
@@ -355,7 +427,7 @@ class TrimLMHeadVocab(OnnxGraphEdit):
             new_logits_shape = [1, 1, kept_count]
 
         trimmed_logits = gs.Variable(
-            name="logits",
+            name=logits_out.name,
             dtype=logits_out.dtype,
             shape=new_logits_shape,
         )
@@ -381,6 +453,29 @@ class TrimLMHeadVocab(OnnxGraphEdit):
         for i, graph_out in enumerate(self.graph.outputs):
             if graph_out is logits_out:
                 self.graph.outputs[i] = final_out
+
+        # Every tensor between the trimmed matmul and the graph's actual
+        # output(s) still carries its *stale* pre-trim declared shape (e.g.
+        # gemma4's logit-softcap `Div`/`Tanh`/`Mul` chain, downstream of
+        # `output_name` here rather than *being* it) -- elementwise ops, so
+        # the values compute correctly regardless, but the graph's shape
+        # metadata is now wrong until cleared and re-inferred. Same fix as
+        # `EliminateExpand._clear_downstream_shapes` in shape.py, except
+        # graph outputs are cleared too (there the output shape doesn't
+        # change; here it does).
+        queue = list({id(c): c for c in final_out.outputs}.values())
+        visited: set[int] = set()
+        while queue:
+            n = queue.pop(0)
+            if id(n) in visited:
+                continue
+            visited.add(id(n))
+            for out in n.outputs:
+                if isinstance(out, gs.Variable):
+                    out.shape = None
+                    for consumer in out.outputs:
+                        if id(consumer) not in visited:
+                            queue.append(consumer)
 
         if self.save_lut is not None:
             lut_path = Path(self.save_lut)
