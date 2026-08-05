@@ -27,6 +27,7 @@ from ..utils.onnx import (
 from ..tools.convert_dtype.onnx import (
     convert_model
 )
+from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
     "FP_EXPORT_DTYPE_MAPPING",
@@ -67,6 +68,7 @@ class OnnxModelExporterBase(ABC):
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
 
+        self._harness: GraphEditHarness | None = None
         self._model_dtype = model_dtype
         self._config = config
         self._models_dir = Path(models_dir)
@@ -90,6 +92,28 @@ class OnnxModelExporterBase(ABC):
     @property
     def export_dir(self) -> Path:
         return self._export_dir
+
+    def set_graph_edit_harness(self, harness: GraphEditHarness | None) -> None:
+        """Attach a parsed graph-edit harness used by ``make_static`` / view."""
+        self._harness = harness
+
+    def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
+        """Return the exporter's default graph-edit blocks (name -> ordered specs).
+
+        Each block corresponds to a contiguous run of graph edits applied to a
+        component/graph.  Override in subclasses that use the declarative
+        harness; used both by ``make_static`` (as the default specs fed to
+        ``OnnxGraphEditor.apply_specs``) and by ``--view-graph-edits``.
+        """
+        return {}
+
+    def describe_graph_edits(self) -> dict[str, list[EditSpec]]:
+        """Return the finalized (harness-merged) edit blocks for display."""
+        harness = self._harness or GraphEditHarness()
+        return {
+            name: harness.finalize(specs)
+            for name, specs in self.graph_edit_blocks().items()
+        }
 
     @abstractmethod
     def _setup_dirs(self) -> list[Path]: ...

@@ -28,6 +28,7 @@ dependencies = [
     "onnx_graphsurgeon",
     "optimum[onnxruntime]",
     "polygraphy",
+    "pyyaml",
     "tokenizers",
     "transformers",
 ]
