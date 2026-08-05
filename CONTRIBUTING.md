@@ -101,6 +101,26 @@ torq-export-model <model> --skip-torq
 
 If the change affects Torq compilation, also run the exporter without `--skip-torq` with `torq-compiler` installed, or point the run at a compiler with `TORQ_COMPILER_PATH` / `--compiler-path`.
 
+### Graph Edit Harness
+
+Exporters declare their default graph edits *declaratively* rather than calling editor methods imperatively. Each exporter overrides `graph_edit_blocks()` (on `OnnxModelExporterBase`) to return an ordered `dict[str, list[EditSpec]]`, where each block is a contiguous run of edits applied to one component/graph. An `EditSpec` is just an edit's registered name (its `OnnxGraphEdit` class name) plus positional constructor args. Args that are only known at export time (e.g. a `cur_len` tensor) are written as `ctx("name")` placeholders and resolved from a context mapping passed to `OnnxGraphEditor.apply_specs(specs, harness, context)`.
+
+Inside `make_static` / post-static patches, replace imperative edit calls with `editor.apply_specs(self.graph_edit_blocks()[block], self._harness, context)`. Non-edit editor operations (IO fixing, KV combining, input reordering, `to_onnx`) stay imperative and simply bracket the `apply_specs` calls.
+
+This wires up the shared CLI flags automatically once you call `add_graph_edit_harness_args(parser)` and, in `export_<model>_from_args`, `exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))` plus the `--view-graph-edits` short-circuit:
+
+```python
+exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+if args.view_graph_edits:
+    print(render_graph_edit_plan(exporter.describe_graph_edits()))
+    return
+```
+
+Users then get `--apply-graph-edit NAME[:ARGS]` (repeatable, YAML args), `--apply-graph-edits-from-file FILE`, their `--exclude-graph-edit` / `--exclude-graph-edits-from-file` counterparts, and `--view-graph-edits`. Precedence when merging is flags > file > defaults: an overriding edit keeps the default's position, brand-new edits are appended (once per editor instance), and excluded edits are removed last.
+
+The harness core and registry live in `src/torq/graph_edit/harness.py`; add unit coverage under `tests/unit/graph_edit/test_harness.py`.
+
+
 ## Tools and Utilities
 
 Tools live under `src/torq/tools/`, and shared helpers live under `src/torq/utils/`. For new or updated tools, it is easiest to keep the command line wrapper thin and put the behavior in importable functions. Then tests can call those functions directly, with CLI-level tests reserved for argument parsing, file wiring, or user-visible behavior.
