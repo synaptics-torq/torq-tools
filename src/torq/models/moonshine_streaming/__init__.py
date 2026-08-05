@@ -8,6 +8,7 @@ from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
+from ...graph_edit.harness import add_graph_edit_harness_args
 
 DEFAULT_INPUT_AUDIO_S: Final[int] = 5
 DEFAULT_DEC_TOK_PER_SEC: Final[int] = 6
@@ -106,6 +107,7 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         type=str,
         help="Moonshine Streaming model's HuggingFace repo ID (default: UsefulSensors/moonshine-streaming-{model_size})",
     )
+    add_graph_edit_harness_args(parser)
     add_logging_args(parser)
     add_torq_args(parser)
 

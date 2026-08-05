@@ -5,6 +5,7 @@ from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
 from ...utils.onnx import add_onnx_args
+from ...graph_edit.harness import add_graph_edit_harness_args
 
 
 DEFAULT_MODEL_SIZE: Final[str] = "270m"
@@ -125,6 +126,7 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=None,
         help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
+    add_graph_edit_harness_args(parser)
     add_logging_args(parser)
     add_torq_args(parser)
 

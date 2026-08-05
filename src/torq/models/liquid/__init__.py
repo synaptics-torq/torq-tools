@@ -10,6 +10,7 @@ from ...utils.compile import add_torq_args
 
 from ...utils.demo import add_common_args
 from ...utils.onnx import add_onnx_args
+from ...graph_edit.harness import add_graph_edit_harness_args
 
 
 DEFAULT_MODEL_SIZE: Final[str] = "350m"
@@ -129,6 +130,7 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
             "during prefill. Requires --convert-dtypes."
         ),
     )
+    add_graph_edit_harness_args(parser)
     add_logging_args(parser)
     add_torq_args(parser)
 
@@ -261,6 +263,7 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
             "decoder — the board's lower-TTFT split."
         ),
     )
+    add_graph_edit_harness_args(parser)
     add_logging_args(parser)
     add_torq_args(parser)
 

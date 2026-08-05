@@ -26,6 +26,7 @@ from . import (
 
 from ._graph import MoonshineStreamingOnnxGraphEditor
 from ._inference import MoonshineStreaming
+from ...graph_edit.harness import EditSpec, GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 
 # TODO: drop once the target compiler natively supports LayerNormalization.
@@ -671,6 +672,14 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     # Graph-edit helpers
 
+    def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
+        return {
+            "encoder.static": [EditSpec("DecomposeLayerNormalization", (_DECOMPOSE_LAYERNORM,))],
+            "decoder.static": [EditSpec("DecomposeLayerNormalization", (_DECOMPOSE_LAYERNORM,))],
+            "encoder.patch": [EditSpec("EliminateTranspose"), EditSpec("CollapseReshapeChain")],
+            "decoder.patch": [EditSpec("EliminateTranspose"), EditSpec("CollapseReshapeChain")],
+        }
+
     def _make_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
             model, "encoder", self._onnx_export_dtype
@@ -681,7 +690,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             chunk_len=self._chunk_len,
             feat_len=self._feature_stride,
         )
-        editor.decompose_layer_normalization(enabled=_DECOMPOSE_LAYERNORM)
+        editor.apply_specs(self.graph_edit_blocks()["encoder.static"], self._harness)
         # Ensure kernel_shape is present on all 1-D Conv nodes (dynamo may omit it).
         for node in list(editor._graph.nodes):
             if node.op == "Conv":
@@ -704,7 +713,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             model, "decoder", self._onnx_export_dtype
         )
         editor.make_decoder_static(self._max_tokens)
-        editor.decompose_layer_normalization(enabled=_DECOMPOSE_LAYERNORM)
+        editor.apply_specs(self.graph_edit_blocks()["decoder.static"], self._harness)
         # editor.decompose_gelu()
         editor.clear_intermediate_shapes()
         new_model = editor.to_onnx(override_ir=model.ir_version)
@@ -738,8 +747,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             )
             # editor.decompose_asinh() #Currently using the polynomial fit
             editor.remove_identity_gather_nd()
-            editor.eliminate_transposes()
-            editor.collapse_reshape_chains()
+            editor.apply_specs(self.graph_edit_blocks()["encoder.patch"], self._harness)
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
@@ -747,8 +755,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
                 model_path, component, self._onnx_export_dtype
             )
-            editor.eliminate_transposes()
-            editor.collapse_reshape_chains()
+            editor.apply_specs(self.graph_edit_blocks()["decoder.patch"], self._harness)
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
             onnx.save(new_model, model_path)
 
@@ -876,6 +883,10 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         skip_export=args.skip_export,
         broadcast_ops=args.broadcast_ops,
     )
+    exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+    if args.view_graph_edits:
+        print(render_graph_edit_plan(exporter.describe_graph_edits()))
+        return
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
