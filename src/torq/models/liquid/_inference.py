@@ -13,19 +13,38 @@ from pathlib import Path
 from typing import Final
 
 import numpy as np
-from huggingface_hub import hf_hub_download
-from tokenizers import Tokenizer
-
-from torq.runtime import (
-    InferenceRunner,
-    VMFBInferenceRunner
-)
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    hf_hub_download = None
+try:
+    from tokenizers import Tokenizer
+except ImportError:
+    Tokenizer = None
 
 from ...inference.runners import (
+    InferenceRunner,
     ORTInferenceRunner,
+    VMFBInferenceRunner,
 )
 
 DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant. Provide concise answers."
+
+
+def _download_asset(repo_id: str, asset_name: str) -> str:
+    if hf_hub_download is None:
+        raise RuntimeError(
+            "huggingface_hub python API not available in environment"
+        )
+    return hf_hub_download(repo_id, asset_name)
+
+
+def _load_tokenizer(tokenizer_path: str | os.PathLike):
+    if Tokenizer is None:
+        raise RuntimeError(
+            "tokenizers python API not available in environment"
+        )
+    return Tokenizer.from_file(str(tokenizer_path))
 
 
 @dataclass(frozen=True)
@@ -81,6 +100,10 @@ class LiquidBase(ABC):
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._model = model
+        sess = getattr(model, "_sess", None)
+        self._input_names: set[str] | None = (
+            {i.name for i in sess.get_inputs()} if sess is not None else None
+        )
         self._max_prompt_tokens = max_prompt_tokens
         self._max_gen_tokens = max_gen_tokens
         self._tokenizer = tokenizer
@@ -140,6 +163,16 @@ class LiquidBase(ABC):
         if isinstance(max_prompt_tokens, (int, float)) and isinstance(max_gen_tokens, (int, float)):
             return int(max_prompt_tokens + max_gen_tokens)
         return None
+
+    def _declares_input(self, name: str, default: bool = False) -> bool:
+        """Whether the loaded model declares a graph input called `name`.
+
+        Falls back to `default` for runners that cannot report their
+        signature (e.g. VMFB, which is fed positionally).
+        """
+        if self._input_names is None:
+            return default
+        return name in self._input_names
 
     def _reset_cache(self):
         self._kv_cache.update(self._reset_cache_state)
@@ -266,15 +299,15 @@ class LiquidDynamic(LiquidBase):
         tokenizer_path: str | os.PathLike | None = None,
     ):
         if config_path is None:
-            config_path = hf_hub_download(repo_id or self.DEFAULT_REPO_ID, "config.json")
+            config_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "config.json")
         if tokenizer_path is None:
-            tokenizer_path = hf_hub_download(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
+            tokenizer_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
         super().__init__(
             model,
             ModelConfig.from_json_config(config_path, instruct_model),
             max_prompt_tokens,
             max_gen_tokens,
-            Tokenizer.from_file(str(tokenizer_path)),
+            _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
         )
 
@@ -350,9 +383,16 @@ class LiquidDynamic(LiquidBase):
         inputs = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
-            "num_logits_to_keep": np.array(1, dtype=np.int64),
-            **self._kv_cache,
         }
+        # Source exports disagree on the third input: the upstream LiquidAI
+        # ONNX takes a `num_logits_to_keep` scalar, the Synaptics mirror takes
+        # `position_ids`.  Feed whichever this model declares, keeping
+        # `num_logits_to_keep` when the runner cannot report its signature.
+        if self._declares_input("position_ids"):
+            inputs["position_ids"] = np.array([[curr_seq_len]], dtype=np.int64)
+        if self._declares_input("num_logits_to_keep", default=True):
+            inputs["num_logits_to_keep"] = np.array(1, dtype=np.int64)
+        inputs.update(self._kv_cache)
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
@@ -401,9 +441,9 @@ class LiquidStatic(LiquidBase):
         tokenizer_path: str | os.PathLike | None = None,
     ):
         if config_path is None:
-            config_path = hf_hub_download(repo_id or self.DEFAULT_REPO_ID, "config.json")
+            config_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "config.json")
         if tokenizer_path is None:
-            tokenizer_path = hf_hub_download(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
+            tokenizer_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
         self._combined_kv_io = combined_kv_io
         # When `--extract-embeddings` was used at export time the model's
         # input is `token_embedding` rather than `input_ids`; load the LUT
@@ -421,7 +461,7 @@ class LiquidStatic(LiquidBase):
             ModelConfig.from_json_config(config_path, instruct_model),
             max_prompt_tokens,
             max_gen_tokens,
-            Tokenizer.from_file(str(tokenizer_path)),
+            _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
         )
 
@@ -527,12 +567,10 @@ class LiquidStatic(LiquidBase):
         # If the static model still exposes attention_mask, supply a full
         # mask sized at the *compiled* KV-cache length (not the runtime
         # generation cap, which may be smaller).
-        if hasattr(self._model, "_sess"):
-            input_names = {i.name for i in self._model._sess.get_inputs()}
-            if "attention_mask" in input_names:
-                inputs["attention_mask"] = np.ones(
-                    [1, self._kv_cache_len], dtype=np.int64
-                )
+        if self._declares_input("attention_mask"):
+            inputs["attention_mask"] = np.ones(
+                [1, self._kv_cache_len], dtype=np.int64
+            )
         logits, *cache = self._model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
