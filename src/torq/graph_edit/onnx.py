@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx
@@ -16,6 +17,9 @@ import onnx_graphsurgeon as gs
 from onnx import helper, numpy_helper, shape_inference, TensorProto
 
 from ..utils.onnx import drop_empty_name_value_info
+
+if TYPE_CHECKING:
+    from .harness import EditSpec, GraphEditHarness
 
 
 def rewire_consumers(
@@ -102,6 +106,7 @@ class OnnxGraphEditor:
         self._graph_bak = self._graph.copy()
         self._logger = logging.getLogger(str(self))
         self._edits: dict[str, OnnxGraphEdit] = {}
+        self._harness_applied_extras: set[str] = set()
         # Restoring omitted RNN outputs is only relevant for graphs that
         # actually contain RNN/GRU/LSTM nodes; opt-in via ``is_rnn`` so we
         # don't run the post-pass on every unrelated graph.
@@ -204,6 +209,44 @@ class OnnxGraphEditor:
     def apply_edits(self, edits: Sequence[OnnxGraphEdit | str]):
         for edit in edits:
             self.apply_edit(edit)
+        return self
+
+    def apply_specs(
+        self,
+        default_specs: "Sequence[EditSpec]",
+        harness: "GraphEditHarness | None" = None,
+        context: Mapping[str, object] | None = None,
+    ):
+        """Apply a declarative list of :class:`EditSpec` through the harness.
+
+        ``default_specs`` is the exporter's built-in ordered edit list.  When a
+        ``harness`` is given, user ``--apply-graph-edit`` / file / ``--exclude``
+        overrides are merged in (flags > file > defaults; overrides keep the
+        default's position, new edits are appended).  ``ContextRef`` args in the
+        finalized specs are resolved against ``context``.
+
+        Brand-new (non-default) edits are applied at most once per editor
+        instance so that models with multiple edit passes don't double-apply
+        them within the same graph.
+        """
+        from .harness import edit_registry, resolve_args
+
+        ctx = dict(context or {})
+        specs = harness.finalize(list(default_specs)) if harness else list(default_specs)
+        registry = edit_registry()
+        default_names = {spec.name for spec in default_specs}
+
+        for spec in specs:
+            if spec.name not in default_names:
+                if spec.name in self._harness_applied_extras:
+                    continue
+                self._harness_applied_extras.add(spec.name)
+            try:
+                edit_cls = registry[spec.name]
+            except KeyError:
+                raise ValueError(f"Unknown graph edit '{spec.name}'")
+            args = resolve_args(spec.args, ctx)
+            self.apply_edit(edit_cls(self._graph, self._graph_name, *args))
         return self
 
     def _infer_shapes(self):

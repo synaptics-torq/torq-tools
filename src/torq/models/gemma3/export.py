@@ -25,6 +25,7 @@ from ._trim_vocab import (
     build_trimmed_vocab_spec,
     load_json,
 )
+from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
 
@@ -307,6 +308,46 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 continue
             shutil.copy2(src_path, dst_dir / asset_name)
 
+    def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
+        blocks: dict[str, list[EditSpec]] = {}
+        blocks["model.static"] = [
+            EditSpec("RemoveRedundantCasts"),
+            EditSpec("RemoveIsNaN"),
+        ]
+        blocks["model.static (KV cache)"] = [
+            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
+            EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+            EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
+            EditSpec("ConvertToStaticIndex"),
+        ]
+
+        patch = [
+            EditSpec("EliminateTranspose"),
+            EditSpec("CollapseReshapeChain"),
+            EditSpec("CollapseGQABroadcast"),
+            EditSpec("FoldScalarMatMul"),
+        ]
+        if self._broadcast_ops is not None:
+            patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
+        else:
+            patch.append(EditSpec("EliminateExpand", (["Mul", "MatMul", "Where", "Transpose"],)))
+        if self._extract_embeddings:
+            patch.append(EditSpec(
+                "ExtractConstantLUT",
+                ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+            ))
+        blocks["model.patch"] = patch
+
+        if self._trim_vocab:
+            blocks["model.patch (trim vocab)"] = [
+                EditSpec("TrimLMHeadVocab", (ctx("kept_token_ids"), "logits", ctx("token_id_lut_path"), False))
+            ]
+        if self._split_lm_head:
+            blocks["model.patch (split LM head)"] = [
+                EditSpec("SplitLMHead", (ctx("lm_head_path"), "logits", "last_hidden_states"))
+            ]
+        return blocks
+
     def _make_model_static(
         self, model: onnx.ModelProto
     ) -> onnx.ModelProto:
@@ -334,10 +375,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         editor = Gemma3OnnxGraphEditor(graph, self._onnx_export_dtype)
         editor.fix_io(self._max_gen_tokens)
 
-        # Remove redundant Cast ops
-        editor.remove_redundant_casts()
-        # Remove isNaN ops
-        editor.remove_isNaN()
+        blocks = self.graph_edit_blocks()
+        # Remove redundant Cast + isNaN ops
+        editor.apply_specs(blocks["model.static"], self._harness)
 
         cur_len_2d = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
         graph.inputs.append(cur_len_2d)
@@ -354,16 +394,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             outputs=[gs.Variable(cur_len.name + "_squeezed", dtype=np.int64, shape=[])],
         )[0]
 
-        (
-            editor
-            # Replace dynamic KV cache
-            .replace_dynamic_kv_cache(cur_len, self._max_gen_tokens)
-            # Add causal attention score mask
-            .mask_future_attn_scores(cur_len, self._max_gen_tokens)
-            # Replace dynamic sequence length getter with `cur_len`
-            .add_curr_len_input(cur_len)
-            # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
-            .convert_to_static_index()
+        editor.apply_specs(
+            blocks["model.static (KV cache)"],
+            self._harness,
+            {
+                "cur_len": cur_len,
+                "max_tokens": self._max_gen_tokens,
+                "export_dtype": self._onnx_export_dtype,
+            },
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
@@ -373,39 +411,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = Gemma3OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
 
-        # Eliminate data-preserving Transpose ops (no-op K/V head transposes, K^T when seq==head_dim)
-        editor.eliminate_transposes()
-        # Collapse consecutive Reshape chains
-        editor.collapse_reshape_chains()
-        # Collapse Unsqueeze→Expand→Reshape GQA broadcast into single Expand (KV_heads=1)
-        editor.collapse_gqa_broadcast()
-        # Fold MatMul A @ B where B is a scalar into Mul
-        editor.fold_scalar_matmul()
-        # Broadcast op inputs to match output shape
-        if self._broadcast_ops is not None:
-            editor.broadcast_op_inputs(
-                ops=self._broadcast_ops,
-            )
-        else:
-            # Eliminate explicit Expand ops
-            editor.eliminate_expands([
-                # supports kernel broadcast in Torq-compiler
-                "Mul", "MatMul", "Where",
-                # produced by collapse_gqa_broadcast()
-                "Transpose",
-            ])
+        blocks = self.graph_edit_blocks()
+        embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
+        editor.apply_specs(
+            blocks["model.patch"], self._harness, {"embeddings_path": embeddings_npy}
+        )
 
         if self._extract_embeddings:
-            # Extract token embeddings LUT
-            embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
-            embeddings_inp = "token_embedding"
-            editor.extract_token_embeddings(
-                self._hidden_size,
-                self._vocab_size,
-                embeddings_npy,
-                inp_name=embeddings_inp
-            )
-            editor.reorder_graph_input(embeddings_inp, 0)
+            editor.reorder_graph_input("token_embedding", 0)
 
         if not self._keep_individual_kv_io:
             editor.combine_kv_io_tensors([
@@ -418,16 +431,24 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if self._trim_vocab:
             spec = self._get_trimmed_vocab_spec()
             token_id_lut_path = Path(model_path).parent / "token_id_lut.npy"
-            editor.trim_lm_head_vocab(
-                kept_token_ids=np.array(spec.kept_model_ids, dtype=np.int64),
-                save_lut=token_id_lut_path,
+            editor.apply_specs(
+                blocks["model.patch (trim vocab)"],
+                self._harness,
+                {
+                    "kept_token_ids": np.array(spec.kept_model_ids, dtype=np.int64),
+                    "token_id_lut_path": token_id_lut_path,
+                },
             )
 
         editor.reorder_graph_input("position_ids", 1)
 
         if self._split_lm_head:
             lm_head_path = Path(model_path).parent / self._export_model_filenames[1]
-            editor.split_lm_head(lm_head_path)
+            editor.apply_specs(
+                blocks["model.patch (split LM head)"],
+                self._harness,
+                {"lm_head_path": lm_head_path},
+            )
             lm_head_model = onnx.load(lm_head_path)
             lm_head_model.ir_version = model.ir_version
             onnx.save(self.check_model(lm_head_model), lm_head_path)
@@ -580,6 +601,10 @@ def export_gemma3_from_args(args: argparse.Namespace):
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )
+    exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+    if args.view_graph_edits:
+        print(render_graph_edit_plan(exporter.describe_graph_edits()))
+        return
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)

@@ -48,6 +48,7 @@ from . import add_liquid_export_args
 from ._graph import LiquidOnnxGraphEditor
 from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
+from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 
 
@@ -277,18 +278,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
         # Replace ORT custom ops with standard ONNX ops in the source graph.
         editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
-        self._logger.info("Replacing SimplifiedLayerNormalization ops...")
-        editor.replace_simplified_layer_norm()
-        self._logger.info("Replacing SkipSimplifiedLayerNormalization ops...")
-        editor.replace_skip_simplified_layer_norm()
+        blocks = self.graph_edit_blocks()
+        self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
+        editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
         self._logger.info("Folding external RotaryEmbedding ops into GQA...")
         self._fold_external_rotary_into_gqa(editor.graph)
         self._logger.info("Replacing GroupQueryAttention ops...")
-        editor.replace_group_query_attention(
-            num_heads=self._num_attention_heads,
-            kv_num_heads=self._num_key_value_heads,
-            head_dim=self._head_dim,
-        )
+        editor.apply_specs(blocks["source.convert (attention)"], self._harness)
 
         editor.graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
@@ -465,6 +461,44 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._logger.info("Folded %d external RotaryEmbedding pair(s) into GQA", folded)
         return folded
 
+    def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
+        blocks: dict[str, list[EditSpec]] = {
+            "source.convert (layer norm)": [
+                EditSpec("ReplaceSimplifiedLayerNorm"),
+                EditSpec("ReplaceSkipSimplifiedLayerNorm"),
+            ],
+            "source.convert (attention)": [
+                EditSpec("ReplaceGroupQueryAttention", (
+                    self._num_attention_heads, self._num_key_value_heads, self._head_dim,
+                )),
+            ],
+            "model.static": [
+                EditSpec("RemoveRedundantCasts"),
+                EditSpec("RemoveIsNaN"),
+            ],
+            "model.static (KV cache)": [
+                EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
+                EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+                EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
+                EditSpec("ConvertToStaticIndex"),
+            ],
+        }
+        patch = [
+            EditSpec("EliminateTranspose"),
+            EditSpec("CollapseReshapeChain"),
+            EditSpec("CollapseGQABroadcast"),
+            EditSpec("FoldScalarMatMul"),
+        ]
+        if self._broadcast_ops is not None:
+            patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
+        blocks["model.patch"] = patch
+        if self._extract_embeddings:
+            blocks["model.patch (embeddings)"] = [EditSpec(
+                "ExtractConstantLUT",
+                ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+            )]
+        return blocks
+
     def _make_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph: gs.Graph = gs.import_onnx(model)
         editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
@@ -476,8 +510,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         editor.fold_num_logits_to_keep(1)
 
         # Clean up common artifacts.
-        editor.remove_redundant_casts()
-        editor.remove_isNaN()
+        editor.apply_specs(self.graph_edit_blocks()["model.static"], self._harness)
 
         # Build a 1D `current_len` scalar from the existing seqlen_k tensors
         # that the GQA replacement created.  If absent (no attention layers),
@@ -519,12 +552,14 @@ class LiquidModelExporter(OnnxModelExporterBase):
             if name.endswith("/seqlen_k_squeezed") and hasattr(t, "outputs"):
                 rewire_consumers(list(t.outputs), t, cur_len_scalar)
 
-        (
-            editor
-            .replace_dynamic_kv_cache(cur_len, self._max_gen_tokens)
-            .mask_future_attn_scores(cur_len, self._max_gen_tokens)
-            .add_curr_len_input(cur_len)
-            .convert_to_static_index()
+        editor.apply_specs(
+            self.graph_edit_blocks()["model.static (KV cache)"],
+            self._harness,
+            {
+                "cur_len": cur_len,
+                "max_tokens": self._max_gen_tokens,
+                "export_dtype": self._onnx_export_dtype,
+            },
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=False)
@@ -1087,12 +1122,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         model = onnx.load(model_path)
         editor = LiquidOnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
 
-        editor.eliminate_transposes()
-        editor.collapse_reshape_chains()
-        editor.collapse_gqa_broadcast()
-        editor.fold_scalar_matmul()
-        if self._broadcast_ops is not None:
-            editor.broadcast_op_inputs(ops=self._broadcast_ops)
+        editor.apply_specs(self.graph_edit_blocks()["model.patch"], self._harness)
 
         if self._extract_embeddings:
             embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
@@ -1102,11 +1132,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
             for node in editor.graph.nodes:
                 if node.op == "Gather" and "axis" not in node.attrs:
                     node.attrs["axis"] = 0
-            editor.extract_token_embeddings(
-                self._hidden_size,
-                self._vocab_size,
-                embeddings_npy,
-                inp_name="token_embedding",
+            editor.apply_specs(
+                self.graph_edit_blocks()["model.patch (embeddings)"],
+                self._harness,
+                {"embeddings_path": embeddings_npy},
             )
             editor.reorder_graph_input("token_embedding", 0)
 
@@ -1461,6 +1490,10 @@ def export_liquid_from_args(args: argparse.Namespace):
         keep_conv1d=args.keep_conv1d,
         split_lm_head=args.split_lm_head,
     )
+    exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+    if args.view_graph_edits:
+        print(render_graph_edit_plan(exporter.describe_graph_edits()))
+        return
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)

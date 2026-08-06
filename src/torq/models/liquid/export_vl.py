@@ -41,6 +41,7 @@ from torq.utils.logging import configure_logging
 
 from .export import LiquidModelExporter, LIQUID_TORQ_FLAGS  # noqa: F401  (import triggers gs bf16 patch)
 from ._graph import LiquidOnnxGraphEditor
+from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase
 
 
@@ -344,16 +345,11 @@ class LiquidVLModelExporter(LiquidModelExporter):
                 inp.name = "token_embedding"
 
         editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
-        self._logger.info("Replacing SimplifiedLayerNormalization ops...")
-        editor.replace_simplified_layer_norm()
-        self._logger.info("Replacing SkipSimplifiedLayerNormalization ops...")
-        editor.replace_skip_simplified_layer_norm()
+        blocks = self.graph_edit_blocks()
+        self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
+        editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
         self._logger.info("Replacing GroupQueryAttention ops...")
-        editor.replace_group_query_attention(
-            num_heads=self._num_attention_heads,
-            kv_num_heads=self._num_key_value_heads,
-            head_dim=self._head_dim,
-        )
+        editor.apply_specs(blocks["source.convert (attention)"], self._harness)
         editor.graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
         ).toposort()
@@ -764,6 +760,10 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         vision_res=args.vision_res,
         image_decoder_parts=args.image_decoder_parts,
     )
+    exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+    if args.view_graph_edits:
+        print(render_graph_edit_plan(exporter.describe_graph_edits()))
+        return
     exporter.export_onnx(validate=not args.skip_validation)
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)

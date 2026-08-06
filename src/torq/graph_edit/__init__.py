@@ -8,11 +8,27 @@ from .onnx import (
     OnnxGraphEditor,
     rewire_consumers
 )
+from .harness import (
+    ContextRef,
+    ctx,
+    EditSpec,
+    GraphEditHarness,
+    edit_registry,
+    add_graph_edit_harness_args,
+    render_graph_edit_plan,
+)
 
 __all__ = [
     "OnnxGraphEdit",
     "DimMatchType",
     "FixedDimMapping",
     "OnnxGraphEditor",
-    "rewire_consumers"
+    "rewire_consumers",
+    "ContextRef",
+    "ctx",
+    "EditSpec",
+    "GraphEditHarness",
+    "edit_registry",
+    "add_graph_edit_harness_args",
+    "render_graph_edit_plan",
 ]
