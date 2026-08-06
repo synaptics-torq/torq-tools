@@ -288,10 +288,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
     # -------------------------------------------------------------------- load
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
-        # The token-embedding LUT is pulled out to a sibling .npy now so it can
-        # ride along with the decoder vmfb on the board.
-        self._extract_embed_lut()
-
         components: dict[str, onnx.ModelProto] = {DECODER: self._load_decoder()}
 
         vision_path = self._onnx_dir / f"{VISION}.onnx"
@@ -301,6 +297,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
         else:
             self._logger.warning("No vision_encoder.onnx found; skipping it")
         return components
+
+    def _embed_lut_path(self) -> Path:
+        """Path to the token-embedding LUT, extracting it on first use.
+
+        The LUT is a sibling artifact of the exported decoder, so it has to be
+        written *after* ``export_onnx`` resets the export dir rather than while
+        the exporter is being constructed.
+        """
+        out = self._export_dir / "token_embeddings.npy"
+        if not out.exists():
+            self._extract_embed_lut()
+        return out
 
     def _extract_embed_lut(self):
         """Dump the ``embed_tokens.onnx`` Gather weight to token_embeddings.npy."""
@@ -323,6 +331,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             return
         lut = onnx.numpy_helper.to_array(init)  # [vocab, hidden], fp32
         out = self._export_dir / "token_embeddings.npy"
+        out.parent.mkdir(parents=True, exist_ok=True)
         np.save(out, lut)
         self._logger.info("Extracted token embedding LUT %s -> '%s'", lut.shape, out)
 
@@ -453,7 +462,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             import shutil
             sim_path = sim_dir / Path(model_path).name
             shutil.copy2(model_path, sim_path)
-            emb_src = self._export_dir / "token_embeddings.npy"
+            emb_src = self._embed_lut_path()
             if emb_src.exists():
                 shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
             self._simulate_bf16_precision(sim_path)
@@ -509,7 +518,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             _convert_dtype(model_path, converted, "bf16", convert_io=not preserve_io)
             self._export_paths[comp] = converted
 
-        emb_src = self._export_dir / "token_embeddings.npy"
+        emb_src = self._embed_lut_path()
         if emb_src.exists():
             emb = np.load(emb_src).astype(ml_dtypes.bfloat16)
             np.save(self._convert_dir / "token_embeddings.npy", emb)
@@ -689,7 +698,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # token-embedding LUT (bf16 if converted, else fp32)
         lut = (self._convert_dir / "token_embeddings.npy")
         if not lut.exists():
-            lut = self._export_dir / "token_embeddings.npy"
+            lut = self._embed_lut_path()
         if lut.exists():
             shutil.copy2(lut, dest / "token_embeddings.npy")
 
