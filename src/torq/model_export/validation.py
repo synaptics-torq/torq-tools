@@ -45,20 +45,26 @@ def validate_decoder_only_onnx(
     repo_id: str | None = None,
     n_iters: int = 5,
     n_threads: int | None = None,
+    lm_head_path: str | os.PathLike | None = None,
 ):
     """Compare the exported model's output against the unedited source ONNX.
 
     The reference is always `dynamic_cls` on the source `model.onnx`; the model
     under test is static or dynamic depending on how it was exported.
+    `lm_head_path` chains a split LM head onto the model under test, whose own
+    first output is then hidden states rather than logits.
     """
     n_threads = n_threads or os.cpu_count()
     if static_models:
+        # Only exporters that can split the LM head accept `lm_head_path`.
+        lm_head_kwargs = {"lm_head_path": lm_head_path} if lm_head_path else {}
         runner = static_cls.from_onnx(
             model_path,
             max_gen_tokens,
             n_threads=n_threads,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            **lm_head_kwargs,
         )
     else:
         runner = dynamic_cls.from_onnx(

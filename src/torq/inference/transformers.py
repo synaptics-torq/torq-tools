@@ -299,12 +299,16 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
         combined_kv_io: bool = True,
         token_embeddings: np.ndarray | None = None,
         token_id_lut: np.ndarray | None = None,
+        lm_head: InferenceRunner | None = None,
+        hidden_states_name: str = "last_hidden_states",
         temperature: float = 0.0,
         top_p: float = 1.0,
     ):
         self._combined_kv_io = combined_kv_io
         self._token_embeddings = token_embeddings
         self._token_id_lut = token_id_lut
+        self._lm_head = lm_head
+        self._hidden_states_name = hidden_states_name
         super().__init__(
             model,
             config,
@@ -349,6 +353,10 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
             **self._kv_cache,
         })
         logits, *cache = self._model.infer(inputs)
+        if self._lm_head is not None:
+            # With a split LM head the first output is the hidden state, not
+            # logits; run it through the standalone head to get the logits.
+            logits = self._lm_head.infer({self._hidden_states_name: logits})[0]
         next_token = self.sample_next_token(logits[0, -1])
         if self._token_id_lut is not None:
             if next_token >= len(self._token_id_lut):

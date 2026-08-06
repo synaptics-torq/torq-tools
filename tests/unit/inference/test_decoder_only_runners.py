@@ -90,6 +90,22 @@ class _DemoDynamic(_DemoMixin, DynamicDecoderOnlyRunner):
         )
 
 
+class _FakeLMHead:
+    """Standalone split LM head: hidden states in, logits out."""
+
+    def __init__(self, token: int, vocab_size: int = 8):
+        self.model_path = Path("lm_head.onnx")
+        self.calls = []
+        self.token = token
+        self.vocab_size = vocab_size
+
+    def infer(self, inputs):
+        self.calls.append(inputs)
+        logits = np.zeros((1, 1, self.vocab_size), dtype=np.float32)
+        logits[0, 0, self.token] = 1.0
+        return [logits]
+
+
 class _DemoStatic(_DemoMixin, StaticDecoderOnlyRunner):
     def __init__(
         self,
@@ -98,6 +114,7 @@ class _DemoStatic(_DemoMixin, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         token_embeddings: np.ndarray | None = None,
         token_id_lut: np.ndarray | None = None,
+        lm_head: _FakeLMHead | None = None,
     ):
         StaticDecoderOnlyRunner.__init__(
             self,
@@ -110,6 +127,7 @@ class _DemoStatic(_DemoMixin, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             token_embeddings=token_embeddings,
             token_id_lut=token_id_lut,
+            lm_head=lm_head,
         )
 
 
@@ -160,6 +178,40 @@ def test_static_runner_uses_token_embeddings_and_token_lut():
     assert next_token == 42
     assert model.calls[0]["token_embedding"].shape == (1, 1, 3)
     assert np.array_equal(model.calls[0]["token_embedding"][0, 0], embeddings[2])
+
+
+def test_static_runner_chains_split_lm_head():
+    """With a split LM head the model's first output is hidden states."""
+    # Without the head, sampling the model output directly yields token 1.
+    unified = _DemoStatic(_FakeRunner(tokens=[1]))
+    assert unified._llm_step(2, 0)[0] == 1
+
+    model = _FakeRunner(tokens=[1])
+    lm_head = _FakeLMHead(token=6)
+    runner = _DemoStatic(model, lm_head=lm_head)
+
+    next_token, _ = runner._llm_step(2, 0)
+
+    # Sampled from the head's logits, not the model's hidden states.
+    assert next_token == 6
+    # The model's first output is forwarded to the head verbatim.
+    hidden_states = lm_head.calls[0]["last_hidden_states"]
+    assert hidden_states.shape == (1, 1, 4)
+    assert int(hidden_states[0, -1].argmax()) == 1
+
+
+def test_static_runner_split_lm_head_remaps_through_token_lut():
+    model = _FakeRunner(tokens=[1])
+    lm_head = _FakeLMHead(token=1)
+    runner = _DemoStatic(
+        model,
+        lm_head=lm_head,
+        token_id_lut=np.array([8, 42], dtype=np.int64),
+    )
+
+    next_token, _ = runner._llm_step(2, 0)
+
+    assert next_token == 42
 
 
 def test_gemma3_stop_rules_are_preserved():
