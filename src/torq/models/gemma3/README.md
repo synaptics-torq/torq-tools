@@ -12,7 +12,11 @@ The source is downloaded automatically from HuggingFace via Optimum on first run
 |---|---|
 | `270m` | `google/gemma-3-270m` |
 | `270m --instruct-model` | `google/gemma-3-270m-it` |
-| `1b`   | `google/gemma-3-1b` |
+| `1b`   | `google/gemma-3-1b-pt` |
+| `1b --instruct-model` | `google/gemma-3-1b-it` |
+
+> Upstream publishes the base 1B checkpoint as `-pt`, unlike 270M which has a
+> bare repo, so plain `-s 1b` resolves to `google/gemma-3-1b-pt`.
 
 Override the source with `--hf-repo <repo>` (optionally `--hf-repo-subdir`) to
 point at a pre-exported ONNX repo, or `--onnx-source-dir <dir>` to use a local

@@ -40,6 +40,9 @@ _GEMMA3_MODEL_FILENAMES: Final[tuple[tuple[str, ...], tuple[str, ...]]] = (
     ("model.onnx",),
 )
 
+# Sizes whose base (non-instruct) checkpoint is published with a `-pt` suffix.
+_GEMMA3_PRETRAINED_SUFFIX_SIZES: Final[frozenset[str]] = frozenset({"1b"})
+
 
 class Gemma3ModelExporter(OnnxModelExporterBase):
 
@@ -81,6 +84,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._hf_repo = f"google/gemma-3-{model_size}"
             if self._instruct_model:
                 self._hf_repo += "-it"
+            elif model_size in _GEMMA3_PRETRAINED_SUFFIX_SIZES:
+                # Upstream publishes the base 1B checkpoint as `-pt`; 270m has a
+                # bare repo, so the suffix cannot be applied unconditionally.
+                self._hf_repo += "-pt"
         self._source_asset_dirs = [
             path
             for path in (
