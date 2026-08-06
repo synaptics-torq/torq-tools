@@ -18,6 +18,7 @@ from ._graph import SmolLM2OnnxGraphEditor
 from ._inference import SmolLM2Dynamic, SmolLM2Static
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx
 
 from ...utils.logging import (
@@ -234,71 +235,17 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._patch_static_model(model_path)
 
     def validate_onnx(self, n_iters: int = 5):
-        # simple dataset to test functional equivalence
-        prompts = [
-            # very short (position_ids = 0 edge case)
-            "Hello",
-
-            # normal medium-length prompt
-            "The quick brown fox jumps over the lazy dog.",
-
-            # repetitive tokens (attention accumulation / stability)
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-
-            # non-ASCII / multi-token UTF-8
-            "こんにちは世界",
-
-            # structured / punctuation-heavy (tokenizer edge cases)
-            "def foo(x): return x * 2 # simple test"
-        ]
-        n_threads: int = os.cpu_count()
-
-        if self._static_models:
-            runner = SmolLM2Static.from_onnx(
-                self._export_paths["model"],
-                self._max_gen_tokens,
-                n_threads=n_threads,
-                instruct_model=self._instruct_model,
-                repo_id=self._hf_repo
-            )
-        else:
-            runner = SmolLM2Dynamic.from_onnx(
-                self._export_paths["model"],
-                n_threads=n_threads,
-                instruct_model=self._instruct_model,
-                repo_id=self._hf_repo
-            )
-        val_runner = SmolLM2Dynamic.from_onnx(
-            self._onnx_dir /  "model.onnx",
-            n_threads=n_threads,
+        validate_decoder_only_onnx(
+            self._logger,
+            SmolLM2Static,
+            SmolLM2Dynamic,
+            self._export_paths["model"],
+            self._onnx_dir / "model.onnx",
+            static_models=self._static_models,
+            max_gen_tokens=self._max_gen_tokens,
             instruct_model=self._instruct_model,
-            repo_id=self._hf_repo
-        )
-
-        for i in range(n_iters):
-            if i >= len(prompts):
-                self._logger.warning("(ONNX-validation) No more samples to validate, stopping")
-                break
-        
-            input = prompts[i]
-            output = runner.run(input)
-            val_output = val_runner.run(input)
-            min_len = min(len(output), len(val_output))
-            if output[:min_len] != val_output[:min_len]:
-                result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_output},\nGenerated:\n{output}"
-            else:
-                result = f"Validation successful, identical outputs"
-                if len(output) != len(val_output):
-                    result += f" (output lengths differ: {len(output)} vs {len(val_output)})"
-            self._logger.info(
-                "(ONNX-validation) [iter %d, %.3f ms]: %s",
-                i,
-                runner.last_infer_time / 1e6,
-                result
-            )
-        self._logger.info(
-            "(ONNX-validation) Avg. inference time: %.3f ms",
-            runner.avg_infer_time / 1e6
+            repo_id=self._hf_repo,
+            n_iters=n_iters,
         )
 
     def convert_models(

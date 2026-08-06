@@ -89,6 +89,8 @@ The existing model directories use this layout:
 - `_inference.py`: runtime wrappers used for validation and demos.
 - `infer.py` or `validate.py`: user-facing inference and validation entry points.
 
+For decoder-only models, implement `validate_onnx()` by calling `validate_decoder_only_onnx()` from `src/torq/model_export/validation.py` with the model's static and dynamic runner classes, rather than writing the prompt loop by hand. It compares the export against the unedited source ONNX and keeps the prompt set and pass/fail reporting consistent across models.
+
 Exporter tests should be fast and deterministic by default. Prefer local synthetic data or mocked downloads for path naming, config handling, asset copying, graph patch decisions, and validation helpers. Full Hugging Face downloads, full ONNX export, and Torq compiler runs are useful manual checks, but they are usually too heavy for normal tests.
 
 For pipeline-level changes, please run a manual end-to-end export when the dependencies are available and record the exact command and result in the PR notes or patch summary. Common checks include:
