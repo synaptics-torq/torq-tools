@@ -106,6 +106,33 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
         type=str,
         help="Moonshine Streaming model's HuggingFace repo ID (default: UsefulSensors/moonshine-streaming-{model_size})",
     )
+    parser.add_argument(
+        "--quantize",
+        type=str,
+        choices=["int8"],
+        default=None,
+        help="Weight-only quantize MatMul weights to the given precision, emitting the "
+             "DequantizeLinear(axis=0, block_size) -> MatMul decomposition (reuses "
+             "WeightQuantizer). Replaces the plain --convert-dtypes bf16 step (the "
+             "quantizer converts everything else to bf16/int32 itself).",
+    )
+    parser.add_argument(
+        "--quant-block-size",
+        type=int,
+        default=32,
+        metavar="N",
+        help="Block size for weight quantization (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--quant-skip-layers",
+        type=str,
+        nargs="*",
+        default=None,
+        metavar="SUBSTR",
+        help="Node-name substrings whose MatMul weights are left unquantized "
+             "(e.g. 'proj_out' to keep the output projection high-precision). "
+             "Repeat/space-separate to skip multiple; omit to quantize all MatMuls.",
+    )
     add_logging_args(parser)
     add_torq_args(parser)
 

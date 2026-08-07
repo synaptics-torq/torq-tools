@@ -415,6 +415,9 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
+        quantize: str | None = None,
+        quant_block_size: int = 32,
+        quant_skip_layers: list[str] | None = None,
         skip_export: list[str] | None = None,
         **edit_args,
     ):
@@ -422,6 +425,9 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         self._extract_embeddings = extract_embeddings
         self._export_attention = export_attention
         self._onnx_source_dir = onnx_source_dir
+        self._quantize = quantize
+        self._quant_block_size = quant_block_size
+        self._quant_skip_layers = quant_skip_layers or []
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-streaming-{self._model_size}"
         self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._num_samples = max_audio_s * 16_000
@@ -710,6 +716,25 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return self.check_model(new_model)
 
+    def check_model(self, model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
+        """Best-effort variant of the base check. ONNX's C++ shape inference /
+        checker have no type constraints for several bf16 ops (`Conv`, `Cos`,
+        bf16-`B` `MatMul`, ...), so `infer_shapes(check_type=True)` /
+        `check_model(full_check=True)` raise on the bf16 models produced by
+        `quantize_models()` (or `--convert-dtypes`) even though the graph is
+        valid for torq-compile -- this is hit from `export_torq()`. Fall back
+        to the un-inferred model instead of aborting the export; on the fp32
+        static graph this still runs the full base check normally.
+        """
+        try:
+            return super().check_model(model, skip_data_prop=skip_data_prop)
+        except Exception as e:
+            self._logger.warning(
+                "check_model shape inference/validation failed (%s); "
+                "proceeding without inferred shapes", e,
+            )
+            return model
+
     def make_static(self):
         F = self._feature_stride
         assert F is not None, "feature_stride is None — _load_onnx must run first"
@@ -809,6 +834,103 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             if src.exists():
                 shutil.copy2(src, self._convert_dir / fname)
 
+    def quantize_models(self, quant_dir: str | os.PathLike | None = None):
+        """Weight-only int8-quantize each exported static component, emitting the
+        ``DequantizeLinear(axis=0, block_size) -> MatMul`` decomposition -- the
+        same graph pattern gemma4's ``DecomposeMatMulNBits`` produces, but built
+        from plain fp32 ``MatMul`` weights (moonshine_streaming has no
+        pre-quantized ``MatMulNBits`` nodes to decompose).
+
+        Reuses the shared ``WeightQuantizer``
+        (``torq.tools.quantization.weight_quantization``), which already
+        implements ORT-matching asymmetric int8 block quantization + the DQL
+        rewrite, then converts every remaining fp32 tensor and the model I/O to
+        bf16/int32. That last step means a quantized export does **not** also
+        need ``--convert-dtypes`` -- ``quantize_models`` is used *instead of*
+        ``convert_models``, writing into the same convert dir so ``export_torq``
+        picks the quantized models up unchanged.
+
+        The resulting bf16 model takes bf16 ``position_embeddings``/
+        ``inputs_embeds``, so the host-side embedding LUT sidecars are converted
+        to bf16 to match (mirrors ``convert_models``' ``external_data`` handling).
+        """
+        from ...tools.quantization.weight_quantization.quantize import WeightQuantizer
+
+        if self._quantize != "int8":
+            raise ValueError(f"Unsupported --quantize value '{self._quantize}'; expected 'int8'")
+
+        logger = self._logger
+        block_size = self._quant_block_size
+
+        class _Quantizer(WeightQuantizer):
+            # Quantize both ``MatMul`` and (``transB=0``) ``Gemm`` weights --
+            # the streaming encoder/decoder FFNs are ORT ``MatMulAddFusion``
+            # Gemms, and ``WeightQuantizer`` only matches ``MatMul`` by default.
+            # A ``transB=0`` Gemm is ``Y = A@B + C`` with ``B`` laid out ``[K,N]``
+            # exactly like a MatMul weight, so the same axis-0 block DQL applies
+            # (its DQL output just feeds the Gemm instead of a MatMul); transposed
+            # Gemms are left alone since axis-0 blocking would be wrong.
+            #
+            # Divisibility skip: torq-compile's blocked ``DequantizeLinear`` only
+            # legalizes full blocks, so any weight whose K (``dims[0]``) isn't a
+            # multiple of block_size is left bf16. For this model that's the
+            # encoder frontend input projection (``embedder.linear``, K=80),
+            # which is also the only accuracy-sensitive weight (see README
+            # 'Quantization').
+            def _find_matmul_weights(self, model):
+                from onnx import TensorProto, helper
+                init_map = {i.name: i for i in model.graph.initializer}
+                kept = []
+                for node in model.graph.node:
+                    if node.op_type == "Gemm":
+                        attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+                        if attrs.get("transA", 0) or attrs.get("transB", 0):
+                            continue
+                    elif node.op_type != "MatMul":
+                        continue
+                    if self._should_skip(node.name):
+                        continue
+                    for inp in node.input:
+                        t = init_map.get(inp)
+                        if t is not None and len(t.dims) == 2 and t.data_type == TensorProto.FLOAT:
+                            if t.dims[0] % block_size != 0:
+                                logger.warning(
+                                    "(quantize) skipping '%s' (K=%d not divisible by "
+                                    "block_size=%d): keeping bf16", node.name, t.dims[0], block_size,
+                                )
+                                break
+                            kept.append((node, inp, t))
+                            break
+                return kept
+
+        self._convert_dir = Path(quant_dir or self._convert_dir)
+        if self._convert_dir.exists():
+            shutil.rmtree(self._convert_dir, ignore_errors=True)
+        self._convert_dir.mkdir(parents=True, exist_ok=True)
+
+        for comp, model_path in list(self._export_paths.items()):
+            out_path = self._convert_dir / model_path.name
+            self._logger.info(
+                "(quantize) '%s': int8 weight-quantizing (block_size=%d, skip_layers=%s)...",
+                comp, self._quant_block_size, self._quant_skip_layers,
+            )
+            _Quantizer(
+                model_path, out_path, skip_layers=self._quant_skip_layers,
+            ).quantize_uniform(bits=8, block_size=self._quant_block_size)
+            self._export_paths[comp] = out_path
+            self._logger.info("(quantize) '%s' -> '%s'", comp, str(out_path))
+
+        # Quantized model has bf16 I/O -> the host-side embedding LUTs must be
+        # bf16 too; metadata sidecars are copied verbatim.
+        for fname in self.EMBEDDING_SIDECARS:
+            src = self._export_dir / fname
+            if src.exists():
+                np.save(self._convert_dir / fname, np.load(src).astype(ml_dtypes.bfloat16))
+        for fname in self.METADATA_SIDECARS:
+            src = self._export_dir / fname
+            if src.exists():
+                shutil.copy2(src, self._convert_dir / fname)
+
     def validate_onnx(self, n_iters: int = 5):
         self._logger.info("Validating exported streaming ONNX models...")
         runner = MoonshineStreaming.from_onnx(
@@ -873,11 +995,23 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
+        quantize=args.quantize,
+        quant_block_size=args.quant_block_size,
+        quant_skip_layers=args.quant_skip_layers,
         skip_export=args.skip_export,
         broadcast_ops=args.broadcast_ops,
     )
     exporter.export_onnx(validate=not args.skip_validation)
-    if args.convert_dtypes:
+    # --quantize produces int8 weights + bf16/int32 for everything else in one
+    # pass, so it stands in for the plain --convert-dtypes bf16 conversion.
+    if args.quantize:
+        if args.convert_dtypes:
+            exporter._logger.warning(
+                "--quantize supersedes --convert-dtypes (the quantizer converts "
+                "non-weight tensors to bf16/int32 itself); skipping convert_models()"
+            )
+        exporter.quantize_models()
+    elif args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if args.skip_torq is None or "all" not in args.skip_torq:
         exporter.export_torq(

@@ -572,11 +572,27 @@ class OnnxDtypeConverterBase(ABC):
         all_tensors += conv_info[0]
         not_converted += conv_info[1]
 
-        new_model = onnx.shape_inference.infer_shapes(
-            gs.export_onnx(root), check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
-        )
+        new_model = gs.export_onnx(root)
+        try:
+            new_model = onnx.shape_inference.infer_shapes(
+                new_model, check_type=True, strict_mode=True, data_prop=len(subgraphs) == 0
+            )
+            onnx.checker.check_model(new_model, full_check=True)
+        except Exception as e:
+            # ONNX's C++ shape inference / checker reject some dtypes it has no
+            # type constraints for -- notably bf16 `Conv`/`MatMul` (e.g. the
+            # moonshine-streaming encoder frontend convs). Shape inference here
+            # is advisory (the dtype conversion itself is already done above by
+            # `_convert_graph`), so fall back to the converted graph without
+            # inferred value_info rather than failing the whole conversion.
+            # Mirrors the best-effort handling of the pre-conversion
+            # `infer_shapes` above.
+            logger.warning(
+                "Post-conversion shape inference/check failed (%s); returning the "
+                "converted model without inferred shapes", e,
+            )
+            new_model = gs.export_onnx(root)
         new_model.ir_version = input_model.ir_version
-        onnx.checker.check_model(new_model, full_check=True)
 
         all_tensors = set(all_tensors)
         not_converted = set(not_converted)

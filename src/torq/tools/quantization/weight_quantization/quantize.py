@@ -535,6 +535,17 @@ class WeightQuantizer:
         Must be called **before** int64→int32 conversion (INT64_MAX truncated
         to int32 produces garbage values).
 
+        Each Slice node that needs fixing gets rewired to its own resolved
+        ``ends`` initializer (looked up/created via a value->name cache) rather
+        than mutating the existing one in place. ``ends=[INT64_MAX]`` constants
+        are commonly deduplicated into a single shared initializer across many
+        Slice nodes with different axis lengths (e.g. one streaming model had
+        20 Slice nodes sharing one such constant); mutating that initializer
+        in place for one node's axis length silently corrupts every other
+        node sharing it, since only the first node processed ever observes
+        the un-mutated ``INT64_MAX`` value -- every later node just inherits
+        whatever the first one resolved to, regardless of its own axis length.
+
         Returns the number of Slice nodes fixed.
         """
         from onnx import shape_inference
@@ -556,6 +567,11 @@ class WeightQuantizer:
                 ]
 
         init_map = {i.name: idx for idx, i in enumerate(model.graph.initializer)}
+        existing_names = set(init_map)
+        new_initializers: list[TensorProto] = []
+        # resolved ends values -> initializer name, so nodes that legitimately
+        # need the same concrete ends share one new initializer.
+        resolved_cache: dict[tuple[int, ...], str] = {}
 
         fixed = 0
         for node in model.graph.node:
@@ -588,10 +604,26 @@ class WeightQuantizer:
                         new_ends[i] = shape[axis_val]
                         needs_fix = True
 
-            if needs_fix:
-                new_tensor = numpy_helper.from_array(new_ends, name=ends_name)
-                model.graph.initializer[init_map[ends_name]].CopyFrom(new_tensor)
-                fixed += 1
+            if not needs_fix:
+                continue
+
+            key = tuple(int(v) for v in new_ends)
+            new_name = resolved_cache.get(key)
+            if new_name is None:
+                base_name = f"{ends_name}_resolved"
+                new_name = base_name
+                suffix = 1
+                while new_name in existing_names:
+                    new_name = f"{base_name}_{suffix}"
+                    suffix += 1
+                existing_names.add(new_name)
+                resolved_cache[key] = new_name
+                new_initializers.append(numpy_helper.from_array(new_ends, name=new_name))
+
+            node.input[2] = new_name
+            fixed += 1
+
+        model.graph.initializer.extend(new_initializers)
 
         if fixed:
             logger.info(
