@@ -43,11 +43,11 @@ models/liquid-2p5-350m/source/onnx/fp32/
 Download it there with the helper script:
 
 ```sh
-source /home/kshanmug/torq/.venv-torq-tools/bin/activate
-cd /home/kshanmug/torq/torq-tools-dev
+source .venv/bin/activate
+cd torq-tools-dev
 
 python src/torq/models/liquid/download_source.py \
-  --models-dir /home/kshanmug/torq/torq-tools-dev/models
+  --models-dir models
 ```
 
 (`download_source.py` is self-contained — no compiler-toolchain imports — and
@@ -85,11 +85,11 @@ host-side script; they now live as static methods on
   `SimplifiedLayerNormalization`
 
 ```sh
-source /home/kshanmug/torq/.venv-torq-tools/bin/activate
-cd /home/kshanmug/torq/torq-tools-dev
+source .venv/bin/activate
+cd torq-tools-dev
 
 torq-export-model liquid \
-  --models-dir /home/kshanmug/torq/torq-tools-dev/models \
+  --models-dir models \
   --instruct-model \
   --convert-dtypes \
   --extract-embeddings
@@ -160,7 +160,7 @@ To compile a standalone ONNX/MLIR later (e.g. a diagnostic variant), use the
 same driver directly (the output directory is created automatically):
 
 ```sh
-export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
+export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 python -m torq.utils.compile \
   models/export/onnx/bf16/static/model.onnx \
   -o models/export/iree/bf16/static/model.vmfb \

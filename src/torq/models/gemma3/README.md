@@ -43,7 +43,7 @@ HuggingFace (google/gemma-3-*)
 
 ```sh
 cd torq-tools-dev
-source .venv/bin/activate    # or: source /home/kshanmug/torq/.venv-torq-tools/bin/activate
+source .venv/bin/activate
 
 torq-export-model gemma3 \
     --instruct-model \
@@ -58,7 +58,7 @@ If the Torq compiler Python API isn't installed in the venv, point the fallback
 at the binary first:
 
 ```sh
-export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
+export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 ```
 
 ## Key export flags

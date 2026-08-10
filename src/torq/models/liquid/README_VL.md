@@ -58,9 +58,9 @@ LFM2.5 chip rewrites, converts to bf16, and compiles the decoder to a vmfb —
 all in one command:
 
 ```sh
-source /home/kshanmug/torq/.venv-torq-tools/bin/activate
-cd /home/kshanmug/torq/torq-tools-dev
-export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
+source .venv/bin/activate
+cd torq-tools-dev
+export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 
 torq-export-model liquid-vl \
   --models-dir models/liquid-2p5-450M-VL \
@@ -144,13 +144,13 @@ The `iree/bf16/static/` dir is self-contained for the LiquidStatic runner
 (vmfb + LUT + config + tokenizer all staged):
 
 ```sh
-M=/home/kshanmug/torq/torq-tools-dev/models/liquid-2p5-450M-VL/export/iree/bf16/static
+M=models/liquid-2p5-450M-VL/export/iree/bf16/static
 scp \
   $M/decoder_model_merged.vmfb \
   $M/token_embeddings.npy \
   $M/config.json \
   $M/tokenizer.json \
-  root@10.3.10.55:/home/root/torq-examples/models/Synaptics/LFM2-VL-450M-torq/
+  <board-user>@<board-host>:/path/to/torq-examples/models/Synaptics/LFM2-VL-450M-torq/
 ```
 
 Then run the text decoder on the board with the LFM2.5 runner, pointing `-m`
