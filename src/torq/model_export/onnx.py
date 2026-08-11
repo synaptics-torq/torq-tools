@@ -177,6 +177,16 @@ class OnnxModelExporterBase(ABC):
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
 
+    def _allows_dynamic_shapes(self, component: str) -> bool:
+        """Whether ``component`` is *intentionally* exported with dynamic shapes.
+
+        A static export normally hard-fails on any leftover dynamic dim, but a
+        multi-component model can legitimately ship a dynamic component that is
+        never chip-compiled (e.g. an ORT/host-side subgraph). Override to exempt
+        those from the static-shape verification.
+        """
+        return False
+
     def _export_path_for_component(self, component: str) -> Path:
         return self._export_dir / f"{component}.onnx"
 
@@ -246,7 +256,12 @@ class OnnxModelExporterBase(ABC):
                 self._logger.info("(%s) Applying post-static conversion patches...", comp)
                 self.apply_post_static_patches(self._export_paths[comp], comp)
             self.check_model(onnx.load(self._export_paths[comp]))
-            if self._static_models:
+            if self._static_models and self._allows_dynamic_shapes(comp):
+                self._logger.info(
+                    "(%s) Skipping static-shape verification (component is "
+                    "exported dynamic by design)", comp
+                )
+            elif self._static_models:
                 self._logger.info("(%s) Verifying static shapes...", comp)
                 dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
                 if dynamic_shapes:
