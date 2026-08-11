@@ -451,13 +451,20 @@ class LiquidVLModelExporter(LiquidModelExporter):
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
 
-        It is exported for host/ORT use only (``Resize``/``ScatterND`` over a
-        dynamic patch count is not chip-compilable), so a static export must not
-        fail on it. ``--vision-res {128,256}`` builds the static, compilable
-        single-resolution encoder as a separate ``vision_encoder_<res>``
-        component (see :meth:`_make_static_vision`).
+        It is exported for the host (`Resize`/`ScatterND` over a dynamic patch
+        count is not chip-compilable) and ``export_torq`` skips it, so a static
+        export must not fail on it. It is not merely tolerated: it is the source
+        ``--vision-res`` builds the static encoder *from*, and the ORT reference
+        that build is validated against — see :meth:`_make_static_vision`. A
+        static graph must commit to one resolution, so the compilable encoder is
+        a separate ``vision_encoder_<res>`` component, which *is* verified (by
+        :meth:`_verify_static_build`).
+
+        The exemption is dropped under ``--compile-vision``: that asks for this
+        graph to be compiled as-is, and anything heading for the chip has to
+        satisfy the static-shape check.
         """
-        return component == VISION
+        return component == VISION and not self._compile_vision
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         if component != DECODER:
