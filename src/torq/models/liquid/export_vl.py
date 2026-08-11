@@ -38,6 +38,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import ml_dtypes
 from torq.utils.logging import configure_logging
+from torq.utils.onnx import check_dynamic_shapes
 
 from .export import LiquidModelExporter, LIQUID_TORQ_FLAGS  # noqa: F401  (import triggers gs bf16 patch)
 from ._graph import LiquidOnnxGraphEditor
@@ -629,32 +630,44 @@ class LiquidVLModelExporter(LiquidModelExporter):
         ``convert_models``, i.e. after ``export_onnx``'s static-shape
         verification loop has already run, so they need checking here.
 
-        Deliberately narrower than :func:`check_dynamic_shapes`: the builder's
-        final graphsurgeon round-trip (LN decomposition, matmul splitting) leaves
-        freshly created intermediates without ``value_info``, and a missing shape
-        is not a dynamic one. So this flags what actually breaks the compile —
-        a non-concrete graph input/output dim, or a symbolic (``dim_param``) dim
-        anywhere in the graph.
+        The builders rebuild their graph with graphsurgeon as a last step, which
+        leaves the new intermediates with no ``value_info`` — ~1500 tensors on the
+        vision encoder, ~1900 on an image part. Those are *unannotated*, not
+        dynamic, and none of them carries a symbolic dim; shape inference
+        resolves every one (measured: 1501 -> 0). So annotate first and then
+        apply the same :func:`check_dynamic_shapes` the decoder is held to,
+        rather than a looser component-specific check.
         """
         model = onnx.load(model_path)
+        annotated = True
         try:
             model = onnx.shape_inference.infer_shapes(model, strict_mode=False)
         except Exception as e:
-            self._logger.warning("(%s) shape inference on the static build: %s",
-                                 component, e)
+            # Inference bails on models near the 2 GB protobuf limit. The strict
+            # check would then report every unannotated intermediate as dynamic,
+            # so fall back to what is always declared: the graph boundary.
+            annotated = False
+            self._logger.warning(
+                "(%s) shape inference failed (%s); verifying the graph boundary only",
+                component, e,
+            )
 
         def _dims(vi):
             return list(vi.type.tensor_type.shape.dim)
 
-        offenders: dict[str, list[str]] = {}
-        for vi in list(model.graph.input) + list(model.graph.output):
-            if any(not d.HasField("dim_value") or d.dim_value <= 0 for d in _dims(vi)):
-                offenders[vi.name] = [
-                    d.dim_param or str(d.dim_value) or "?" for d in _dims(vi)
-                ]
-        for vi in model.graph.value_info:
-            if any(d.dim_param for d in _dims(vi)):
-                offenders[vi.name] = [d.dim_param or str(d.dim_value) for d in _dims(vi)]
+        if annotated:
+            offenders = check_dynamic_shapes(model)
+        else:
+            offenders = {
+                vi.name: [d.dim_param or d.dim_value for d in _dims(vi)]
+                for vi in list(model.graph.input) + list(model.graph.output)
+                if any(not d.HasField("dim_value") or d.dim_value <= 0 for d in _dims(vi))
+            }
+            offenders.update({
+                vi.name: [d.dim_param or d.dim_value for d in _dims(vi)]
+                for vi in model.graph.value_info
+                if any(d.dim_param for d in _dims(vi))
+            })
         if offenders:
             raise ValueError(
                 f"Component '{component}' ('{Path(model_path).name}') is not "
