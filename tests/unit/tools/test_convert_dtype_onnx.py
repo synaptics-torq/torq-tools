@@ -485,6 +485,31 @@ def test_int64_conversion_default_preserves_slice_index_initializers_without_cas
     assert {init.data_type for init in converted.graph.initializer} == {TensorProto.INT64}
 
 
+def test_int64_conversion_preserves_split_sizes_initializer():
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [6])
+    first = helper.make_tensor_value_info("first", TensorProto.FLOAT, [4])
+    second = helper.make_tensor_value_info("second", TensorProto.FLOAT, [2])
+    initializers = [helper.make_tensor("split_sizes", TensorProto.INT64, [2], [4, 2])]
+    split_node = helper.make_node(
+        "Split",
+        ["data", "split_sizes"],
+        ["first", "second"],
+        name="split",
+        axis=0,
+    )
+    model = _make_model(
+        [split_node], "split_graph", [data], [first, second], initializers
+    )
+
+    converted = Int64Converter("int32", convert_io=True).convert_model(model)
+
+    split_node = _node_by_name(converted, "split")
+
+    assert not any(node.op_type == "Cast" for node in converted.graph.node)
+    assert list(split_node.input) == ["data", "split_sizes"]
+    assert {init.data_type for init in converted.graph.initializer} == {TensorProto.INT64}
+
+
 def test_int64_conversion_default_keeps_shape_output_int64_without_casts():
     data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [6])
     shape_source = helper.make_tensor_value_info("shape_source", TensorProto.FLOAT, [2, 3])

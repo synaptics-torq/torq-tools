@@ -83,13 +83,13 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         "--trim-vocab",
         action="store_true",
         default=False,
-        help="Trim static export vocab to selected token groups plus required safety tokens"
+        help="Trim static export vocab to selected token groups plus required safety tokens (static exports only)"
     )
     parser.add_argument(
         "--split-lm-head",
         action="store_true",
         default=False,
-        help="Split the final LM head into lm_head.onnx and export hidden states from model.onnx"
+        help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states"
     )
     parser.add_argument(
         "--trim-vocab-groups",

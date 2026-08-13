@@ -782,6 +782,7 @@ class Int64Converter(OnnxDtypeConverterBase):
         "Shape": ((), (0,)),        # v25: outputs: (shape, )
         "Slice": ((1, 2, 3, 4),),   # v13: inputs: (starts, ends, axes, steps)
         "Size": ((), (0,)),         # v25: outputs: (size, )
+        "Split": ((1,),),           # v18: inputs: (split, )
         "Squeeze": ((1,),),         # v25: inputs: (axes, )
         "Tile": ((1,),),            # v13: inputs: (repeats, )
         "TopK": ((1,), (1,)),       # v24: inputs: (K, ), outputs: (I, )

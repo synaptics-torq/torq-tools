@@ -43,11 +43,11 @@ models/liquid-2p5-350m/source/onnx/fp32/
 Download it there with the helper script:
 
 ```sh
-source /home/kshanmug/torq/.venv-torq-tools/bin/activate
-cd /home/kshanmug/torq/torq-tools-dev
+source .venv/bin/activate
+cd torq-tools-dev
 
 python src/torq/models/liquid/download_source.py \
-  --models-dir /home/kshanmug/torq/torq-tools-dev/models
+  --models-dir models
 ```
 
 (`download_source.py` is self-contained — no compiler-toolchain imports — and
@@ -85,11 +85,11 @@ host-side script; they now live as static methods on
   `SimplifiedLayerNormalization`
 
 ```sh
-source /home/kshanmug/torq/.venv-torq-tools/bin/activate
-cd /home/kshanmug/torq/torq-tools-dev
+source .venv/bin/activate
+cd torq-tools-dev
 
 torq-export-model liquid \
-  --models-dir /home/kshanmug/torq/torq-tools-dev/models \
+  --models-dir models \
   --instruct-model \
   --convert-dtypes \
   --extract-embeddings
@@ -108,7 +108,7 @@ Flag breakdown:
 | `--models-dir` | base dir; the exporter reads from `<dir>/liquid-2p5-<size>/source/` and writes to `<dir>/liquid-2p5-<size>/export/` |
 | `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
 | `--instruct-model` | use the instruction-tuned variant (this is what enables ChatML at inference) |
-| `--convert-dtypes` | emit bf16 alongside fp32 (driven by the `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py`) |
+| `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
 | `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
 | `--compile-flags …` | extra flags forwarded to `torq-compile` (must be last). The liquid export already adds `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`. |
@@ -119,6 +119,9 @@ Two opt-out flags for the chip-specific rewrites:
 |---|---|
 | `--keep-conv1d` | leave the original depthwise Conv1D in place (useful for CPU/ORT targets) |
 | `--split-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
+
+> [!Note]
+> `--split-lm-head` here is **not** the gemma3 flag of the same name. This one chunks the lm_head MatMul *within* the single exported model; gemma3's extracts the lm_head into a separate `lm_head.onnx` file. Neither affects the other's export.
 
 Output on disk after a successful run:
 
@@ -138,11 +141,8 @@ models/liquid-2p5-350m/
         └── tokenizer.json
 ```
 
-> Note: the fp32 export is the right artifact to validate end-to-end through
-> onnxruntime ("What is the capital of France?" → "The capital of France is
-> Paris."). bf16 cannot be validated through ORT because the CPU MatMul
-> kernel has no bf16 path; compare bf16 against fp32 via the host casting
-> tools if you need a quality check.
+> [!Note]
+> The fp32 export is the right artifact to validate end-to-end through onnxruntime ("What is the capital of France?" → "The capital of France is Paris."). bf16 cannot be validated through ORT because the CPU MatMul kernel has no bf16 path; compare bf16 against fp32 via the host casting tools if you need a quality check.
 
 ---
 
@@ -160,7 +160,7 @@ To compile a standalone ONNX/MLIR later (e.g. a diagnostic variant), use the
 same driver directly (the output directory is created automatically):
 
 ```sh
-export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
+export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 python -m torq.utils.compile \
   models/export/onnx/bf16/static/model.onnx \
   -o models/export/iree/bf16/static/model.vmfb \

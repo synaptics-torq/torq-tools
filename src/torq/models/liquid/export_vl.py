@@ -38,6 +38,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import ml_dtypes
 from torq.utils.logging import configure_logging
+from torq.utils.onnx import check_dynamic_shapes
 
 from .export import LiquidModelExporter, LIQUID_TORQ_FLAGS  # noqa: F401  (import triggers gs bf16 patch)
 from ._graph import LiquidOnnxGraphEditor
@@ -288,10 +289,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
     # -------------------------------------------------------------------- load
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
-        # The token-embedding LUT is pulled out to a sibling .npy now so it can
-        # ride along with the decoder vmfb on the board.
-        self._extract_embed_lut()
-
         components: dict[str, onnx.ModelProto] = {DECODER: self._load_decoder()}
 
         vision_path = self._onnx_dir / f"{VISION}.onnx"
@@ -301,6 +298,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
         else:
             self._logger.warning("No vision_encoder.onnx found; skipping it")
         return components
+
+    def _embed_lut_path(self) -> Path:
+        """Path to the token-embedding LUT, extracting it on first use.
+
+        The LUT is a sibling artifact of the exported decoder, so it has to be
+        written *after* ``export_onnx`` resets the export dir rather than while
+        the exporter is being constructed.
+        """
+        out = self._export_dir / "token_embeddings.npy"
+        if not out.exists():
+            self._extract_embed_lut()
+        return out
 
     def _extract_embed_lut(self):
         """Dump the ``embed_tokens.onnx`` Gather weight to token_embeddings.npy."""
@@ -323,6 +332,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             return
         lut = onnx.numpy_helper.to_array(init)  # [vocab, hidden], fp32
         out = self._export_dir / "token_embeddings.npy"
+        out.parent.mkdir(parents=True, exist_ok=True)
         np.save(out, lut)
         self._logger.info("Extracted token embedding LUT %s -> '%s'", lut.shape, out)
 
@@ -439,6 +449,24 @@ class LiquidVLModelExporter(LiquidModelExporter):
             self._dynamic_decoder = copy.deepcopy(self._components[DECODER])
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
 
+    def _allows_dynamic_shapes(self, component: str) -> bool:
+        """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
+
+        It is exported for the host (`Resize`/`ScatterND` over a dynamic patch
+        count is not chip-compilable) and ``export_torq`` skips it, so a static
+        export must not fail on it. It is not merely tolerated: it is the source
+        ``--vision-res`` builds the static encoder *from*, and the ORT reference
+        that build is validated against — see :meth:`_make_static_vision`. A
+        static graph must commit to one resolution, so the compilable encoder is
+        a separate ``vision_encoder_<res>`` component, which *is* verified (by
+        :meth:`_verify_static_build`).
+
+        The exemption is dropped under ``--compile-vision``: that asks for this
+        graph to be compiled as-is, and anything heading for the chip has to
+        satisfy the static-shape check.
+        """
+        return component == VISION and not self._compile_vision
+
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         if component != DECODER:
             return
@@ -453,7 +481,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             import shutil
             sim_path = sim_dir / Path(model_path).name
             shutil.copy2(model_path, sim_path)
-            emb_src = self._export_dir / "token_embeddings.npy"
+            emb_src = self._embed_lut_path()
             if emb_src.exists():
                 shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
             self._simulate_bf16_precision(sim_path)
@@ -509,7 +537,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             _convert_dtype(model_path, converted, "bf16", convert_io=not preserve_io)
             self._export_paths[comp] = converted
 
-        emb_src = self._export_dir / "token_embeddings.npy"
+        emb_src = self._embed_lut_path()
         if emb_src.exists():
             emb = np.load(emb_src).astype(ml_dtypes.bfloat16)
             np.save(self._convert_dir / "token_embeddings.npy", emb)
@@ -548,6 +576,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             # Drop the large fp32 intermediate — only the bf16 part is compiled.
             fp32.unlink(missing_ok=True)
             (self._convert_dir / (fp32.name + "_data")).unlink(missing_ok=True)
+            self._verify_static_build(name, bf16)
             self._export_paths[name] = bf16
             self._logger.info("(image-decoder) part %s: %d outputs -> %s",
                               label, len(part.graph.output), bf16.name)
@@ -574,7 +603,81 @@ class LiquidVLModelExporter(LiquidModelExporter):
             out_prefix, patches=patches, grid=grid, src=vision_src,
             split_matmul=512,
         )
-        self._export_paths[f"vision_encoder_{self._vision_res}"] = Path(bf16)
+        name = f"vision_encoder_{self._vision_res}"
+        # This component is registered after export_onnx has run, so it never
+        # passes through that loop's static-shape verification. Check it here so
+        # a static build that silently kept a symbolic dim fails the export
+        # rather than the compile.
+        self._verify_static_build(name, out_prefix + ".onnx")
+        # export_torq derives the vmfb name from the ONNX file stem, so the bf16
+        # build has to *be* vision_encoder_<res>.onnx to produce the name the
+        # board bundle and runner expect (vision_encoder_<res>.vmfb). Keep the
+        # fp32 static build as .fp32.onnx — it is the ORT reference the builder
+        # validates against — and drop the two shape-fold/ORT intermediates.
+        final = Path(out_prefix + ".onnx")
+        final.replace(Path(out_prefix + ".fp32.onnx"))
+        Path(bf16).replace(final)
+        for scratch in (out_prefix + "_a.onnx", out_prefix + "_b.onnx"):
+            Path(scratch).unlink(missing_ok=True)
+        self._export_paths[name] = final
+        self._logger.info("(vision) static %d-res encoder -> '%s' (compiles to %s.vmfb)",
+                          self._vision_res, final.name, name)
+
+    def _verify_static_build(self, component: str, model_path: str | os.PathLike):
+        """Fail unless a post-``export_onnx`` build is fully static.
+
+        The vision encoder and the image-prefill parts are registered during
+        ``convert_models``, i.e. after ``export_onnx``'s static-shape
+        verification loop has already run, so they need checking here.
+
+        The builders rebuild their graph with graphsurgeon as a last step, which
+        leaves the new intermediates with no ``value_info`` — ~1500 tensors on the
+        vision encoder, ~1900 on an image part. Those are *unannotated*, not
+        dynamic, and none of them carries a symbolic dim; shape inference
+        resolves every one (measured: 1501 -> 0). So annotate first and then
+        apply the same :func:`check_dynamic_shapes` the decoder is held to,
+        rather than a looser component-specific check.
+        """
+        model = onnx.load(model_path)
+        annotated = True
+        try:
+            model = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+        except Exception as e:
+            # Inference bails on models near the 2 GB protobuf limit. The strict
+            # check would then report every unannotated intermediate as dynamic,
+            # so fall back to what is always declared: the graph boundary.
+            annotated = False
+            self._logger.warning(
+                "(%s) shape inference failed (%s); verifying the graph boundary only",
+                component, e,
+            )
+
+        def _dims(vi):
+            return list(vi.type.tensor_type.shape.dim)
+
+        if annotated:
+            offenders = check_dynamic_shapes(model)
+        else:
+            offenders = {
+                vi.name: [d.dim_param or d.dim_value for d in _dims(vi)]
+                for vi in list(model.graph.input) + list(model.graph.output)
+                if any(not d.HasField("dim_value") or d.dim_value <= 0 for d in _dims(vi))
+            }
+            offenders.update({
+                vi.name: [d.dim_param or d.dim_value for d in _dims(vi)]
+                for vi in model.graph.value_info
+                if any(d.dim_param for d in _dims(vi))
+            })
+        if offenders:
+            raise ValueError(
+                f"Component '{component}' ('{Path(model_path).name}') is not "
+                f"fully static: {json.dumps(offenders)}"
+            )
+        io = {
+            vi.name: [d.dim_value for d in _dims(vi)]
+            for vi in list(model.graph.input) + list(model.graph.output)
+        }
+        self._logger.info("(%s) Verified static shapes; I/O %s", component, json.dumps(io))
 
     def _make_decoder_split(self):
         """Split the converted bf16 decoder into ``decoder_nolm`` (body, hidden
@@ -647,6 +750,8 @@ class LiquidVLModelExporter(LiquidModelExporter):
         lmh_path = self._convert_dir / "lm_head.onnx"
         onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
 
+        self._verify_static_build("decoder_nolm", nolm_path)
+        self._verify_static_build("lm_head", lmh_path)
         self._export_paths["decoder_nolm"] = nolm_path
         self._export_paths["lm_head"] = lmh_path
         self._logger.info(
@@ -689,7 +794,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # token-embedding LUT (bf16 if converted, else fp32)
         lut = (self._convert_dir / "token_embeddings.npy")
         if not lut.exists():
-            lut = self._export_dir / "token_embeddings.npy"
+            lut = self._embed_lut_path()
         if lut.exists():
             shutil.copy2(lut, dest / "token_embeddings.npy")
 

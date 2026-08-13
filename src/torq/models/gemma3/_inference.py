@@ -200,6 +200,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        lm_head: InferenceRunner | None = None,
     ):
         token_embeddings = self._find_token_embeddings(model.model_path)
         token_id_lut = self._find_token_id_lut(model.model_path)
@@ -216,11 +217,16 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             token_embeddings=token_embeddings,
             token_id_lut=token_id_lut,
+            lm_head=lm_head,
         )
         if self._token_id_lut is not None:
             self._logger.info(
                 "Loaded token ID LUT (%d entries) for trimmed vocab remap",
                 len(self._token_id_lut),
+            )
+        if self._lm_head is not None:
+            self._logger.info(
+                "Loaded split LM head '%s'", str(self._lm_head.model_path)
             )
 
     @classmethod
@@ -233,7 +239,9 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "Gemma3Static":
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.onnx")
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -241,6 +249,10 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             instruct_model=instruct_model,
             repo_id=repo_id,
             combined_kv_io=combined_kv_io,
+            lm_head=(
+                ORTInferenceRunner(lm_head_path, n_threads=n_threads)
+                if lm_head_path else None
+            ),
         )
 
     @classmethod
@@ -253,7 +265,9 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "Gemma3Static":
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb")
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -261,6 +275,10 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             instruct_model=instruct_model,
             repo_id=repo_id,
             combined_kv_io=combined_kv_io,
+            lm_head=(
+                VMFBInferenceRunner(lm_head_path, n_threads=n_threads)
+                if lm_head_path else None
+            ),
         )
 
     @staticmethod
@@ -280,6 +298,14 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         if path is None:
             return None
         return np.load(path)
+
+    @staticmethod
+    def _find_lm_head(
+        model_path: str | os.PathLike,
+        lm_head_pattern: str,
+    ) -> Path | None:
+        """Locate the split LM head exported alongside the transformer."""
+        return Gemma3Static._find_data_file(model_path, lm_head_pattern, "split LM head")
 
     @staticmethod
     def _find_token_id_lut(

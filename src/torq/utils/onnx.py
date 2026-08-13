@@ -71,7 +71,7 @@ def add_onnx_args(
         "--onnx-source-dir",
         type=str,
         metavar="DIR",
-        help="Directory containing source ONNX models (default: %(default)s)",
+        help="Directory containing source ONNX models (skips the source download)",
     )
     group.add_argument(
         "--show-model-info",
@@ -97,7 +97,7 @@ def add_onnx_args(
             "--convert-dtypes",
             action="store_true",
             default=False,
-            help="Convert model to supported dtypes"
+            help="Convert the exported model to the dtypes Torq supports (float -> bf16, int64 -> int32)"
         )
         group.add_argument(
             "--preserve-io-dtypes",

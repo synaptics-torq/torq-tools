@@ -12,7 +12,11 @@ The source is downloaded automatically from HuggingFace via Optimum on first run
 |---|---|
 | `270m` | `google/gemma-3-270m` |
 | `270m --instruct-model` | `google/gemma-3-270m-it` |
-| `1b`   | `google/gemma-3-1b` |
+| `1b`   | `google/gemma-3-1b-pt` |
+| `1b --instruct-model` | `google/gemma-3-1b-it` |
+
+> Upstream publishes the base 1B checkpoint as `-pt`, unlike 270M which has a
+> bare repo, so plain `-s 1b` resolves to `google/gemma-3-1b-pt`.
 
 Override the source with `--hf-repo <repo>` (optionally `--hf-repo-subdir`) to
 point at a pre-exported ONNX repo, or `--onnx-source-dir <dir>` to use a local
@@ -39,7 +43,7 @@ HuggingFace (google/gemma-3-*)
 
 ```sh
 cd torq-tools-dev
-source .venv/bin/activate    # or: source /home/kshanmug/torq/.venv-torq-tools/bin/activate
+source .venv/bin/activate
 
 torq-export-model gemma3 \
     --instruct-model \
@@ -54,7 +58,7 @@ If the Torq compiler Python API isn't installed in the venv, point the fallback
 at the binary first:
 
 ```sh
-export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/torq-compile
+export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 ```
 
 ## Key export flags
@@ -64,11 +68,11 @@ export TORQ_COMPILER_PATH=/home/kshanmug/torq/iree-build/third_party/iree/tools/
 | `-s, --model-size {270m,1b}` | Model size (default: `270m`) |
 | `--instruct-model` | Use the instruct-tuned (`-it`) variant |
 | `-t, --max-gen-tokens N` | Static sequence length / KV-cache size (default: 256) |
-| `--convert-dtypes` | Convert fp32 → bf16 for the Torq compile |
+| `--convert-dtypes` | Convert the export to the dtypes Torq supports: float → bf16 **and** int64 → int32 |
 | `--extract-embeddings` | Extract the token-embedding table to `token_embeddings.npy` (model input becomes an embedding vector) |
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
-| `--split-lm-head` | Emit `lm_head.onnx` separately and export hidden states from `model.onnx` |
+| `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
@@ -94,6 +98,20 @@ models/<repo>/export/<full|trim>/<unified|split_lm_head>/torq/
 
 `<full|trim>` follows `--trim-vocab`; `<unified|split_lm_head>` follows
 `--split-lm-head`. The exact paths are printed at the end of the run.
+
+With `--split-lm-head` the model file is **not** `model.onnx` — each directory
+above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
+(hidden states → logits) instead:
+
+```
+models/<repo>/export/<full|trim>/split_lm_head/onnx/<dtype>/static/
+    transformer.onnx                    ← the decoder, outputs last_hidden_states
+    lm_head.onnx                        ← standalone LM head
+```
+
+Inference and export validation pick the `lm_head` up automatically when it sits
+next to the transformer, so `torq-infer-model gemma3 -m …/transformer.onnx`
+works unchanged.
 
 ## Weight quantization (int4 / int8)
 

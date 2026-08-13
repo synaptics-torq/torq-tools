@@ -81,16 +81,34 @@ class OnnxModelExporterBase(ABC):
         except KeyError:
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
-        self._onnx_dir, self._export_dir, self._convert_dir, self._torq_dir = self._setup_dirs()
-        if self._export_dir.exists():
-            shutil.rmtree(self._export_dir, ignore_errors=True)
-        self._export_dir.mkdir(parents=True, exist_ok=True)
-
+        # Directory setup (which downloads or optimum-exports the source model)
+        # and loading that source ONNX are deferred to _prepare(), so read-only
+        # commands like --view-graph-edits can build an exporter without hitting
+        # the network or reading a large model.
+        self._onnx_dir: Path | None = None
+        self._export_dir: Path | None = None
+        self._convert_dir: Path | None = None
+        self._torq_dir: Path | None = None
         self._export_paths: dict[str, Path] = {}
+        self._components: dict[str, onnx.ModelProto] = {}
+        self._prepared = False
+
+    def _prepare(self) -> None:
+        """Resolve the export directories and load the source ONNX.
+
+        Idempotent, and called by every entry point that needs either. Kept out
+        of ``__init__`` because it is the expensive, network-touching part of
+        setting up an exporter.
+        """
+        if self._prepared:
+            return
+        self._onnx_dir, self._export_dir, self._convert_dir, self._torq_dir = self._setup_dirs()
         self._components = self._load_onnx()
+        self._prepared = True
 
     @property
     def export_dir(self) -> Path:
+        self._prepare()
         return self._export_dir
 
     def set_graph_edit_harness(self, harness: GraphEditHarness | None) -> None:
@@ -159,6 +177,16 @@ class OnnxModelExporterBase(ABC):
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
 
+    def _allows_dynamic_shapes(self, component: str) -> bool:
+        """Whether ``component`` is *intentionally* exported with dynamic shapes.
+
+        A static export normally hard-fails on any leftover dynamic dim, but a
+        multi-component model can legitimately ship a dynamic component that is
+        never chip-compiled (e.g. an ORT/host-side subgraph). Override to exempt
+        those from the static-shape verification.
+        """
+        return False
+
     def _export_path_for_component(self, component: str) -> Path:
         return self._export_dir / f"{component}.onnx"
 
@@ -201,6 +229,14 @@ class OnnxModelExporterBase(ABC):
         return model
 
     def export_onnx(self, validate: bool = True):
+        self._prepare()
+        # Reset the export dir here rather than in __init__ so that constructing
+        # an exporter (e.g. to render --view-graph-edits) never destroys a
+        # previous export's artifacts. Mirrors convert_models/export_torq.
+        if self._export_dir.exists():
+            shutil.rmtree(self._export_dir, ignore_errors=True)
+        self._export_dir.mkdir(parents=True, exist_ok=True)
+
         if self._static_models:
             self.make_static()
 
@@ -220,7 +256,12 @@ class OnnxModelExporterBase(ABC):
                 self._logger.info("(%s) Applying post-static conversion patches...", comp)
                 self.apply_post_static_patches(self._export_paths[comp], comp)
             self.check_model(onnx.load(self._export_paths[comp]))
-            if self._static_models:
+            if self._static_models and self._allows_dynamic_shapes(comp):
+                self._logger.info(
+                    "(%s) Skipping static-shape verification (component is "
+                    "exported dynamic by design)", comp
+                )
+            elif self._static_models:
                 self._logger.info("(%s) Verifying static shapes...", comp)
                 dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
                 if dynamic_shapes:
@@ -255,6 +296,7 @@ class OnnxModelExporterBase(ABC):
         if not self._convert_dtypes:
             self._logger.warning("Skipping conversion as convert_dtypes==False")
             return
+        self._prepare()
         self._convert_dir = Path(convert_dir or self._convert_dir)
         skip = skip or []
         external_data = external_data or []
@@ -294,6 +336,7 @@ class OnnxModelExporterBase(ABC):
         local_compile: bool = False,
         compiler_path: str | Path | None = None,
     ):
+        self._prepare()
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
         if self._torq_dir.exists():
