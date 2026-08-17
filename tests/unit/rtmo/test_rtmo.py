@@ -11,12 +11,9 @@ import pytest
 from torq.models.rtmo._pos_enc import build_2d_sincos_position_embedding
 from torq.models.rtmo._surgery import build_stripped_model
 
-# The source RTMO ONNX is a large binary that does not live in the repo; tests
-# that need it are skipped when it is absent.
+# The source RTMO ONNX is a large binary not in the repo; skip tests that need it.
 _SOURCE = Path("models/rtmo/model.onnx")
-_requires_source = pytest.mark.skipif(
-    not _SOURCE.exists(), reason=f"RTMO source model not found at {_SOURCE}"
-)
+_requires_source = pytest.mark.skipif(not _SOURCE.exists(), reason=f"RTMO source model not found at {_SOURCE}")
 
 _EXPECTED_OUTPUTS = {
     "cls_scores_s16": 1, "cls_scores_s32": 1,
@@ -89,9 +86,7 @@ def test_strip_matches_original_head(tmp_path):
         orig.graph.output.add().name = internal
     sess_o = ort.InferenceSession(orig.SerializeToString(), providers=["CPUExecutionProvider"])
 
-    stripped = build_stripped_model(
-        onnx.load(str(_SOURCE), load_external_data=True), input_size=416, batch=1
-    )
+    stripped = build_stripped_model(onnx.load(str(_SOURCE), load_external_data=True), input_size=416, batch=1)
     sess_s = ort.InferenceSession(stripped.SerializeToString(), providers=["CPUExecutionProvider"])
 
     rng = np.random.default_rng(0)

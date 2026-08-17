@@ -106,24 +106,15 @@ def export_tflite_to_mlir(
     if not Path(tflite_model).exists():
         raise FileNotFoundError(f"TFLite model '{tflite_model}' not found")
 
-    # Preferred: the self-contained tosa-converter-for-tflite (its own compiled
-    # converter, in-process, no subprocess). The iree.compiler.tflite path below
-    # routes through TensorFlow's pywrap_mlir, which is broken on recent TF (the
-    # ExperimentalTFLiteToTosaBytecode symbol was renamed to snake_case).
+    # Prefer the self-contained in-process tosa-converter-for-tflite: the
+    # iree.compiler.tflite path below goes through TensorFlow's pywrap_mlir,
+    # broken on recent TF (ExperimentalTFLiteToTosaBytecode was renamed).
     try:
-        from tosa_converter_for_tflite import (
-            TosaConverterDebugInfo,
-            TosaConverterOutputFormat,
-            tflite_flatbuffer_to_tosa_mlir,
-        )
-    except ImportError:
-        tflite_flatbuffer_to_tosa_mlir = None
-    if tflite_flatbuffer_to_tosa_mlir is not None:
-        tflite_flatbuffer_to_tosa_mlir(
-            str(tflite_model), str(mlir_model),
-            TosaConverterOutputFormat.Text, TosaConverterDebugInfo.Disabled,
-        )
+        from tosa_converter_for_tflite import TosaConverterDebugInfo, TosaConverterOutputFormat, tflite_flatbuffer_to_tosa_mlir
+        tflite_flatbuffer_to_tosa_mlir(str(tflite_model), str(mlir_model), TosaConverterOutputFormat.Text, TosaConverterDebugInfo.Disabled)
         return
+    except ImportError:
+        pass
 
     if TORQ_C_PYAPI:
         iree_tflite_compile.compile_file(
