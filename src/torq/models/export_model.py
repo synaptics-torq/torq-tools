@@ -8,6 +8,7 @@ from .moonshine_streaming import add_moonshine_streaming_export_args
 from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
+from .piper import add_piper_export_args
 
 
 def main():
@@ -32,6 +33,9 @@ def main():
     liquid_vl = model.add_parser("liquid-vl", help="Export LFM2-VL-450M (Liquid) to Torq")
     add_liquid_vl_export_args(liquid_vl)
 
+    piper = model.add_parser("piper", help="Export a Piper TTS voice to Torq")
+    add_piper_export_args(piper)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -52,6 +56,9 @@ def main():
     elif args.model_name == "liquid-vl":
         from .liquid.export_vl import export_liquid_vl_from_args
         export_liquid_vl_from_args(args)
+    elif args.model_name == "piper":
+        from .piper.export import export_piper_from_args
+        export_piper_from_args(args)
 
 
 if __name__ == "__main__":
