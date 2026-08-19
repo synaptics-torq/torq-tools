@@ -10,7 +10,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
@@ -115,6 +115,9 @@ class CommonGraphEditsMixin:
     def extract_token_embeddings(self, hidden_size, vocab_size, save_to, inp_name="token_embedding"):
         self.apply_edit(ExtractConstantLUT(self._graph, self._graph_name, (vocab_size, hidden_size), save_to, inp_name))
         return self
+
+    def compute_dequant_embeddings(self, save_to):
+        self.apply_edit(ComputeDequantizedLUT(self._graph, self._graph_name, save_to, self._export_dtype))
 
     def eliminate_expands(self, ops: list[str]):
         self.apply_edit(EliminateExpand(self._graph, self._graph_name, ops))

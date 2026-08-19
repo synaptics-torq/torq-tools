@@ -3,13 +3,14 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 import os
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
-from ..onnx import OnnxGraphEdit, rewire_consumers
+from ..onnx import OnnxGraphEdit, rewire_consumers, replace_node
 from ...utils.onnx import normalize_layer_name
 
 
@@ -71,6 +72,132 @@ class ExtractConstantLUT(OnnxGraphEdit):
         self._logger.debug(
             "Extracted LUT from '%s', consumers redirected to graph input '%s'",
             node.name, self.inp_name
+        )
+
+@dataclass
+class ComputeDequantizedLUT(OnnxGraphEdit):
+    """
+    Replace integer embeddings LUT + DequantizeLinear with a constant floating point LUT.
+    """
+
+    lut_path: os.PathLike | str
+    export_dtype: onnx.TensorProto.DataType
+
+    def _is_suitable_dequant(self, node: gs.Node) -> bool:
+        return (
+            node.op == "DequantizeLinear"
+            and 2 <= len(node.inputs) <= 3
+            and node.inputs[0] in self.graph.inputs
+            and all(isinstance(inp, gs.Constant) for inp in node.inputs[1:])
+        )
+
+    def _remove_matching_dequant_nodes(
+        self,
+        emb_inp: gs.Variable,
+        new_emb_inp: gs.Variable,
+        target_scale: np.ndarray,
+        target_zp: np.ndarray | None = None,
+        *,
+        target_axis: int = 1
+    ) -> set[str]:
+
+        def _same_scale_and_zp(node: gs.Node) -> bool:
+            if not self._is_same_constant_value(node.inputs[1], target_scale):
+                return False
+            if target_zp is None:
+                return len(node.inputs) == 2
+            return (
+                len(node.inputs) == 3
+                and self._is_same_constant_value(node.inputs[2], target_zp)
+            )
+
+        removed = set()
+        for consumer in emb_inp.outputs:
+            if not self._is_suitable_dequant(consumer):
+                continue
+            if consumer.attrs.get("axis", 1) != target_axis:
+                continue
+            if not _same_scale_and_zp(consumer):
+                continue
+            replace_node(consumer, [new_emb_inp])
+            removed.add(consumer.name)
+            self._logger.debug(
+                "Generated dequantized LUT from '%s'", consumer.name
+            )
+        return removed
+
+    def _cleanup_emb_inputs(
+        self,
+        emb_inp: gs.Variable,
+        new_emb_inp: gs.Variable,
+        new_lut: np.ndarray,
+        removed_node_names: set[str]
+    ):
+        replace_emb_inp = not emb_inp.outputs or all(node.name in removed_node_names for node in emb_inp.outputs)
+        emb_inp_idx: int | None = None
+        for i, inp in enumerate(self.graph.inputs):
+            if inp is emb_inp:
+                emb_inp_idx = i
+        assert emb_inp_idx is not None, f"Fatal: {emb_inp.name} not in graph inputs"
+        if replace_emb_inp:
+            emb_inp_name = emb_inp.name
+            self.graph.inputs[emb_inp_idx] = new_emb_inp
+            self.graph.cleanup(True, True, True, True)
+            new_emb_inp.name = emb_inp_name
+            np.save(self.lut_path, new_lut)
+            self._logger.debug(
+                "Replaced LUT @ '%s' and graph input '%s' with dequantized values",
+                self.lut_path, new_emb_inp.name
+            )
+        else:
+            tag = uuid4().hex
+            new_emb_inp.name = f"{emb_inp.name}-dequantized-{tag}"
+            self.graph.inputs.insert(emb_inp_idx + 1, new_emb_inp)
+            self.lut_path = Path(self.lut_path)
+            new_lut_path = self.lut_path.with_stem(f"{self.lut_path.stem}-dequantized-{tag}")
+            np.save(new_lut_path, new_lut)
+            self.graph.cleanup(True, True, True, True)
+            self._logger.debug(
+                "Added new LUT @ '%s' and graph input '%s' with dequantized values",
+                new_lut_path, new_emb_inp.name
+            )
+
+    def match(self, node: gs.Node) -> bool:
+        return self._is_suitable_dequant(node)
+
+    def transform(self, node: gs.Node):
+        if len(node.inputs) > 3:
+            raise ValueError("Expected 3 or less inputs for onnx.DequantizeLinear")
+        x_q: np.ndarray = np.load(self.lut_path).astype(np.float32)
+        scale: np.ndarray = node.inputs[1].values.astype(np.float32)
+        if len(node.inputs) > 2:
+            zp: np.ndarray = node.inputs[2].values.astype(np.float32)
+        else:
+            zp: np.ndarray = np.zeros_like(x_q)
+        x = (x_q - zp) * scale
+        export_np_dtype = onnx.helper.tensor_dtype_to_np_dtype(self.export_dtype)
+        new_lut = x.astype(export_np_dtype)
+        emb_inp: gs.Variable = next((i for i in self.graph.inputs if i is node.inputs[0]), None)
+        if emb_inp is None:
+            raise ValueError(f"Could not find DequantizeLinear op '{node.name}' input in graph inputs")
+        tag = uuid4().hex
+        new_emb_inp = gs.Variable(
+            f"{emb_inp.name}-dequantized-{tag}",
+            export_np_dtype,
+            emb_inp.shape,
+        )
+        params = [inp.values for inp in node.inputs[1:]]
+        removed = self._remove_matching_dequant_nodes(
+            emb_inp,
+            new_emb_inp,
+            *params,
+            target_axis=node.attrs.get("axis", 1)
+        )
+        self._cleanup_emb_inputs(
+            emb_inp,
+            new_emb_inp,
+            new_lut,
+            removed
         )
 
 @dataclass
