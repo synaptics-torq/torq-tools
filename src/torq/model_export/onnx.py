@@ -78,7 +78,7 @@ class OnnxModelExporterBase(ABC):
         self._convert_dtypes = convert_dtypes
         self._opt_configs = opt_configs
         try:
-            self._onnx_export_dtype = FP_EXPORT_DTYPE_MAPPING[self._model_dtype]
+            self._onnx_export_dtype = FP_EXPORT_DTYPE_MAPPING.get(self._model_dtype, onnx.TensorProto.FLOAT)
         except KeyError:
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
