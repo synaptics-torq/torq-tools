@@ -14,6 +14,87 @@ from ..onnx import OnnxGraphEdit, rewire_consumers, replace_node
 from ...utils.onnx import normalize_layer_name
 
 
+@dataclass(frozen=True)
+class _LMHead:
+    output_node: gs.Node
+    matmul: gs.Node
+    nodes: tuple[gs.Node, ...]
+    hidden_states: gs.Variable
+    weight: gs.Constant
+    vocab_parameters: tuple[gs.Constant, ...]
+    logits: gs.Variable
+
+
+def _producer(tensor: gs.Tensor, op: str) -> gs.Node | None:
+    if len(tensor.inputs) != 1 or tensor.inputs[0].op != op:
+        return None
+    return tensor.inputs[0]
+
+
+def _match_lm_head(node: gs.Node, output_name: str) -> _LMHead | None:
+    if not node.outputs or node.outputs[0].name != output_name:
+        return None
+
+    if node.op == "MatMul" and len(node.inputs) == 2:
+        hidden_states, weight = node.inputs
+        if isinstance(hidden_states, gs.Variable) and isinstance(weight, gs.Constant):
+            return _LMHead(node, node, (node,), hidden_states, weight, (weight,), node.outputs[0])
+
+    # ORT dynamic integer quantization dequantizes MatMulInteger with
+    # Cast(result) * (activation_scale * weight_scale).
+    if node.op != "Mul" or len(node.inputs) != 2:
+        return None
+    cast = None
+    for inp in node.inputs:
+        if producer := _producer(inp, "Cast"):
+            cast = producer
+            break
+    if cast is None or len(cast.inputs) != 1:
+        return None
+    matmul = _producer(cast.inputs[0], "MatMulInteger")
+    if matmul is None or not 3 <= len(matmul.inputs) <= 4:
+        return None
+    dql = _producer(matmul.inputs[0], "DynamicQuantizeLinear")
+    if dql is None or len(dql.inputs) != 1 or len(dql.outputs) != 3:
+        return None
+    hidden_states = dql.inputs[0]
+    weight = matmul.inputs[1]
+    if not isinstance(hidden_states, gs.Variable) or not isinstance(weight, gs.Constant):
+        return None
+    if matmul.inputs[2] is not dql.outputs[2]:
+        return None
+
+    scale_input = next(inp for inp in node.inputs if inp is not cast.outputs[0])
+    scale_mul = _producer(scale_input, "Mul")
+    if scale_mul is None or len(scale_mul.inputs) != 2 or dql.outputs[1] not in scale_mul.inputs:
+        return None
+    weight_scale = next(inp for inp in scale_mul.inputs if inp is not dql.outputs[1])
+    if not isinstance(weight_scale, gs.Constant):
+        return None
+    vocab_parameters = [weight, weight_scale]
+    if len(matmul.inputs) == 4:
+        weight_zero_point = matmul.inputs[3]
+        if not isinstance(weight_zero_point, gs.Constant):
+            return None
+        vocab_parameters.append(weight_zero_point)
+    return _LMHead(
+        node,
+        matmul,
+        (dql, matmul, cast, scale_mul, node),
+        hidden_states,
+        weight,
+        tuple(vocab_parameters),
+        node.outputs[0],
+    )
+
+
+def _require_lm_head(node: gs.Node, output_name: str) -> _LMHead:
+    lm_head = _match_lm_head(node, output_name)
+    if lm_head is None:
+        raise ValueError(f"Node '{node.name}' is not a supported LM head producing '{output_name}'")
+    return lm_head
+
+
 @dataclass
 class ExtractConstantLUT(OnnxGraphEdit):
 
@@ -203,9 +284,10 @@ class ComputeDequantizedLUT(OnnxGraphEdit):
 @dataclass
 class TrimLMHeadVocab(OnnxGraphEdit):
     """
-    Trim LM head weight matrix to a subset of tokens.
+    Trim an LM head to a subset of tokens.
 
-    The weight matrix is sliced from [hidden, vocab] to [hidden, kept_count].
+    The weight matrix is sliced from [hidden, vocab] to [hidden, kept_count],
+    along with any per-vocabulary quantization scale and zero point.
     If include_argmax is True, an ArgMax is appended to output the compact index.
     Otherwise the output is the trimmed logits tensor [1, 1, kept_count].
 
@@ -232,23 +314,15 @@ class TrimLMHeadVocab(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op != "MatMul" or not node.outputs:
-            return False
-        return node.outputs[0].name == self.output_name
+        return _match_lm_head(node, self.output_name) is not None
 
     def transform(self, node: gs.Node):
-        self._check_node_op(node, "MatMul")
-        weight_inp = node.inputs[1]
-        if not isinstance(weight_inp, gs.Constant):
-            raise ValueError(
-                f"Expected constant weight for LM head MatMul, got {type(weight_inp).__name__}"
-            )
-
-        W = weight_inp.values
+        lm_head = _require_lm_head(node, self.output_name)
+        W = lm_head.weight.values
         if W.ndim != 2:
             raise ValueError(f"Expected 2-D weight matrix, got shape {W.shape}")
 
-        hidden_size, vocab_size = W.shape
+        _, vocab_size = W.shape
         if np.any(self.kept_token_ids >= vocab_size) or np.any(self.kept_token_ids < 0):
             raise ValueError(
                 f"kept_token_ids contains values outside [0, {vocab_size})"
@@ -256,15 +330,39 @@ class TrimLMHeadVocab(OnnxGraphEdit):
         kept_count = len(self.kept_token_ids)
 
         W_trimmed = W[:, self.kept_token_ids]
-        trimmed_weight = gs.Constant(
-            name=weight_inp.name + "_trimmed",
-            values=W_trimmed,
-            export_dtype=getattr(weight_inp, "export_dtype", None),
-        )
+        replacements = []
+        for parameter in lm_head.vocab_parameters:
+            values = parameter.values
+            if parameter is lm_head.weight:
+                trimmed_values = W_trimmed
+            elif values.ndim == 0 or values.shape == (1,):
+                continue
+            elif values.ndim == 1 and values.shape[0] == vocab_size:
+                trimmed_values = values[self.kept_token_ids]
+            else:
+                raise ValueError(
+                    f"Expected scalar or [{vocab_size}] LM head parameter '{parameter.name}', got shape {values.shape}"
+                )
+            replacements.append((
+                parameter,
+                gs.Constant(
+                    name=parameter.name + "_trimmed",
+                    values=trimmed_values,
+                    export_dtype=getattr(parameter, "export_dtype", None),
+                ),
+            ))
+        for lm_head_node in lm_head.nodes:
+            for idx, inp in enumerate(lm_head_node.inputs):
+                replacement = next((new for old, new in replacements if inp is old), None)
+                if replacement is not None:
+                    lm_head_node.inputs[idx] = replacement
 
-        node.inputs[1] = trimmed_weight
+        for lm_head_node in lm_head.nodes[lm_head.nodes.index(lm_head.matmul):]:
+            for output in lm_head_node.outputs:
+                if output.shape and output.shape[-1] == vocab_size:
+                    output.shape = list(output.shape[:-1]) + [kept_count]
 
-        logits_out = node.outputs[0]
+        logits_out = lm_head.logits
         old_shape = list(logits_out.shape) if logits_out.shape else None
         if old_shape and len(old_shape) >= 1:
             new_logits_shape = old_shape[:-1] + [kept_count]
@@ -272,12 +370,12 @@ class TrimLMHeadVocab(OnnxGraphEdit):
             new_logits_shape = [1, 1, kept_count]
 
         trimmed_logits = gs.Variable(
-            name="logits",
+            name=logits_out.name,
             dtype=logits_out.dtype,
             shape=new_logits_shape,
         )
         consumers = list(logits_out.outputs)
-        node.outputs[0] = trimmed_logits
+        lm_head.output_node.outputs[0] = trimmed_logits
 
         if self.include_argmax:
             final_out = self.graph.layer(
@@ -315,61 +413,31 @@ class SplitLMHead(OnnxGraphEdit):
     """
     Extract the final LM head into a standalone graph.
 
-    The main graph output is replaced with the non-constant MatMul input, named
-    ``hidden_states_name``. The extracted LM head graph accepts that tensor as
-    its only input, preserves the original LM head output, and is saved to
-    ``save_to``.
+    The main graph output is replaced with the LM head activation input, named
+    ``hidden_states_name``. The extracted graph accepts that tensor as its only
+    input and preserves either a floating-point MatMul or a dynamically
+    quantized MatMulInteger head.
     """
 
     save_to: Path | str
     output_name: str = "logits"
     hidden_states_name: str = "last_hidden_states"
 
-    def _find_lm_head_matmul(self) -> gs.Node:
-        for node in self.graph.nodes:
-            if node.op != "MatMul" or not node.outputs:
-                continue
-            output = node.outputs[0]
-            if output.name != self.output_name:
-                continue
-            if any(graph_output is output for graph_output in self.graph.outputs):
-                return node
-        raise ValueError(f"Could not find final LM head MatMul feeding graph output '{self.output_name}'")
-
-    @staticmethod
-    def _select_hidden_states(node: gs.Node) -> gs.Variable:
-        if len(node.inputs) != 2:
-            raise ValueError(f"LM head MatMul '{node.name}' must have 2 inputs, found {len(node.inputs)}")
-        if all(isinstance(inp, gs.Constant) for inp in node.inputs):
-            raise ValueError(f"LM head MatMul '{node.name}' is invalid because both inputs are constant")
-        hidden_states = next(
-            (inp for inp in node.inputs if not isinstance(inp, gs.Constant)),
-            None
-        )
-        if not isinstance(hidden_states, gs.Variable):
-            raise ValueError(
-                f"Expected LM head hidden states to be a graph variable, got {type(hidden_states).__name__}"
-            )
-        return hidden_states
-
-    def _extract_lm_head_graph(self) -> gs.Graph:
-        lm_head = self._find_lm_head_matmul()
-        lm_head_logits = lm_head.outputs[0]
-        hidden_states = self._select_hidden_states(lm_head)
+    def _extract_lm_head_graph(self, lm_head: _LMHead) -> gs.Graph:
         lm_head_input = gs.Variable(
             name=self.hidden_states_name,
-            dtype=hidden_states.dtype,
-            shape=hidden_states.shape,
+            dtype=lm_head.hidden_states.dtype,
+            shape=lm_head.hidden_states.shape,
         )
-        for idx, inp in enumerate(lm_head.inputs):
-            if inp is hidden_states:
-                lm_head.inputs[idx] = lm_head_input
-                break
+        for lm_head_node in lm_head.nodes:
+            for idx, inp in enumerate(lm_head_node.inputs):
+                if inp is lm_head.hidden_states:
+                    lm_head_node.inputs[idx] = lm_head_input
         lm_head_graph = gs.Graph(
             name="main",
-            nodes=[lm_head],
+            nodes=list(lm_head.nodes),
             inputs=[lm_head_input],
-            outputs=[lm_head_logits],
+            outputs=[lm_head.logits],
         )
         return lm_head_graph.cleanup(
             remove_unused_graph_inputs=True,
@@ -377,17 +445,13 @@ class SplitLMHead(OnnxGraphEdit):
         ).toposort()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op != "MatMul" or not node.outputs:
-            return False
-        output = node.outputs[0]
-        if output.name != self.output_name:
-            return False
-        return any(graph_output is output for graph_output in self.graph.outputs)
+        lm_head = _match_lm_head(node, self.output_name)
+        return bool(lm_head and any(graph_output is lm_head.logits for graph_output in self.graph.outputs))
 
     def transform(self, node: gs.Node):
-        self._check_node_op(node, "MatMul")
-        hidden_states = self._select_hidden_states(node)
-        lm_head_graph = self._extract_lm_head_graph()
+        lm_head = _require_lm_head(node, self.output_name)
+        hidden_states = lm_head.hidden_states
+        lm_head_graph = self._extract_lm_head_graph(lm_head)
         lm_head_model = onnx.shape_inference.infer_shapes(
             gs.export_onnx(lm_head_graph),
             True, True, True
@@ -396,17 +460,18 @@ class SplitLMHead(OnnxGraphEdit):
         save_to.parent.mkdir(parents=True, exist_ok=True)
         onnx.save(lm_head_model, save_to)
 
-        logits = node.outputs[0]
+        logits = lm_head.logits
         hidden_states.name = self.hidden_states_name
         for idx, graph_output in enumerate(self.graph.outputs):
             if graph_output is logits:
                 self.graph.outputs[idx] = hidden_states
 
-        node.inputs.clear()
-        node.outputs.clear()
+        for lm_head_node in lm_head.nodes:
+            lm_head_node.inputs.clear()
+            lm_head_node.outputs.clear()
         self._logger.debug(
-            "Split LM head MatMul '%s'; graph output '%s' now exposes '%s'",
-            node.name,
+            "Split LM head '%s'; graph output '%s' now exposes '%s'",
+            lm_head.matmul.name,
             logits.name,
             hidden_states.name,
         )

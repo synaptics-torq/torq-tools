@@ -6,7 +6,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph
+from support.graph_edit import graph, quantized_lm_head_graph
 from torq.graph_edit.edits.artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
 
 
@@ -88,6 +88,26 @@ def test_trim_lm_head_vocab_rejects_out_of_range_token_id():
         TrimLMHeadVocab(graph(nodes=[matmul], inputs=[hidden], outputs=[logits]), "unit", kept_token_ids=np.array([4])).transform(matmul)
 
 
+def test_trim_quantized_lm_head_vocab_slices_weight_parameters():
+    g = quantized_lm_head_graph()
+    output_node = g.outputs[0].inputs[0]
+
+    edit = TrimLMHeadVocab(g, "unit", kept_token_ids=np.array([0, 3, 4]))
+    assert edit.match(output_node)
+    edit.transform(output_node)
+
+    constants = {
+        tensor.name: tensor
+        for node in g.nodes
+        for tensor in node.inputs
+        if isinstance(tensor, gs.Constant)
+    }
+    assert constants["weight_quantized_trimmed"].shape == (2, 3)
+    np.testing.assert_array_equal(constants["weight_scale_trimmed"].values, [0.25, 0.75, 0.375])
+    np.testing.assert_array_equal(constants["weight_zero_point_trimmed"].values, [1, 0, -2])
+    assert g.outputs[0].shape == [1, 1, 3]
+
+
 def test_split_lm_head_saves_model_and_exposes_hidden_states(tmp_path):
     hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
     weight = gs.Constant("weight", np.arange(6, dtype=np.float32).reshape(2, 3))
@@ -104,3 +124,20 @@ def test_split_lm_head_saves_model_and_exposes_hidden_states(tmp_path):
     onnx.checker.check_model(onnx.load(save_to))
     assert g.outputs[0].name == "last_hidden_states"
     assert matmul.outputs == []
+
+
+def test_split_quantized_lm_head_saves_full_head_and_exposes_hidden_states(tmp_path):
+    g = quantized_lm_head_graph()
+    output_node = g.outputs[0].inputs[0]
+    save_to = tmp_path / "lm_head.onnx"
+
+    edit = SplitLMHead(g, "unit", save_to=save_to)
+    assert edit.match(output_node)
+    edit.transform(output_node)
+
+    model = onnx.load(save_to)
+    onnx.checker.check_model(model)
+    assert sorted(node.op_type for node in model.graph.node) == sorted(
+        ["DynamicQuantizeLinear", "MatMulInteger", "Cast", "Mul", "Mul"]
+    )
+    assert g.outputs[0].name == "last_hidden_states"
