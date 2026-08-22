@@ -195,6 +195,53 @@ def split_anisotropic_dw(model: onnx.ModelProto) -> int:
     return n_split
 
 
+def decompose_hardsigmoid(model: onnx.ModelProto) -> int:
+    """Rewrite HardSigmoid as Clip(x*alpha + beta, 0, 1): identical arithmetic,
+    but Mul/Add/Clip all lower to NSS while HardSigmoid falls back to host."""
+    g = model.graph
+    n_rw = 0
+    for node in [n for n in g.node if n.op_type == "HardSigmoid"]:
+        alpha = next((a.f for a in node.attribute if a.name == "alpha"), 0.2)
+        beta = next((a.f for a in node.attribute if a.name == "beta"), 0.5)
+        pfx = (node.name or node.output[0]).replace(".", "_")
+        cst = lambda nm, v: _const(g, nm, np.array(v, np.float32))
+        ns = [helper.make_node("Mul", [node.input[0], cst(f"{pfx}_a", alpha)], [f"{pfx}_m"]),
+              helper.make_node("Add", [f"{pfx}_m", cst(f"{pfx}_b", beta)], [f"{pfx}_ab"]),
+              helper.make_node("Clip", [f"{pfx}_ab", cst(f"{pfx}_lo", 0.0), cst(f"{pfx}_hi", 1.0)], [node.output[0]])]
+        i = list(g.node).index(node)
+        g.node.remove(node)
+        for k, nn in enumerate(ns): g.node.insert(i + k, nn)
+        n_rw += 1
+    return n_rw
+
+
+def global_reduce_to_gap(model: onnx.ModelProto) -> int:
+    """Rewrite full-spatial ReduceMean (axes [2,3], keepdims=1, 4-D) as
+    GlobalAveragePool: same semantics, but the dedicated pooling kernel has no
+    NSS width limit, while the reduction generic falls off NSS at wide widths
+    and cannot be tiled on small-LRAM targets."""
+    g = model.graph
+    shapes = _shapes(onnx.shape_inference.infer_shapes(model).graph)
+    init = {i.name: i for i in g.initializer}
+    n_rw = 0
+    for node in [n for n in g.node if n.op_type == "ReduceMean"]:
+        kd = next((a.i for a in node.attribute if a.name == "keepdims"), 1)
+        s_in = shapes.get(node.input[0])
+        if kd != 1 or s_in is None or len(s_in) != 4: continue
+        if len(node.input) > 1:
+            if node.input[1] not in init: continue
+            axes = sorted(a % 4 for a in numpy_helper.to_array(init[node.input[1]]).tolist())
+        else:
+            axes = sorted(a % 4 for a in next((list(a.ints) for a in node.attribute if a.name == "axes"), []))
+        if axes != [2, 3]: continue
+        gap = helper.make_node("GlobalAveragePool", [node.input[0]], [node.output[0]])
+        i = list(g.node).index(node)
+        g.node.remove(node)
+        g.node.insert(i, gap)
+        n_rw += 1
+    return n_rw
+
+
 def gemm_to_matmul(model: onnx.ModelProto) -> int:
     """Rewrite plain Gemm (alpha=beta=1, no transpose) as MatMul + Add, matching the
     reference exports; the 2-D Gemm form trips the NDL builder at wide widths."""

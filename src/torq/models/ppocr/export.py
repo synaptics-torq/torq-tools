@@ -15,7 +15,7 @@ import onnx
 
 from ...tools.convert_dtype.onnx import convert_model
 from ...utils.logging import add_logging_args, configure_logging
-from ._surgery import cascade_resizes, decompose_avgpool, fold_bn, freeze, gemm_to_matmul, split_anisotropic_dw, split_convtranspose
+from ._surgery import cascade_resizes, decompose_avgpool, decompose_hardsigmoid, fold_bn, freeze, gemm_to_matmul, global_reduce_to_gap, split_anisotropic_dw, split_convtranspose
 
 logger = logging.getLogger("ppocr-export")
 
@@ -35,12 +35,12 @@ def export_ppocr(output_dir, det_hw=DEFAULT_DET_HW, buckets=DEFAULT_BUCKETS, bud
     written = {}
 
     det = freeze(onnx.load(src["det"]), [1, 3, *det_hw])
-    logger.info("det surgery: %d resize(s) cascaded, %d convtranspose(s) split", cascade_resizes(det), split_convtranspose(det, budget))
+    logger.info("det surgery: %d resize(s) cascaded, %d convtranspose(s) split, %d hardsigmoid decomposed, %d gap converted", cascade_resizes(det), split_convtranspose(det, budget), decompose_hardsigmoid(det), global_reduce_to_gap(det))
     written["det"] = _finish(det, output_dir / f"ppocr_det_{det_hw[0]}x{det_hw[1]}.onnx")
 
     for w in buckets:
         rec = freeze(onnx.load(src["rec"]), [1, 3, 48, w])
-        logger.info("rec_w%d surgery: %d bn folded, %d avgpool decomposed, %d dw split, %d gemm converted", w, fold_bn(rec), decompose_avgpool(rec), split_anisotropic_dw(rec), gemm_to_matmul(rec))
+        logger.info("rec_w%d surgery: %d bn folded, %d avgpool decomposed, %d dw split, %d gemm converted, %d hardsigmoid decomposed, %d gap converted", w, fold_bn(rec), decompose_avgpool(rec), split_anisotropic_dw(rec), gemm_to_matmul(rec), decompose_hardsigmoid(rec), global_reduce_to_gap(rec))
         written[f"rec_w{w}"] = _finish(rec, output_dir / f"rec_w{w}.onnx")
 
     if compile_vmfb:
