@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     # CLI helpers
     "add_onnx_args",
+    "validate_onnx_source_dir",
 
     # model inspection
     "get_model_opset",
@@ -113,6 +114,24 @@ def add_onnx_args(
             default=False,
             help="Preserve model input/output dtypes by adding runtime casts"
         )
+
+
+def validate_onnx_source_dir(
+    onnx_source_dir: str | os.PathLike | None,
+    required_files: tuple[str, ...] = (),
+) -> Path | None:
+    if onnx_source_dir is None:
+        return None
+
+    source_dir = Path(onnx_source_dir)
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"ONNX source directory does not exist: '{source_dir}'")
+    for filename in ("config.json", *required_files):
+        if not (source_dir / filename).is_file():
+            raise FileNotFoundError(
+                f"Expected {filename} in ONNX source directory: '{source_dir}'"
+            )
+    return source_dir
 
 
 # -----------------------------------------------------------------------------

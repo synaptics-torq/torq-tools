@@ -29,6 +29,7 @@ from ._inference import MoonshineDynamic, MoonshineStatic
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import hf_download_models, optimum_export_onnx
+from ...utils.onnx import validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -74,10 +75,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._fold_encoder_cache = fold_encoder_cache
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
-        self._onnx_source_dir = onnx_source_dir
+        self._onnx_source_dir = validate_onnx_source_dir(onnx_source_dir)
         self._use_optimum = use_optimum
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-{self._model_size}"
-        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._config = AutoConfig.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         self._num_samples = max_audio_s * 16_000
         self._max_tokens = max_audio_s * max_tok_per_s
         self._hidden_size = int(self._config.hidden_size)
@@ -113,9 +117,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
-            onnx_dir = onnx_source_dir
-            print(self._models_dir)
+        if self._onnx_source_dir is not None:
+            onnx_dir = self._onnx_source_dir
         else:
             if self._use_optimum or self._model_dtype in OPTIMUM_DTYPES:
                 self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
@@ -242,6 +245,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             decoder_patch.append(EditSpec(
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+            ))
+            decoder_patch.append(EditSpec(
+                "ComputeDequantizedLUT",
+                (ctx("embeddings_path"), ctx("export_dtype"))
             ))
         decoder_patch.append(EditSpec("ReplacePadWithConcat"))
         blocks["decoder.patch"] = decoder_patch
@@ -719,7 +726,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             max_inp_len=runner.max_inp_len
         )
 
-        processor = AutoProcessor.from_pretrained(f"{self._hf_repo}")
+        processor = AutoProcessor.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         dataset = load_dataset(
             path="hf-internal-testing/librispeech_asr_dummy",
             name="clean",

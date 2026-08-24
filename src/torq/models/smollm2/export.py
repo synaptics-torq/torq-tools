@@ -20,6 +20,7 @@ from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx
+from ...utils.onnx import validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -47,11 +48,16 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
-        self._onnx_source_dir = onnx_source_dir
+        self._onnx_source_dir = validate_onnx_source_dir(
+            onnx_source_dir, required_files=("tokenizer.json",)
+        )
         self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
         if self._instruct_model:
             self._hf_repo += "-Instruct"
-        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._config = AutoConfig.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
@@ -72,8 +78,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
-            onnx_dir = onnx_source_dir
+        if self._onnx_source_dir is not None:
+            onnx_dir = self._onnx_source_dir
         else:
             onnx_dir = self._models_dir / "source" / self._model_dtype
             onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +239,11 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, _):
         self._patch_static_model(model_path)
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
 
     def validate_onnx(self, n_iters: int = 5):
         validate_decoder_only_onnx(
