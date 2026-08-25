@@ -55,6 +55,7 @@ def add_onnx_args(
     parser: argparse.ArgumentParser,
     *,
     model_dtypes: list[str] | None = None,
+    dynamic_quantize: bool = True,
     convert_dtypes: bool = False,
     allow_no_opt: bool = True,
 ):
@@ -100,6 +101,25 @@ def add_onnx_args(
             action="store_true",
             default=False,
             help="Do no optimize exported ONNX models via onnxruntime",
+        )
+    if dynamic_quantize:
+        group.add_argument(
+            "--dynamic-quantize",
+            action="store_true",
+            default=False,
+            help="Dynamically quantize the model to 8-bit integer"
+        )
+        group.add_argument(
+            "--dynamic-quantize-uint8-weights",
+            action="store_true",
+            default=False,
+            help="Quantize weights with unsigned values"
+        )
+        group.add_argument(
+            "--dynamic-quantize-per-tensor",
+            action="store_true",
+            default=False,
+            help="Quantize weights with per-tensor scale and zero point"
         )
     if convert_dtypes:
         group.add_argument(

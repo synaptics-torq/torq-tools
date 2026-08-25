@@ -304,25 +304,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if not updated:
             raise ValueError("Could not find logits output metadata for trimmed-vocab export")
 
-    def _copy_runtime_assets(
-        self,
-        dst_dir: str | os.PathLike,
-        src_dir: str | os.PathLike | None = None,
-        *,
-        include_npy_data: bool = True,
-    ) -> None:
-        src_dir = Path(src_dir or self._export_paths["model"].parent)
-        dst_dir = Path(dst_dir)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        asset_names = ["config.json", "tokenizer.json"]
-        if include_npy_data:
-            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
-        for asset_name in asset_names:
-            src_path = src_dir / asset_name
-            if not src_path.exists():
-                continue
-            shutil.copy2(src_path, dst_dir / asset_name)
-
     def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
         blocks: dict[str, list[EditSpec]] = {}
         blocks["model.static"] = [
