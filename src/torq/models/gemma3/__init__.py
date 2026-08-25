@@ -51,7 +51,8 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
     )
     add_onnx_args(
         parser,
-        convert_dtypes=["bf16", "fp16"],
+        dynamic_quantize=True,
+        convert_dtypes=True,
         allow_no_opt=False,
     )
     parser.add_argument(

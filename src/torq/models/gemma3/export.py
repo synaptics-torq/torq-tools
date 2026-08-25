@@ -61,6 +61,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         trim_vocab: bool = False,
         split_lm_head: bool = False,
@@ -128,6 +129,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
@@ -178,6 +180,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._model_dtype / 
             ("static" if self._static_models else "dynamic")
         )
+        quantize_dir = (
+            self._models_dir 
+            / "export"
+            / model_type
+            / model_topology
+            / "onnx"
+            / "quantized"
+            / ("static" if self._static_models else "dynamic")
+        )
         convert_dir = (
             self._models_dir 
             / "export"
@@ -196,7 +207,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, torq_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir /  "model.onnx"
@@ -489,6 +500,33 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_path=self._export_paths.get("lm_head"),
         )
 
+    def dynamic_quantize_models(
+        self,
+        quantize_dir: str | os.PathLike | None = None,
+        uint8_weights: bool = False,
+        per_tensor: bool = False
+    ):
+        super().dynamic_quantize_models(
+            quantize_dir,
+            skip=None,
+            uint8_weights=uint8_weights,
+            per_tensor=per_tensor,
+        )
+        self._logger.info("Validating quantized model with source model...")
+        validate_decoder_only_onnx(
+            self._logger,
+            Gemma3Static,
+            Gemma3Dynamic,
+            Path(self._quantize_dir) / ("transformer.onnx" if self._split_lm_head else "model.onnx"),
+            self._onnx_dir / "model.onnx",
+            static_models=self._static_models,
+            max_gen_tokens=self._max_gen_tokens,
+            instruct_model=self._instruct_model,
+            repo_id=self._hf_repo,
+            n_iters=5,
+            lm_head_path=Path(self._quantize_dir) / "lm_head.onnx" if self._split_lm_head else None,
+        )
+
     def convert_models(
         self, 
         convert_dir: str | os.PathLike | None = None,
@@ -541,6 +579,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         trim_vocab=args.trim_vocab,
         split_lm_head=args.split_lm_head,
@@ -554,6 +593,11 @@ def export_gemma3_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:
