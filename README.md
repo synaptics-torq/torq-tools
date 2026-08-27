@@ -85,6 +85,19 @@ pip install -r "$torq_tools_dir/src/torq/models/moonshine/requirements.txt"
 `torq-tools` can be used directly from the command line or imported into application code via the `torq` namespace.
 
 ### Available tools
+#### Clean up ONNX exporter artifacts
+Model-agnostic cleanup for ONNX graphs that don't go through a full `torq.models` exporter.
+Composes the `CollapseUnrolledConcat` and `FoldConvBatchNorm` graph edits with ORT-backed constant folding:
+it collapses per-element unrolled stack/unbind Concats back into their source tensor,
+evaluates all-constant subgraphs (positional-embedding builders, constant weight prep, ...) into initializers,
+and folds exported eval-mode BatchNorm (`Conv -> Mul -> Add`) into the conv weights.
+Run it on fp32 graphs, before `convert_dtype`.
+```bash
+python3 -m torq.tools.onnx_cleanup model_fp32.onnx -o model_clean.onnx --verify
+```
+`--verify` re-runs both models under onnxruntime on random inputs and asserts the outputs still match.
+Individual passes can be disabled with `--skip {collapse-concat,fold-constants,fold-conv-bn}`,
+and the graph edits are also usable on their own via `--apply-graph-edit` on any model exporter.
 #### Convert ONNX model dtype
 Convert fp32 ONNX models to lower-precision formats such as bf16 or fp16.
 Particularly useful for getting bf16 models, which have native hardware acceleration in the Torq runtime.

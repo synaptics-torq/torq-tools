@@ -11,13 +11,14 @@ from .arithmetic import (
     ReplaceInt64FloatCast,
 )
 from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
-from .conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
+from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .mixins import CommonGraphEditsMixin
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
 from .shape import (
     BroadcastOpInputs,
     CollapseReshapeChain,
+    CollapseUnrolledConcat,
     ConstantBroadcastPolicy,
     EliminateExpand,
     EliminateRank0Gather,
@@ -58,6 +59,7 @@ __all__ = [
     "EliminateTranspose",
     "RetargetCrossAttnKeyLayout",
     "CollapseReshapeChain",
+    "CollapseUnrolledConcat",
     "CollapseGQABroadcast",
     "TrimLMHeadVocab",
     "SplitLMHead",
@@ -68,6 +70,7 @@ __all__ = [
     "ReplacePadWithConcat",
     "WidenStridedDepthwiseConv",
     "DecomposeStridedConv1D",
+    "FoldConvBatchNorm",
     "DecomposeBidirectionalRnn",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",

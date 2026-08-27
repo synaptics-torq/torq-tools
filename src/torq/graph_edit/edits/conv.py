@@ -152,6 +152,136 @@ class WidenStridedDepthwiseConv(OnnxGraphEdit):
         )
 
 @dataclass
+class FoldConvBatchNorm(OnnxGraphEdit):
+    """
+    Fold ``Conv -> Mul(per-channel const) -> Add(per-channel const)`` into the Conv.
+
+    Eval-mode BatchNorm after a conv typically exports as a per-output-channel
+    Mul (scale) and Add (shift). Algebraically the three ops are one conv:
+
+        Add(Mul(Conv(x, W), s), b) = Conv(x, W')  with
+        W'[oc] = W[oc] * s[oc],  bias'[oc] = c[oc] * s[oc] + b[oc]
+
+    (``c`` is the conv's existing bias, or zero.) Only fires when the conv
+    weight (and bias, if present) are constants, the Mul/Add constants
+    broadcast exactly onto the conv output's channel axis (axis 1 of the
+    ``N C spatial...`` layout), and the Conv/Mul outputs have no other
+    consumers. Residual Adds of two activations are left alone. Works for any
+    spatial rank and grouped convs. Fold math runs in fp32, then casts back to
+    the weight's dtype (``export_dtype`` is preserved).
+    """
+
+    @staticmethod
+    def _values_f32(constant) -> np.ndarray:
+        return np.asarray(constant.values).astype(np.float32)
+
+    def _sole_consumer(self, tensor) -> gs.Node | None:
+        if any(out is tensor for out in self.graph.outputs):
+            return None
+        consumers = list(tensor.outputs)
+        return consumers[0] if len(consumers) == 1 else None
+
+    def _per_channel_const(
+        self, node: gs.Node, data_tensor, cout: int, out_rank: int
+    ) -> np.ndarray | None:
+        """Return the fp32 per-channel vector [cout] of the node's constant
+        operand, or None when it does not broadcast onto the channel axis."""
+        if len(node.inputs) != 2 or len(node.outputs) != 1:
+            return None
+        others = [t for t in node.inputs if t is not data_tensor]
+        if len(others) != 1 or not isinstance(others[0], gs.Constant):
+            return None
+        values = self._values_f32(others[0])
+        if values.size == 1:
+            return np.full(cout, values.reshape(-1)[0], dtype=np.float32)
+        if values.ndim > out_rank:
+            return None
+        # Right-aligned ONNX broadcasting: the constant is per-channel only
+        # when its (padded) shape places cout on axis 1 and 1 everywhere else.
+        padded = (1,) * (out_rank - values.ndim) + tuple(values.shape)
+        if padded[1] != cout:
+            return None
+        if any(dim != 1 for i, dim in enumerate(padded) if i != 1):
+            return None
+        return values.reshape(cout)
+
+    def _resolve(self, node: gs.Node):
+        if node.op != "Conv" or len(node.inputs) < 2 or len(node.outputs) != 1:
+            return None
+        weight = node.inputs[1]
+        if not isinstance(weight, gs.Constant) or len(weight.shape) < 3:
+            return None
+        if len(node.inputs) > 2 and not isinstance(node.inputs[2], gs.Constant):
+            return None
+        cout = int(weight.shape[0])
+        out_rank = len(weight.shape)  # conv output rank equals weight rank
+
+        mul = self._sole_consumer(node.outputs[0])
+        if mul is None or mul.op != "Mul":
+            return None
+        scale = self._per_channel_const(mul, node.outputs[0], cout, out_rank)
+        if scale is None:
+            return None
+        add = self._sole_consumer(mul.outputs[0])
+        if add is None or add.op != "Add":
+            return None
+        shift = self._per_channel_const(add, mul.outputs[0], cout, out_rank)
+        if shift is None:
+            return None
+        return weight, mul, add, scale, shift, cout
+
+    def match(self, node: gs.Node) -> bool:
+        return self._resolve(node) is not None
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Conv")
+        resolved = self._resolve(node)
+        if resolved is None:
+            return
+        weight, mul, add, scale, shift, cout = resolved
+
+        w_values = np.asarray(weight.values)
+        folded_w = self._values_f32(weight) * scale.reshape(
+            (cout,) + (1,) * (w_values.ndim - 1)
+        )
+        bias = (
+            self._values_f32(node.inputs[2]).reshape(cout)
+            if len(node.inputs) > 2
+            else np.zeros(cout, dtype=np.float32)
+        )
+        folded_b = bias * scale + shift
+
+        base = node.name or weight.name
+        export_dtype = getattr(weight, "export_dtype", None)
+        new_w = gs.Constant(
+            f"{base}_bnfold_W",
+            values=folded_w.astype(w_values.dtype),
+            export_dtype=export_dtype,
+        )
+        new_b = gs.Constant(
+            f"{base}_bnfold_b",
+            values=folded_b.astype(w_values.dtype),
+            export_dtype=export_dtype,
+        )
+
+        node.inputs[1] = new_w
+        if len(node.inputs) > 2:
+            node.inputs[2] = new_b
+        else:
+            node.inputs.append(new_b)
+        # Take over the Add's output so downstream consumers (and graph
+        # outputs) keep their tensor; the Mul/Add pair goes dead.
+        node.outputs[0] = add.outputs[0]
+        mul.inputs.clear()
+        mul.outputs.clear()
+        add.inputs.clear()
+        add.outputs.clear()
+
+        self._logger.debug(
+            "folded Conv->Mul->Add at %r into the conv (cout=%d)", node.name, cout
+        )
+
+@dataclass
 class DecomposeStridedConv1D(OnnxGraphEdit):
     """
     Decompose strided 1D convolutions into im2col unfold + MatMul.

@@ -416,6 +416,207 @@ class BroadcastOpInputs(OnnxGraphEdit):
             )
 
 @dataclass
+class CollapseUnrolledConcat(OnnxGraphEdit):
+    """
+    Collapse "unrolled stack/unbind" Concat inputs back into their source tensor.
+
+    Some exporters lower ``torch.stack([t for t in x.unbind(d)], d)`` (or an
+    equivalent flatten/permute of a feature map) into a single Concat with one
+    input *per element*, each produced by
+    ``Unsqueeze(Squeeze(Slice(V, [i:i+1], axis)))``. That is an exact identity
+    on ``V`` over the slice run, but bloats the graph (3 ops per element) and
+    yields very high-arity nodes that downstream tools choke on (e.g.
+    ``iree-run-module`` segfaulting on functions with 300+ arguments).
+
+    Each maximal run of two or more consecutive unit slices of a common tensor
+    ``V`` (ascending starts, step 1) is rewritten to ``V`` itself when the run
+    covers all of ``V`` along the concat axis, or to a single ``Slice`` of
+    ``V`` otherwise. Non-slice inputs (e.g. learned special tokens) keep their
+    place and order. An input only counts as a unit slice when static shapes
+    prove the pass-through ops between the Slice and the Concat net to an
+    identity; anything unproven (including unknown/dynamic shapes) is left
+    untouched, so the rewrite fires only when it is value-preserving.
+
+    Args:
+        min_fanin (int): Only consider Concat nodes with at least this many
+            inputs (default: 32).
+    """
+
+    min_fanin: int = 32
+
+    # Ops between the Slice and the Concat input that only add/remove size-1
+    # axes; they preserve flat element order, so equal shapes imply identity.
+    _PASSTHROUGH_OPS = frozenset({"Squeeze", "Unsqueeze", "Identity"})
+
+    @staticmethod
+    def _sole_producer(tensor) -> gs.Node | None:
+        producers = getattr(tensor, "inputs", None) or []
+        return producers[0] if len(producers) == 1 else None
+
+    def _trace_to_slice(self, tensor) -> gs.Node | None:
+        cur = tensor
+        for _ in range(16):
+            producer = self._sole_producer(cur)
+            if producer is None:
+                return None
+            if producer.op == "Slice":
+                return producer
+            if producer.op in self._PASSTHROUGH_OPS and producer.inputs:
+                cur = producer.inputs[0]
+                continue
+            return None
+        return None
+
+    @staticmethod
+    def _parse_unit_slice(slice_node: gs.Node, axis: int) -> int | None:
+        """Return the start index if slice_node is a step-1, width-1 Slice on ``axis``."""
+        ins = slice_node.inputs
+        if len(ins) < 3:
+            return None
+        starts = _const_int_list(ins[1])
+        ends = _const_int_list(ins[2])
+        if starts is None or ends is None or len(starts) != 1 or len(ends) != 1:
+            return None
+        if len(ins) > 3 and ins[3] is not None and ins[3].name:
+            axes = _const_int_list(ins[3])
+            if axes is None or len(axes) != 1:
+                return None
+            slice_axis = axes[0]
+        else:
+            slice_axis = 0
+        if len(ins) > 4 and ins[4] is not None and ins[4].name:
+            steps = _const_int_list(ins[4])
+            if steps is None or steps != [1]:
+                return None
+        if ends[0] - starts[0] != 1:
+            return None
+        data_shape = _static_int_shape(ins[0])
+        if data_shape is None:
+            return None
+        if slice_axis < 0:
+            slice_axis += len(data_shape)
+        if slice_axis != axis:
+            return None
+        return starts[0]
+
+    def _classify(self, inp, concat_axis: int):
+        """Return (V_tensor, axis, start) if ``inp`` provably equals a unit slice of V."""
+        in_shape = _static_int_shape(inp)
+        if in_shape is None:
+            return None
+        slice_node = self._trace_to_slice(inp)
+        if slice_node is None:
+            return None
+        source = slice_node.inputs[0]
+        v_shape = _static_int_shape(source)
+        if v_shape is None or len(v_shape) != len(in_shape):
+            return None
+        axis = concat_axis + len(v_shape) if concat_axis < 0 else concat_axis
+        if not 0 <= axis < len(v_shape):
+            return None
+        start = self._parse_unit_slice(slice_node, axis)
+        if start is None or not 0 <= start < v_shape[axis]:
+            return None
+        expected = list(v_shape)
+        expected[axis] = 1
+        if in_shape != expected:
+            return None
+        return source, axis, start
+
+    def _plan(self, node: gs.Node):
+        """Return (axis, entries) where each entry is ('keep', t) / ('tensor', V) /
+        ('slice', V, s0, s1), or None when there is nothing provable to collapse."""
+        axis_attr = node.attrs.get("axis")
+        if axis_attr is None:
+            return None
+        items = []
+        axis = None
+        for inp in node.inputs:
+            classified = self._classify(inp, int(axis_attr))
+            if classified is None:
+                items.append(("other", None, None, inp))
+            else:
+                source, axis, start = classified
+                items.append(("slice", source, start, inp))
+
+        entries = []
+        collapsed_any = False
+        i = 0
+        while i < len(items):
+            kind, source, start, tensor = items[i]
+            if kind != "slice":
+                entries.append(("keep", tensor))
+                i += 1
+                continue
+            run = [start]
+            j = i + 1
+            while (
+                j < len(items)
+                and items[j][0] == "slice"
+                and items[j][1] is source
+                and items[j][2] == run[-1] + 1
+            ):
+                run.append(items[j][2])
+                j += 1
+            if len(run) == 1:
+                entries.append(("keep", tensor))
+                i += 1
+                continue
+            collapsed_any = True
+            v_shape = _static_int_shape(source)
+            if run[0] == 0 and len(run) == v_shape[axis]:
+                entries.append(("tensor", source))
+            else:
+                entries.append(("slice", source, run[0], run[-1] + 1))
+            i = j
+
+        if not collapsed_any:
+            return None
+        return axis, entries
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Concat" or len(node.inputs) < self.min_fanin:
+            return False
+        return self._plan(node) is not None
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Concat")
+        plan = self._plan(node)
+        if plan is None:
+            return
+        axis, entries = plan
+
+        base = node.name or "unrolled_concat"
+        old_arity = len(node.inputs)
+        new_inputs = []
+        for entry in entries:
+            if entry[0] in ("keep", "tensor"):
+                new_inputs.append(entry[1])
+                continue
+            _, source, s0, s1 = entry
+            prefix = f"{base}_collapsed_{s0}_{s1}"
+            starts = gs.Constant(f"{prefix}_starts", np.array([s0], dtype=np.int64))
+            ends = gs.Constant(f"{prefix}_ends", np.array([s1], dtype=np.int64))
+            axes = gs.Constant(f"{prefix}_axes", np.array([axis], dtype=np.int64))
+            out_shape = list(_static_int_shape(source))
+            out_shape[axis] = s1 - s0
+            sliced = self.graph.layer(
+                name=prefix,
+                op="Slice",
+                inputs=[source, starts, ends, axes],
+                outputs=[gs.Variable(
+                    f"{prefix}_out", dtype=source.dtype, shape=out_shape
+                )],
+            )[0]
+            new_inputs.append(sliced)
+
+        node.inputs = new_inputs
+        self._logger.debug(
+            "collapsed Concat %r: %d -> %d inputs (axis=%d)",
+            node.name, old_arity, len(new_inputs), axis,
+        )
+
+@dataclass
 class EliminateRank0Gather(OnnxGraphEdit):
     """
     Rewrite ``Gather(rank-0) -> Unsqueeze(axes=[0])`` chains to a rank-1 Gather.
