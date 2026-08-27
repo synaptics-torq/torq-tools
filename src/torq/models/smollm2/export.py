@@ -41,6 +41,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         **edit_args
     ):
@@ -69,6 +70,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
@@ -304,6 +306,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
@@ -313,6 +316,13 @@ def export_smollm2_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:

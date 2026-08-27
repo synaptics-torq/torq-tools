@@ -28,7 +28,11 @@ from ..tools.convert_dtype.onnx import (
     convert_model
 )
 from ..tools.cleanup.onnx import cleanup_onnx_model
-from ..tools.quantization.dynamic_quantization import dynamic_quantize_model
+from ..tools.quantization.dynamic_quantization import (
+    analyze_dynamic_quantization,
+    dynamic_quantize_model,
+    summarize_dynamic_quantization,
+)
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
@@ -327,6 +331,7 @@ class OnnxModelExporterBase(ABC):
         self,
         quantize_dir: str | os.PathLike | None = None,
         skip: list[str] | None = None,
+        analyze_nodes: bool = False,
         **quantize_kwargs,
     ):
         if not self._dynamic_quantize:
@@ -349,6 +354,23 @@ class OnnxModelExporterBase(ABC):
                 **quantize_kwargs
             )
             self._logger.info("(ONNX-quantize) Successfully dynamically quantizied model @ '%s'", str(quantized_model_path))
+            summary = summarize_dynamic_quantization(model_path, quantized_model_path)
+            self._logger.info(
+                "(ONNX-quantize) Quantization summary for '%s': kl=%.6g cosine=%.6f max_abs_error=%.6g [%s]",
+                comp, summary["kl"], summary["cosine"], summary["max_abs_error"], summary["classification"],
+            )
+            if analyze_nodes:
+                self._logger.info("(ONNX-quantize) Analyzing per-node quantization sensitivity for '%s'...", str(model_path))
+                report = analyze_dynamic_quantization(
+                    model_path,
+                    uint8_weights=quantize_kwargs.get("uint8_weights", False),
+                    per_tensor=quantize_kwargs.get("per_tensor", False),
+                )
+                report_path = self._quantize_dir / f"{model_path.stem}_sensitivity.json"
+                report_path.write_text(json.dumps(report, indent=2))
+                self._logger.info(
+                    "(ONNX-quantize) Saved sensitivity report (%d nodes) to '%s'", len(report), str(report_path)
+                )
             self._export_paths[comp] = quantized_model_path
             self._logger.debug("(ONNX-quantize) Update %s model path to '%s'", comp, str(quantized_model_path))
         self._copy_runtime_assets(self._quantize_dir, self._export_dir)

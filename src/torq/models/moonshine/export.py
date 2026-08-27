@@ -66,10 +66,16 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         use_optimum: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
         **edit_args
     ):
+        if model_dtype in ("quantized", "quantized_4bit") and dynamic_quantize:
+            raise ValueError(
+                f"'--dynamic-quantize' is not supported with '-d {model_dtype}' models, "
+                "which are already pre-quantized"
+            )
         self._model_size = model_size
         self._split_encoder = split_encoder
         self._fold_encoder_cache = fold_encoder_cache
@@ -110,6 +116,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs=opt_configs,
             skip_export=skip_export,
@@ -820,6 +827,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         use_optimum=args.use_optimum,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
@@ -830,6 +838,13 @@ def export_moonshine_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if args.skip_torq is None or "all" not in args.skip_torq:

@@ -170,6 +170,31 @@ def analyze_dynamic_quantization(
     return results
 
 
+def summarize_dynamic_quantization(
+    model_input_path: str | os.PathLike,
+    quantized_model_path: str | os.PathLike,
+    *,
+    calibration_data: dict[str, np.ndarray] | None = None,
+    seed: int = 42,
+) -> dict:
+    """Whole-model, single-pass comparison of a quantized model against its fp32 source."""
+    model = onnx.load(model_input_path)
+    feeds = (
+        calibration_data
+        if calibration_data is not None
+        else _build_random_feeds(model, seed)
+    )
+    base_out = _run_session(make_cpu_session(str(model_input_path)), feeds)
+    quant_out = _run_session(make_cpu_session(str(quantized_model_path)), feeds)
+    kl, cos, max_err = _compare_outputs(base_out, quant_out)
+    return {
+        "kl": kl,
+        "cosine": cos,
+        "max_abs_error": max_err,
+        "classification": classify_severity(kl),
+    }
+
+
 def add_dynamic_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-i",

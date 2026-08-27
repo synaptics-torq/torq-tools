@@ -6,7 +6,8 @@ import argparse
 from .analyze import (
     add_dynamic_analyze_args,
     analyze_dynamic_quantization,
-    dynamic_analyze_from_args
+    dynamic_analyze_from_args,
+    summarize_dynamic_quantization,
 )
 from .quantize import (
     add_dynamic_quantize_args,
@@ -22,7 +23,8 @@ __all__ = [
     "dynamic_quantize_model",
     "add_dynamic_analyze_args",
     "dynamic_analyze_from_args",
-    "analyze_dynamic_quantization"
+    "analyze_dynamic_quantization",
+    "summarize_dynamic_quantization",
 ]
 
 

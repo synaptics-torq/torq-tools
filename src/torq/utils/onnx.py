@@ -121,6 +121,23 @@ def add_onnx_args(
             default=False,
             help="Quantize weights with per-tensor scale and zero point"
         )
+        group.add_argument(
+            "--dynamic-quantization-skip-model",
+            type=str,
+            nargs="+",
+            metavar="COMPONENT",
+            default=None,
+            help="Skip dynamic quantization for the given model component(s) "
+            "(e.g. quantize the transformer but not the lm_head)",
+        )
+        group.add_argument(
+            "--dynamic-quantize-analyze-nodes",
+            action="store_true",
+            default=False,
+            help="Also run a per-node quantization-sensitivity report (one quantize+inference "
+            "pass per candidate node; slow on large models). A fast whole-model summary "
+            "always runs regardless of this flag.",
+        )
     if convert_dtypes:
         group.add_argument(
             "--convert-dtypes",
