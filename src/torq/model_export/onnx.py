@@ -340,7 +340,7 @@ class OnnxModelExporterBase(ABC):
         self._quantize_dir.mkdir(parents=True, exist_ok=True)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
-                shutil.copy2(model_path, self._quantize_dir)
+                self._export_paths[comp] = Path(shutil.copy2(model_path, self._quantize_dir))
                 continue
             self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
             quantized_model_path = self._quantize_dir / model_path.name
@@ -372,7 +372,7 @@ class OnnxModelExporterBase(ABC):
         self._convert_dir.mkdir(parents=True, exist_ok=True)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
-                shutil.copy2(model_path, self._convert_dir)
+                self._export_paths[comp] = Path(shutil.copy2(model_path, self._convert_dir))
                 continue
             self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(model_path))
             converted_model_path = self._convert_dir / model_path.name
