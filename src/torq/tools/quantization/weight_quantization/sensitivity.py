@@ -29,6 +29,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from ....utils.logging import add_logging_args, configure_logging
+from ....utils.metrics import classify_severity, cosine_similarity, kl_divergence
 from .config import SensitivityResult, SensitivityResults
 from .quantize import dequantize_weight, quantize_weight
 
@@ -385,8 +386,8 @@ class LayerSensitivityAnalyzer:
                     for step_idx in range(min(len(bl_results), len(mod_results))):
                         bl_logits = bl_results[step_idx][1]
                         mod_logits = mod_results[step_idx][1]
-                        kl_divs.append(_kl_divergence(bl_logits, mod_logits))
-                        cos_sims.append(_cosine_similarity(bl_logits, mod_logits))
+                        kl_divs.append(kl_divergence(bl_logits, mod_logits))
+                        cos_sims.append(cosine_similarity(bl_logits, mod_logits))
                         top1_matches.append(
                             1.0
                             if bl_logits.argmax() == mod_logits.argmax()
@@ -403,7 +404,7 @@ class LayerSensitivityAnalyzer:
                 layer_cos[bits] = mean_cos
                 layer_top1[bits] = mean_top1
 
-                sev = _classify(mean_kl)
+                sev = classify_severity(mean_kl)
                 logger.info(
                     "  %d-bit: KL=%.10f cos=%.6f top1=%.2f [%s]",
                     bits, mean_kl, mean_cos, mean_top1, sev,
@@ -425,7 +426,7 @@ class LayerSensitivityAnalyzer:
                 kl_divergence=layer_kl,
                 cosine_similarity=layer_cos,
                 top1_match=layer_top1,
-                classification=_classify(worst_kl),
+                classification=classify_severity(worst_kl),
             )
             results.layers.append(result)
 
@@ -741,41 +742,6 @@ class LayerSensitivityAnalyzer:
 # ---------------------------------------------------------------------------
 # Metric helpers
 # ---------------------------------------------------------------------------
-
-
-def _kl_divergence(p_logits: np.ndarray, q_logits: np.ndarray) -> float:
-    """KL divergence D(P || Q) from logits."""
-    p = p_logits.astype(np.float64)
-    q = q_logits.astype(np.float64)
-    p -= p.max()
-    q -= q.max()
-    p_exp = np.exp(p)
-    q_exp = np.exp(q)
-    p_sum = p_exp.sum()
-    q_sum = q_exp.sum()
-    log_p = p - np.log(p_sum)
-    log_q = q - np.log(q_sum)
-    p_prob = p_exp / p_sum
-    kl = float(np.sum(p_prob * (log_p - log_q)))
-    return max(0.0, kl)
-
-
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
-
-def _classify(kl_divergence: float) -> str:
-    if kl_divergence > 1.0:
-        return "CRITICAL"
-    if kl_divergence > 0.1:
-        return "HIGH"
-    if kl_divergence > 0.01:
-        return "MEDIUM"
-    return "LOW"
 
 
 # ---------------------------------------------------------------------------

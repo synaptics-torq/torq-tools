@@ -26,6 +26,7 @@ def dynamic_quantize_model(
     *,
     quantize_only_ops: list[str] | None = None,
     quantize_only_nodes: list[str] | None = None,
+    exclude_nodes: list[str] | None = None,
     skip_preprocess: bool = False,
     uint8_weights: bool = False,
     per_tensor: bool = False,
@@ -36,6 +37,7 @@ def dynamic_quantize_model(
     logger.debug("  Per-tensor   = %s", str(per_tensor))
     logger.debug("  Op types     = %s", "all" if quantize_only_ops is None else ", ".join(quantize_only_ops))
     logger.debug("  Graph nodes  = %s", "all" if quantize_only_nodes is None else ", ".join(quantize_only_nodes))
+    logger.debug("  Exclude nodes = %s", "none" if exclude_nodes is None else ", ".join(exclude_nodes))
     if not skip_preprocess:
         quant_pre_process(model_input_path, model_output_path)
         logger.debug("Preprocessed model '%s' before quantization", str(model_output_path))
@@ -44,6 +46,7 @@ def dynamic_quantize_model(
         model_output_path,
         op_types_to_quantize=quantize_only_ops,
         nodes_to_quantize=quantize_only_nodes,
+        nodes_to_exclude=exclude_nodes,
         weight_type=QuantType.QUInt8 if uint8_weights else QuantType.QInt8,
         per_channel=not per_tensor,
         **quantize_kwargs
@@ -84,6 +87,13 @@ def add_dynamic_quantize_args(parser: argparse.ArgumentParser) -> None:
         help="Only quantize specified nodes; must be valid node names from graph",
     )
     parser.add_argument(
+        "--exclude-nodes",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Exclude specified nodes from quantization (e.g. an analysis exclude list)",
+    )
+    parser.add_argument(
         "--skip-preprocess",
         action="store_true",
         default=False,
@@ -122,6 +132,9 @@ def dynamic_quantize_from_args(args: argparse.Namespace):
     )
     dynamic_quantize_model(
         args.input, args.output,
+        quantize_only_ops=args.quantize_only_ops,
+        quantize_only_nodes=args.quantize_only_nodes,
+        exclude_nodes=args.exclude_nodes,
         skip_preprocess=args.skip_preprocess,
         uint8_weights=args.uint8_weights,
         per_tensor=args.per_tensor,

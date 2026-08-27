@@ -15,6 +15,11 @@ Uint8 weights + per-tensor quantization::
 
     python -m torq.tools.quantization.dynamic_quantization quantize \\
         -i model.onnx -o model_quantized.onnx --uint8-weights --per-tensor
+
+Per-node sensitivity analysis (writes a report + optional exclude list)::
+
+    python -m torq.tools.quantization.dynamic_quantization analyze \\
+        -i model.onnx -o report.json --exclude-output exclude.json
 """
 
 from __future__ import annotations
