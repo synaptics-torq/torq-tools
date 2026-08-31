@@ -5,8 +5,18 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import assert_model_outputs_close, clone_graph, graph
-from torq.graph_edit.edits.conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
+from support.graph_edit import (
+    assert_model_outputs_close,
+    clone_graph,
+    conv_bn_graph,
+    graph,
+    only_node,
+)
+from torq.graph_edit.edits.conv import (
+    DecomposeStridedConv1D,
+    FoldConvBatchNorm,
+    WidenStridedDepthwiseConv,
+)
 
 
 pytestmark = [pytest.mark.conv, pytest.mark.ort]
@@ -36,4 +46,21 @@ def test_widened_depthwise_conv_is_numerically_equivalent_after_slice():
     WidenStridedDepthwiseConv(edited, "integration").transform(edited.nodes[0])
 
     feeds = {"x": np.arange(10, dtype=np.float32).reshape(1, 2, 5) / 5.0}
+    assert_model_outputs_close(original, edited, feeds)
+
+
+def test_folded_conv_batchnorm_is_numerically_equivalent():
+    original, _, _, _ = conv_bn_graph(
+        np.arange(54, dtype=np.float32).reshape(2, 3, 3, 3) / 27.0,
+        np.array([2.0, 0.5], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, -3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        bias_values=np.array([0.5, -1.0], dtype=np.float32),
+    )
+    edited = clone_graph(original)
+    edit = FoldConvBatchNorm(edited, "integration")
+    conv_edited = only_node(edited, "Conv")
+    assert edit.match(conv_edited)
+    edit.transform(conv_edited)
+
+    feeds = {"x": np.random.default_rng(0).standard_normal((1, 3, 4, 4)).astype(np.float32)}
     assert_model_outputs_close(original, edited, feeds)

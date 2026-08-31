@@ -5,8 +5,12 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph
-from torq.graph_edit.edits.conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
+from support.graph_edit import conv_bn_graph, graph
+from torq.graph_edit.edits.conv import (
+    DecomposeStridedConv1D,
+    FoldConvBatchNorm,
+    WidenStridedDepthwiseConv,
+)
 
 
 pytestmark = pytest.mark.conv
@@ -89,3 +93,104 @@ def test_decompose_strided_conv1d_replaces_single_channel_unsqueeze_case():
     assert conv.outputs == []
     assert unsq.outputs == []
     assert any(node.name == "conv_matmul" for node in g.nodes)
+
+
+def test_fold_conv_batchnorm_folds_scale_and_shift():
+    w = np.ones((2, 3, 3, 3), dtype=np.float32)
+    g, conv, mul, add = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+    )
+
+    edit = FoldConvBatchNorm(g, "unit")
+    assert edit.match(conv)
+    edit.transform(conv)
+
+    np.testing.assert_array_equal(conv.inputs[1].values[0], np.full((3, 3, 3), 2.0))
+    np.testing.assert_array_equal(conv.inputs[1].values[1], np.full((3, 3, 3), 3.0))
+    np.testing.assert_array_equal(conv.inputs[2].values, [10.0, 20.0])
+    assert conv.outputs[0].name == "add_out"
+    assert g.outputs[0] is conv.outputs[0]
+    assert mul.outputs == []
+    assert add.outputs == []
+
+
+def test_fold_conv_batchnorm_composes_existing_bias():
+    w = np.ones((2, 3, 3, 3), dtype=np.float32)
+    g, conv, _, _ = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        bias_values=np.array([1.0, -1.0], dtype=np.float32),
+    )
+
+    edit = FoldConvBatchNorm(g, "unit")
+    assert edit.match(conv)
+    edit.transform(conv)
+
+    np.testing.assert_array_equal(conv.inputs[2].values, [12.0, 17.0])  # c*s + b
+
+
+def test_fold_conv_batchnorm_accepts_scalar_and_conv1d():
+    w = np.ones((2, 3, 5), dtype=np.float32)
+    g, conv, _, _ = conv_bn_graph(
+        w,
+        np.array(2.0, dtype=np.float32),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1),
+    )
+
+    edit = FoldConvBatchNorm(g, "unit")
+    assert edit.match(conv)
+    edit.transform(conv)
+
+    np.testing.assert_array_equal(conv.inputs[1].values, np.full((2, 3, 5), 2.0))
+    np.testing.assert_array_equal(conv.inputs[2].values, [10.0, 20.0])
+
+
+def test_fold_conv_batchnorm_rejects_last_axis_broadcast():
+    # A rank-1 [C] constant broadcasts onto the LAST axis of the NCHW output,
+    # not the channel axis; folding it per-channel would miscompile.
+    w = np.ones((2, 3, 3, 3), dtype=np.float32)
+    g, conv, _, _ = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+    )
+
+    assert not FoldConvBatchNorm(g, "unit").match(conv)
+
+
+def test_fold_conv_batchnorm_rejects_second_consumer():
+    w = np.ones((2, 3, 3, 3), dtype=np.float32)
+    g, conv, _, _ = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        extra_consumer=True,
+    )
+
+    assert not FoldConvBatchNorm(g, "unit").match(conv)
+
+
+def test_fold_conv_batchnorm_rejects_activation_add_and_nonconst_weight():
+    w = np.ones((2, 3, 3, 3), dtype=np.float32)
+    g, conv, mul, add = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+    )
+    residual = gs.Variable("residual", dtype=np.float32, shape=[1, 2, 4, 4])
+    add.inputs = [mul.outputs[0], residual]
+    g.inputs.append(residual)
+    assert not FoldConvBatchNorm(g, "unit").match(conv)
+
+    g2, conv2, _, _ = conv_bn_graph(
+        w,
+        np.array([2.0, 3.0], dtype=np.float32).reshape(1, 2, 1, 1),
+        np.array([10.0, 20.0], dtype=np.float32).reshape(1, 2, 1, 1),
+    )
+    w_var = gs.Variable("w_var", dtype=np.float32, shape=[2, 3, 3, 3])
+    conv2.inputs[1] = w_var
+    g2.inputs.append(w_var)
+    assert not FoldConvBatchNorm(g2, "unit").match(conv2)

@@ -11,12 +11,13 @@ from .arithmetic import (
     ReplaceInt64FloatCast,
 )
 from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
-from .conv import DecomposeStridedConv1D, WidenStridedDepthwiseConv
+from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
 from .shape import (
     BroadcastOpInputs,
     CollapseReshapeChain,
+    CollapseUnrolledConcat,
     ConstantBroadcastPolicy,
     EliminateExpand,
     EliminateRank0Gather,
@@ -179,4 +180,14 @@ class CommonGraphEditsMixin:
         self.apply_edit(
             DecomposeBidirectionalRnn(self._graph, self._graph_name, max_chunk_len)
         )
+        return self
+
+    def collapse_unrolled_concat(self, min_fanin: int = 32):
+        self.apply_edit(
+            CollapseUnrolledConcat(self._graph, self._graph_name, min_fanin)
+        )
+        return self
+
+    def fold_conv_batchnorm(self):
+        self.apply_edit(FoldConvBatchNorm(self._graph, self._graph_name))
         return self

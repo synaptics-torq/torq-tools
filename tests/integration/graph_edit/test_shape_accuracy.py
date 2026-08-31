@@ -5,8 +5,19 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import assert_model_outputs_close, clone_graph, graph
-from torq.graph_edit.edits.shape import BroadcastOpInputs, ConstantBroadcastPolicy, EliminateTranspose
+from support.graph_edit import (
+    assert_model_outputs_close,
+    clone_graph,
+    graph,
+    only_node,
+    unrolled_concat_graph,
+)
+from torq.graph_edit.edits.shape import (
+    BroadcastOpInputs,
+    CollapseUnrolledConcat,
+    ConstantBroadcastPolicy,
+    EliminateTranspose,
+)
 
 
 pytestmark = [pytest.mark.shape, pytest.mark.ort]
@@ -40,4 +51,20 @@ def test_materialized_constant_broadcast_is_numerically_equivalent():
     ).transform(edited.nodes[0])
 
     feeds = {"x": np.arange(6, dtype=np.float32).reshape(2, 3)}
+    assert_model_outputs_close(original, edited, feeds)
+
+
+def test_collapsed_unrolled_concat_is_numerically_equivalent():
+    original, _, _ = unrolled_concat_graph(v_len=4, extra_front=1)
+    edited = clone_graph(original)
+    edit = CollapseUnrolledConcat(edited, "integration", min_fanin=5)
+    concat = only_node(edited, "Concat")
+    assert edit.match(concat)
+    edit.transform(concat)
+
+    rng = np.random.default_rng(0)
+    feeds = {
+        "v": rng.standard_normal((1, 4, 8)).astype(np.float32),
+        "tok0": rng.standard_normal((1, 1, 8)).astype(np.float32),
+    }
     assert_model_outputs_close(original, edited, feeds)

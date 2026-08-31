@@ -6,10 +6,11 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph
+from support.graph_edit import graph, unit_slice_chain, unrolled_concat_graph
 from torq.graph_edit.edits.shape import (
     BroadcastOpInputs,
     CollapseReshapeChain,
+    CollapseUnrolledConcat,
     ConstantBroadcastPolicy,
     EliminateExpand,
     EliminateRank0Gather,
@@ -174,3 +175,62 @@ def test_eliminate_singleton_gather_unsqueeze_feeds_unary_from_original_data():
     assert relu.outputs[0] is out
     assert gather_node.outputs == []
     assert unsq.outputs == []
+
+
+def test_collapse_unrolled_concat_full_cover_becomes_source_tensor():
+    g, concat, v = unrolled_concat_graph(v_len=4)
+
+    edit = CollapseUnrolledConcat(g, "unit", min_fanin=4)
+    assert edit.match(concat)
+    edit.transform(concat)
+
+    assert list(concat.inputs) == [v]
+
+
+def test_collapse_unrolled_concat_preserves_non_slice_inputs_in_order():
+    g, concat, v = unrolled_concat_graph(v_len=4, extra_front=2)
+
+    edit = CollapseUnrolledConcat(g, "unit", min_fanin=4)
+    assert edit.match(concat)
+    edit.transform(concat)
+
+    assert [t.name for t in concat.inputs] == ["tok0", "tok1", "v"]
+
+
+def test_collapse_unrolled_concat_partial_run_becomes_single_slice():
+    v = gs.Variable("v", dtype=np.float32, shape=[1, 6, 8])
+    out = gs.Variable("out", dtype=np.float32, shape=[1, 4, 8])
+    nodes = []
+    cat_inputs = []
+    for i in range(1, 5):  # slices 1..4 of a length-6 axis: no full cover
+        chain, tip = unit_slice_chain(v, i, 1, [1, 1, 8])
+        nodes += chain
+        cat_inputs.append(tip)
+    concat = gs.Node("Concat", "cat", inputs=cat_inputs, outputs=[out], attrs={"axis": 1})
+    nodes.append(concat)
+    g = graph(nodes=nodes, inputs=[v], outputs=[out])
+
+    edit = CollapseUnrolledConcat(g, "unit", min_fanin=4)
+    assert edit.match(concat)
+    edit.transform(concat)
+
+    assert len(concat.inputs) == 1
+    new_slice = concat.inputs[0].inputs[0]
+    assert new_slice.op == "Slice"
+    assert new_slice.inputs[0] is v
+    assert new_slice.inputs[1].values.tolist() == [1]
+    assert new_slice.inputs[2].values.tolist() == [5]
+
+
+def test_collapse_unrolled_concat_requires_proven_shapes():
+    g, concat, _ = unrolled_concat_graph(v_len=4)
+    for tensor in concat.inputs:
+        tensor.shape = None  # unproven identity must NOT collapse
+
+    assert not CollapseUnrolledConcat(g, "unit", min_fanin=4).match(concat)
+
+
+def test_collapse_unrolled_concat_respects_min_fanin():
+    g, concat, _ = unrolled_concat_graph(v_len=4)
+
+    assert not CollapseUnrolledConcat(g, "unit").match(concat)  # default min_fanin=32

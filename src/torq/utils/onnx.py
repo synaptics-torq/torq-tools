@@ -85,6 +85,14 @@ def add_onnx_args(
         default=False,
         help="Skip validation for edited ONNX models"
     )
+    group.add_argument(
+        "--no-onnx-cleanup",
+        action="store_true",
+        default=False,
+        help="Skip the torq.tools.cleanup pipeline (collapse unrolled "
+             "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
+             "exported component before dtype conversion",
+    )
     if allow_no_opt:
         group.add_argument(
             "--no-optimize",
