@@ -87,6 +87,13 @@ def test_cleanup_pipeline_removes_all_three_artifact_kinds():
     assert_model_outputs_close(model, cleaned, feeds)
 
 
+def test_cleanup_is_idempotent():
+    model = _artifact_model()
+    once = cleanup_onnx_model(model, min_fanin=4)
+    twice = cleanup_onnx_model(once, min_fanin=4)
+    assert once.SerializeToString() == twice.SerializeToString()
+
+
 def test_cleanup_skip_flags_disable_passes():
     model = _artifact_model()
     cleaned = cleanup_onnx_model(model, min_fanin=4, skip=("fold-conv-bn",))
