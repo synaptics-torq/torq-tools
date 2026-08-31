@@ -60,14 +60,33 @@ class _StubExporter(OnnxModelExporterBase):
     def validate_onnx(self, n_iters: int = 5): ...
 
 
-@pytest.mark.parametrize("cleanup", [False, True])
+@pytest.mark.parametrize("cleanup", [None, True, False])
 def test_export_onnx_cleanup_flag(tmp_path, cleanup):
     exporter = _StubExporter(tmp_path)
-    exporter.export_onnx(validate=False, cleanup=cleanup)
+    if cleanup is None:  # cleanup is the default
+        exporter.export_onnx(validate=False)
+    else:
+        exporter.export_onnx(validate=False, cleanup=cleanup)
 
     exported = onnx.load(exporter.export_dir / "model.onnx")
     ops = [node.op_type for node in exported.graph.node]
-    if cleanup:
-        assert ops == ["Conv"]  # BN chain folded into the conv
-    else:
+    if cleanup is False:
         assert ops == ["Conv", "Mul", "Add"]
+    else:
+        assert ops == ["Conv"]  # BN chain folded into the conv
+
+
+def test_export_onnx_survives_cleanup_failure(tmp_path, monkeypatch):
+    """Cleanup is an optimization: a failure must not break the export."""
+    import torq.model_export.onnx as me
+
+    def boom(model, **kwargs):
+        raise RuntimeError("injected cleanup failure")
+
+    monkeypatch.setattr(me, "cleanup_onnx_model", boom)
+    exporter = _StubExporter(tmp_path)
+    exporter.export_onnx(validate=False)
+
+    exported = onnx.load(exporter.export_dir / "model.onnx")
+    ops = [node.op_type for node in exported.graph.node]
+    assert ops == ["Conv", "Mul", "Add"]  # uncleaned model exported

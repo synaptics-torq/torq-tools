@@ -36,13 +36,18 @@ PASSES = ("collapse-concat", "fold-constants", "fold-conv-bn")
 
 GRAPH_NAME = "onnx_cleanup"
 
+# Don't materialize folded constants above this size: constant-folding e.g. a
+# Transpose of a (possibly weight-tied) lm_head matrix would duplicate hundreds
+# of MB for a rewrite the downstream optimizer/compiler handles anyway.
+DEFAULT_FOLD_SIZE_THRESHOLD = 16 << 20
+
 
 def cleanup_onnx_model(
     model: onnx.ModelProto,
     *,
     min_fanin: int = 32,
     skip: Collection[str] = (),
-    fold_size_threshold: int | None = None,
+    fold_size_threshold: int | None = DEFAULT_FOLD_SIZE_THRESHOLD,
 ) -> onnx.ModelProto:
     """Return a cleaned copy of ``model`` (the input proto is not modified)."""
     unknown = set(skip) - set(PASSES)
@@ -66,7 +71,10 @@ def cleanup_onnx_model(
             editor.graph.fold_constants(size_threshold=fold_size_threshold)
         if "fold-conv-bn" not in skip:
             editor.apply_edit(FoldConvBatchNorm(editor.graph, GRAPH_NAME))
-        cleaned = editor.to_onnx()
+        # Non-strict: some exporters legitimately carry annotations strict
+        # inference rejects (e.g. around ORT contrib ops); cleanup must not
+        # impose stricter invariants than the input model satisfied.
+        cleaned = editor.to_onnx(strict_mode=False)
 
     logger.info(
         "cleanup: %d -> %d nodes, %d -> %d initializers",
@@ -109,8 +117,10 @@ def add_onnx_cleanup_args(parser: argparse.ArgumentParser) -> None:
         help=f"Skip one of the cleanup passes {PASSES}. Repeatable.",
     )
     parser.add_argument(
-        "--fold-size-threshold", type=int, default=None, metavar="BYTES",
-        help="Don't fold constants larger than this many bytes (default: no limit)",
+        "--fold-size-threshold", type=int, default=DEFAULT_FOLD_SIZE_THRESHOLD,
+        metavar="BYTES",
+        help="Don't fold constants larger than this many bytes; negative for "
+             "no limit (default: %(default)d)",
     )
     parser.add_argument(
         "--verify", action="store_true",
@@ -121,11 +131,14 @@ def add_onnx_cleanup_args(parser: argparse.ArgumentParser) -> None:
 
 def onnx_cleanup_from_args(args: argparse.Namespace) -> None:
     model = onnx.load(args.input)
+    threshold = args.fold_size_threshold
+    if threshold is not None and threshold < 0:
+        threshold = None
     cleaned = cleanup_onnx_model(
         model,
         min_fanin=args.min_fanin,
         skip=tuple(args.skip or ()),
-        fold_size_threshold=args.fold_size_threshold,
+        fold_size_threshold=threshold,
     )
     if args.verify:
         from ...utils.onnx_verify import verify_equivalence

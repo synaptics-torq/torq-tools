@@ -98,8 +98,10 @@ python3 -m torq.tools.onnx_cleanup model_fp32.onnx -o model_clean.onnx --verify
 `--verify` re-runs both models under onnxruntime on random inputs and asserts the outputs still match.
 Individual passes can be disabled with `--skip {collapse-concat,fold-constants,fold-conv-bn}`,
 and the graph edits are also usable on their own via `--apply-graph-edit` on any model exporter.
-The pipeline is idempotent, so every model exporter can also run it on each exported component
-via `--onnx-cleanup` (before dtype conversion).
+Constants larger than `--fold-size-threshold` bytes (default 16 MiB) are not folded, so folding
+can't blow up a model by materializing e.g. a transposed lm_head matrix.
+The pipeline is idempotent and fails safe, so every model exporter also runs it on each exported
+component by default (before dtype conversion); opt out with `--no-onnx-cleanup`.
 #### Convert ONNX model dtype
 Convert fp32 ONNX models to lower-precision formats such as bf16 or fp16.
 Particularly useful for getting bf16 models, which have native hardware acceleration in the Torq runtime.

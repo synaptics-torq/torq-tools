@@ -229,7 +229,7 @@ class OnnxModelExporterBase(ABC):
                 vi.name = rename_map[vi.name]
         return model
 
-    def export_onnx(self, validate: bool = True, cleanup: bool = False):
+    def export_onnx(self, validate: bool = True, cleanup: bool = True):
         self._prepare()
         # Reset the export dir here rather than in __init__ so that constructing
         # an exporter (e.g. to render --view-graph-edits) never destroys a
@@ -249,9 +249,17 @@ class OnnxModelExporterBase(ABC):
             model = self.sanitize_onnx_names(model)
             if cleanup:
                 # Idempotent and cheap (~1 s no-op re-run on a 250-node
-                # graph), so safe to run even on already-clean exports.
+                # graph), so safe to run even on already-clean exports. The
+                # cleanup is an optimization: a failure must not break an
+                # export that works without it.
                 self._logger.info("(%s) Cleaning up exporter artifacts...", comp)
-                model = cleanup_onnx_model(model)
+                try:
+                    model = cleanup_onnx_model(model)
+                except Exception:
+                    self._logger.warning(
+                        "(%s) ONNX cleanup failed; continuing with the "
+                        "uncleaned model", comp, exc_info=True,
+                    )
             self._logger.info("(%s) Checking model...", comp)
             model = self.check_model(model)
             onnx.save(model, self._export_paths[comp])
