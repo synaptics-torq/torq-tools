@@ -9,7 +9,6 @@ constructing an exporter -- otherwise read-only commands like
 """
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import onnx
@@ -17,7 +16,6 @@ import onnx_graphsurgeon as gs
 import pytest
 
 from support.model_export import StubExporter
-from torq.model_export.onnx import OnnxModelExporterBase
 
 
 pytestmark = pytest.mark.unit
@@ -33,46 +31,6 @@ def _identity_model() -> onnx.ModelProto:
         opset=17,
     )
     return gs.export_onnx(graph)
-
-
-class _StubExporter(OnnxModelExporterBase):
-    """Minimal concrete exporter writing one trivial component.
-
-    ``setup_calls`` / ``load_calls`` stand in for the real exporters' source
-    download and multi-GB ONNX read.
-    """
-
-    def __init__(self, root: Path, dynamic_quantize: bool = False, convert_dtypes: bool = False):
-        self._root = Path(root)
-        self.setup_calls = 0
-        self.load_calls = 0
-        super().__init__(
-            "fp32", False, {}, self._root,
-            dynamic_quantize=dynamic_quantize, convert_dtypes=convert_dtypes, opt_configs={},
-        )
-
-    def _setup_dirs(self):
-        self.setup_calls += 1
-        return (
-            self._root / "source",
-            self._root / "export",
-            self._root / "quantize",
-            self._root / "convert",
-            self._root / "torq",
-        )
-
-    def _load_onnx(self):
-        self.load_calls += 1
-        return {"model": _identity_model()}
-
-    def make_static(self):
-        raise AssertionError("static export not exercised by this test")
-
-    def apply_post_static_patches(self, model_path, component):
-        pass
-
-    def validate_onnx(self, n_iters: int = 5):
-        pass
 
 
 def test_construction_leaves_existing_export_artifacts_untouched(tmp_path):
@@ -123,8 +81,8 @@ def test_export_onnx_prepares_once(tmp_path):
 
 
 def test_dynamic_quantize_models_skips_when_disabled(tmp_path, caplog):
-    caplog.set_level(logging.WARNING, logger="_StubExporter")
-    exporter = _StubExporter(tmp_path)
+    caplog.set_level(logging.WARNING, logger="StubExporter")
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
 
     exporter.dynamic_quantize_models()
 
@@ -134,7 +92,7 @@ def test_dynamic_quantize_models_skips_when_disabled(tmp_path, caplog):
 
 
 def test_dynamic_quantize_models_quantizes_and_updates_export_paths(tmp_path):
-    exporter = _StubExporter(tmp_path, dynamic_quantize=True)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
     exporter.export_onnx(validate=False)
 
     exporter.dynamic_quantize_models(skip_preprocess=True)
@@ -150,7 +108,7 @@ def test_dynamic_quantize_models_resets_stale_artifacts(tmp_path):
     stale = quantize_dir / "stale.onnx"
     stale.write_bytes(b"stale")
 
-    exporter = _StubExporter(tmp_path, dynamic_quantize=True)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
     exporter.export_onnx(validate=False)
     exporter.dynamic_quantize_models(skip_preprocess=True)
 
@@ -158,7 +116,7 @@ def test_dynamic_quantize_models_resets_stale_artifacts(tmp_path):
 
 
 def test_dynamic_quantize_models_skip_list_copies_without_quantizing(tmp_path):
-    exporter = _StubExporter(tmp_path, dynamic_quantize=True)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
     exporter.export_onnx(validate=False)
     original_bytes = (tmp_path / "export" / "model.onnx").read_bytes()
 
@@ -170,7 +128,7 @@ def test_dynamic_quantize_models_skip_list_copies_without_quantizing(tmp_path):
 
 
 def test_dynamic_quantize_models_copies_runtime_assets_from_export_dir(tmp_path):
-    exporter = _StubExporter(tmp_path, dynamic_quantize=True)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
     exporter.export_onnx(validate=False)
     export_dir = tmp_path / "export"
     (export_dir / "config.json").write_text("{}")
@@ -185,7 +143,7 @@ def test_dynamic_quantize_models_copies_runtime_assets_from_export_dir(tmp_path)
 
 def test_convert_models_skip_list_updates_export_paths(tmp_path):
     """A skipped component is copied into convert_dir; later stages (e.g. export_torq) must pick up that copy, not the stale pre-conversion path."""
-    exporter = _StubExporter(tmp_path, convert_dtypes=True)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, convert_dtypes=True)
     exporter.export_onnx(validate=False)
     original_bytes = (tmp_path / "export" / "model.onnx").read_bytes()
 
