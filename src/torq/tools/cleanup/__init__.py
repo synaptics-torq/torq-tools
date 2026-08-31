@@ -5,10 +5,10 @@
 Undo common exporter artifacts before dtype conversion
 (``torq.tools.convert_dtype``) and Torq compilation, by composing the
 ``CollapseUnrolledConcat`` and ``FoldConvBatchNorm`` graph edits with
-ORT-backed constant folding. See :mod:`torq.tools.onnx_cleanup.onnx`.
+ORT-backed constant folding. See :mod:`torq.tools.cleanup.onnx`.
 
-CLI: ``python -m torq.tools.onnx_cleanup IN.onnx -o OUT.onnx`` (or the
-``torq-onnx-cleanup`` console script).
+CLI: ``python -m torq.tools.cleanup onnx IN.onnx -o OUT.onnx`` (or the
+``torq-cleanup-model`` console script).
 """
 
 from .onnx import (

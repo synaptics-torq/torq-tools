@@ -93,7 +93,7 @@ evaluates all-constant subgraphs (positional-embedding builders, constant weight
 and folds exported eval-mode BatchNorm (`Conv -> Mul -> Add`) into the conv weights.
 Run it on fp32 graphs, before `convert_dtype`.
 ```bash
-python3 -m torq.tools.onnx_cleanup model_fp32.onnx -o model_clean.onnx --verify
+torq-cleanup-model onnx model_fp32.onnx -o model_clean.onnx --verify
 ```
 `--verify` re-runs both models under onnxruntime on random inputs and asserts the outputs still match.
 Individual passes can be disabled with `--skip {collapse-concat,fold-constants,fold-conv-bn}`,

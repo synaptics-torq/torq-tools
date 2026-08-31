@@ -11,7 +11,7 @@ from support.graph_edit import (
     to_model,
     unit_slice_chain,
 )
-from torq.tools.onnx_cleanup import cleanup_onnx_model
+from torq.tools.cleanup import cleanup_onnx_model
 
 
 pytestmark = pytest.mark.ort

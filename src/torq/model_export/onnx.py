@@ -27,7 +27,7 @@ from ..utils.onnx import (
 from ..tools.convert_dtype.onnx import (
     convert_model
 )
-from ..tools.onnx_cleanup.onnx import cleanup_onnx_model
+from ..tools.cleanup.onnx import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
