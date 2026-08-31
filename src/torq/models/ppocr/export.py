@@ -19,18 +19,17 @@ from ._surgery import cascade_resizes, decompose_avgpool, decompose_hardsigmoid,
 
 logger = logging.getLogger("ppocr-export")
 
-# DBNet's stride-32 backbone needs H and W that are multiples of 32. 640x384 is the
-# 16:9-ish bucket: 640x360 rounded UP to the next multiple of 32, so letterboxed 16:9
-# content is padded rather than cropped.
-DEFAULT_DET_SIZES = ((800, 608), (640, 384))
+# DBNet's stride-32 backbone needs H and W that are multiples of 32. 640x352 is the
+# 16:9-ish bucket: 640x360 rounded to the nearest multiple of 32.
+DEFAULT_DET_SIZES = ((800, 608), (640, 352))
 DEFAULT_BUCKETS = (320, 640, 1280, 2432)
 COMPILER_ARGS = ["--torq-hw=SL2610", "--torq-disable-slicing"]
 
 
 def _round32(hw: tuple[int, int]) -> tuple[int, int]:
-    rounded = tuple(-(-d // 32) * 32 for d in hw)
+    rounded = tuple(max(32, round(d / 32) * 32) for d in hw)
     if rounded != tuple(hw):
-        logger.warning("det input %s rounded up to %s (dims must be multiples of 32)", tuple(hw), rounded)
+        logger.warning("det input %s rounded to %s (dims must be multiples of 32)", tuple(hw), rounded)
     return rounded
 
 
@@ -73,7 +72,7 @@ def _finish(model: onnx.ModelProto, dest: Path) -> Path:
 
 def add_ppocr_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output-dir", type=str, default="models/ppocr/export", help="Output directory (default: %(default)s)")
-    parser.add_argument("--det-hw", type=int, nargs="+", metavar="D", default=[d for hw in DEFAULT_DET_SIZES for d in hw], help="Static detector inputs as H W pairs; dims are rounded up to multiples of 32 (default: %(default)s)")
+    parser.add_argument("--det-hw", type=int, nargs="+", metavar="D", default=[d for hw in DEFAULT_DET_SIZES for d in hw], help="Static detector inputs as H W pairs; dims are rounded to the nearest multiple of 32 (default: %(default)s)")
     parser.add_argument("--buckets", type=int, nargs="+", default=list(DEFAULT_BUCKETS), help="Recognizer width buckets (default: %(default)s)")
     parser.add_argument("--budget", type=int, default=150_000, help="Max bytes per ConvTranspose slice (default: %(default)s)")
     parser.add_argument("--no-compile", action="store_true", help="Stop after the bf16 ONNX exports")
