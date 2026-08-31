@@ -19,13 +19,23 @@ from ._surgery import cascade_resizes, decompose_avgpool, decompose_hardsigmoid,
 
 logger = logging.getLogger("ppocr-export")
 
-DEFAULT_DET_HW = (800, 608)
+# DBNet's stride-32 backbone needs H and W that are multiples of 32. 640x384 is the
+# 16:9-ish bucket: 640x360 rounded UP to the next multiple of 32, so letterboxed 16:9
+# content is padded rather than cropped.
+DEFAULT_DET_SIZES = ((800, 608), (640, 384))
 DEFAULT_BUCKETS = (320, 640, 1280, 2432)
 COMPILER_ARGS = ["--torq-hw=SL2610", "--torq-disable-slicing"]
 
 
-def export_ppocr(output_dir, det_hw=DEFAULT_DET_HW, buckets=DEFAULT_BUCKETS, budget=150_000, compile_vmfb=True, compiler_path=None) -> dict[str, Path]:
-    """Download, freeze, surger, bf16-convert and (optionally) compile all five models."""
+def _round32(hw: tuple[int, int]) -> tuple[int, int]:
+    rounded = tuple(-(-d // 32) * 32 for d in hw)
+    if rounded != tuple(hw):
+        logger.warning("det input %s rounded up to %s (dims must be multiples of 32)", tuple(hw), rounded)
+    return rounded
+
+
+def export_ppocr(output_dir, det_sizes=DEFAULT_DET_SIZES, buckets=DEFAULT_BUCKETS, budget=150_000, compile_vmfb=True, compiler_path=None) -> dict[str, Path]:
+    """Download, freeze, surger, bf16-convert and (optionally) compile all the models."""
     from ...utils.compile import export_torq
     from .download_source import download_source
 
@@ -34,9 +44,11 @@ def export_ppocr(output_dir, det_hw=DEFAULT_DET_HW, buckets=DEFAULT_BUCKETS, bud
     src = download_source(output_dir / "source")
     written = {}
 
-    det = freeze(onnx.load(src["det"]), [1, 3, *det_hw])
-    logger.info("det surgery: %d resize(s) cascaded, %d convtranspose(s) split, %d hardsigmoid decomposed, %d gap converted", cascade_resizes(det), split_convtranspose(det, budget), decompose_hardsigmoid(det), global_reduce_to_gap(det))
-    written["det"] = _finish(det, output_dir / f"ppocr_det_{det_hw[0]}x{det_hw[1]}.onnx")
+    for hw in det_sizes:
+        h, w = _round32(hw)
+        det = freeze(onnx.load(src["det"]), [1, 3, h, w])
+        logger.info("det_%dx%d surgery: %d resize(s) cascaded, %d convtranspose(s) split, %d hardsigmoid decomposed, %d gap converted", h, w, cascade_resizes(det), split_convtranspose(det, budget), decompose_hardsigmoid(det), global_reduce_to_gap(det))
+        written[f"det_{h}x{w}"] = _finish(det, output_dir / f"ppocr_det_{h}x{w}.onnx")
 
     for w in buckets:
         rec = freeze(onnx.load(src["rec"]), [1, 3, 48, w])
@@ -61,7 +73,7 @@ def _finish(model: onnx.ModelProto, dest: Path) -> Path:
 
 def add_ppocr_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output-dir", type=str, default="models/ppocr/export", help="Output directory (default: %(default)s)")
-    parser.add_argument("--det-hw", type=int, nargs=2, metavar=("H", "W"), default=list(DEFAULT_DET_HW), help="Static detector input, multiples of 32 (default: %(default)s)")
+    parser.add_argument("--det-hw", type=int, nargs="+", metavar="D", default=[d for hw in DEFAULT_DET_SIZES for d in hw], help="Static detector inputs as H W pairs; dims are rounded up to multiples of 32 (default: %(default)s)")
     parser.add_argument("--buckets", type=int, nargs="+", default=list(DEFAULT_BUCKETS), help="Recognizer width buckets (default: %(default)s)")
     parser.add_argument("--budget", type=int, default=150_000, help="Max bytes per ConvTranspose slice (default: %(default)s)")
     parser.add_argument("--no-compile", action="store_true", help="Stop after the bf16 ONNX exports")
@@ -71,7 +83,10 @@ def add_ppocr_export_args(parser: argparse.ArgumentParser) -> None:
 
 def export_ppocr_from_args(args: argparse.Namespace) -> None:
     configure_logging(args.logging)
-    written = export_ppocr(args.output_dir, tuple(args.det_hw), tuple(args.buckets), args.budget, compile_vmfb=not args.no_compile, compiler_path=args.compiler_path)
+    if len(args.det_hw) % 2:
+        raise SystemExit("--det-hw takes H W pairs; got an odd number of values")
+    det_sizes = tuple(zip(args.det_hw[::2], args.det_hw[1::2]))
+    written = export_ppocr(args.output_dir, det_sizes, tuple(args.buckets), args.budget, compile_vmfb=not args.no_compile, compiler_path=args.compiler_path)
     for tag, path in written.items():
         print(f"{tag}: {path}")
 
