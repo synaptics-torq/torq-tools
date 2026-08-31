@@ -450,7 +450,7 @@ class CollapseUnrolledConcat(OnnxGraphEdit):
 
     @staticmethod
     def _sole_producer(tensor) -> gs.Node | None:
-        producers = getattr(tensor, "inputs", None) or []
+        producers = tensor.inputs
         return producers[0] if len(producers) == 1 else None
 
     def _trace_to_slice(self, tensor) -> gs.Node | None:

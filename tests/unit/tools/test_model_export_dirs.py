@@ -15,7 +15,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from torq.model_export.onnx import OnnxModelExporterBase
+from support.model_export import StubExporter
 
 
 pytestmark = pytest.mark.unit
@@ -33,55 +33,19 @@ def _identity_model() -> onnx.ModelProto:
     return gs.export_onnx(graph)
 
 
-class _StubExporter(OnnxModelExporterBase):
-    """Minimal concrete exporter writing one trivial component.
-
-    ``setup_calls`` / ``load_calls`` stand in for the real exporters' source
-    download and multi-GB ONNX read.
-    """
-
-    def __init__(self, root: Path):
-        self._root = Path(root)
-        self.setup_calls = 0
-        self.load_calls = 0
-        super().__init__("fp32", False, {}, self._root, opt_configs={})
-
-    def _setup_dirs(self):
-        self.setup_calls += 1
-        return (
-            self._root / "source",
-            self._root / "export",
-            self._root / "convert",
-            self._root / "torq",
-        )
-
-    def _load_onnx(self):
-        self.load_calls += 1
-        return {"model": _identity_model()}
-
-    def make_static(self):
-        raise AssertionError("static export not exercised by this test")
-
-    def apply_post_static_patches(self, model_path, component):
-        pass
-
-    def validate_onnx(self, n_iters: int = 5):
-        pass
-
-
 def test_construction_leaves_existing_export_artifacts_untouched(tmp_path):
     export_dir = tmp_path / "export"
     export_dir.mkdir(parents=True)
     artifact = export_dir / "model.onnx"
     artifact.write_bytes(b"previous export")
 
-    _StubExporter(tmp_path)
+    StubExporter(tmp_path, {"model": _identity_model()})
 
     assert artifact.read_bytes() == b"previous export"
 
 
 def test_construction_does_not_create_the_export_dir(tmp_path):
-    _StubExporter(tmp_path)
+    StubExporter(tmp_path, {"model": _identity_model()})
 
     assert not (tmp_path / "export").exists()
 
@@ -92,7 +56,7 @@ def test_export_onnx_resets_stale_artifacts(tmp_path):
     stale = export_dir / "stale_lm_head.onnx"
     stale.write_bytes(b"stale")
 
-    exporter = _StubExporter(tmp_path)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
     exporter.export_onnx(validate=False)
 
     assert not stale.exists()
@@ -101,14 +65,14 @@ def test_export_onnx_resets_stale_artifacts(tmp_path):
 
 def test_construction_does_not_download_or_load_the_source_model(tmp_path):
     """`--view-graph-edits` builds an exporter purely to render its edit plan."""
-    exporter = _StubExporter(tmp_path)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
 
     assert (exporter.setup_calls, exporter.load_calls) == (0, 0)
     assert exporter.describe_graph_edits() == {}
 
 
 def test_export_onnx_prepares_once(tmp_path):
-    exporter = _StubExporter(tmp_path)
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
 
     exporter.export_onnx(validate=False)
     exporter.export_onnx(validate=False)

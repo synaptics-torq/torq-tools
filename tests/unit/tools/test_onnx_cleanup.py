@@ -5,7 +5,12 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import assert_model_outputs_close, graph, to_model
+from support.graph_edit import (
+    assert_model_outputs_close,
+    graph,
+    to_model,
+    unit_slice_chain,
+)
 from torq.tools.onnx_cleanup import cleanup_onnx_model
 
 
@@ -42,24 +47,9 @@ def _artifact_model():
     nodes = [island, conv, mul, add]
     cat_inputs = []
     for i in range(4):
-        sliced = gs.Variable(f"sl{i}", dtype=np.float32, shape=[1, 1, 8])
-        squeezed = gs.Variable(f"sq{i}", dtype=np.float32, shape=[1, 8])
-        unsqueezed = gs.Variable(f"un{i}", dtype=np.float32, shape=[1, 1, 8])
-        nodes += [
-            gs.Node("Slice", f"slice{i}", inputs=[
-                v,
-                gs.Constant(f"s{i}", np.array([i], dtype=np.int64)),
-                gs.Constant(f"e{i}", np.array([i + 1], dtype=np.int64)),
-                gs.Constant(f"a{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[sliced]),
-            gs.Node("Squeeze", f"squeeze{i}", inputs=[
-                sliced, gs.Constant(f"sqax{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[squeezed]),
-            gs.Node("Unsqueeze", f"unsqueeze{i}", inputs=[
-                squeezed, gs.Constant(f"unax{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[unsqueezed]),
-        ]
-        cat_inputs.append(unsqueezed)
+        chain, tip = unit_slice_chain(v, i, 1, [1, 1, 8])
+        nodes += chain
+        cat_inputs.append(tip)
     cat_out = gs.Variable("cat_out", dtype=np.float32, shape=[1, 4, 8])
     nodes.append(gs.Node("Concat", "cat", inputs=cat_inputs, outputs=[cat_out], attrs={"axis": 1}))
 

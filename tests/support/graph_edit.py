@@ -114,3 +114,77 @@ def const(name: str, values, *, dtype=None, export_dtype=None) -> gs.Constant:
 
 def empty_optional() -> gs.Variable:
     return gs.Variable.empty()
+
+
+def conv_bn_graph(w_values, scale_values, shift_values, bias_values=None, extra_consumer=False):
+    """Conv -> Mul -> Add chain (exported eval-mode BatchNorm), the pattern
+    FoldConvBatchNorm targets. Returns (graph, conv, mul, add)."""
+    cin = w_values.shape[1]
+    spatial = [4] * (w_values.ndim - 2)
+    cout = w_values.shape[0]
+    x = gs.Variable("x", dtype=np.float32, shape=[1, cin] + spatial)
+    conv_out = gs.Variable("conv_out", dtype=np.float32, shape=[1, cout] + spatial)
+    mul_out = gs.Variable("mul_out", dtype=np.float32, shape=[1, cout] + spatial)
+    add_out = gs.Variable("add_out", dtype=np.float32, shape=[1, cout] + spatial)
+    conv_inputs = [x, gs.Constant("w", w_values)]
+    if bias_values is not None:
+        conv_inputs.append(gs.Constant("c", bias_values))
+    conv = gs.Node("Conv", "conv", inputs=conv_inputs, outputs=[conv_out],
+                   attrs={"kernel_shape": list(w_values.shape[2:]), "pads": [1] * (2 * len(spatial))})
+    mul = gs.Node("Mul", "mul", inputs=[conv_out, gs.Constant("s", scale_values)], outputs=[mul_out])
+    add = gs.Node("Add", "add", inputs=[mul_out, gs.Constant("b", shift_values)], outputs=[add_out])
+    nodes = [conv, mul, add]
+    outputs = [add_out]
+    if extra_consumer:
+        relu_out = gs.Variable("relu_out", dtype=np.float32, shape=[1, cout] + spatial)
+        nodes.append(gs.Node("Relu", "relu", inputs=[conv_out], outputs=[relu_out]))
+        outputs.append(relu_out)
+    g = graph(nodes=nodes, inputs=[x], outputs=outputs)
+    return g, conv, mul, add
+
+
+def unit_slice_chain(v, i, axis, slice_shape):
+    """Build Slice(v,[i:i+1],axis) -> Squeeze(axis) -> Unsqueeze(axis), one
+    element of an unrolled stack/unbind. Returns (nodes, tip_tensor)."""
+    sliced = gs.Variable(f"{v.name}_sl{i}", dtype=np.float32, shape=slice_shape)
+    squeezed_shape = [d for j, d in enumerate(slice_shape) if j != axis]
+    squeezed = gs.Variable(f"{v.name}_sq{i}", dtype=np.float32, shape=squeezed_shape)
+    unsqueezed = gs.Variable(f"{v.name}_un{i}", dtype=np.float32, shape=slice_shape)
+    nodes = [
+        gs.Node("Slice", f"{v.name}_slice{i}", inputs=[
+            v,
+            gs.Constant(f"{v.name}_s{i}", np.array([i], dtype=np.int64)),
+            gs.Constant(f"{v.name}_e{i}", np.array([i + 1], dtype=np.int64)),
+            gs.Constant(f"{v.name}_a{i}", np.array([axis], dtype=np.int64)),
+        ], outputs=[sliced]),
+        gs.Node("Squeeze", f"{v.name}_squeeze{i}", inputs=[
+            sliced, gs.Constant(f"{v.name}_sqax{i}", np.array([axis], dtype=np.int64)),
+        ], outputs=[squeezed]),
+        gs.Node("Unsqueeze", f"{v.name}_unsqueeze{i}", inputs=[
+            squeezed, gs.Constant(f"{v.name}_unax{i}", np.array([axis], dtype=np.int64)),
+        ], outputs=[unsqueezed]),
+    ]
+    return nodes, unsqueezed
+
+
+def unrolled_concat_graph(v_len, axis=1, extra_front=0):
+    """Concat over per-element unit_slice_chains of v (an "unrolled
+    stack/unbind"), optionally with extra_front non-slice inputs prepended.
+    Returns (graph, concat, v)."""
+    v = gs.Variable("v", dtype=np.float32, shape=[1, v_len, 8])
+    out_len = v_len + extra_front
+    out = gs.Variable("out", dtype=np.float32, shape=[1, out_len, 8])
+    nodes = []
+    cat_inputs = []
+    graph_inputs = [v]
+    for i in range(extra_front):
+        tok = gs.Variable(f"tok{i}", dtype=np.float32, shape=[1, 1, 8])
+        graph_inputs.append(tok)
+        cat_inputs.append(tok)
+    for i in range(v_len):
+        chain, tip = unit_slice_chain(v, i, axis, [1, 1, 8])
+        nodes += chain
+        cat_inputs.append(tip)
+    concat = gs.Node("Concat", "cat", inputs=cat_inputs, outputs=[out], attrs={"axis": axis})
+    nodes.append(concat)
+    return graph(nodes=nodes, inputs=graph_inputs, outputs=[out]), concat, v

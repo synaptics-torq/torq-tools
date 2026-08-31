@@ -5,7 +5,13 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import assert_model_outputs_close, clone_graph, graph
+from support.graph_edit import (
+    assert_model_outputs_close,
+    clone_graph,
+    graph,
+    only_node,
+    unrolled_concat_graph,
+)
 from torq.graph_edit.edits.shape import (
     BroadcastOpInputs,
     CollapseUnrolledConcat,
@@ -48,46 +54,17 @@ def test_materialized_constant_broadcast_is_numerically_equivalent():
     assert_model_outputs_close(original, edited, feeds)
 
 
-def _unrolled_concat_original():
-    v = gs.Variable("v", dtype=np.float32, shape=[1, 4, 8])
-    tok = gs.Variable("tok", dtype=np.float32, shape=[1, 1, 8])
-    out = gs.Variable("out", dtype=np.float32, shape=[1, 5, 8])
-    nodes = []
-    cat_inputs = [tok]
-    for i in range(4):
-        sliced = gs.Variable(f"sl{i}", dtype=np.float32, shape=[1, 1, 8])
-        squeezed = gs.Variable(f"sq{i}", dtype=np.float32, shape=[1, 8])
-        unsqueezed = gs.Variable(f"un{i}", dtype=np.float32, shape=[1, 1, 8])
-        nodes += [
-            gs.Node("Slice", f"slice{i}", inputs=[
-                v,
-                gs.Constant(f"s{i}", np.array([i], dtype=np.int64)),
-                gs.Constant(f"e{i}", np.array([i + 1], dtype=np.int64)),
-                gs.Constant(f"a{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[sliced]),
-            gs.Node("Squeeze", f"squeeze{i}", inputs=[
-                sliced, gs.Constant(f"sqax{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[squeezed]),
-            gs.Node("Unsqueeze", f"unsqueeze{i}", inputs=[
-                squeezed, gs.Constant(f"unax{i}", np.array([1], dtype=np.int64)),
-            ], outputs=[unsqueezed]),
-        ]
-        cat_inputs.append(unsqueezed)
-    nodes.append(gs.Node("Concat", "cat", inputs=cat_inputs, outputs=[out], attrs={"axis": 1}))
-    return graph(nodes=nodes, inputs=[v, tok], outputs=[out])
-
-
 def test_collapsed_unrolled_concat_is_numerically_equivalent():
-    original = _unrolled_concat_original()
+    original, _, _ = unrolled_concat_graph(v_len=4, extra_front=1)
     edited = clone_graph(original)
     edit = CollapseUnrolledConcat(edited, "integration", min_fanin=5)
-    concat = next(node for node in edited.nodes if node.op == "Concat")
+    concat = only_node(edited, "Concat")
     assert edit.match(concat)
     edit.transform(concat)
 
     rng = np.random.default_rng(0)
     feeds = {
         "v": rng.standard_normal((1, 4, 8)).astype(np.float32),
-        "tok": rng.standard_normal((1, 1, 8)).astype(np.float32),
+        "tok0": rng.standard_normal((1, 1, 8)).astype(np.float32),
     }
     assert_model_outputs_close(original, edited, feeds)

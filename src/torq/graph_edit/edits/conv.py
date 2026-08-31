@@ -8,7 +8,7 @@ import onnx
 import onnx_graphsurgeon as gs
 
 from ..onnx import OnnxGraphEdit, rewire_consumers
-from ._helpers import _static_int_shape
+from ._helpers import _const_array, _static_int_shape
 
 
 @dataclass
@@ -189,9 +189,12 @@ class FoldConvBatchNorm(OnnxGraphEdit):
         if len(node.inputs) != 2 or len(node.outputs) != 1:
             return None
         others = [t for t in node.inputs if t is not data_tensor]
-        if len(others) != 1 or not isinstance(others[0], gs.Constant):
+        if len(others) != 1:
             return None
-        values = self._values_f32(others[0])
+        values = _const_array(others[0])
+        if values is None:
+            return None
+        values = values.astype(np.float32)
         if values.size == 1:
             return np.full(cout, values.reshape(-1)[0], dtype=np.float32)
         if values.ndim > out_rank:

@@ -27,7 +27,7 @@ from collections.abc import Collection
 import onnx
 import onnx_graphsurgeon as gs
 
-from ...graph_edit.edits import CollapseUnrolledConcat, FoldConvBatchNorm
+from ...graph_edit.edits import CommonGraphEditsMixin
 from ...graph_edit.onnx import OnnxGraphEditor
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 PASSES = ("collapse-concat", "fold-constants", "fold-conv-bn")
 
 GRAPH_NAME = "onnx_cleanup"
+
+
+class _CleanupEditor(OnnxGraphEditor, CommonGraphEditsMixin):
+    """Bare editor exposing the fluent convenience methods."""
 
 # Don't materialize folded constants above this size: constant-folding e.g. a
 # Transpose of a (possibly weight-tied) lm_head matrix would duplicate hundreds
@@ -61,16 +65,16 @@ def cleanup_onnx_model(
     except Exception as exc:
         logger.warning("shape inference failed, continuing without: %s", exc)
 
-    editor = OnnxGraphEditor(gs.import_onnx(model), GRAPH_NAME)
+    n_nodes, n_inits = len(model.graph.node), len(model.graph.initializer)
+    editor = _CleanupEditor(gs.import_onnx(model), GRAPH_NAME)
+    del model  # only the counts are needed below; free the inferred copy
     with editor:
         if "collapse-concat" not in skip:
-            editor.apply_edit(
-                CollapseUnrolledConcat(editor.graph, GRAPH_NAME, min_fanin)
-            )
+            editor.collapse_unrolled_concat(min_fanin)
         if "fold-constants" not in skip:
             editor.graph.fold_constants(size_threshold=fold_size_threshold)
         if "fold-conv-bn" not in skip:
-            editor.apply_edit(FoldConvBatchNorm(editor.graph, GRAPH_NAME))
+            editor.fold_conv_batchnorm()
         # Non-strict: some exporters legitimately carry annotations strict
         # inference rejects (e.g. around ORT contrib ops); cleanup must not
         # impose stricter invariants than the input model satisfied.
@@ -78,8 +82,8 @@ def cleanup_onnx_model(
 
     logger.info(
         "cleanup: %d -> %d nodes, %d -> %d initializers",
-        len(model.graph.node), len(cleaned.graph.node),
-        len(model.graph.initializer), len(cleaned.graph.initializer),
+        n_nodes, len(cleaned.graph.node),
+        n_inits, len(cleaned.graph.initializer),
     )
     return cleaned
 
