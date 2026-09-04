@@ -33,6 +33,17 @@ def rewire_consumers(
                 consumer.inputs[i] = new
 
 
+def replace_node(
+    node: gs.Node,
+    new: list[gs.Constant | gs.Variable],
+) -> None:
+    if len(new) != len(node.outputs):
+        raise ValueError("Replacement output count must match node output count")
+    for output, replacement in zip(node.outputs, new):
+        rewire_consumers(output.outputs.copy(), output, replacement)
+    node.outputs.clear()
+
+
 class DimMatchType(Enum):
     EXACT    = auto()
     CONTAINS = auto()
@@ -81,6 +92,18 @@ class OnnxGraphEdit(ABC):
         if node.op != expected_op:
             self._logger.error("Expected '%s' node, got '%s'", expected_op, node.op)
             raise ValueError(f"{self.name}[{self.graph_name}]: Expected '{expected_op}' node, got '{node.op}'")
+
+    def _is_same_constant_value(self, inp: gs.Constant, expected: np.ndarray, norm_dtype: bool = False) -> bool:
+        if not isinstance(inp, gs.Constant):
+            return False
+        actual = inp.values
+        if norm_dtype:
+            actual = actual.astype(expected.dtype)
+        return (
+            actual is not None
+            and actual.dtype == expected.dtype
+            and np.array_equal(actual, expected)
+        )
 
     def __call__(self, node: gs.Node):
         self.apply_edit(node)

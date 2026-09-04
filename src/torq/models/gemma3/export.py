@@ -29,6 +29,7 @@ from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
+from ...utils.onnx import validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -60,6 +61,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         trim_vocab: bool = False,
         split_lm_head: bool = False,
@@ -71,7 +73,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
-        self._onnx_source_dir = onnx_source_dir
+        self._onnx_source_dir = validate_onnx_source_dir(
+            onnx_source_dir, required_files=("tokenizer.json",)
+        )
         self._trim_vocab = trim_vocab
         self._split_lm_head = split_lm_head
         self._export_model_filenames = _GEMMA3_MODEL_FILENAMES[0 if split_lm_head else 1]
@@ -88,25 +92,25 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 # Upstream publishes the base 1B checkpoint as `-pt`; 270m has a
                 # bare repo, so the suffix cannot be applied unconditionally.
                 self._hf_repo += "-pt"
-        self._source_asset_dirs = [
-            path
-            for path in (
-                Path(self._onnx_source_dir) if self._onnx_source_dir else None,
-                Path(models_dir) / self._hf_repo / "source" / "fp32",
-            )
-            if isinstance(path, Path) and path.exists()
-        ]
-        local_config_dir = next(
-            (path for path in self._source_asset_dirs if (path / "config.json").exists()),
-            None,
+        self._source_asset_dirs = (
+            [self._onnx_source_dir]
+            if self._onnx_source_dir is not None
+            else [Path(models_dir) / self._hf_repo / "source" / "fp32"]
         )
-        if local_config_dir is not None:
-            self._config = AutoConfig.from_pretrained(local_config_dir, local_files_only=True)
+        if self._onnx_source_dir is not None:
+            self._config = AutoConfig.from_pretrained(self._onnx_source_dir, local_files_only=True)
         else:
-            try:
-                self._config = AutoConfig.from_pretrained(self._hf_repo, local_files_only=True)
-            except OSError:
-                self._config = AutoConfig.from_pretrained(self._hf_repo)
+            local_config_dir = next(
+                (path for path in self._source_asset_dirs if (path / "config.json").exists()),
+                None,
+            )
+            if local_config_dir is not None:
+                self._config = AutoConfig.from_pretrained(local_config_dir, local_files_only=True)
+            else:
+                try:
+                    self._config = AutoConfig.from_pretrained(self._hf_repo, local_files_only=True)
+                except OSError:
+                    self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
@@ -125,6 +129,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
@@ -134,8 +139,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
-            onnx_dir = onnx_source_dir
+        if self._onnx_source_dir is not None:
+            onnx_dir = self._onnx_source_dir
         else:
             onnx_dir = self._models_dir / "source" / self._model_dtype
             onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +180,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._model_dtype / 
             ("static" if self._static_models else "dynamic")
         )
+        quantize_dir = (
+            self._models_dir 
+            / "export"
+            / model_type
+            / model_topology
+            / "onnx"
+            / "quantized"
+            / ("static" if self._static_models else "dynamic")
+        )
         convert_dir = (
             self._models_dir 
             / "export"
@@ -193,7 +207,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, torq_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir /  "model.onnx"
@@ -220,6 +234,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             asset_path = asset_dir / asset_name
             if asset_path.exists():
                 return asset_path
+        if self._onnx_source_dir is not None:
+            raise FileNotFoundError(
+                f"Expected {asset_name} in ONNX source directory: '{self._onnx_source_dir}'"
+            )
         try:
             return Path(hf_hub_download(self._hf_repo, asset_name, local_files_only=True))
         except Exception:
@@ -297,25 +315,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if not updated:
             raise ValueError("Could not find logits output metadata for trimmed-vocab export")
 
-    def _copy_runtime_assets(
-        self,
-        dst_dir: str | os.PathLike,
-        src_dir: str | os.PathLike | None = None,
-        *,
-        include_npy_data: bool = True,
-    ) -> None:
-        src_dir = Path(src_dir or self._export_paths["model"].parent)
-        dst_dir = Path(dst_dir)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        asset_names = ["config.json", "tokenizer.json"]
-        if include_npy_data:
-            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
-        for asset_name in asset_names:
-            src_path = src_dir / asset_name
-            if not src_path.exists():
-                continue
-            shutil.copy2(src_path, dst_dir / asset_name)
-
     def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
         blocks: dict[str, list[EditSpec]] = {}
         blocks["model.static"] = [
@@ -343,6 +342,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             patch.append(EditSpec(
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+            ))
+            patch.append(EditSpec(
+                "ComputeDequantizedLUT", (ctx("embeddings_path"), ctx("export_dtype"))
             ))
         blocks["model.patch"] = patch
 
@@ -422,7 +424,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         blocks = self.graph_edit_blocks()
         embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
         editor.apply_specs(
-            blocks["model.patch"], self._harness, {"embeddings_path": embeddings_npy}
+            blocks["model.patch"], self._harness,
+            {
+                "embeddings_path": embeddings_npy,
+                "export_dtype": self._onnx_export_dtype,
+            }
         )
 
         if self._extract_embeddings:
@@ -546,6 +552,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         trim_vocab=args.trim_vocab,
         split_lm_head=args.split_lm_head,
@@ -559,6 +566,13 @@ def export_gemma3_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:

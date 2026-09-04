@@ -2,12 +2,29 @@
 
 import argparse
 import logging
+import os
 from collections.abc import Iterable
 
 __all__ = [
     "add_logging_args",
     "configure_logging",
 ]
+
+_ORT_QUANTIZATION_PATH = os.path.join("onnxruntime", "quantization")
+
+
+def _drop_ort_quantizer_noise(record: logging.LogRecord) -> bool:
+    """Silence onnxruntime.quantization's per-tensor/per-node ``logging.info(...)`` chatter.
+
+    That module logs via the bare ``logging`` functions rather than a named logger, so the
+    records show up as ``root`` in our own log format; torq's own code never does this, so
+    filtering on ``record.name == "root"`` only ever catches vendor noise like this.
+    """
+    return not (
+        record.name == "root"
+        and record.levelno <= logging.INFO
+        and _ORT_QUANTIZATION_PATH in record.pathname
+    )
 
 
 def add_logging_args(parser: argparse.ArgumentParser):
@@ -54,6 +71,7 @@ def configure_logging(
     for handler in handlers:
         formatter = logging.Formatter("Torq-tools [%(levelname)-8s] %(name)s: %(message)s")
         handler.setFormatter(formatter)
+        handler.addFilter(_drop_ort_quantizer_noise)
 
     loggers = loggers or [logging.getLogger()]
     for logger in loggers:

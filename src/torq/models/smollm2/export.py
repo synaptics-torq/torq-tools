@@ -20,6 +20,7 @@ from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx
+from ...utils.onnx import validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -40,6 +41,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         **edit_args
     ):
@@ -47,11 +49,16 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
-        self._onnx_source_dir = onnx_source_dir
+        self._onnx_source_dir = validate_onnx_source_dir(
+            onnx_source_dir, required_files=("tokenizer.json",)
+        )
         self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
         if self._instruct_model:
             self._hf_repo += "-Instruct"
-        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._config = AutoConfig.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
         self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
@@ -63,6 +70,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
@@ -72,8 +80,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
-            onnx_dir = onnx_source_dir
+        if self._onnx_source_dir is not None:
+            onnx_dir = self._onnx_source_dir
         else:
             onnx_dir = self._models_dir / "source" / self._model_dtype
             onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +241,11 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, _):
         self._patch_static_model(model_path)
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
 
     def validate_onnx(self, n_iters: int = 5):
         validate_decoder_only_onnx(
@@ -260,25 +273,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))
             ]
         )
-
-    def _copy_runtime_assets(
-        self,
-        dst_dir: str | os.PathLike,
-        src_dir: str | os.PathLike | None = None,
-        *,
-        include_npy_data: bool = True,
-    ) -> None:
-        src_dir = Path(src_dir or self._export_paths["model"].parent)
-        dst_dir = Path(dst_dir)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        asset_names = ["config.json", "tokenizer.json"]
-        if include_npy_data:
-            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
-        for asset_name in asset_names:
-            src_path = src_dir / asset_name
-            if not src_path.exists():
-                continue
-            shutil.copy2(src_path, dst_dir / asset_name)
 
     def export_torq(
         self,
@@ -312,6 +306,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
@@ -321,6 +316,13 @@ def export_smollm2_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:

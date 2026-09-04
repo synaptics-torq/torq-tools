@@ -28,6 +28,11 @@ from ..tools.convert_dtype.onnx import (
     convert_model
 )
 from ..tools.cleanup.onnx import cleanup_onnx_model
+from ..tools.quantization.dynamic_quantization import (
+    analyze_dynamic_quantization,
+    dynamic_quantize_model,
+    summarize_dynamic_quantization,
+)
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
@@ -63,6 +68,7 @@ class OnnxModelExporterBase(ABC):
         models_dir: str | os.PathLike,
         *,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         opt_configs: Mapping[str, ORTOptimizerConfig] | None = None,
         skip_export: list[str] | None = None,
@@ -75,10 +81,11 @@ class OnnxModelExporterBase(ABC):
         self._models_dir = Path(models_dir)
         self._static_models = static_models
         self._show_model_info = show_model_info
+        self._dynamic_quantize = dynamic_quantize
         self._convert_dtypes = convert_dtypes
         self._opt_configs = opt_configs
         try:
-            self._onnx_export_dtype = FP_EXPORT_DTYPE_MAPPING[self._model_dtype]
+            self._onnx_export_dtype = FP_EXPORT_DTYPE_MAPPING.get(self._model_dtype, onnx.TensorProto.FLOAT)
         except KeyError:
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
@@ -88,6 +95,7 @@ class OnnxModelExporterBase(ABC):
         # the network or reading a large model.
         self._onnx_dir: Path | None = None
         self._export_dir: Path | None = None
+        self._quantize_dir: Path | None = None
         self._convert_dir: Path | None = None
         self._torq_dir: Path | None = None
         self._export_paths: dict[str, Path] = {}
@@ -103,9 +111,28 @@ class OnnxModelExporterBase(ABC):
         """
         if self._prepared:
             return
-        self._onnx_dir, self._export_dir, self._convert_dir, self._torq_dir = self._setup_dirs()
+        self._onnx_dir, self._export_dir, self._quantize_dir, self._convert_dir, self._torq_dir = self._setup_dirs()
         self._components = self._load_onnx()
         self._prepared = True
+
+    def _copy_runtime_assets(
+        self,
+        dst_dir: str | os.PathLike,
+        src_dir: str | os.PathLike | None = None,
+        *,
+        include_npy_data: bool = True,
+    ) -> None:
+        src_dir = Path(src_dir or self._export_paths["model"].parent)
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        asset_names = ["config.json", "tokenizer.json"]
+        if include_npy_data:
+            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
+        for asset_name in asset_names:
+            src_path = src_dir / asset_name
+            if not src_path.exists():
+                continue
+            shutil.copy2(src_path, dst_dir / asset_name)
 
     @property
     def export_dir(self) -> Path:
@@ -300,6 +327,54 @@ class OnnxModelExporterBase(ABC):
             else:
                 self.validate_onnx()
 
+    def dynamic_quantize_models(
+        self,
+        quantize_dir: str | os.PathLike | None = None,
+        skip: list[str] | None = None,
+        analyze_nodes: bool = False,
+        **quantize_kwargs,
+    ):
+        if not self._dynamic_quantize:
+            self._logger.warning("Skipping dynamic quantization as dynamic_quantize==False")
+            return
+        self._prepare()
+        self._quantize_dir = Path(quantize_dir or self._quantize_dir)
+        skip = skip or []
+        if self._quantize_dir.exists():
+            shutil.rmtree(self._quantize_dir, ignore_errors=True)
+        self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        for comp, model_path in self._export_paths.items():
+            if comp in skip:
+                self._export_paths[comp] = Path(shutil.copy2(model_path, self._quantize_dir))
+                continue
+            self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
+            quantized_model_path = self._quantize_dir / model_path.name
+            dynamic_quantize_model(
+                model_path, quantized_model_path,
+                **quantize_kwargs
+            )
+            self._logger.info("(ONNX-quantize) Successfully dynamically quantizied model @ '%s'", str(quantized_model_path))
+            summary = summarize_dynamic_quantization(model_path, quantized_model_path)
+            self._logger.info(
+                "(ONNX-quantize) Quantization summary for '%s': kl=%.6g cosine=%.6f max_abs_error=%.6g [%s]",
+                comp, summary["kl"], summary["cosine"], summary["max_abs_error"], summary["classification"],
+            )
+            if analyze_nodes:
+                self._logger.info("(ONNX-quantize) Analyzing per-node quantization sensitivity for '%s'...", str(model_path))
+                report = analyze_dynamic_quantization(
+                    model_path,
+                    uint8_weights=quantize_kwargs.get("uint8_weights", False),
+                    per_tensor=quantize_kwargs.get("per_tensor", False),
+                )
+                report_path = self._quantize_dir / f"{model_path.stem}_sensitivity.json"
+                report_path.write_text(json.dumps(report, indent=2))
+                self._logger.info(
+                    "(ONNX-quantize) Saved sensitivity report (%d nodes) to '%s'", len(report), str(report_path)
+                )
+            self._export_paths[comp] = quantized_model_path
+            self._logger.debug("(ONNX-quantize) Update %s model path to '%s'", comp, str(quantized_model_path))
+        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
+
     def convert_models(
         self,
         convert_dir: str | os.PathLike | None = None,
@@ -319,7 +394,7 @@ class OnnxModelExporterBase(ABC):
         self._convert_dir.mkdir(parents=True, exist_ok=True)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
-                shutil.copy2(model_path, self._convert_dir)
+                self._export_paths[comp] = Path(shutil.copy2(model_path, self._convert_dir))
                 continue
             self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(model_path))
             converted_model_path = self._convert_dir / model_path.name

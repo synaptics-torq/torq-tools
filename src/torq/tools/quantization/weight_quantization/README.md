@@ -2,21 +2,25 @@
 
 Quantize MatMul weights in fp32 ONNX models to int8, int4, or bf16.
 
+This is the `weights` method of `torq-quantize-model`; the `dynamic` method
+(onnxruntime int8 dynamic quantization) lives under
+`torq.tools.quantization.dynamic_quantization`.
+
 ## Usage
 
 ```bash
 # --- Uniform quantization ---
 
 # Int8 (ORT-matching asymmetric uint8, block_size=32)
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_int8_dql.onnx --bits 8
 
 # Int4 (signed [-8,7], block_size=32)
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_int4_dql.onnx --bits 4
 
 # bf16 only (no quantization, just dtype conversion)
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_bf16.onnx --bits 16
 
 # --- Dequantized bf16 output (ready for Torq compilation) ---
@@ -25,27 +29,27 @@ torq-quantize-model quantize \
 # Scales are truncated to bf16 precision BEFORE dequantization so that the
 # output matches what the hardware computes at runtime (bf16 scale × int8 weight).
 # The final weights are: bf16( (q - zp) * bf16(scale) )
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_bf16.onnx --bits 8 --dequantize-weights
 
 # --- Mixed quantization from config ---
 
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json
 
 # With dequantized bf16 output
-torq-quantize-model quantize \
+torq-quantize-model weights quantize \
   -i model_fp32.onnx -o model_bf16.onnx --config quant_config.json --dequantize-weights
 
 # --- Sensitivity analysis ---
 
-torq-quantize-model analyze \
+torq-quantize-model weights analyze \
   -i model_fp32.onnx -o sensitivity_results.json \
   --config-output quant_config.json \
   --embeddings token_embeddings.npy
 
 # Custom thresholds and tokenizer
-torq-quantize-model analyze \
+torq-quantize-model weights analyze \
   -i model_fp32.onnx -o results.json \
   --config-output config.json \
   --embeddings token_embeddings.npy \
@@ -56,7 +60,7 @@ torq-quantize-model analyze \
   --num-tokens 10
 
 # Reduced-vocab models (pass token ID LUT for correct index mapping)
-torq-quantize-model analyze \
+torq-quantize-model weights analyze \
   -i model_reduced_vocab.onnx -o results.json \
   --config-output config.json \
   --embeddings token_embeddings.npy \

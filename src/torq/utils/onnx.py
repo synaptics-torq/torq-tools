@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     # CLI helpers
     "add_onnx_args",
+    "validate_onnx_source_dir",
 
     # model inspection
     "get_model_opset",
@@ -54,6 +55,7 @@ def add_onnx_args(
     parser: argparse.ArgumentParser,
     *,
     model_dtypes: list[str] | None = None,
+    dynamic_quantize: bool = True,
     convert_dtypes: bool = False,
     allow_no_opt: bool = True,
 ):
@@ -100,6 +102,42 @@ def add_onnx_args(
             default=False,
             help="Do no optimize exported ONNX models via onnxruntime",
         )
+    if dynamic_quantize:
+        group.add_argument(
+            "--dynamic-quantize",
+            action="store_true",
+            default=False,
+            help="Dynamically quantize the model to 8-bit integer"
+        )
+        group.add_argument(
+            "--dynamic-quantize-uint8-weights",
+            action="store_true",
+            default=False,
+            help="Quantize weights with unsigned values"
+        )
+        group.add_argument(
+            "--dynamic-quantize-per-tensor",
+            action="store_true",
+            default=False,
+            help="Quantize weights with per-tensor scale and zero point"
+        )
+        group.add_argument(
+            "--dynamic-quantization-skip-model",
+            type=str,
+            nargs="+",
+            metavar="COMPONENT",
+            default=None,
+            help="Skip dynamic quantization for the given model component(s) "
+            "(e.g. quantize the transformer but not the lm_head)",
+        )
+        group.add_argument(
+            "--dynamic-quantize-analyze-nodes",
+            action="store_true",
+            default=False,
+            help="Also run a per-node quantization-sensitivity report (one quantize+inference "
+            "pass per candidate node; slow on large models). A fast whole-model summary "
+            "always runs regardless of this flag.",
+        )
     if convert_dtypes:
         group.add_argument(
             "--convert-dtypes",
@@ -113,6 +151,24 @@ def add_onnx_args(
             default=False,
             help="Preserve model input/output dtypes by adding runtime casts"
         )
+
+
+def validate_onnx_source_dir(
+    onnx_source_dir: str | os.PathLike | None,
+    required_files: tuple[str, ...] = (),
+) -> Path | None:
+    if onnx_source_dir is None:
+        return None
+
+    source_dir = Path(onnx_source_dir)
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"ONNX source directory does not exist: '{source_dir}'")
+    for filename in ("config.json", *required_files):
+        if not (source_dir / filename).is_file():
+            raise FileNotFoundError(
+                f"Expected {filename} in ONNX source directory: '{source_dir}'"
+            )
+    return source_dir
 
 
 # -----------------------------------------------------------------------------

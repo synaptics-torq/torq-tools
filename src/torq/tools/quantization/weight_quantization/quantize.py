@@ -10,6 +10,7 @@ model suitable for IREE compilation.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, numpy_helper
 
+from ....utils.logging import add_logging_args, configure_logging
 from .config import LayerQuantConfig, QuantizationConfig
 
 logger = logging.getLogger(__name__)
@@ -659,3 +661,86 @@ def _ensure_opset(model: onnx.ModelProto, min_opset: int) -> None:
                 opset.version = min_opset
             return
     model.opset_import.append(onnx.helper.make_opsetid("", min_opset))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def add_weight_quantize_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=str,
+        required=True,
+        help="Input fp32 ONNX model path",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        required=True,
+        help="Output quantized ONNX model path",
+    )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=None,
+        help="Uniform quantization bit-width (4=int4, 8=int8, 16=bf16). "
+        "Ignored when --config is provided.",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=32,
+        help="Block size for block quantization (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to quantization config JSON (from sensitivity analysis). "
+        "Overrides --bits for per-layer mixed quantization.",
+    )
+    parser.add_argument(
+        "--dequantize-weights",
+        action="store_true",
+        help="Dequantize weights and output a single bf16 model "
+        "ready for IREE compilation (no DQL nodes).",
+    )
+    parser.add_argument(
+        "--skip-layers",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Layer name substrings to skip (e.g. lm_head)",
+    )
+    add_logging_args(parser)
+
+
+def weight_quantize_from_args(args: argparse.Namespace) -> None:
+    configure_logging(args.logging)
+
+    if args.config:
+        config = QuantizationConfig.load(args.config)
+        logger.info("Loaded per-layer config from %s", args.config)
+    elif args.bits is not None:
+        config = QuantizationConfig.uniform(args.bits, args.block_size)
+        logger.info("Uniform %d-bit quantization, block_size=%d", args.bits, args.block_size)
+    else:
+        raise SystemExit("Error: Either --bits or --config is required for quantize")
+
+    if args.bits == 16 and not args.dequantize_weights and not args.config:
+        # bf16 only — use WeightQuantizer with bits=16 and dequantize_weights
+        # (bits=16 layers are skipped in quantization, then _convert_to_bf16
+        # converts the whole model to bf16)
+        pass  # fall through to WeightQuantizer below
+
+    quantizer = WeightQuantizer(
+        model_path=args.input,
+        output_path=args.output,
+        skip_layers=args.skip_layers,
+    )
+    quantizer.quantize(config, dequantize_weights=args.dequantize_weights)

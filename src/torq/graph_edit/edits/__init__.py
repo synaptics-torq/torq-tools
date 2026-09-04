@@ -10,7 +10,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .mixins import CommonGraphEditsMixin
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
@@ -55,6 +55,7 @@ __all__ = [
     "ConstantBroadcastPolicy",
     "BroadcastOpInputs",
     "ExtractConstantLUT",
+    "ComputeDequantizedLUT",
     "EliminateExpand",
     "EliminateTranspose",
     "RetargetCrossAttnKeyLayout",

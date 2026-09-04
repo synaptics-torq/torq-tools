@@ -29,6 +29,7 @@ from ._inference import MoonshineDynamic, MoonshineStatic
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.hf import hf_download_models, optimum_export_onnx
+from ...utils.onnx import validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -65,19 +66,28 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         use_optimum: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
         **edit_args
     ):
+        if model_dtype in ("quantized", "quantized_4bit") and dynamic_quantize:
+            raise ValueError(
+                f"'--dynamic-quantize' is not supported with '-d {model_dtype}' models, "
+                "which are already pre-quantized"
+            )
         self._model_size = model_size
         self._split_encoder = split_encoder
         self._fold_encoder_cache = fold_encoder_cache
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
-        self._onnx_source_dir = onnx_source_dir
+        self._onnx_source_dir = validate_onnx_source_dir(onnx_source_dir)
         self._use_optimum = use_optimum
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-{self._model_size}"
-        self._config = AutoConfig.from_pretrained(self._hf_repo)
+        self._config = AutoConfig.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         self._num_samples = max_audio_s * 16_000
         self._max_tokens = max_audio_s * max_tok_per_s
         self._hidden_size = int(self._config.hidden_size)
@@ -106,6 +116,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._config,
             Path(models_dir) / self._hf_repo,
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
             opt_configs=opt_configs,
             skip_export=skip_export,
@@ -113,9 +124,8 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
-        if self._onnx_source_dir and (onnx_source_dir := Path(self._onnx_source_dir)).exists():
-            onnx_dir = onnx_source_dir
-            print(self._models_dir)
+        if self._onnx_source_dir is not None:
+            onnx_dir = self._onnx_source_dir
         else:
             if self._use_optimum or self._model_dtype in OPTIMUM_DTYPES:
                 self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
@@ -242,6 +252,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             decoder_patch.append(EditSpec(
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+            ))
+            decoder_patch.append(EditSpec(
+                "ComputeDequantizedLUT",
+                (ctx("embeddings_path"), ctx("export_dtype"))
             ))
         decoder_patch.append(EditSpec("ReplacePadWithConcat"))
         blocks["decoder.patch"] = decoder_patch
@@ -719,7 +733,10 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             max_inp_len=runner.max_inp_len
         )
 
-        processor = AutoProcessor.from_pretrained(f"{self._hf_repo}")
+        processor = AutoProcessor.from_pretrained(
+            self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
+            local_files_only=self._onnx_source_dir is not None,
+        )
         dataset = load_dataset(
             path="hf-internal-testing/librispeech_asr_dummy",
             name="clean",
@@ -810,6 +827,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         use_optimum=args.use_optimum,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
@@ -820,6 +838,13 @@ def export_moonshine_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if args.skip_torq is None or "all" not in args.skip_torq:

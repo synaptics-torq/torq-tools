@@ -35,6 +35,65 @@ def graph(
     )
 
 
+def quantized_lm_head_graph() -> gs.Graph:
+    hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
+    quantized = gs.Variable("hidden_quantized", dtype=np.uint8, shape=[1, 1, 2])
+    activation_scale = gs.Variable("hidden_scale", dtype=np.float32, shape=[])
+    activation_zero_point = gs.Variable("hidden_zero_point", dtype=np.uint8, shape=[])
+    dql = gs.Node(
+        "DynamicQuantizeLinear",
+        "lm_head_quantize",
+        inputs=[hidden],
+        outputs=[quantized, activation_scale, activation_zero_point],
+    )
+    weight = gs.Constant(
+        "weight_quantized",
+        np.array([[2, -3, 4, 5, -6], [7, 8, -9, 10, 11]], dtype=np.int8),
+    )
+    weight_scale = gs.Constant(
+        "weight_scale",
+        np.array([0.25, 0.5, 0.125, 0.75, 0.375], dtype=np.float32),
+    )
+    weight_zero_point = gs.Constant(
+        "weight_zero_point",
+        np.array([1, -1, 2, 0, -2], dtype=np.int8),
+    )
+    quantized_logits = gs.Variable("logits_quantized", dtype=np.int32, shape=[1, 1, 5])
+    matmul = gs.Node(
+        "MatMulInteger",
+        "lm_head_matmul",
+        inputs=[quantized, weight, activation_zero_point, weight_zero_point],
+        outputs=[quantized_logits],
+    )
+    cast_logits = gs.Variable("logits_cast", dtype=np.float32, shape=[1, 1, 5])
+    cast = gs.Node(
+        "Cast",
+        "lm_head_cast",
+        attrs={"to": onnx.TensorProto.FLOAT},
+        inputs=[quantized_logits],
+        outputs=[cast_logits],
+    )
+    output_scale = gs.Variable("output_scale", dtype=np.float32, shape=[5])
+    scale_mul = gs.Node(
+        "Mul",
+        "lm_head_scales",
+        inputs=[activation_scale, weight_scale],
+        outputs=[output_scale],
+    )
+    logits = gs.Variable("logits", dtype=np.float32, shape=[1, 1, 5])
+    dequant_mul = gs.Node(
+        "Mul",
+        "lm_head_dequant",
+        inputs=[cast_logits, output_scale],
+        outputs=[logits],
+    )
+    return graph(
+        nodes=[dql, matmul, cast, scale_mul, dequant_mul],
+        inputs=[hidden],
+        outputs=[logits],
+    )
+
+
 def clone_graph(g: gs.Graph) -> gs.Graph:
     return gs.import_onnx(to_model(g))
 
