@@ -4,10 +4,14 @@
 import argparse
 
 from .moonshine import add_moonshine_export_args
+<<<<<<< HEAD
 from .moonshine_streaming import add_moonshine_streaming_export_args
 from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
+=======
+from .washingbert import add_washingbert_export_args
+>>>>>>> dc138cf (Add WashingBERT model support)
 
 
 def main():
@@ -31,6 +35,9 @@ def main():
 
     liquid_vl = model.add_parser("liquid-vl", help="Export LFM2-VL-450M (Liquid) to Torq")
     add_liquid_vl_export_args(liquid_vl)
+    
+    washingbert = model.add_parser("washingbert", help="Export WashingBERT to Torq")
+    add_washingbert_export_args(washingbert)
 
     args = parser.parse_args()
 
@@ -52,6 +59,9 @@ def main():
     elif args.model_name == "liquid-vl":
         from .liquid.export_vl import export_liquid_vl_from_args
         export_liquid_vl_from_args(args)
+    elif args.model_name == "washingbert":
+        from .washingbert.export import export_washingbert_from_args
+        export_washingbert_from_args(args)
 
 
 if __name__ == "__main__":

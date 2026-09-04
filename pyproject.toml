@@ -79,3 +79,11 @@ markers = [
     "artifacts: artifact graph edit tests",
     "custom_ops: LFM2.5 custom-op replacement graph edit tests",
 ]
+washingbert = [
+    "transformers",
+    "fugashi",
+    "mecab-python3",
+    "unidic-lite",
+    "sentencepiece",
+]
+all = ["torq-tools[moonshine,washingbert]"]

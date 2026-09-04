@@ -26,6 +26,7 @@ __all__ = [
     "gemma3",
     "liquid",
     "synaptics_audio",
+    "washingbert"
 ]
 
 
