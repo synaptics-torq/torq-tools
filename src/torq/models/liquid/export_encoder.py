@@ -217,6 +217,9 @@ def _simplify_onnx(path: Path):
     if not ok:
         raise RuntimeError(f"onnxsim failed to simplify {path}")
     model = onnx.shape_inference.infer_shapes(model, data_prop=True)
+    # torch names the graph "main_graph"; the demo runners expect the vmfb
+    # entrypoint (named after the graph) to be "main"
+    model.graph.name = "main"
     onnx.save(model, path)
 
 
