@@ -182,14 +182,21 @@ def split_large_matmuls(graph, shape_of, max_out=512):
             wc = gs.Constant(f"{b}/w{ci}", B.values[:, s:e].copy())
             o = gs.Variable(f"{b}/mm{ci}", dtype=np.float32)
             graph.layer(op="MatMul", name=f"{b}/mm{ci}", inputs=[A, wc], outputs=[o])
-            if bias_v is not None:
-                bc = gs.Constant(f"{b}/b{ci}", bias_v[s:e].copy())
-                o2 = gs.Variable(f"{b}/ba{ci}", dtype=np.float32)
-                graph.layer(op="Add", name=f"{b}/ba{ci}", inputs=[o, bc], outputs=[o2])
-                o = o2
             chunks.append(o)
         cc = gs.Variable(b + "/cat", dtype=np.float32)
         graph.layer(op="Concat", name=b + "/cat", inputs=chunks, outputs=[cc], attrs={"axis": -1})
+        if bias_v is not None:
+            # One full-width bias Add AFTER the concat, never per-slice: on the
+            # bf16 path torq-compile misaligns a sliced bias Add that sits
+            # between a split MatMul and a rank-changing reshape (the bias cone
+            # picks the wrong axis once the reshape is folded) — outputs beyond
+            # the first chunk get the wrong bias. Same math either way; this
+            # form compiles correctly (micro-verified: per-slice cos 0.977 vs
+            # ORT, post-concat cos 1.0000).
+            bc = gs.Constant(f"{b}/bias", bias_v.copy())
+            cb = gs.Variable(b + "/cat_bias", dtype=np.float32)
+            graph.layer(op="Add", name=b + "/cat_bias", inputs=[cc, bc], outputs=[cb])
+            cc = cb
         for c in graph.nodes:
             c.inputs = [cc if i is out else i for i in c.inputs]
         graph.outputs = [cc if o is out else o for o in graph.outputs]
