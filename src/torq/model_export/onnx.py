@@ -178,6 +178,30 @@ class OnnxModelExporterBase(ABC):
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
 
+    def _torq_compile_args_for(self, component: str) -> list[str]:
+        """Extra torq-compile args for one component, appended after the shared
+        ``torq_compile_args``.
+
+        Exists because compile knobs can be per-component in effect even when
+        they look global: ``--torq-max-nss-programs-size`` reserves its full
+        value inside every network's XRAM address map, so a cap sized for the
+        biggest component, passed to all of them, inflates each network's
+        IOMMU footprint and the whole bundle can stop fitting on the device
+        (observed as ``failed to acquire hardware`` /
+        ``Failed to map SG table ... -12`` with five networks x 384 MB).
+        Right-size per component instead.
+        """
+        return []
+
+    def _torq_entry_point(self, component: str) -> str:
+        """Name of the compiled vmfb's entry function (i.e. the ONNX graph name).
+
+        The runtime looks functions up by name, so a component whose runner
+        expects something other than ``main`` must override this — compiling it
+        as ``main`` produces a vmfb that loads but cannot be invoked.
+        """
+        return "main"
+
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """Whether ``component`` is *intentionally* exported with dynamic shapes.
 
@@ -360,10 +384,11 @@ class OnnxModelExporterBase(ABC):
             if comp in skip:
                 self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
+            comp_args = list(torq_compile_args or []) + self._torq_compile_args_for(comp)
             self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
             model = onnx.load(onnx_path)
             graph = gs.import_onnx(model)
-            graph.name = "main"
+            graph.name = self._torq_entry_point(comp)
             graph.cleanup(
                 remove_unused_graph_inputs=True, remove_unused_node_outputs=True
             ).toposort()
@@ -374,7 +399,7 @@ class OnnxModelExporterBase(ABC):
                 onnx_path,
                 self._torq_dir,
                 opset=get_model_opset(model),
-                compiler_args=torq_compile_args,
+                compiler_args=comp_args,
                 use_binary=use_binary,
                 local_compile=local_compile,
                 compiler_path=compiler_path,
