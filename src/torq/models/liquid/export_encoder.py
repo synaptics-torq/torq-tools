@@ -43,6 +43,12 @@ from torq.utils.logging import configure_logging
 from ...utils.compile import export_torq
 from .export import LIQUID_TORQ_FLAGS
 
+# The encoder's dispatch programs exceed the 8 MB default NSS program budget
+# (S=64 needs ~17-20 MB, S=256 ~35-41 MB; it grows with sequence length).
+ENCODER_EXTRA_TORQ_FLAGS: tuple[str, ...] = (
+    "--torq-max-nss-programs-size=67108864",
+)
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -352,7 +358,9 @@ def export_liquid_encoder_from_args(args: argparse.Namespace):
         export_torq(
             bf16_path,
             iree_dir,
-            compiler_args=list(LIQUID_TORQ_FLAGS) + (args.compile_flags or []),
+            compiler_args=list(LIQUID_TORQ_FLAGS)
+            + list(ENCODER_EXTRA_TORQ_FLAGS)
+            + (args.compile_flags or []),
             local_compile=args.local_compile,
             use_binary=args.use_binary,
             compiler_path=args.compiler_path,
