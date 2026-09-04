@@ -367,17 +367,26 @@ def export_liquid_encoder_from_args(args: argparse.Namespace):
             opset=args.opset,
         )
 
-    # write a small manifest the demo runner can read
+    # write a small manifest the demo runner can read; merge seq_lens with
+    # any previous export so a later single-length run doesn't clobber them
+    manifest_path = assets_dir / "encoder_manifest.json"
+    prev_lens: list[int] = []
+    if manifest_path.exists():
+        try:
+            prev_lens = json.loads(manifest_path.read_text()).get("seq_lens", [])
+        except Exception:
+            pass
+    all_lens = sorted(set(prev_lens) | set(args.seq_len), reverse=True)
     manifest = {
         "model": HF_REPO_ENCODER[args.model_size],
         "hidden_size": mlm.config.hidden_size,
-        "seq_lens": args.seq_len,
+        "seq_lens": all_lens,
         "mask_token_id": tok.mask_token_id,
         "pad_token_id": tok.pad_token_id,
         "inputs": ["token_embedding", "attention_mask"],
         "outputs": ["hidden"],
     }
-    with open(assets_dir / "encoder_manifest.json", "w") as f:
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     logger.info("Done.")
 
