@@ -46,8 +46,8 @@ from .export import (
 from ._graph import LiquidOnnxGraphEditor
 from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import (
+    NSS_PROGRAMS_SIZE_FLAG,
     OnnxModelExporterBase,
-    TORQ_MAX_NSS_PROGRAMS_SIZE,
 )
 
 
@@ -526,6 +526,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
                 chunk_len=self._batch_prefill,
             )
 
+    def _torq_entry_point(self, component: str) -> str:
+        """The board runner loads the vision encoder by name:
+        ``VMFBInferenceRunner(vision_path, function="embed_images")``
+        (torq-examples ``LiquidAI-LFM2-VL-450M/src/runner.py``). Compiling it as
+        ``main`` yields a vmfb the demo refuses to load, so keep the builder's
+        ``embed_images`` graph name for that component only — everything else
+        (decoder, lm_head, image parts) is invoked as ``main``.
+        """
+        if self._vision_res and component == f"vision_encoder_{self._vision_res}":
+            return "embed_images"
+        return super()._torq_entry_point(component)
+
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
 
@@ -789,15 +801,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
             **quantize_kwargs,
         )
 
-    def _auto_torq_compile_extras(self) -> list[str]:
-        extras = super()._auto_torq_compile_extras()
-        if (getattr(self, "_image_decoder_parts", None) or getattr(self, "_vision_res", None)) and not extras:
-            # The image-decoder parts and the materialized static vision encoder
-            # emit many NSS programs (~195-205 MB); the 8 MB default is far too
-            # small (image_prefill.md §3e). Harmless for the other components.
-            extras = ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
-        return extras
-
     def export_torq(self, *args, skip: list[str] | None = None,
                     torq_compile_args: list[str] | None = None, **kwargs):
         """Compile the decoder (and, if requested, the vision encoder / image
@@ -806,6 +809,25 @@ class LiquidVLModelExporter(LiquidModelExporter):
         if not self._compile_vision and VISION not in skip:
             skip.append(VISION)
         return super().export_torq(*args, skip=skip, torq_compile_args=torq_compile_args, **kwargs)
+
+    def _torq_compile_args_for(self, component: str) -> list[str]:
+        """Per-component NSS-programs caps (see the base hook's docstring for
+        why this must NOT be one global value).
+
+        Measured requirements: the 256-res vision encoder needs ~12.1 MB (the
+        8 MB default fails with 'Not enough space available for NSS programs');
+        the 8-layer image-prefill parts need >101 MB (image_prefill.md §3e; the
+        192 MB value is that doc's proven headroom). The decoder / lm_head fit
+        the default and get only the base's run-derived budget (batched
+        prefill). A former global 384 MB cap made every network's XRAM
+        footprint ~384 MB and the 5-network VL demo could not acquire the
+        hardware; it also slowed the vision compile ~16x.
+        """
+        if self._vision_res and component == f"vision_encoder_{self._vision_res}":
+            return [NSS_PROGRAMS_SIZE_FLAG, "33554432"]
+        if component.startswith("decoder_image_"):
+            return [NSS_PROGRAMS_SIZE_FLAG, "201326592"]
+        return super()._torq_compile_args_for(component)
 
     # ------------------------------------------------------- deployment assets
     def _find_tokenizer(self) -> Path | None:

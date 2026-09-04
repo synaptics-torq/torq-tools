@@ -66,6 +66,26 @@ def test_existing_nss_flag_is_not_duplicated(tmp_path, monkeypatch):
     assert calls == [["--torq-max-nss-programs-size", "999"]]
 
 
+def test_component_budget_replaces_run_wide_budget(tmp_path, monkeypatch):
+    """The budget is reserved in every network's XRAM map, so an exporter can
+    right-size it per component instead of inheriting the run-wide value."""
+    calls = _fake_compile(monkeypatch)
+    exporter = _exporter(tmp_path, batch_prefill=64)
+    exporter._torq_compile_args_for = lambda comp: ["--torq-max-nss-programs-size", "33554432"]
+    exporter.export_torq()
+
+    assert calls == [["--torq-max-nss-programs-size", "33554432"]]
+
+
+def test_user_nss_flag_wins_over_component_budget(tmp_path, monkeypatch):
+    calls = _fake_compile(monkeypatch)
+    exporter = _exporter(tmp_path)
+    exporter._torq_compile_args_for = lambda comp: ["--torq-max-nss-programs-size", "33554432"]
+    exporter.export_torq(torq_compile_args=["--torq-max-nss-programs-size=999"])
+
+    assert calls == [["--torq-max-nss-programs-size=999"]]
+
+
 def test_convert_io_flag_stages_runtime_dtype_artefacts(tmp_path, monkeypatch):
     _fake_compile(monkeypatch)
     exporter = _exporter(tmp_path)
