@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
-"""Compile a HuggingFace-hosted YOLO26 int8 TFLite (``Synaptics/yolov26_od``, int8 NHWC IO,
+"""Compile a HuggingFace-hosted YOLO26 int8 TFLite (``Synaptics/yolov26n_od``, int8 NHWC IO,
 1x320x320x3 -> 1x84x2100 — the artifact this module's export+quantize pipeline produced)
 to a Torq NPU vmfb: download, convert to TOSA MLIR via ``tosa-converter-for-tflite``
 (must be on PATH), then ``torq-compile --torq-hw=SL2610 --torq-disable-slicing``.
@@ -23,7 +23,7 @@ from ...utils.logging import add_logging_args, configure_logging
 
 logger = logging.getLogger("yolo26-compile")
 
-DEFAULT_HF_REPO = "Synaptics/yolov26_od"
+DEFAULT_HF_REPO = "Synaptics/yolov26n_od"
 SIZES = ("n", "s")
 TFLITE_TEMPLATE = "yolo26{size}_full_integer_quant_320_od.tflite"
 COMPILER_ARGS = ["--torq-hw=SL2610", "--torq-disable-slicing"]
