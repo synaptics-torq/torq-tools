@@ -21,12 +21,14 @@ class SmolLM2OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCa
     def __init__(
         self,
         graph: gs.Graph,
-        export_dtype: onnx.TensorProto.DataType | None = None
+        export_dtype: onnx.TensorProto.DataType | None = None,
+        **editor_kwargs,
     ):
         super().__init__(
             graph,
             "model",
-            export_dtype=export_dtype
+            export_dtype=export_dtype,
+            **editor_kwargs,
         )
 
     @classmethod
@@ -34,13 +36,15 @@ class SmolLM2OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCa
         cls,
         onnx_model: str | os.PathLike | onnx.ModelProto,
         export_dtype: onnx.TensorProto.DataType | None = None,
+        **editor_kwargs,
     ) -> "SmolLM2OnnxGraphEditor":
         if not isinstance(onnx_model, onnx.ModelProto):
             onnx_model = onnx.load(onnx_model)
         graph = gs.import_onnx(onnx_model)
         return cls(
             graph,
-            export_dtype
+            export_dtype,
+            **editor_kwargs,
         )
 
     def fix_io(

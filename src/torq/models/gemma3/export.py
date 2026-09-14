@@ -67,6 +67,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         split_lm_head: bool = False,
         trim_vocab_groups: list[str] | None = None,
         trim_byte_fallback: bool = True,
+        split_weights: bool = False,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -134,7 +135,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
                 hidden_size=self._config.hidden_size
-            )}
+            )},
+            split_weights=split_weights,
         )
 
     def _setup_dirs(self) -> list[Path]:
@@ -359,7 +361,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         return blocks
 
     def _make_model_static(
-        self, model: onnx.ModelProto
+        self, model: onnx.ModelProto, component: str = "model"
     ) -> onnx.ModelProto:
         """
         Make model static by replacing dynamic dimensions with fixed values and applying necessary transformations.
@@ -382,7 +384,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
-        editor = Gemma3OnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = Gemma3OnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
+        )
         editor.fix_io(self._max_gen_tokens)
 
         blocks = self.graph_edit_blocks()
@@ -419,7 +425,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _patch_static_model(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = Gemma3OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+        editor = Gemma3OnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         blocks = self.graph_edit_blocks()
         embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
@@ -465,12 +475,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             )
             lm_head_model = onnx.load(lm_head_path)
             lm_head_model.ir_version = model.ir_version
-            onnx.save(self.check_model(lm_head_model), lm_head_path)
+            self._save_component_model(self.check_model(lm_head_model), lm_head_path)
             self._export_paths["lm_head"] = lm_head_path
             self._logger.info("(lm_head) Saved split LM head to '%s'", str(lm_head_path))
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -558,6 +568,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         split_lm_head=args.split_lm_head,
         trim_vocab_groups=args.trim_vocab_groups,
         trim_byte_fallback=args.trim_byte_fallback,
+        split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )

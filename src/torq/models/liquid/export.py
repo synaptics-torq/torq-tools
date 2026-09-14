@@ -122,6 +122,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
+        split_weights: bool = False,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -178,6 +179,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             Path(models_dir) / f"liquid-2p5-{model_size}",
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
             # LFM2's custom ops break the ORT bert optimizer; skip it.
             opt_configs={},
         )
@@ -277,7 +279,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
         graph.name = "main"
 
         # Replace ORT custom ops with standard ONNX ops in the source graph.
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("model")),
+        )
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
@@ -501,7 +507,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def _make_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         graph: gs.Graph = gs.import_onnx(model)
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("model")),
+        )
 
         # Fix all dynamic IO dims first.
         editor.fix_io(self._max_gen_tokens)
@@ -1120,7 +1130,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def _patch_static_model(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = LiquidOnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         editor.apply_specs(self.graph_edit_blocks()["model.patch"], self._harness)
 
@@ -1187,7 +1201,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             )
         except Exception as e:
             self._logger.warning("(lm-head) shape inference after split: %s", e)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -1485,6 +1499,7 @@ def export_liquid_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
+        split_weights=args.split_weights,
         broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
