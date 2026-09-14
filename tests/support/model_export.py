@@ -13,7 +13,7 @@ class StubExporter(OnnxModelExporterBase):
     download and multi-GB ONNX read.
     """
 
-    def __init__(self, root, components, dynamic_quantize=False, convert_dtypes=False):
+    def __init__(self, root, components, dynamic_quantize=False, convert_dtypes=False, split_weights=False):
         self._root = Path(root)
         self._stub_components = dict(components)
         self.setup_calls = 0
@@ -21,6 +21,7 @@ class StubExporter(OnnxModelExporterBase):
         super().__init__(
             "fp32", False, {}, self._root,
             dynamic_quantize=dynamic_quantize, convert_dtypes=convert_dtypes, opt_configs={},
+            split_weights=split_weights,
         )
 
     def _setup_dirs(self):

@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,7 +18,7 @@ import onnx
 import onnx_graphsurgeon as gs
 from onnx import helper, numpy_helper, shape_inference, TensorProto
 
-from ..utils.onnx import drop_empty_name_value_info
+from ..utils.onnx import drop_empty_name_value_info, save_onnx_split_weights
 
 if TYPE_CHECKING:
     from .harness import EditSpec, GraphEditHarness
@@ -122,6 +124,9 @@ class OnnxGraphEditor:
         edits: Iterable[OnnxGraphEdit] | None = None,
         export_dtype: onnx.TensorProto.DataType | None = None,
         is_rnn: bool = False,
+        dump_path: str | os.PathLike | None = None,
+        dump_after_edit: str | None = None,
+        split_weights: bool = False,
     ):
         self._export_dtype = export_dtype
         self._graph = graph
@@ -130,6 +135,14 @@ class OnnxGraphEditor:
         self._logger = logging.getLogger(str(self))
         self._edits: dict[str, OnnxGraphEdit] = {}
         self._harness_applied_extras: set[str] = set()
+        # Per-edit intermediate dumps (MLIR --mlir-print-ir-after style):
+        # after each matching edit, write the current graph to ``dump_path``.
+        # ``dump_after_edit`` is None/"all" for every edit, else a
+        # comma-separated edit-name list; ``split_weights`` stores tensor data
+        # in an external ``<dump_path>.data`` file to keep the dump light.
+        self._dump_path = Path(dump_path) if dump_path is not None else None
+        self._dump_edit_names = _parse_dump_edit_names(dump_after_edit)
+        self._dump_split_weights = split_weights
         # Restoring omitted RNN outputs is only relevant for graphs that
         # actually contain RNN/GRU/LSTM nodes; opt-in via ``is_rnn`` so we
         # don't run the post-pass on every unrelated graph.
@@ -227,12 +240,42 @@ class OnnxGraphEditor:
             self.restore_rnn_output_arity(self._graph)
         if edit.requires_shape_inference:
             self._infer_shapes()
+        self._maybe_dump_intermediate(edit.name)
         return self
 
     def apply_edits(self, edits: Sequence[OnnxGraphEdit | str]):
         for edit in edits:
             self.apply_edit(edit)
         return self
+
+    def _maybe_dump_intermediate(self, edit_name: str):
+        if self._dump_path is None:
+            return
+        if self._dump_edit_names is not None and edit_name not in self._dump_edit_names:
+            return
+        model = gs.export_onnx(self._graph)
+        try:
+            model = onnx.shape_inference.infer_shapes(
+                model, check_type=False, strict_mode=False, data_prop=False
+            )
+            drop_empty_name_value_info(model)
+        except Exception:
+            # Mid-edit graphs can carry stale annotations; a dump is a
+            # diagnostic and must never break the export.
+            self._logger.debug(
+                "Intermediate dump for '%s': shape inference failed, dumping raw graph",
+                edit_name, exc_info=True,
+            )
+        self._dump_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._dump_split_weights:
+            save_onnx_split_weights(model, self._dump_path)
+            self._logger.info(
+                "Dumped graph after '%s' to '%s' (weights in '%s')",
+                edit_name, self._dump_path, self._dump_path.name + ".data",
+            )
+        else:
+            onnx.save(model, self._dump_path)
+            self._logger.info("Dumped graph after '%s' to '%s'", edit_name, self._dump_path)
 
     def apply_specs(
         self,
@@ -430,8 +473,19 @@ class OnnxGraphEditor:
 
 
 # -----------------------------------------------------------------------------
-# Module-level helpers used by OnnxGraphEditor.freeze_shape_seeds.
+# Module-level helpers used by OnnxGraphEditor.
 # -----------------------------------------------------------------------------
+
+def _parse_dump_edit_names(dump_after_edit: str | None) -> frozenset[str] | None:
+    """Parse a ``--dump-after-edit`` style value.
+
+    ``None``, empty, or ``"all"`` means every edit; otherwise a
+    comma-separated list of edit names.
+    """
+    if dump_after_edit is None or not dump_after_edit.strip() or dump_after_edit.strip().lower() == "all":
+        return None
+    return frozenset(name.strip() for name in dump_after_edit.split(",") if name.strip())
+
 
 _SHAPE_OPS: frozenset[str] = frozenset(
     {

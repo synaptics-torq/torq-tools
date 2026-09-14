@@ -201,12 +201,18 @@ class GraphEditHarness:
     Precedence (high -> low) is flags > file > defaults.  An overriding edit
     keeps the original position of the default it replaces; brand-new edits are
     appended.  Excluded edits are removed last.
+
+    ``dump_after_edit`` (``--dump-after-edit[=EDITS]``) controls per-edit
+    intermediate graph dumps: None disables, "all"/"" dumps after every edit,
+    else a comma-separated edit-name list.  See ``OnnxGraphEditor``'s
+    ``dump_path``/``dump_after_edit``/``split_weights`` options.
     """
 
     apply_flag: list[EditSpec] = field(default_factory=list)
     apply_file: list[EditSpec] = field(default_factory=list)
     exclude: set[str] = field(default_factory=set)
     view: bool = False
+    dump_after_edit: str | None = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "GraphEditHarness":
@@ -226,6 +232,7 @@ class GraphEditHarness:
             apply_file=apply_file,
             exclude=exclude,
             view=bool(getattr(args, "view_graph_edits", False)),
+            dump_after_edit=getattr(args, "dump_after_edit", None),
         )
 
     def _validate_names(self) -> None:
@@ -235,6 +242,12 @@ class GraphEditHarness:
             for spec in (*self.apply_flag, *self.apply_file)
             if spec.name not in registry
         } | {name for name in self.exclude if name not in registry}
+        if self.dump_after_edit is not None and self.dump_after_edit.strip().lower() != "all":
+            unknown |= {
+                name.strip()
+                for name in self.dump_after_edit.split(",")
+                if name.strip() and name.strip() not in registry
+            }
         if unknown:
             raise ValueError(
                 "Unknown graph edit(s): "
@@ -319,6 +332,19 @@ def add_graph_edit_harness_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Print the finalized graph edits for this export command and exit.",
+    )
+    group.add_argument(
+        "--dump-after-edit",
+        metavar="EDITS",
+        nargs="?",
+        const="all",
+        default=None,
+        help=(
+            "Dump the graph to <export-dir>/intermediates/<model>.onnx after graph "
+            "edits, for manual inspection. "
+            "Bare flag dumps after every edit; --dump-after-edit=Edit1,Edit2 dumps only "
+            "after those edits. Each dump overwrites the previous one."
+        ),
     )
 
 

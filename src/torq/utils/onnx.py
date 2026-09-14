@@ -30,6 +30,7 @@ __all__ = [
 
     # Transformations
     "drop_empty_name_value_info",
+    "save_onnx_split_weights",
     "finalize_torq_ready_onnx",
 ]
 
@@ -81,6 +82,19 @@ def add_onnx_args(
         help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
              "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
              "exported component before dtype conversion",
+    )
+    group.add_argument(
+        "--split-weights",
+        action="store_true",
+        default=False,
+        help=(
+            "Write the exported models (and --dump-after-edit files) with tensor "
+            "data above 1024 bytes in an external <model>.onnx.data file (ONNX "
+            "convention) so the .onnx stays lightweight and opens fast in a model "
+            "viewer. Only tensor data above 1024 bytes is externalized; smaller "
+            "constants stay inline so onnxruntime can still resolve shape-op "
+            "inputs (Squeeze/Reshape axes, Slice/Pad parameters) at load time."
+        ),
     )
     if allow_no_opt:
         group.add_argument(
@@ -296,6 +310,30 @@ def drop_empty_name_value_info(model: onnx.ModelProto) -> onnx.ModelProto:
         del graph.value_info[:]
         graph.value_info.extend(kept)
     return model
+
+
+def save_onnx_split_weights(model: onnx.ModelProto, path: str | os.PathLike) -> None:
+    """Save ``model`` to ``path`` with large tensor data in ``<path>.data``.
+
+    Follows the ONNX external-data convention (``model.onnx`` + ``model.onnx.data``).
+    Only tensor data above 1024 bytes (onnx's ``size_threshold``) is externalized; 
+    smaller constants (e.g. Squeeze/Reshape axes, Slice/Pad parameters) stay inline.
+    """
+    path = Path(path)
+    data_path = path.parent / f"{path.name}.data"
+    # onnx.save appends to an existing external-data file (each tensor lands at
+    # a fresh offset beyond the old content), so a rewritten dump would
+    # accumulate stale data across saves; start from a clean file.
+    if data_path.exists():
+        data_path.unlink()
+    onnx.save(
+        model,
+        str(path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=f"{path.name}.data",
+        size_threshold=1024,
+    )
 
 
 def finalize_torq_ready_onnx(
