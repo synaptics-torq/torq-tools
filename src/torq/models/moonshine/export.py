@@ -69,6 +69,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
+        split_weights: bool = False,
         **edit_args
     ):
         if model_dtype in ("quantized", "quantized_4bit") and dynamic_quantize:
@@ -120,6 +121,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             convert_dtypes=convert_dtypes,
             opt_configs=opt_configs,
             skip_export=skip_export,
+            split_weights=split_weights,
         )
 
     def _setup_dirs(self) -> list[Path]:
@@ -273,7 +275,12 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             onnx.ModelProto: The modified encoder model with static dimensions
         """
 
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            "encoder",
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("encoder")),
+        )
         editor.fix_encoder_io(self._num_samples, self._enc_seq_len)
         new_encoder = editor.to_onnx(override_ir=model.ir_version)
         graph = gs.import_onnx(new_encoder)
@@ -314,7 +321,12 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._config.hidden_size // self._config.decoder_num_attention_heads
         ) % 8
 
-        editor = MoonshineOnnxGraphEditor(graph, comp, self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor(
+            graph,
+            comp,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(comp)),
+        )
         editor.fix_decoder_io(self._enc_seq_len, self._max_tokens, with_past)
 
         blocks = self.graph_edit_blocks()
@@ -349,7 +361,12 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
     def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            component,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         # Replace potentially unsupported int64 -> float cast with lookup table
         editor.apply_specs(
@@ -357,32 +374,47 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def _patch_static_preprocessor(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, "preprocessor", self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            "preprocessor",
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         # Decompose large strided Conv1D into im2col + MatMul
         editor.apply_specs(self.graph_edit_blocks()["preprocessor.patch"], self._harness)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def _patch_static_gen_encoder_cache(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, "gen_encoder_cache", self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            "gen_encoder_cache",
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         # Emit cross-attn key cache in [B, H, D, L] so the decoder can drop its
         # matching re-transpose (incompatible with combined KV I/O)
         editor.apply_specs(self.graph_edit_blocks()["gen_encoder_cache.patch"], self._harness)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def _patch_static_encoder(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, "encoder", self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            "encoder",
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         editor.apply_specs(
             self.graph_edit_blocks()["encoder.patch"],
@@ -391,11 +423,16 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def _patch_static_decoder(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(model, component, self._onnx_export_dtype)
+        editor = MoonshineOnnxGraphEditor.from_onnx(
+            model,
+            component,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         embeddings_npy = Path(model_path).parent / f"{component}_token_embeddings.npy"
         editor.apply_specs(
@@ -426,7 +463,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         editor.reorder_graph_input("current_len", 1)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     @staticmethod
     def compute_encoder_seq_len(
@@ -830,6 +867,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
+        split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )

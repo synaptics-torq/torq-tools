@@ -19,12 +19,19 @@ class Gemma3OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCac
     def __init__(
         self,
         graph: gs.Graph,
-        export_dtype: onnx.TensorProto.DataType | None = None
+        export_dtype: onnx.TensorProto.DataType | None = None,
+        *,
+        dump_path: str | os.PathLike | None = None,
+        dump_after_edit: str | None = None,
+        split_weights: bool = False,
     ):
         super().__init__(
             graph,
             "model",
-            export_dtype=export_dtype
+            export_dtype=export_dtype,
+            dump_path=dump_path,
+            dump_after_edit=dump_after_edit,
+            split_weights=split_weights,
         )
 
     @classmethod
@@ -32,13 +39,15 @@ class Gemma3OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCac
         cls,
         onnx_model: str | os.PathLike | onnx.ModelProto,
         export_dtype: onnx.TensorProto.DataType | None = None,
+        **editor_kwargs,
     ) -> "Gemma3OnnxGraphEditor":
         if not isinstance(onnx_model, onnx.ModelProto):
             onnx_model = onnx.load(onnx_model)
         graph = gs.import_onnx(onnx_model)
         return cls(
             graph,
-            export_dtype
+            export_dtype,
+            **editor_kwargs,
         )
 
     def fix_io(

@@ -105,12 +105,14 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         self,
         graph: gs.Graph,
         component: str,
-        export_dtype: onnx.TensorProto.DataType | None = None
+        export_dtype: onnx.TensorProto.DataType | None = None,
+        **editor_kwargs,
     ):
         super().__init__(
             graph,
             component,
-            export_dtype=export_dtype
+            export_dtype=export_dtype,
+            **editor_kwargs,
         )
 
     @classmethod
@@ -119,6 +121,7 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         onnx_model: str | os.PathLike | onnx.ModelProto,
         component: str,
         export_dtype: onnx.TensorProto.DataType | None = None,
+        **editor_kwargs,
     ) -> "MoonshineStreamingOnnxGraphEditor":
         if not isinstance(onnx_model, onnx.ModelProto):
             onnx_model = onnx.load(onnx_model)
@@ -126,7 +129,8 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         return cls(
             graph,
             component,
-            export_dtype
+            export_dtype,
+            **editor_kwargs,
         )
 
     def fix_encoder_io(

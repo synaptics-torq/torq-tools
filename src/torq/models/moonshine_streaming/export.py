@@ -417,6 +417,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         show_model_info: bool = False,
         convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
+        split_weights: bool = False,
         **edit_args,
     ):
         self._model_size = model_size
@@ -462,6 +463,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             convert_dtypes=convert_dtypes,
             opt_configs=opt_configs,
             skip_export=skip_export,
+            split_weights=split_weights,
         )
 
     def _setup_dirs(self) -> list[Path]:
@@ -682,7 +684,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     def _make_encoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-            model, "encoder", self._onnx_export_dtype
+            model, "encoder", self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("encoder")),
         )
         # Dynamo export produces concrete shapes; fix_io_dims handles any residual
         # symbolic dims on batch or seq axes.
@@ -710,7 +713,8 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
     def _make_decoder_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
         editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-            model, "decoder", self._onnx_export_dtype
+            model, "decoder", self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("decoder")),
         )
         editor.make_decoder_static(self._max_tokens)
         editor.apply_specs(self.graph_edit_blocks()["decoder.static"], self._harness)
@@ -743,21 +747,23 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
         if "encoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-                model_path, component, self._onnx_export_dtype
+                model_path, component, self._onnx_export_dtype,
+                **self._editor_dump_kwargs(Path(model_path)),
             )
             # editor.decompose_asinh() #Currently using the polynomial fit
             editor.remove_identity_gather_nd()
             editor.apply_specs(self.graph_edit_blocks()["encoder.patch"], self._harness)
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
-            onnx.save(new_model, model_path)
+            self._save_component_model(new_model, model_path)
 
         if "decoder" in component:
             editor = MoonshineStreamingOnnxGraphEditor.from_onnx(
-                model_path, component, self._onnx_export_dtype
+                model_path, component, self._onnx_export_dtype,
+                **self._editor_dump_kwargs(Path(model_path)),
             )
             editor.apply_specs(self.graph_edit_blocks()["decoder.patch"], self._harness)
             new_model = editor.to_onnx(override_ir=onnx.load(model_path).ir_version)
-            onnx.save(new_model, model_path)
+            self._save_component_model(new_model, model_path)
 
         for filename in ("tokenizer.json", "config.json"):
             src = self._onnx_dir / filename
@@ -881,6 +887,7 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
+        split_weights=args.split_weights,
         broadcast_ops=args.broadcast_ops,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))

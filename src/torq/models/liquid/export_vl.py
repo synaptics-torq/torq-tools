@@ -90,6 +90,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
+        split_weights: bool = False,
         compile_vision: bool = False,
         keep_individual_kv_io: bool = False,
         static_models: bool = True,
@@ -152,6 +153,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             Path(models_dir),
             show_model_info=show_model_info,
             convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
             opt_configs={},  # LFM2 custom ops break the ORT bert optimizer
         )
 
@@ -354,7 +356,11 @@ class LiquidVLModelExporter(LiquidModelExporter):
             if inp.name == "inputs_embeds":
                 inp.name = "token_embedding"
 
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("model")),
+        )
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
@@ -486,8 +492,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
                 shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
             self._simulate_bf16_precision(sim_path)
 
-    @staticmethod
-    def _reorder_decoder_inputs(model_path: str | os.PathLike):
+    def _reorder_decoder_inputs(self, model_path: str | os.PathLike):
         """Pin ``token_embedding`` then ``position_ids`` as the first two graph
         inputs (the rest keep their order)."""
         order = ["token_embedding", "position_ids"]
@@ -497,7 +502,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         rest = [i for i in model.graph.input if i.name not in set(order)]
         del model.graph.input[:]
         model.graph.input.extend(front + rest)
-        onnx.save(model, model_path)
+        self._save_component_model(model, model_path)
 
     # ----------------------------------------------------------------- convert
     def convert_models(
@@ -854,6 +859,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=args.convert_dtypes,
+        split_weights=args.split_weights,
         compile_vision=args.compile_vision,
         keep_individual_kv_io=args.keep_individual_kv_io,
         static_models=not args.dynamic_models,

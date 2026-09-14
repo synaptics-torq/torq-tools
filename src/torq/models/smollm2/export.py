@@ -43,6 +43,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         show_model_info: bool = False,
         dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
+        split_weights: bool = False,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -72,6 +73,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             show_model_info=show_model_info,
             dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
                 hidden_size=self._config.hidden_size
@@ -176,7 +178,11 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
-        editor = SmolLM2OnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = SmolLM2OnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("model")),
+        )
         editor.fix_io(self._max_gen_tokens)
 
         blocks = self.graph_edit_blocks()
@@ -211,7 +217,11 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
     def _patch_static_model(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
-        editor = SmolLM2OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+        editor = SmolLM2OnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
         editor.apply_specs(
@@ -232,7 +242,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             ])
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -308,6 +318,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         show_model_info=args.show_model_info,
         dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
+        split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )
