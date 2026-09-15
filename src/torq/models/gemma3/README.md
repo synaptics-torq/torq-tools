@@ -73,6 +73,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
 | `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits |
+| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens; requires `--split-lm-head` |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
@@ -107,6 +108,7 @@ above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
 ```
 models/<repo>/export/<full|trim>/split_lm_head/onnx/<dtype>/static/
     transformer.onnx                    ← the decoder, outputs last_hidden_states
+    transformer_prefill.onnx            ← with --batch-prefill; processes N tokens and outputs the last hidden state
     lm_head.onnx                        ← standalone LM head
 ```
 

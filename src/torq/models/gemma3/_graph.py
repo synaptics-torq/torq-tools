@@ -55,13 +55,14 @@ class Gemma3OnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCac
         seq_len: int,
         dims: list[FixedDimMapping] | None = None,
         *,
+        chunk_len: int = 1,
         batch_dim: str = "batch_size",
         seq_len_dim: str = "sequence_length",
         past_seq_len_dim: str = "past_sequence_length"
     ):
         to_fix = [
             FixedDimMapping(batch_dim, DimMatchType.EXACT, 1),
-            FixedDimMapping(seq_len_dim, DimMatchType.EXACT, 1),
+            FixedDimMapping(seq_len_dim, DimMatchType.EXACT, chunk_len),
             FixedDimMapping(past_seq_len_dim, DimMatchType.CONTAINS, seq_len),
         ]
         to_fix.extend(dims or [])
