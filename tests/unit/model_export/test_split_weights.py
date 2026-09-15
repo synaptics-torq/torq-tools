@@ -71,7 +71,7 @@ def test_export_onnx_inline_without_split_weights(tmp_path):
     assert np.array_equal(numpy_helper.to_array(_inits(m)["weight"]), weight)
 
 
-def test_editor_dump_kwargs_reads_harness_and_split_weights(tmp_path):
+def test_editor_dump_kwargs_reads_harness(tmp_path):
     exporter = StubExporter(tmp_path, {"model": _two_tensor_model()[0]})
 
     # No harness (or no --dump-after-edit) -> no dump kwargs.
@@ -83,7 +83,6 @@ def test_editor_dump_kwargs_reads_harness_and_split_weights(tmp_path):
     assert exporter._editor_dump_kwargs(Path("export/model.onnx")) == {
         "dump_path": Path("export/intermediates/model.onnx"),
         "dump_after_edit": "all",
-        "split_weights": False,
     }
 
     split = StubExporter(tmp_path, {"model": _two_tensor_model()[0]}, split_weights=True)
@@ -91,5 +90,4 @@ def test_editor_dump_kwargs_reads_harness_and_split_weights(tmp_path):
     assert split._editor_dump_kwargs(Path("export/model.onnx")) == {
         "dump_path": Path("export/intermediates/model.onnx"),
         "dump_after_edit": "EliminateExpand,FoldScalarMatMul",
-        "split_weights": True,
     }

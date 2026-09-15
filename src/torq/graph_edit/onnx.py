@@ -18,7 +18,7 @@ import onnx
 import onnx_graphsurgeon as gs
 from onnx import helper, numpy_helper, shape_inference, TensorProto
 
-from ..utils.onnx import drop_empty_name_value_info, save_onnx_split_weights
+from ..utils.onnx import drop_empty_name_value_info
 
 if TYPE_CHECKING:
     from .harness import EditSpec, GraphEditHarness
@@ -136,13 +136,12 @@ class OnnxGraphEditor:
         self._edits: dict[str, OnnxGraphEdit] = {}
         self._harness_applied_extras: set[str] = set()
         # Per-edit intermediate dumps (MLIR --mlir-print-ir-after style):
-        # after each matching edit, write the current graph to ``dump_path``.
-        # ``dump_after_edit`` is None/"all" for every edit, else a
-        # comma-separated edit-name list; ``split_weights`` stores tensor data
-        # in an external ``<dump_path>.data`` file to keep the dump light.
+        # after each matching edit, write the current graph to a numbered path
+        # next to ``dump_path``. ``dump_after_edit`` is None/"all" for every
+        # edit, else a comma-separated edit-name list.
         self._dump_path = Path(dump_path) if dump_path is not None else None
         self._dump_edit_names = _parse_dump_edit_names(dump_after_edit)
-        self._dump_split_weights = split_weights
+        self._dump_index = _last_dump_index(self._dump_path)
         # Restoring omitted RNN outputs is only relevant for graphs that
         # actually contain RNN/GRU/LSTM nodes; opt-in via ``is_rnn`` so we
         # don't run the post-pass on every unrelated graph.
@@ -266,16 +265,25 @@ class OnnxGraphEditor:
                 "Intermediate dump for '%s': shape inference failed, dumping raw graph",
                 edit_name, exc_info=True,
             )
-        self._dump_path.parent.mkdir(parents=True, exist_ok=True)
-        if self._dump_split_weights:
-            save_onnx_split_weights(model, self._dump_path)
-            self._logger.info(
-                "Dumped graph after '%s' to '%s' (weights in '%s')",
-                edit_name, self._dump_path, self._dump_path.name + ".data",
+        self._dump_index += 1
+        dump_path = self._dump_path.with_name(
+            f"{self._dump_index:04d}_{edit_name}_{self._dump_path.name}"
+        )
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        data_path = dump_path.with_name(dump_path.name + ".data")
+        data_path.unlink(missing_ok=True)
+        try:
+            onnx.save_model(
+                model,
+                dump_path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=data_path.name,
+                size_threshold=0,
             )
-        else:
-            onnx.save(model, self._dump_path)
-            self._logger.info("Dumped graph after '%s' to '%s'", edit_name, self._dump_path)
+        finally:
+            data_path.unlink(missing_ok=True)
+        self._logger.info("Dumped graph after '%s' to '%s'", edit_name, dump_path)
 
     def apply_specs(
         self,
@@ -485,6 +493,18 @@ def _parse_dump_edit_names(dump_after_edit: str | None) -> frozenset[str] | None
     if dump_after_edit is None or not dump_after_edit.strip() or dump_after_edit.strip().lower() == "all":
         return None
     return frozenset(name.strip() for name in dump_after_edit.split(",") if name.strip())
+
+
+def _last_dump_index(dump_path: Path | None) -> int:
+    if dump_path is None or not dump_path.parent.exists():
+        return 0
+    suffix = f"_{dump_path.name}"
+    indices = []
+    for path in dump_path.parent.iterdir():
+        prefix, separator, _ = path.name.partition("_")
+        if separator and path.name.endswith(suffix) and prefix.isdigit():
+            indices.append(int(prefix))
+    return max(indices, default=0)
 
 
 _SHAPE_OPS: frozenset[str] = frozenset(

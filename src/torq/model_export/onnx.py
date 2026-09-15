@@ -236,9 +236,8 @@ class OnnxModelExporterBase(ABC):
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
 
         The dump trigger comes from the attached graph-edit harness
-        (``--dump-after-edit``) and the storage form from ``--split-weights``.
-        Dumps land in ``<export-dir>/intermediates/<model>.onnx`` so the final
-        export (and later pipeline steps) never clobbers them.
+        (``--dump-after-edit``). Dumps land in ``<export-dir>/intermediates``
+        so the final export (and later pipeline steps) never clobbers them.
         """
         harness = self._harness
         if harness is None or harness.dump_after_edit is None:
@@ -246,7 +245,6 @@ class OnnxModelExporterBase(ABC):
         return {
             "dump_path": final_path.parent / "intermediates" / final_path.name,
             "dump_after_edit": harness.dump_after_edit,
-            "split_weights": self._split_weights,
         }
 
     def _copy_external_data(self, src: str | os.PathLike, dst: Path) -> None:
