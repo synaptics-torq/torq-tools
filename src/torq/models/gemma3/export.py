@@ -542,6 +542,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             repo_id=self._hf_repo,
             n_iters=n_iters,
             lm_head_path=self._export_paths.get("lm_head"),
+            prefill_model_path=self._export_paths.get("model_prefill"),
+            prefill_size=self._batch_prefill,
         )
 
     def convert_models(
