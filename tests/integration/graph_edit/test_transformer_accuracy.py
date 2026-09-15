@@ -30,6 +30,26 @@ def test_static_kv_cache_update_matches_expected_position_blend():
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_static_kv_cache_chunk_update_places_each_row():
+    past = gs.Variable("past", dtype=np.float32, shape=[1, 1, 4, 2])
+    new = gs.Variable("new", dtype=np.float32, shape=[1, 1, 2, 2])
+    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1])
+    present = gs.Variable("present", dtype=np.float32, shape=[1, 1, 4, 2])
+    concat = gs.Node("Concat", "present_concat", inputs=[past, new], outputs=[present], attrs={"axis": -2})
+    g = graph(nodes=[concat], inputs=[past, new, cur_len], outputs=[present])
+    ReplaceDynamicKVCache(g, "integration", cur_len=cur_len, max_tokens=4, chunk_len=2).transform(concat)
+
+    past_value = np.arange(8, dtype=np.float32).reshape(1, 1, 4, 2)
+    new_value = np.array([[[[20, 21], [30, 31]]]], dtype=np.float32)
+    actual = run_model(
+        g,
+        {"past": past_value, "new": new_value, "cur_len": np.array([1], dtype=np.int64)},
+    )["present"]
+    expected = past_value.copy()
+    expected[:, :, 1:3, :] = new_value
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_attention_future_mask_matches_expected_softmax():
     scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
     biased_in = gs.Variable("biased_in", dtype=np.float32, shape=[1, 1, 1, 4])
@@ -46,3 +66,26 @@ def test_attention_future_mask_matches_expected_softmax():
     expected = np.exp(masked - np.max(masked))
     expected = expected / expected.sum()
     np.testing.assert_allclose(actual.reshape(-1), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_attention_future_mask_advances_for_each_chunk_row():
+    scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 2, 4])
+    biased_in = gs.Variable("biased_in", dtype=np.float32, shape=[1, 1, 2, 4])
+    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 2, 4])
+    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1])
+    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[biased_in])
+    softmax = gs.Node("Softmax", "layer/self_attn/Softmax", inputs=[biased_in], outputs=[probs], attrs={"axis": -1})
+    g = graph(nodes=[identity, softmax], inputs=[scores, cur_len], outputs=[probs])
+    MaskFutureAttentionScores(
+        g, "integration", cur_len=cur_len, max_tokens=4,
+        export_dtype=onnx.TensorProto.FLOAT, chunk_len=2,
+    ).transform(softmax)
+
+    score_values = np.array([[[[1, 2, 3, 4], [1, 2, 3, 4]]]], dtype=np.float32)
+    actual = run_model(
+        g,
+        {"scores": score_values, "cur_len": np.array([[[[1]]]], dtype=np.int64)},
+    )["probs"]
+    assert actual[0, 0, 0, 2] == 0
+    assert actual[0, 0, 1, 2] > 0
+    assert actual[0, 0, 1, 3] == 0

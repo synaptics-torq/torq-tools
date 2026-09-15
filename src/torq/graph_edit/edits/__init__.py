@@ -10,7 +10,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TakeLastToken, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .mixins import CommonGraphEditsMixin
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
@@ -64,6 +64,7 @@ __all__ = [
     "CollapseGQABroadcast",
     "TrimLMHeadVocab",
     "SplitLMHead",
+    "TakeLastToken",
     "EliminateRank0Gather",
     "EliminateSingletonGatherUnsqueeze",
     "RewriteNegativePads",
