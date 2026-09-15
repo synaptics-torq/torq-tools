@@ -112,9 +112,10 @@ models/<repo>/export/<full|trim>/split_lm_head/onnx/<dtype>/static/
     lm_head.onnx                        ← standalone LM head
 ```
 
-Inference and export validation pick the `lm_head` up automatically when it sits
-next to the transformer, so `torq-infer-model gemma3 -m …/transformer.onnx`
-works unchanged.
+Inference and export validation pick up both companion models automatically when
+they sit next to the transformer. Full `N`-token prompt chunks run through
+`transformer_prefill.onnx`; any remainder and generated tokens use
+`transformer.onnx`, with both paths sharing `lm_head.onnx`.
 
 ## Weight quantization (int4 / int8)
 

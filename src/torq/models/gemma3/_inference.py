@@ -201,6 +201,8 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         repo_id: str | None = None,
         combined_kv_io: bool = True,
         lm_head: InferenceRunner | None = None,
+        prefill_model: InferenceRunner | None = None,
+        prefill_size: int | None = None,
     ):
         token_embeddings = self._find_token_embeddings(model.model_path)
         token_id_lut = self._find_token_id_lut(model.model_path)
@@ -218,6 +220,8 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             token_embeddings=token_embeddings,
             token_id_lut=token_id_lut,
             lm_head=lm_head,
+            prefill_model=prefill_model,
+            prefill_size=prefill_size,
         )
         if self._token_id_lut is not None:
             self._logger.info(
@@ -227,6 +231,12 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         if self._lm_head is not None:
             self._logger.info(
                 "Loaded split LM head '%s'", str(self._lm_head.model_path)
+            )
+        if self._prefill_model is not None:
+            self._logger.info(
+                "Loaded %d-token prefill model '%s'",
+                self._prefill_size,
+                str(self._prefill_model.model_path),
             )
 
     @classmethod
@@ -240,8 +250,19 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         repo_id: str | None = None,
         combined_kv_io: bool = True,
         lm_head_path: str | os.PathLike | None = None,
+        prefill_model_path: str | os.PathLike | None = None,
+        prefill_size: int | None = None,
     ) -> "Gemma3Static":
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.onnx")
+        prefill_model_path = prefill_model_path or cls._find_prefill_model(
+            model_path, "transformer_prefill.onnx"
+        )
+        prefill_model = (
+            ORTInferenceRunner(prefill_model_path, n_threads=n_threads)
+            if prefill_model_path else None
+        )
+        if prefill_model is not None and prefill_size is None:
+            prefill_size = cls._infer_prefill_size(prefill_model)
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -253,6 +274,8 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
                 ORTInferenceRunner(lm_head_path, n_threads=n_threads)
                 if lm_head_path else None
             ),
+            prefill_model=prefill_model,
+            prefill_size=prefill_size,
         )
 
     @classmethod
@@ -266,8 +289,13 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         repo_id: str | None = None,
         combined_kv_io: bool = True,
         lm_head_path: str | os.PathLike | None = None,
+        prefill_model_path: str | os.PathLike | None = None,
+        prefill_size: int | None = None,
     ) -> "Gemma3Static":
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb")
+        prefill_model_path = prefill_model_path or cls._find_prefill_model(
+            model_path, "transformer_prefill.vmfb"
+        )
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -279,6 +307,11 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
                 VMFBInferenceRunner(lm_head_path, n_threads=n_threads)
                 if lm_head_path else None
             ),
+            prefill_model=(
+                VMFBInferenceRunner(prefill_model_path, n_threads=n_threads)
+                if prefill_model_path else None
+            ),
+            prefill_size=prefill_size,
         )
 
     @staticmethod
@@ -306,6 +339,24 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
     ) -> Path | None:
         """Locate the split LM head exported alongside the transformer."""
         return Gemma3Static._find_data_file(model_path, lm_head_pattern, "split LM head")
+
+    @staticmethod
+    def _find_prefill_model(
+        model_path: str | os.PathLike,
+        prefill_pattern: str,
+    ) -> Path | None:
+        """Locate the batched prefill model exported alongside the transformer."""
+        return Gemma3Static._find_data_file(model_path, prefill_pattern, "prefill model")
+
+    @staticmethod
+    def _infer_prefill_size(prefill_model: InferenceRunner) -> int:
+        for input_name in ("token_embedding", "input_ids"):
+            shape = prefill_model.input_shapes.get(input_name)
+            if shape is not None and len(shape) >= 2 and isinstance(shape[1], int):
+                return shape[1]
+        raise ValueError(
+            f"Could not determine fixed prefill size from '{prefill_model.model_path}'"
+        )
 
     @staticmethod
     def _find_token_id_lut(
