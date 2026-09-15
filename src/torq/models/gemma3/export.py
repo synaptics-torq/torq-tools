@@ -58,6 +58,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         hf_repo: str | None = None,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -123,6 +124,21 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             raise ValueError("`--trim-vocab` is currently supported only for static Gemma exports")
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static Gemma exports")
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not self._split_lm_head:
+                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+        self._batch_prefill = batch_prefill
+
+        opt_config = ORTOptimizerConfig(
+            num_heads=self._config.num_attention_heads,
+            hidden_size=self._config.hidden_size,
+        )
 
         super().__init__(
             "fp32",
@@ -132,10 +148,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             show_model_info=show_model_info,
             dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
-            opt_configs={"model": ORTOptimizerConfig(
-                num_heads=self._config.num_attention_heads,
-                hidden_size=self._config.hidden_size
-            )},
+            opt_configs={"model": opt_config, "model_prefill": opt_config},
             split_weights=split_weights,
         )
 
@@ -229,6 +242,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
     def _export_path_for_component(self, component: str) -> Path:
         if component == "model":
             return self._export_dir / self._export_model_filenames[0]
+        if component == "model_prefill":
+            return self._export_dir / "transformer_prefill.onnx"
         return super()._export_path_for_component(component)
 
     def _resolve_source_asset_path(self, asset_name: str) -> Path:
@@ -324,10 +339,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("RemoveIsNaN"),
         ]
         blocks["model.static (KV cache)"] = [
-            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
-            EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
+            EditSpec(
+                "MaskFutureAttentionScores",
+                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+            ),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
-            EditSpec("ConvertToStaticIndex"),
+            EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
         ]
 
         patch = [
@@ -343,7 +361,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             patch.append(EditSpec(
                 "ExtractConstantLUT",
-                ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+                ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             ))
             patch.append(EditSpec(
                 "ComputeDequantizedLUT", (ctx("embeddings_path"), ctx("export_dtype"))
@@ -358,10 +376,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch (split LM head)"] = [
                 EditSpec("SplitLMHead", (ctx("lm_head_path"), "logits", "last_hidden_states"))
             ]
+        if self._batch_prefill is not None:
+            blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
     def _make_model_static(
-        self, model: onnx.ModelProto, component: str = "model"
+        self, model: onnx.ModelProto, component: str = "model", chunk_len: int = 1
     ) -> onnx.ModelProto:
         """
         Make model static by replacing dynamic dimensions with fixed values and applying necessary transformations.
@@ -389,7 +409,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
         )
-        editor.fix_io(self._max_gen_tokens)
+        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
 
         blocks = self.graph_edit_blocks()
         # Remove redundant Cast + isNaN ops
@@ -417,13 +437,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 "cur_len": cur_len,
                 "max_tokens": self._max_gen_tokens,
                 "export_dtype": self._onnx_export_dtype,
+                "chunk_len": chunk_len,
             },
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return new_model
 
-    def _patch_static_model(self, model_path: str | os.PathLike):
+    def _patch_static_model(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
         editor = Gemma3OnnxGraphEditor.from_onnx(
             model,
@@ -437,6 +458,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch"], self._harness,
             {
                 "embeddings_path": embeddings_npy,
+                "save_embeddings_path": embeddings_npy if component == "model" else None,
                 "export_dtype": self._onnx_export_dtype,
             }
         )
@@ -460,11 +482,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._harness,
                 {
                     "kept_token_ids": np.array(spec.kept_model_ids, dtype=np.int64),
-                    "token_id_lut_path": token_id_lut_path,
+                    "token_id_lut_path": token_id_lut_path if component == "model" else None,
                 },
             )
 
         editor.reorder_graph_input("position_ids", 1)
+
+        if component == "model_prefill":
+            editor.apply_specs(blocks["model.patch (batch prefill)"], self._harness)
 
         if self._split_lm_head:
             lm_head_path = Path(model_path).parent / self._export_model_filenames[1]
@@ -483,12 +508,21 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._save_component_model(new_model, model_path)
 
     def make_static(self):
+        source_model = self.check_model(self._components["model"])
         self._logger.info("(model) Making graph static...")
-        self._components["model"] = self.check_model(self._components["model"])
-        self._components["model"] = self._make_model_static(self._components["model"])
+        self._components["model"] = self._make_model_static(source_model)
+        if self._batch_prefill is not None:
+            self._logger.info(
+                "(model_prefill) Making graph static with %d tokens...", self._batch_prefill
+            )
+            self._components["model_prefill"] = self._make_model_static(
+                source_model,
+                component="model_prefill",
+                chunk_len=self._batch_prefill,
+            )
 
-    def apply_post_static_patches(self, model_path: str | os.PathLike, _):
-        self._patch_static_model(model_path)
+    def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
+        self._patch_static_model(model_path, component)
         self._copy_runtime_assets(
             Path(model_path).parent,
             self._onnx_dir,
@@ -559,6 +593,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         hf_repo=args.hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=args.batch_prefill,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,

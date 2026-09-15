@@ -3,7 +3,10 @@
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from torq.model_export.onnx import OnnxModelExporterBase
 from torq.models.gemma3.export import (
     Gemma3ModelExporter,
     _GEMMA3_MODEL_FILENAMES,
@@ -36,6 +39,41 @@ class Gemma3ExportFilenameTests(unittest.TestCase):
             exporter._export_model_filenames,
             ("transformer.onnx", "lm_head.onnx"),
         )
+
+    def test_batch_prefill_uses_distinct_transformer_filename(self):
+        exporter = self._exporter(split_lm_head=True)
+
+        self.assertEqual(
+            exporter._export_path_for_component("model_prefill"),
+            Path("export/transformer_prefill.onnx"),
+        )
+
+
+class Gemma3BatchPrefillValidationTests(unittest.TestCase):
+    def _create_exporter(self, **kwargs) -> Gemma3ModelExporter:
+        config = SimpleNamespace(hidden_size=8, vocab_size=16, num_attention_heads=2)
+        with (
+            patch("torq.models.gemma3.export.AutoConfig.from_pretrained", return_value=config),
+            patch.object(OnnxModelExporterBase, "__init__", return_value=None),
+        ):
+            return Gemma3ModelExporter(**kwargs)
+
+    def test_batch_prefill_requires_split_lm_head(self):
+        with self.assertRaisesRegex(ValueError, "requires `--split-lm-head`"):
+            self._create_exporter(batch_prefill=8)
+
+    def test_batch_prefill_must_be_positive_and_fit_cache(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            self._create_exporter(batch_prefill=0, split_lm_head=True)
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            self._create_exporter(batch_prefill=9, max_gen_tokens=8, split_lm_head=True)
+
+    def test_batch_prefill_is_retained_when_valid(self):
+        exporter = self._create_exporter(
+            batch_prefill=8, max_gen_tokens=16, split_lm_head=True
+        )
+
+        self.assertEqual(exporter._batch_prefill, 8)
 
 
 if __name__ == "__main__":
