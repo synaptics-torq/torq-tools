@@ -101,8 +101,7 @@ def add_onnx_args(
         action="store_true",
         default=False,
         help=(
-            "Write the exported models (and --dump-after-edit files) with tensor "
-            "data above 1024 bytes in an external <model>.onnx.data file (ONNX "
+            "Write the exported models with tensor data above 1024 bytes in an external <model>.onnx.data file (ONNX "
             "convention) so the .onnx stays lightweight and opens fast in a model "
             "viewer. Only tensor data above 1024 bytes is externalized; smaller "
             "constants stay inline so onnxruntime can still resolve shape-op "

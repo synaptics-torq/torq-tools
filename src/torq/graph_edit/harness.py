@@ -340,10 +340,10 @@ def add_graph_edit_harness_args(parser: argparse.ArgumentParser) -> None:
         const="all",
         default=None,
         help=(
-            "Dump the graph to <export-dir>/intermediates/<model>.onnx after graph "
+            "Dump the graph to <export-dir>/intermediates/0001_<edit>_<model>.onnx after graph "
             "edits, for manual inspection. "
             "Bare flag dumps after every edit; --dump-after-edit=Edit1,Edit2 dumps only "
-            "after those edits. Each dump overwrites the previous one."
+            "after those edits."
         ),
     )
 
