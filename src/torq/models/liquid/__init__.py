@@ -120,6 +120,16 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
+        "--batch-prefill",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "Also export a fixed-shape model_prefill.onnx that processes N tokens "
+            "per step (static exports only)"
+        ),
+    )
+    parser.add_argument(
         "--split-decoder",
         action="store_true",
         default=False,
@@ -251,6 +261,17 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         help=(
             "Split the lm_head MatMul into 512 chunks of [1024, 128] (default: "
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-prefill",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "Also export a fixed-shape decoder_model_merged_prefill.onnx LLM "
+            "decoder that processes N tokens per step (static exports only; "
+            "the vision encoder is unaffected)"
         ),
     )
     parser.add_argument(

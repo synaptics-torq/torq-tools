@@ -119,6 +119,7 @@ Two opt-out flags for the chip-specific rewrites:
 |---|---|
 | `--keep-conv1d` | leave the original depthwise Conv1D in place (useful for CPU/ORT targets) |
 | `--split-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
+| `--batch-prefill N` | also emit a fixed-shape `model_prefill.onnx` that processes N tokens per step (static exports only; see [Batched prefill](#3-batched-prefill)) |
 
 > [!Note]
 > `--split-lm-head` here is **not** the gemma3 flag of the same name. This one chunks the lm_head MatMul *within* the single exported model; gemma3's extracts the lm_head into a separate `lm_head.onnx` file. Neither affects the other's export.
@@ -131,11 +132,13 @@ models/liquid-2p5-350m/
 └── export/onnx/
     ├── fp32/static/
     │   ├── model.onnx                (~1.4 GB)
+    │   ├── model_prefill.onnx        (only with --batch-prefill N)
     │   ├── token_embeddings.npy      (~128 MB)
     │   ├── config.json
     │   └── tokenizer.json
     └── bf16/static/
         ├── model.onnx                (~700 MB)
+        ├── model_prefill.onnx        (only with --batch-prefill N)
         ├── token_embeddings.npy      (~128 MB)
         ├── config.json
         └── tokenizer.json
@@ -179,5 +182,30 @@ Notes:
 
 Output: `model.vmfb` (~712 MB for the full bf16 build, ~553 MB without
 lm_head, ~258 MB without FFN).
+
+---
+
+## 3. Batched prefill
+
+`--batch-prefill N` (with `1 <= N <= --max-gen-tokens`) additionally emits
+`model_prefill.onnx`: the same static decoder with its token input pinned to
+exactly N positions. It takes `input_ids` / `token_embedding` of shape
+`[1, N]` / `[1, N, hidden]` plus a `position_ids [1, 1]` holding the chunk's
+*start* position, updates N consecutive KV-cache rows in one step, and emits
+the final position's logit (`logits [1, 1, vocab]`). The short-conv stack and
+the attention layers handle the chunk natively; RoPE rotates each sequence row
+by its own position, and the causal mask covers the N query rows. The decode
+model and the prefill model share KV-cache I/O shapes, so they can be driven
+alternately on the same cache state. The prefill component is converted to
+bf16 and compiled to `model_prefill.vmfb` alongside the decode model by the
+same command.
+
+Inference (`LiquidStatic`) picks up `model_prefill.onnx` / `model_prefill.vmfb`
+automatically when it sits next to the decode model, reading N from the
+prefill model's input metadata (pass `prefill_size=` explicitly for vmfb,
+which reports no shapes). Prompt processing then runs every complete N-token
+chunk through the prefill model and falls back to single-token decode for any
+remainder; generation always uses the decode model. Export validation compares
+the chunked runner against the unedited dynamic source ONNX.
 
 ---

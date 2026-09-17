@@ -27,6 +27,7 @@ from ...inference.runners import (
     ORTInferenceRunner,
     VMFBInferenceRunner,
 )
+from ...inference.transformers import find_single_data_file
 
 DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant. Provide concise answers."
 
@@ -439,11 +440,19 @@ class LiquidStatic(LiquidBase):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        prefill_model: InferenceRunner | None = None,
+        prefill_size: int | None = None,
     ):
         if config_path is None:
             config_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "config.json")
         if tokenizer_path is None:
             tokenizer_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
+        if (prefill_model is None) != (prefill_size is None):
+            raise ValueError("prefill_model and prefill_size must be provided together")
+        if prefill_size is not None and prefill_size < 1:
+            raise ValueError(f"prefill_size must be positive, got {prefill_size}")
+        self._prefill_model = prefill_model
+        self._prefill_size = prefill_size
         self._combined_kv_io = combined_kv_io
         # When `--extract-embeddings` was used at export time the model's
         # input is `token_embedding` rather than `input_ids`; load the LUT
@@ -464,6 +473,12 @@ class LiquidStatic(LiquidBase):
             _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
         )
+        if self._prefill_model is not None:
+            self._logger.info(
+                "Loaded %d-token prefill model '%s'",
+                self._prefill_size,
+                str(self._prefill_model.model_path),
+            )
 
     @staticmethod
     def _find_token_embeddings(
@@ -477,6 +492,24 @@ class LiquidStatic(LiquidBase):
             raise RuntimeError(f"Found multiple embedding files: {paths}")
         return np.load(paths[0])
 
+    @staticmethod
+    def _find_prefill_model(
+        model_path: str | os.PathLike,
+        prefill_pattern: str,
+    ) -> Path | None:
+        """Locate the batched prefill model exported alongside the transformer."""
+        return find_single_data_file(model_path, prefill_pattern, "prefill model")
+
+    @staticmethod
+    def _infer_prefill_size(prefill_model: InferenceRunner) -> int:
+        for input_name in ("token_embedding", "input_ids"):
+            shape = prefill_model.input_shapes.get(input_name)
+            if shape is not None and len(shape) >= 2 and isinstance(shape[1], int):
+                return shape[1]
+        raise ValueError(
+            f"Could not determine fixed prefill size from '{prefill_model.model_path}'"
+        )
+
     @classmethod
     def from_onnx(
         cls,
@@ -489,7 +522,18 @@ class LiquidStatic(LiquidBase):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        prefill_model_path: str | os.PathLike | None = None,
+        prefill_size: int | None = None,
     ) -> "LiquidStatic":
+        prefill_model_path = prefill_model_path or cls._find_prefill_model(
+            model_path, "model_prefill.onnx"
+        )
+        prefill_model = (
+            ORTInferenceRunner(prefill_model_path, n_threads=n_threads)
+            if prefill_model_path else None
+        )
+        if prefill_model is not None and prefill_size is None:
+            prefill_size = cls._infer_prefill_size(prefill_model)
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -499,6 +543,8 @@ class LiquidStatic(LiquidBase):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
+            prefill_model=prefill_model,
+            prefill_size=prefill_size,
         )
 
     @classmethod
@@ -513,7 +559,12 @@ class LiquidStatic(LiquidBase):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        prefill_model_path: str | os.PathLike | None = None,
+        prefill_size: int | None = None,
     ) -> "LiquidStatic":
+        prefill_model_path = prefill_model_path or cls._find_prefill_model(
+            model_path, "model_prefill.vmfb"
+        )
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -523,6 +574,11 @@ class LiquidStatic(LiquidBase):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
+            prefill_model=(
+                VMFBInferenceRunner(prefill_model_path, n_threads=n_threads)
+                if prefill_model_path else None
+            ),
+            prefill_size=prefill_size,
         )
 
     def _init_cache(self) -> dict[str, np.ndarray]:
@@ -550,19 +606,22 @@ class LiquidStatic(LiquidBase):
         for k, v in zip(self._kv_cache.keys(), new_values):
             self._kv_cache[k] = v
 
-    def _llm_step(
-        self, token: int, curr_seq_len: int
+    def _llm_tokens_step(
+        self,
+        model: InferenceRunner,
+        tokens: list[int],
+        curr_seq_len: int,
     ) -> tuple[int, list[np.ndarray]]:
+        token_ids = np.asarray(tokens, dtype=np.int64)
         if isinstance(self._token_embeddings, np.ndarray):
             inputs = {
-                "token_embedding": np.expand_dims(self._token_embeddings[token], axis=(0, 1)),
+                "token_embedding": np.expand_dims(self._token_embeddings[token_ids], axis=0),
             }
         else:
             inputs = {
-                "input_ids": np.array([[token]], dtype=np.int64),
+                "input_ids": np.expand_dims(token_ids, axis=0),
             }
-        pos_ids = np.array([[curr_seq_len]], dtype=np.int64)
-        inputs["position_ids"] = pos_ids
+        inputs["position_ids"] = np.array([[curr_seq_len]], dtype=np.int64)
         inputs.update(self._kv_cache)
         # If the static model still exposes attention_mask, supply a full
         # mask sized at the *compiled* KV-cache length (not the runtime
@@ -571,9 +630,39 @@ class LiquidStatic(LiquidBase):
             inputs["attention_mask"] = np.ones(
                 [1, self._kv_cache_len], dtype=np.int64
             )
-        logits, *cache = self._model.infer(inputs)
+        logits, *cache = model.infer(inputs)
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
+
+    def _llm_step(
+        self, token: int, curr_seq_len: int
+    ) -> tuple[int, list[np.ndarray]]:
+        return self._llm_tokens_step(self._model, [token], curr_seq_len)
+
+    def _prefill_prompt(self, prompt_tokens: list[int], start_seq_len: int = 0) -> tuple[int, int]:
+        if self._prefill_model is None or self._prefill_size is None:
+            return super()._prefill_prompt(prompt_tokens, start_seq_len)
+
+        curr_seq_len = start_seq_len
+        next_token: int | None = None
+        chunk_start = 0
+        while chunk_start + self._prefill_size <= len(prompt_tokens):
+            chunk = prompt_tokens[chunk_start:chunk_start + self._prefill_size]
+            next_token, cache = self._llm_tokens_step(
+                self._prefill_model,
+                chunk,
+                curr_seq_len,
+            )
+            self._update_cache(cache)
+            chunk_start += self._prefill_size
+            curr_seq_len += self._prefill_size
+
+        if chunk_start < len(prompt_tokens):
+            next_token, curr_seq_len = super()._prefill_prompt(
+                prompt_tokens[chunk_start:],
+                start_seq_len=curr_seq_len,
+            )
+        return next_token, curr_seq_len
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
         if next_token == self._eos_token_id:
