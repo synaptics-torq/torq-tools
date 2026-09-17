@@ -102,6 +102,7 @@ VL-specific flags (everything else matches `torq-export-model liquid`):
 | `--models-dir` | base dir; reads `<dir>/source/onnx/fp32/` and writes `<dir>/export/` |
 | `--vision-res {128,256}` | build + compile the **static** SigLIP encoder (`vision_encoder_<res>.vmfb`); 256 → 64 image tokens, 128 → 16 |
 | `--split-decoder` | also emit `decoder_nolm.vmfb` + `lm_head.vmfb` (lower-TTFT split) |
+| `--batch-prefill N` | also emit the fixed-shape `decoder_model_merged_prefill.onnx` LLM decoder (N tokens per step, static exports only); the vision encoder is unaffected |
 | `--image-decoder-parts [N]` | build + compile the one-shot image-prefill decoder, split into N layer parts (bare = 2) |
 | `--compile-vision` | compile the *dynamic* encoder as-is (experimental; dynamic shapes + exotic ops — prefer `--vision-res`) |
 | `--skip-torq` | stop after ONNX export |
@@ -122,10 +123,12 @@ models/liquid-2p5-450M-VL/export/
 ├── onnx/
 │   ├── fp32/static/
 │   │   ├── decoder_model_merged.onnx      (~1.4 GB)
+│   │   ├── decoder_model_merged_prefill.onnx (with --batch-prefill N)
 │   │   ├── vision_encoder.onnx            (~363 MB, fp32, dynamic — for ORT)
 │   │   └── token_embeddings.npy           (~256 MB, fp32)
 │   └── bf16/static/                        ← convert dir; also the build scratch
 │       ├── decoder_model_merged.onnx      (~676 MB)
+│       ├── decoder_model_merged_prefill.onnx (with --batch-prefill N)
 │       ├── decoder_nolm.onnx              (~548 MB)   --split-decoder
 │       ├── lm_head.onnx                   (~128 MB)   --split-decoder
 │       ├── vision_encoder_256.onnx        (~182 MB)   --vision-res 256 (compile input)
@@ -135,6 +138,7 @@ models/liquid-2p5-450M-VL/export/
 │       └── token_embeddings.npy           (~128 MB, bf16)
 └── iree/bf16/static/                       ← board bundle (+ one .mlir per vmfb)
     ├── decoder_model_merged.vmfb          (~679 MB)   single-token decoder
+    ├── decoder_model_merged_prefill.vmfb  (with --batch-prefill N)
     ├── decoder_nolm.vmfb                  (~550 MB)
     ├── lm_head.vmfb                       (~128 MB)
     ├── vision_encoder_256.vmfb            (~1.77 GB!)  static SigLIP encoder

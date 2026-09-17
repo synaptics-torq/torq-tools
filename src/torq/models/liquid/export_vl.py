@@ -49,6 +49,7 @@ from ...model_export.onnx import OnnxModelExporterBase
 # Component keys — match the source ONNX filenames so the base exporter writes
 # ``<comp>.onnx`` back out under the same names.
 DECODER = "decoder_model_merged"
+DECODER_PREFILL = "decoder_model_merged_prefill"
 VISION = "vision_encoder"
 EMBED_FILE = "embed_tokens.onnx"
 
@@ -86,6 +87,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         *,
         instruct_model: bool = False,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -104,6 +106,16 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._extract_embeddings = False
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not static_models:
+                raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
+        self._batch_prefill = batch_prefill
         self._onnx_source_dir = onnx_source_dir
         self._model_size = "450m-vl"
         self._hf_repo = HF_REPO_VL
@@ -344,6 +356,15 @@ class LiquidVLModelExporter(LiquidModelExporter):
         replacement, exactly as LiquidModelExporter._load_onnx does for the
         single 350m model — but rename ``inputs_embeds`` to ``token_embedding``
         so the existing LiquidStatic runner / chip demo feed it unchanged."""
+        return self._convert_decoder(chunk_len=1, component=DECODER)
+
+    def _convert_decoder(self, chunk_len: int = 1, component: str = DECODER) -> onnx.ModelProto:
+        """Convert the VL decoder source ONNX (custom ops -> standard ONNX).
+
+        `chunk_len` selects the RoPE position layout the GQA decomposition
+        emits: 1 for single-token decode steps, N for the fixed-size batched
+        prefill step.
+        """
         model_path = self._onnx_dir / f"{DECODER}.onnx"
         self._val_model_path = model_path
 
@@ -360,13 +381,15 @@ class LiquidVLModelExporter(LiquidModelExporter):
         editor = LiquidOnnxGraphEditor(
             graph,
             self._onnx_export_dtype,
-            **self._editor_dump_kwargs(self._export_path_for_component("model")),
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
         )
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
         self._logger.info("Replacing GroupQueryAttention ops...")
-        editor.apply_specs(blocks["source.convert (attention)"], self._harness)
+        editor.apply_specs(
+            blocks["source.convert (attention)"], self._harness, {"chunk_len": chunk_len}
+        )
         editor.graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
         ).toposort()
@@ -455,6 +478,22 @@ class LiquidVLModelExporter(LiquidModelExporter):
             import copy
             self._dynamic_decoder = copy.deepcopy(self._components[DECODER])
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
+        if self._batch_prefill is not None:
+            self._logger.info(
+                "(%s) Making graph static with %d tokens...",
+                DECODER_PREFILL, self._batch_prefill,
+            )
+            prefill_model = self._convert_decoder(
+                chunk_len=self._batch_prefill, component=DECODER_PREFILL
+            )
+            self._components[DECODER_PREFILL] = self.check_model(
+                prefill_model, skip_data_prop=True
+            )
+            self._components[DECODER_PREFILL] = self._make_model_static(
+                self._components[DECODER_PREFILL],
+                component=DECODER_PREFILL,
+                chunk_len=self._batch_prefill,
+            )
 
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
@@ -475,13 +514,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return component == VISION and not self._compile_vision
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
-        if component != DECODER:
+        if component not in (DECODER, DECODER_PREFILL):
             return
-        self._patch_static_model(model_path)
+        self._patch_static_model(model_path, component)
         # The chip runner invokes the vmfb positionally, so pin the decoder's
         # leading inputs: token_embedding (0), position_ids (1).
         self._reorder_decoder_inputs(model_path)
-        if self._simulate_bf16:
+        if self._simulate_bf16 and component == DECODER:
             self._logger.info("(model) Creating bf16-simulated copy...")
             sim_dir = Path(model_path).parent.parent / "bf16_sim" / "static"
             sim_dir.mkdir(parents=True, exist_ok=True)
@@ -856,6 +895,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     exporter = LiquidVLModelExporter(
         instruct_model=args.instruct_model,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=args.batch_prefill,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
