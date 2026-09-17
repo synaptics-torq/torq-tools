@@ -181,11 +181,21 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
 
     Decomposes into: RoPE -> KV concat -> Q*K^T*scale -> mask -> Softmax -> *V
     Matches the fp32 model's expanded attention structure.
+
+    chunk_len: fixed number of consecutive query/key positions per step.
+    1 (default) is single-token decode.  For batched prefill, RoPE rotates
+    sequence row ``t`` by position ``seqlen_k + t``.
     """
 
     num_heads: int
     kv_num_heads: int
     head_dim: int
+    chunk_len: int = 1
+
+    def __post_init__(self):
+        if self.chunk_len < 1:
+            raise ValueError("chunk_len must be positive")
+        return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
         return node.op == "GroupQueryAttention"
@@ -387,38 +397,75 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         cos_unsq = sin_unsq = None
         if do_rotary and inv_freq_const is not None and seqlen_k is not None:
             # Runtime RoPE computation: cos(position * inv_freq), sin(position * inv_freq)
-            # Cast position (int32 scalar) to float32 and reshape to (1, 1, 1) for MatMul
             pos_float = self.graph.layer(
                 name=f"{prefix}/pos_cast", op="Cast",
                 inputs=[seqlen_k],
                 outputs=[gs.Variable(f"{prefix}/pos_float")],
                 attrs={"to": int(onnx.TensorProto.FLOAT)},
             )[0]
-            pos_3d = self.graph.layer(
-                name=f"{prefix}/pos_reshape", op="Reshape",
-                inputs=[pos_float, gs.Constant(f"{prefix}/pos_shape", np.array([1, 1, 1], dtype=np.int64))],
-                outputs=[gs.Variable(f"{prefix}/pos_3d")],
-            )[0]
-            # MatMul: inv_freq(1, hd//2, 1) @ position(1, 1, 1) → (1, hd//2, 1)
-            angles = self.graph.layer(
-                name=f"{prefix}/rope_angles", op="MatMul",
-                inputs=[inv_freq_const, pos_3d],
-                outputs=[gs.Variable(f"{prefix}/rope_angles_out")],
-            )[0]
-            # Transpose: (1, hd//2, 1) → (1, 1, hd//2)
-            angles_t = self.graph.layer(
-                name=f"{prefix}/rope_angles_t", op="Transpose",
-                inputs=[angles],
-                outputs=[gs.Variable(f"{prefix}/rope_angles_transposed")],
-                attrs={"perm": [0, 2, 1]},
-            )[0]
-            # Duplicate: Concat(angles, angles) → (1, 1, hd)
-            angles_full = self.graph.layer(
-                name=f"{prefix}/rope_angles_dup", op="Concat",
-                inputs=[angles_t, angles_t],
-                outputs=[gs.Variable(f"{prefix}/rope_angles_full")],
-                attrs={"axis": -1},
-            )[0]
+            if self.chunk_len == 1:
+                # Cast position (int32 scalar) to float32 and reshape to (1, 1, 1) for MatMul
+                pos_3d = self.graph.layer(
+                    name=f"{prefix}/pos_reshape", op="Reshape",
+                    inputs=[pos_float, gs.Constant(f"{prefix}/pos_shape", np.array([1, 1, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/pos_3d")],
+                )[0]
+                # MatMul: inv_freq(1, hd//2, 1) @ position(1, 1, 1) → (1, hd//2, 1)
+                angles = self.graph.layer(
+                    name=f"{prefix}/rope_angles", op="MatMul",
+                    inputs=[inv_freq_const, pos_3d],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_out")],
+                )[0]
+                # Transpose: (1, hd//2, 1) → (1, 1, hd//2)
+                angles_t = self.graph.layer(
+                    name=f"{prefix}/rope_angles_t", op="Transpose",
+                    inputs=[angles],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_transposed")],
+                    attrs={"perm": [0, 2, 1]},
+                )[0]
+                # Duplicate: Concat(angles, angles) → (1, 1, hd)
+                angles_full = self.graph.layer(
+                    name=f"{prefix}/rope_angles_dup", op="Concat",
+                    inputs=[angles_t, angles_t],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_full")],
+                    attrs={"axis": -1},
+                )[0]
+            else:
+                # Batched prefill: one position per sequence row,
+                # seqlen_k .. seqlen_k + chunk_len - 1.
+                pos_2d = self.graph.layer(
+                    name=f"{prefix}/pos_reshape", op="Reshape",
+                    inputs=[pos_float, gs.Constant(f"{prefix}/pos_shape", np.array([1, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/pos_2d")],
+                )[0]
+                pos_chunk = self.graph.layer(
+                    name=f"{prefix}/pos_offsets", op="Add",
+                    inputs=[pos_2d, gs.Constant(
+                        f"{prefix}/pos_offset_values",
+                        np.arange(self.chunk_len, dtype=np.float32).reshape(1, self.chunk_len),
+                    )],
+                    outputs=[gs.Variable(f"{prefix}/pos_chunk")],
+                )[0]
+                # MatMul: inv_freq(1, hd//2, 1) @ positions(1, chunk) → (1, hd//2, chunk)
+                angles = self.graph.layer(
+                    name=f"{prefix}/rope_angles", op="MatMul",
+                    inputs=[inv_freq_const, pos_chunk],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_out")],
+                )[0]
+                # Transpose: (1, hd//2, chunk) → (1, chunk, hd//2)
+                angles_t = self.graph.layer(
+                    name=f"{prefix}/rope_angles_t", op="Transpose",
+                    inputs=[angles],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_transposed")],
+                    attrs={"perm": [0, 2, 1]},
+                )[0]
+                # Duplicate: Concat(angles, angles) → (1, chunk, hd)
+                angles_full = self.graph.layer(
+                    name=f"{prefix}/rope_angles_dup", op="Concat",
+                    inputs=[angles_t, angles_t],
+                    outputs=[gs.Variable(f"{prefix}/rope_angles_full")],
+                    attrs={"axis": -1},
+                )[0]
             # Cos / Sin
             cos_val = self.graph.layer(
                 name=f"{prefix}/rope_cos", op="Cos",
@@ -430,7 +477,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
                 inputs=[angles_full],
                 outputs=[gs.Variable(f"{prefix}/rope_sin_out")],
             )[0]
-            # Unsqueeze to (1, 1, 1, hd) for broadcast with (B, nh, S=1, hd)
+            # Unsqueeze to (1, 1, S, hd) for broadcast with (B, nh, S, hd)
             cos_unsq = self.graph.layer(
                 name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
                 inputs=[cos_val, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0], dtype=np.int64))],
@@ -455,28 +502,67 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
                 outputs=[gs.Variable(f"{prefix}/sin_full")],
                 attrs={"axis": -1},
             )[0]
-            cos_pos = self.graph.layer(
-                name=f"{prefix}/cos_gather", op="Gather",
-                inputs=[cos_full, seqlen_k],
-                outputs=[gs.Variable(f"{prefix}/cos_at_pos")],
-                attrs={"axis": 0},
-            )[0]
-            sin_pos = self.graph.layer(
-                name=f"{prefix}/sin_gather", op="Gather",
-                inputs=[sin_full, seqlen_k],
-                outputs=[gs.Variable(f"{prefix}/sin_at_pos")],
-                attrs={"axis": 0},
-            )[0]
-            cos_unsq = self.graph.layer(
-                name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
-                inputs=[cos_pos, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0, 1], dtype=np.int64))],
-                outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
-            )[0]
-            sin_unsq = self.graph.layer(
-                name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
-                inputs=[sin_pos, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0, 1], dtype=np.int64))],
-                outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
-            )[0]
+            if self.chunk_len == 1:
+                cos_pos = self.graph.layer(
+                    name=f"{prefix}/cos_gather", op="Gather",
+                    inputs=[cos_full, seqlen_k],
+                    outputs=[gs.Variable(f"{prefix}/cos_at_pos")],
+                    attrs={"axis": 0},
+                )[0]
+                sin_pos = self.graph.layer(
+                    name=f"{prefix}/sin_gather", op="Gather",
+                    inputs=[sin_full, seqlen_k],
+                    outputs=[gs.Variable(f"{prefix}/sin_at_pos")],
+                    attrs={"axis": 0},
+                )[0]
+                cos_unsq = self.graph.layer(
+                    name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+                    inputs=[cos_pos, gs.Constant(f"{prefix}/unsq_axes_01", np.array([0, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+                )[0]
+                sin_unsq = self.graph.layer(
+                    name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+                    inputs=[sin_pos, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([0, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+                )[0]
+            else:
+                # Batched prefill: gather one cos/sin row per sequence row.
+                idx_dtype = seqlen_k.dtype or np.int32
+                pos_2d = self.graph.layer(
+                    name=f"{prefix}/pos_reshape", op="Reshape",
+                    inputs=[seqlen_k, gs.Constant(f"{prefix}/pos_shape", np.array([1, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/pos_2d")],
+                )[0]
+                pos_chunk = self.graph.layer(
+                    name=f"{prefix}/pos_offsets", op="Add",
+                    inputs=[pos_2d, gs.Constant(
+                        f"{prefix}/pos_offset_values",
+                        np.arange(self.chunk_len, dtype=idx_dtype).reshape(1, self.chunk_len),
+                    )],
+                    outputs=[gs.Variable(f"{prefix}/pos_chunk")],
+                )[0]
+                cos_pos = self.graph.layer(
+                    name=f"{prefix}/cos_gather", op="Gather",
+                    inputs=[cos_full, pos_chunk],
+                    outputs=[gs.Variable(f"{prefix}/cos_at_pos")],
+                    attrs={"axis": 0},
+                )[0]
+                sin_pos = self.graph.layer(
+                    name=f"{prefix}/sin_gather", op="Gather",
+                    inputs=[sin_full, pos_chunk],
+                    outputs=[gs.Variable(f"{prefix}/sin_at_pos")],
+                    attrs={"axis": 0},
+                )[0]
+                cos_unsq = self.graph.layer(
+                    name=f"{prefix}/cos_unsqueeze", op="Unsqueeze",
+                    inputs=[cos_pos, gs.Constant(f"{prefix}/unsq_axes_01", np.array([1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/cos_unsqueezed")],
+                )[0]
+                sin_unsq = self.graph.layer(
+                    name=f"{prefix}/sin_unsqueeze", op="Unsqueeze",
+                    inputs=[sin_pos, gs.Constant(f"{prefix}/unsq_axes_01b", np.array([1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/sin_unsqueezed")],
+                )[0]
         elif do_rotary:
             # No seqlen_k: use full cos/sin cache directly (e.g. multi-token prefill)
             cos_full = self.graph.layer(

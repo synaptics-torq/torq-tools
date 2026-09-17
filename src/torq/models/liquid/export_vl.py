@@ -231,12 +231,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
         suffix = "static" if self._static_models else "dynamic"
         export_dir = self._models_dir / "export" / "onnx" / self._model_dtype / suffix
+        quantize_dir = self._models_dir / "export" / "onnx" / "quantized" / suffix
         convert_dir = self._models_dir / "export" / "onnx" / "bf16" / suffix
         iree_dir = (
             self._models_dir / "export" / "iree"
             / ("bf16" if self._convert_dtypes else self._model_dtype) / suffix
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, iree_dir
 
     def _download_source(self, target_dir: Path):
         """Fetch the LFM2-VL ONNX components from the mirror repos.
