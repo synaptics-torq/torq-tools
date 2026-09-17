@@ -199,6 +199,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
             / self._model_dtype
             / ("static" if self._static_models else "dynamic")
         )
+        quantize_dir = (
+            self._models_dir
+            / "export"
+            / "onnx"
+            / "quantized"
+            / ("static" if self._static_models else "dynamic")
+        )
         convert_dir = (
             self._models_dir
             / "export"
@@ -213,7 +220,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             / ("bf16" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, iree_dir
 
     def _download_from_hf(self, target_dir: Path):
         from huggingface_hub import hf_hub_download
