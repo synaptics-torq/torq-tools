@@ -10,11 +10,9 @@ import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from shutil import rmtree
-from typing import Union
 
 import onnx
 import onnx_graphsurgeon as gs
-import numpy as np
 from onnx import shape_inference
 
 
@@ -36,13 +34,8 @@ __all__ = [
     "extract_boundary_tensors",
     "extract_subgraphs",
 
-    # DType utilities
-    "DTypeLike",
-    "is_same_dtype",
-
     # Transformations
     "drop_empty_name_value_info",
-    "upgrade_model",
     "finalize_torq_ready_onnx",
 ]
 
@@ -386,38 +379,6 @@ def normalize_layer_name(
 
 
 # -----------------------------------------------------------------------------
-# DType utilities
-# -----------------------------------------------------------------------------
-
-DTypeLike = Union[int, np.dtype, type, str, None]
-
-def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
-    if typ1 is typ2:
-        return True
-    if typ1 == typ2:
-        return True
-
-    def _to_np_dtype(typ: DTypeLike) -> np.dtype | None:
-        if typ is None:
-            return None
-        if isinstance(typ, np.dtype):
-            return typ
-        if isinstance(typ, int):
-            try:
-                return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(typ))
-            except (TypeError, ValueError, KeyError):
-                return None
-        try:
-            return np.dtype(typ)
-        except TypeError:
-            return None
-
-    dt1 = _to_np_dtype(typ1)
-    dt2 = _to_np_dtype(typ2)
-    return dt1 is not None and dt2 is not None and dt1 == dt2
-
-
-# -----------------------------------------------------------------------------
 # Transformations
 # -----------------------------------------------------------------------------
 
@@ -491,15 +452,6 @@ def finalize_torq_ready_onnx(
         logger.warning("ONNX checker warning after finalize_torq_ready_onnx: %s", exc)
 
     return work
-
-
-def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
-    if (curr_opset := get_model_opset(model)) >= target_opset:
-        logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
-        return model
-    upgraded = onnx.version_converter.convert_version(model, target_opset)
-    logger.info("Upgraded model opset to %d", target_opset)
-    return upgraded
 
 
 if __name__ == "__main__":
