@@ -125,9 +125,11 @@ The harness core and registry live in `src/torq/graph_edit/harness.py`; add unit
 
 ## Tools and Utilities
 
-Tools live under `src/torq/tools/`, and shared helpers live under `src/torq/utils/`. For new or updated tools, it is easiest to keep the command line wrapper thin and put the behavior in importable functions. Then tests can call those functions directly, with CLI-level tests reserved for argument parsing, file wiring, or user-visible behavior.
+Standalone tools live next to the domain they serve: ONNX cleanup under `src/torq/model_export/`, model benchmarking under `src/torq/utils/benchmark/`. Shared helpers live under `src/torq/utils/`. Generic model-workflow tools (ONNX dtype conversion, ONNX quantization, TFLite static-shape conversion) ship in the `torq-compiler` package (`torq.lab`).
 
-For ONNX tools, tiny synthetic models in the test are preferred over checked-in binaries. For TFLite tools, generated fixtures in `tmp_path` are usually enough. Please update `README.md` when a command, option, output artifact, or supported workflow changes.
+For new or updated tools, it is easiest to keep the command line wrapper thin and put the behavior in importable functions. Then tests can call those functions directly, with CLI-level tests reserved for argument parsing, file wiring, or user-visible behavior.
+
+For ONNX tools, tiny synthetic models in the test are preferred over checked-in binaries. Please update `README.md` when a command, option, output artifact, or supported workflow changes.
 
 ## Before Review
 

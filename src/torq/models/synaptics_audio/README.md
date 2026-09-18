@@ -89,8 +89,8 @@ outputs match within tight FP32 tolerances (`atol=1e-5`, `rtol=1e-4`).
 
 This is the **safety net** that catches any pass that is not value-preserving.
 BF16 numeric loss is a separate concern and is **not** verified here -- it is
-the responsibility of `torq.tools.convert_dtype.onnx`, which is invoked
-afterwards to do the FP32 -> BF16 conversion.
+the responsibility of `torq.lab.model_tools.dtype_conversion.onnx`
+(torq-compiler), which is invoked afterwards to do the FP32 -> BF16 conversion.
 
 ## Recipes
 

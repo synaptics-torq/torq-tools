@@ -11,9 +11,7 @@ torq_tools_dir=$(readlink -f torq-tools)
 
 ### Compiler dependency
 
-The Torq compiler Python package (`torq-compiler`) is **required when exporting models** (i.e. when running model exporters or compiling `.onnx`/`.tflite` files). These workflows need the compiler's Python bindings to convert ONNX/TFLite -> MLIR -> VMFB.
-
-The compiler package is **not required** if you only need to compile pre-exported `.mlir` files and already have a `torq-compile` binary available on your `PATH` (or pointed to via `--compiler-path` / `TORQ_COMPILER_PATH`).
+`torq-tools` depends on the Torq compiler Python package (`torq-compiler>=2.2.0`): the model exporters use it for ONNX dtype conversion, dynamic quantization, and the `.onnx`/`.tflite` -> MLIR -> VMFB compilation flow, and the generic model tools (`torq-convert-dtype`, `torq-quantize-model`, `torq-convert-static`) ship in that package. A pip install of `torq-tools` brings it in automatically; If you use torq-tools from a source checkout or submodule without installing it, install `torq-compiler` into the same environment.
 
 Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler Python package.
 
@@ -49,7 +47,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-You can make the submodule importable under the `torq.tools` namespace using either of the following techniques:
+You can make the submodule importable under the `torq` namespace using either of the following techniques:
 
 **Technique A: Add to site-packages**
 Add the submodule path permanently to the Python environment by creating a .pth file in your site-packages directory:
@@ -91,7 +89,7 @@ Composes the `CollapseUnrolledConcat` and `FoldConvBatchNorm` graph edits with O
 it collapses per-element unrolled stack/unbind Concats back into their source tensor,
 evaluates all-constant subgraphs (positional-embedding builders, constant weight prep, ...) into initializers,
 and folds exported eval-mode BatchNorm (`Conv -> Mul -> Add`) into the conv weights.
-Run it on fp32 graphs, before `convert_dtype`.
+Run it on fp32 graphs, before dtype conversion.
 ```bash
 torq-cleanup-model onnx model_fp32.onnx -o model_clean.onnx --verify
 ```
@@ -102,53 +100,13 @@ Constants larger than `--fold-size-threshold` bytes (default 16 MiB) are not fol
 can't blow up a model by materializing e.g. a transposed lm_head matrix.
 The pipeline is idempotent and fails safe, so every model exporter also runs it on each exported
 component by default (before dtype conversion); opt out with `--no-onnx-cleanup`.
-#### Convert ONNX model dtype
-Convert fp32 ONNX models to lower-precision formats such as bf16 or fp16.
-Particularly useful for getting bf16 models, which have native hardware acceleration in the Torq runtime.
+#### Benchmark quantized models
+Run a quantized (VMFB or ONNX) Gemma3 model over a standard question set and compare two runs (throughput, time-to-first-token, answers):
 ```bash
-python3 -m src.torq.tools.convert_dtype -d bf16 -i model_fp32.onnx -o model_bf16.onnx
+python -m src.torq.utils.benchmark run -m /path/to/model.vmfb --instruct-model -o results.json
+python -m src.torq.utils.benchmark compare -a results_int8.json -b results_mixed.json --name-a int8 --name-b mixed -o comparison.md
 ```
-This tool can also downcast int64 tensors to int32 or smaller integer data types like int16 and int8.
-```bash
-python3 -m src.torq.tools.convert_dtype -d int32 -i model.onnx -o model_int32.onnx
-```
-> [!WARNING]
-> Some operator inputs/outputs cannot be downcasted to int32 due to ONNX spec constraints and are preserved as int64.
-> By default these tensors are kept as int64 in place (no extra casts). Pass `--enforce-io-casts` to instead insert `Cast` nodes at these edges, which is needed for models where a spec-mandated int64 input is produced by a generic integer op (otherwise the resulting graph has mixed-type producers).
-> Additionally, downcasting to small integers like int8 can have a detrimental effect on inference accuracy.
-#### Quantize ONNX model weights
-Quantize MatMul weights in fp32 ONNX models to int4/int8 with optional per-layer sensitivity analysis.
-Supports two output modes: DequantizeLinear (DQL) nodes for runtime dequantization, or pre-dequantized bf16 for direct IREE compilation.
-
-**Sensitivity analysis** — determines optimal per-layer bit-width:
-```bash
-python3 -m torq.tools.quantization.weight_quantization analyze \
-    -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json \
-    --embeddings token_embeddings.npy --tokenizer tokenizer.json \
-    --bits 4 8 --num-tokens 15
-```
-
-**Quantize with per-layer config** (DQL output for sharing/further compilation):
-```bash
-python3 -m torq.tools.quantization.weight_quantization quantize \
-    -i model_fp32.onnx -o model_int8_int4_dql.onnx --config quant_config.json
-```
-
-**Quantize with pre-dequantized bf16** (ready for IREE compilation):
-```bash
-python3 -m torq.tools.quantization.weight_quantization quantize \
-    -i model_fp32.onnx -o model_bf16.onnx --config quant_config.json --dequantize-weights
-```
-
-**Uniform quantization** (all layers same bit-width):
-```bash
-python3 -m torq.tools.quantization.weight_quantization quantize \
-    -i model_fp32.onnx -o model_int8.onnx --bits 8
-```
-
-> [!NOTE]
-> For reduced-vocab models, pass `--token-lut token_id_lut.npy` to the analyze command
-> to map reduced vocab indices back to full vocab IDs during evaluation.
+See `src/torq/utils/benchmark/README.md` for options.
 #### Export supported ONNX models to static graphs
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
@@ -168,14 +126,6 @@ python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280 --convert
 > exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
 > e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side
 > `*.npy` LUTs and a `streaming_config.json`.
-
-#### Convert TFLite models to static shapes
-Converts dynamic TFLite models to static by removing `shapeSignature` metadata from tensors, forcing the runtime to use the concrete dimensions already present in the `shape` field. This works for most dynamic models whose default shapes are valid.
-```bash
-python3 -m src.torq.tools.convert_static tflite \
-  -i path/model.tflite \
-  -o path/model_static.tflite
-```
 
 > [!WARNING]
 > This tool assumes the model's default `shape` values are valid and mutually consistent. If any tensor has an invalid
@@ -199,15 +149,18 @@ python -m src.torq.models.moonshine_streaming.infer apostle.wav \
 ```
 
 ### CLI usage
-If `torq-tools` was installed as a Python package, all major tools are also exposed as CLI commands.
+If `torq-tools` was installed as a Python package, its tools are exposed as CLI commands; the generic model tools (`torq-convert-dtype`, `torq-quantize-model`, `torq-convert-static`) are provided by the `torq-compiler` dependency and are available in the same environment.
 ```bash
-# convert to bf16
+# clean up exported artifacts
+torq-cleanup-model onnx model_fp32.onnx -o model_clean.onnx --verify
+
+# convert to bf16 (torq-compiler)
 torq-convert-dtype onnx -d bf16 -i model_fp32.onnx -o model_bf16.onnx
 
-# quantize weights
-torq-quantize-model analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
-torq-quantize-model quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
-torq-quantize-model quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
+# quantize weights (torq-compiler)
+torq-quantize-model weights analyze -i model_fp32.onnx -o sensitivity.json --config-output quant_config.json --embeddings token_embeddings.npy
+torq-quantize-model weights quantize -i model_fp32.onnx -o model_int8.onnx --bits 8
+torq-quantize-model weights quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
 
 # export models
 torq-export-model moonshine --convert-dtype bf16
@@ -222,7 +175,7 @@ torq-infer-model moonshine_streaming apostle.wav -m models/moonshine_streaming_s
 ### Using in code
 You can import and use the same tools programmatically through the torq namespace:
 ```python
->>> from torq.tools.convert_dtype.onnx import convert_model
+>>> from torq.lab.model_tools.dtype_conversion.onnx import convert_model
 >>> from torq.models.moonshine.export import MoonshineModelExporter
 >>> exporter = MoonshineModelExporter(...)
 >>> exporter.export_onnx()
