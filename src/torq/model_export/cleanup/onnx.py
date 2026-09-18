@@ -15,7 +15,8 @@ pipeline for models that don't go through a full ``torq.models`` exporter
 3. ``FoldConvBatchNorm`` — fold exported eval-mode BatchNorm
    (``Conv -> Mul -> Add`` with per-channel constants) into the conv.
 
-Run on fp32 graphs, before ``torq.tools.convert_dtype``.
+Run on fp32 graphs, before dtype conversion (``torq-convert-dtype`` from
+torq-compiler).
 """
 
 from __future__ import annotations

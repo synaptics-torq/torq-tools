@@ -3,11 +3,12 @@
 """Model-agnostic ONNX graph cleanup.
 
 Undo common exporter artifacts before dtype conversion
-(``torq.tools.convert_dtype``) and Torq compilation, by composing the
-``CollapseUnrolledConcat`` and ``FoldConvBatchNorm`` graph edits with
-ORT-backed constant folding. See :mod:`torq.tools.cleanup.onnx`.
+(``torq-convert-dtype`` from torq-compiler) and Torq compilation, by
+composing the ``CollapseUnrolledConcat`` and ``FoldConvBatchNorm`` graph
+edits with ORT-backed constant folding. See
+:mod:`torq.model_export.cleanup.onnx`.
 
-CLI: ``python -m torq.tools.cleanup onnx IN.onnx -o OUT.onnx`` (or the
+CLI: ``python -m torq.model_export.cleanup onnx IN.onnx -o OUT.onnx`` (or the
 ``torq-cleanup-model`` console script).
 """
 

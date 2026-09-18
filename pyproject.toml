@@ -38,7 +38,7 @@ Homepage = "https://github.com/synaptics-torq/torq-tools"
 Issues = "https://github.com/synaptics-torq/torq-tools/issues"
 
 [project.scripts]
-torq-cleanup-model = "torq.tools.cleanup.__main__:main"
+torq-cleanup-model = "torq.model_export.cleanup.__main__:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
 torq-synaptics-audio = "torq.models.synaptics_audio.__main__:main"

@@ -32,7 +32,7 @@ from ..utils.onnx import (
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
 )
-from ..tools.cleanup.onnx import cleanup_onnx_model
+from .cleanup import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [

@@ -84,7 +84,7 @@ def add_onnx_args(
         "--no-onnx-cleanup",
         action="store_true",
         default=False,
-        help="Skip the torq.tools.cleanup pipeline (collapse unrolled "
+        help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
              "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
              "exported component before dtype conversion",
     )
