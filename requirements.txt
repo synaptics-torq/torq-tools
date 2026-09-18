@@ -6,11 +6,11 @@
 # <4.58, so this environment CANNOT host moonshine_streaming, which needs
 # transformers 5.x. See src/torq/models/moonshine_streaming/requirements.txt
 # for its separate, dedicated environment.
+torq-compiler>=2.2.0
 ai-edge-litert==2.1.5
 datasets==4.8.5
 huggingface_hub==0.36.2
 numpy==2.5.1
-nvidia-modelopt==0.44.0
 ml_dtypes==0.5.4
 onnx==1.21.0
 onnxruntime==1.26.0
