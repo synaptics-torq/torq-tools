@@ -511,7 +511,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         break it) like the 350m exporter, and skips the vision encoder unless
         ``--compile-vision`` was requested."""
         import shutil
-        from ...tools.convert_dtype.onnx import convert_model as _convert_dtype
+        from torq.lab.model_tools.dtype_conversion.onnx import convert_model as _convert_dtype
 
         if not self._convert_dtypes:
             self._logger.warning("Skipping conversion as convert_dtypes==False")
@@ -557,7 +557,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         registering each ``decoder_image_<N>part_<label>`` bf16 component so
         export_torq compiles it. See :mod:`._image_prefill`."""
         from ._image_prefill import build_image_decoder, split_image_decoder
-        from ...tools.convert_dtype.onnx import convert_model as _convert_dtype
+        from torq.lab.model_tools.dtype_conversion.onnx import convert_model as _convert_dtype
 
         n = self._image_decoder_parts
         self._logger.info("(image-decoder) building cache-only image decoder + %d-part split...", n)

@@ -1371,7 +1371,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         The bf16 model alone is what IREE consumes for bf16 compilation.
         """
         import shutil
-        from ...tools.convert_dtype.onnx import convert_model as _convert_dtype
+        from torq.lab.model_tools.dtype_conversion.onnx import convert_model as _convert_dtype
 
         if not self._convert_dtypes:
             self._logger.warning("Skipping conversion as convert_dtypes==False")

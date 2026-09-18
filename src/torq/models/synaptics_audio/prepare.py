@@ -27,9 +27,10 @@ from typing import Mapping, Sequence
 import onnx
 import onnx_graphsurgeon as gs
 
+from torq.lab.model_tools.dtype_conversion.onnx import convert_model
+
 from ...graph_edit import OnnxGraphEditor
 from ...graph_edit.edits import CommonGraphEditsMixin
-from ...tools.convert_dtype.onnx import convert_model
 from ...utils.onnx import finalize_torq_ready_onnx
 from ...utils.onnx_verify import verify_equivalence
 
@@ -148,7 +149,6 @@ def _prepare_one(recipe: Recipe, src_path: Path, dst: Path) -> Path:
             str(dst),
             convert_dtype="bf16",
             convert_io=True,
-            preserve_unused_node_outputs=True,
         )
 
     return dst

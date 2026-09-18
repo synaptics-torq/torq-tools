@@ -28,8 +28,9 @@ import onnx
 import onnx_graphsurgeon as gs
 import onnxruntime as ort
 
+from torq.lab.model_tools.dtype_conversion.onnx import convert_model
+
 from .export import LiquidModelExporter as L
-from ...tools.convert_dtype.onnx import convert_model
 
 SRC = "models/liquid-2p5-450M-VL/export/onnx/fp32/static/vision_encoder.onnx"
 HEADS, HD = 12, 64
