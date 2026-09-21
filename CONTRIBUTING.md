@@ -12,6 +12,9 @@ A virtual environment for Python development is highly recommended. The first st
 cd torq-tools
 python3 -m venv .venv
 source .venv/bin/activate
+# torq-compiler is not on PyPI until v2.2.1: install the release wheel (with
+# the [onnx] extra) first. See the Compiler dependency section of README.md.
+python -m pip install "torq-compiler[onnx] @ https://github.com/synaptics-torq/torq-compiler/releases/download/v2.2.0/torq_compiler-2.2.0-cp312-cp312-manylinux_2_28_x86_64.whl"
 python -m pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r tests/requirements.txt
 ```

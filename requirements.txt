@@ -6,6 +6,9 @@
 # <4.58, so this environment CANNOT host moonshine_streaming, which needs
 # transformers 5.x. See src/torq/models/moonshine_streaming/requirements.txt
 # for its separate, dedicated environment.
+# torq-compiler provides the `torq.lab` namespace used by the exporters. It
+# is not on PyPI until v2.2.1, so it must be installed first, from the GitHub
+# release wheel with the [onnx] extra (see README.md).
 torq-compiler>=2.2.0
 ai-edge-litert==2.1.5
 datasets==4.8.5
