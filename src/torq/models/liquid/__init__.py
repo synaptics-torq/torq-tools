@@ -111,7 +111,7 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-lm-head",
+        "--chunk-lm-head",
         action="store_true",
         default=False,
         help=(
@@ -130,15 +130,10 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-decoder",
+        "--split-lm-head",
         action="store_true",
         default=False,
-        help=(
-            "Also emit body.vmfb (decoder minus lm_head, hidden output) + "
-            "lm_head.vmfb (standalone hidden->logits) alongside the fused "
-            "model.vmfb — the lower-TTFT split where the lm_head is skipped "
-            "during prefill. Requires --convert-dtypes."
-        ),
+        help="Split the final LM head into lm_head.onnx; the main model is then exported as model.onnx and outputs hidden states",
     )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)

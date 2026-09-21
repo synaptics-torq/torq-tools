@@ -442,6 +442,7 @@ class LiquidStatic(LiquidBase):
         tokenizer_path: str | os.PathLike | None = None,
         prefill_model: InferenceRunner | None = None,
         prefill_size: int | None = None,
+        lm_head: InferenceRunner | None = None,
     ):
         if config_path is None:
             config_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "config.json")
@@ -453,6 +454,7 @@ class LiquidStatic(LiquidBase):
             raise ValueError(f"prefill_size must be positive, got {prefill_size}")
         self._prefill_model = prefill_model
         self._prefill_size = prefill_size
+        self._lm_head = lm_head
         self._combined_kv_io = combined_kv_io
         # When `--extract-embeddings` was used at export time the model's
         # input is `token_embedding` rather than `input_ids`; load the LUT
@@ -473,6 +475,8 @@ class LiquidStatic(LiquidBase):
             _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
         )
+        if self._lm_head is not None:
+            self._logger.info("Loaded split LM head '%s'", str(self._lm_head.model_path))
         if self._prefill_model is not None:
             self._logger.info(
                 "Loaded %d-token prefill model '%s'",
@@ -501,6 +505,14 @@ class LiquidStatic(LiquidBase):
         return find_single_data_file(model_path, prefill_pattern, "prefill model")
 
     @staticmethod
+    def _find_lm_head(
+        model_path: str | os.PathLike,
+        lm_head_pattern: str,
+    ) -> Path | None:
+        """Locate the split LM head exported alongside the decode model."""
+        return find_single_data_file(model_path, lm_head_pattern, "split LM head")
+
+    @staticmethod
     def _infer_prefill_size(prefill_model: InferenceRunner) -> int:
         for input_name in ("token_embedding", "input_ids"):
             shape = prefill_model.input_shapes.get(input_name)
@@ -524,6 +536,7 @@ class LiquidStatic(LiquidBase):
         tokenizer_path: str | os.PathLike | None = None,
         prefill_model_path: str | os.PathLike | None = None,
         prefill_size: int | None = None,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "LiquidStatic":
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
             model_path, "model_prefill.onnx"
@@ -534,6 +547,7 @@ class LiquidStatic(LiquidBase):
         )
         if prefill_model is not None and prefill_size is None:
             prefill_size = cls._infer_prefill_size(prefill_model)
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.onnx")
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -545,6 +559,10 @@ class LiquidStatic(LiquidBase):
             tokenizer_path=tokenizer_path,
             prefill_model=prefill_model,
             prefill_size=prefill_size,
+            lm_head=(
+                ORTInferenceRunner(lm_head_path, n_threads=n_threads)
+                if lm_head_path else None
+            ),
         )
 
     @classmethod
@@ -561,10 +579,12 @@ class LiquidStatic(LiquidBase):
         tokenizer_path: str | os.PathLike | None = None,
         prefill_model_path: str | os.PathLike | None = None,
         prefill_size: int | None = None,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "LiquidStatic":
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
             model_path, "model_prefill.vmfb"
         )
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb")
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,
@@ -579,6 +599,10 @@ class LiquidStatic(LiquidBase):
                 if prefill_model_path else None
             ),
             prefill_size=prefill_size,
+            lm_head=(
+                VMFBInferenceRunner(lm_head_path, n_threads=n_threads)
+                if lm_head_path else None
+            ),
         )
 
     def _init_cache(self) -> dict[str, np.ndarray]:
@@ -631,6 +655,10 @@ class LiquidStatic(LiquidBase):
                 [1, self._kv_cache_len], dtype=np.int64
             )
         logits, *cache = model.infer(inputs)
+        if self._lm_head is not None and model is self._model:
+            # With a split LM head the decode model's first output is the
+            # hidden state, not logits; the prefill model stays fused.
+            logits = self._lm_head.infer({"last_hidden_states": logits})[0]
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache
 

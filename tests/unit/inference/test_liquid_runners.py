@@ -95,6 +95,7 @@ class _DemoStatic(LiquidStatic):
         self._kv_cache_len = 7
         self._prefill_model = prefill_model
         self._prefill_size = prefill_size
+        self._lm_head = None
         LiquidBase.__init__(
             self,
             model,
