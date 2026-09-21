@@ -1308,6 +1308,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._patch_static_model(model_path, component)
         if component == "model" and self._split_lm_head:
             self.make_lm_head_split(model_path)
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
         if self._simulate_bf16:
             self._logger.info("(model) Creating bf16-simulated copy...")
             sim_dir = Path(model_path).parent.parent / "bf16_sim" / "static"
@@ -1470,7 +1475,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         ``torq.utils.compile`` driver via the base exporter.
         """
         merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
-        return super().export_torq(
+        result = super().export_torq(
             torq_export_dir=torq_export_dir,
             torq_compile_args=merged_args,
             use_binary=use_binary,
@@ -1478,6 +1483,12 @@ class LiquidModelExporter(OnnxModelExporterBase):
             local_compile=local_compile,
             compiler_path=compiler_path,
         )
+        self._copy_runtime_assets(
+            self._torq_dir,
+            self._export_paths["model"].parent,
+            include_npy_data=False,
+        )
+        return result
 
     def convert_models(
         self,
@@ -1514,6 +1525,9 @@ class LiquidModelExporter(OnnxModelExporterBase):
             if emb_src.exists():
                 emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
                 np.save(self._convert_dir / emb_src.name, emb_data)
+        self._copy_runtime_assets(
+            self._convert_dir, self._export_dir, include_npy_data=False
+        )
 
     def make_lm_head_split(self, model_path: str | os.PathLike):
         """Split the decoder at the lm_head boundary (gemma3-style): the

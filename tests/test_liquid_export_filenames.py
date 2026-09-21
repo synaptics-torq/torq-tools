@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from torq.models.liquid.export import LiquidModelExporter
 from torq.models.liquid.export_vl import DECODER, DECODER_PREFILL, LiquidVLModelExporter
@@ -100,6 +101,23 @@ class LiquidBatchPrefillValidationTests(unittest.TestCase):
 
         self.assertIn("model.patch (batch prefill)", enabled.graph_edit_blocks())
         self.assertNotIn("model.patch (batch prefill)", disabled.graph_edit_blocks())
+
+    def test_static_export_stages_runtime_assets(self):
+        source_dir = _write_config(self.tmp)
+        (source_dir / "tokenizer.json").write_text("tokenizer")
+        export_dir = self.tmp / "export"
+        model_path = export_dir / "model.onnx"
+
+        exporter = LiquidModelExporter.__new__(LiquidModelExporter)
+        exporter._onnx_dir = source_dir
+        exporter._split_lm_head = False
+        exporter._simulate_bf16 = False
+        exporter._patch_static_model = Mock()
+
+        exporter.apply_post_static_patches(model_path, "model")
+
+        self.assertEqual((export_dir / "config.json").read_text(), json.dumps(_CONFIG))
+        self.assertEqual((export_dir / "tokenizer.json").read_text(), "tokenizer")
 
 
 class LiquidVLBatchPrefillValidationTests(unittest.TestCase):
