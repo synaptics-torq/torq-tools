@@ -43,13 +43,18 @@ class LiquidExportFilenameTests(unittest.TestCase):
             Path("export/onnx/fp32/static/model.onnx"),
         )
 
-    def test_batch_prefill_uses_distinct_prefill_filename(self):
+    def test_split_lm_head_uses_transformer_filenames(self):
         exporter = LiquidModelExporter.__new__(LiquidModelExporter)
         exporter._export_dir = Path("export/onnx/fp32/static")
+        exporter._split_lm_head = True
 
         self.assertEqual(
+            exporter._export_path_for_component("model"),
+            Path("export/onnx/fp32/static/transformer.onnx"),
+        )
+        self.assertEqual(
             exporter._export_path_for_component("model_prefill"),
-            Path("export/onnx/fp32/static/model_prefill.onnx"),
+            Path("export/onnx/fp32/static/transformer_prefill.onnx"),
         )
 
     def test_vl_batch_prefill_uses_distinct_decoder_filename(self):
@@ -76,6 +81,7 @@ class LiquidBatchPrefillValidationTests(unittest.TestCase):
 
     def _create_exporter(self, tmp_path: Path, **kwargs) -> LiquidModelExporter:
         source_dir = _write_config(tmp_path)
+        kwargs.setdefault("split_lm_head", True)
         return LiquidModelExporter(onnx_source_dir=source_dir, **kwargs)
 
     def test_batch_prefill_must_be_positive(self):
@@ -89,6 +95,10 @@ class LiquidBatchPrefillValidationTests(unittest.TestCase):
     def test_batch_prefill_requires_static_models(self):
         with self.assertRaisesRegex(ValueError, "static LFM exports"):
             self._create_exporter(self.tmp, batch_prefill=8, static_models=False)
+
+    def test_batch_prefill_requires_split_lm_head(self):
+        with self.assertRaisesRegex(ValueError, "requires `--split-lm-head`"):
+            self._create_exporter(self.tmp, batch_prefill=8, split_lm_head=False)
 
     def test_batch_prefill_is_retained_when_valid(self):
         exporter = self._create_exporter(self.tmp, batch_prefill=8, max_gen_tokens=16)
@@ -186,11 +196,11 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
             model, check_type=False, strict_mode=False, data_prop=True
         )
 
-    def _write_model(self, directory: Path) -> Path:
+    def _write_model(self, directory: Path, filename: str = "model.onnx") -> Path:
         import onnx
 
-        onnx.save(self._model, str(directory / "model.onnx"))
-        return directory / "model.onnx"
+        onnx.save(self._model, str(directory / filename))
+        return directory / filename
 
     def _make_exporter(self, model_path: Path) -> LiquidModelExporter:
         import logging
@@ -242,11 +252,11 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            # The split rewrites model.onnx in place (the fused decoder is
+            # The split rewrites transformer.onnx in place (the fused decoder is
             # not kept), so keep a reference copy for the recomposition check.
             ref_path = td / "fused_ref.onnx"
             onnx.save(self._model, str(ref_path))
-            model_path = self._write_model(td)
+            model_path = self._write_model(td, "transformer.onnx")
             exporter = self._make_exporter(model_path)
             exporter.make_lm_head_split(model_path)
 
@@ -260,7 +270,7 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
             onnx.checker.check_model(body, full_check=True)
             onnx.checker.check_model(lm_head, full_check=True)
 
-            # model.onnx is now the body: lm_head node dropped, hidden state
+            # transformer.onnx is now the body: lm_head node dropped, hidden state
             # exposed as `last_hidden_states` first output (gemma3 naming),
             # dtype inferred from the (fp32) model, not assumed.
             body_nodes = {n.name for n in body.graph.node}

@@ -125,15 +125,15 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         metavar="N",
         default=None,
         help=(
-            "Also export a fixed-shape model_prefill.onnx that processes N tokens "
-            "per step (static exports only)"
+            "Also export transformer_prefill.onnx with N tokens per step "
+            "(requires --split-lm-head; static exports only)"
         ),
     )
     parser.add_argument(
         "--split-lm-head",
         action="store_true",
         default=False,
-        help="Split the final LM head into lm_head.onnx; the main model is then exported as model.onnx and outputs hidden states",
+        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
     )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)

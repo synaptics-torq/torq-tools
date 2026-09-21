@@ -160,6 +160,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 raise ValueError(
                     f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
                 )
+            if not self._split_lm_head:
+                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
             if not static_models:
                 raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
         self._batch_prefill = batch_prefill
@@ -319,6 +321,16 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._logger.warning("Could not save single-file source model: %s", e)
 
         return {"model": model}
+
+    def _export_path_for_component(self, component: str) -> Path:
+        if getattr(self, "_split_lm_head", False):
+            filenames = {
+                "model": "transformer.onnx",
+                "model_prefill": "transformer_prefill.onnx",
+            }
+            if component in filenames:
+                return self._export_dir / filenames[component]
+        return super()._export_path_for_component(component)
 
     def _convert_source_model(
         self, chunk_len: int = 1, component: str = "model"

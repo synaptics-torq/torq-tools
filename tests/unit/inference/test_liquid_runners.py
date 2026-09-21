@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from torq.models.liquid._inference import LiquidBase, LiquidDynamic, LiquidStatic, ModelConfig
+from torq.inference.transformers import DynamicDecoderOnlyRunner, StaticDecoderOnlyRunner
+from torq.models.liquid._inference import LiquidDynamic, LiquidStatic, ModelConfig
 
 
 class _Encoded:
@@ -72,7 +73,8 @@ MIRROR_INPUTS = ["input_ids", "attention_mask", "position_ids"]
 
 class _DemoDynamic(LiquidDynamic):
     def __init__(self, model: _FakeRunner):
-        LiquidBase.__init__(
+        self._set_liquid_config(_CONFIG)
+        DynamicDecoderOnlyRunner.__init__(
             self,
             model,
             _CONFIG,
@@ -80,6 +82,7 @@ class _DemoDynamic(LiquidDynamic):
             max_gen_tokens=3,
             tokenizer=_FakeTokenizer(),
             sys_prompt=None,
+            include_position_ids=False,
         )
 
 
@@ -90,13 +93,9 @@ class _DemoStatic(LiquidStatic):
         prefill_model: _FakeRunner | None = None,
         prefill_size: int | None = None,
     ):
-        self._combined_kv_io = True
-        self._token_embeddings = None
+        self._set_liquid_config(_CONFIG)
         self._kv_cache_len = 7
-        self._prefill_model = prefill_model
-        self._prefill_size = prefill_size
-        self._lm_head = None
-        LiquidBase.__init__(
+        StaticDecoderOnlyRunner.__init__(
             self,
             model,
             _CONFIG,
@@ -104,7 +103,15 @@ class _DemoStatic(LiquidStatic):
             max_gen_tokens=7,
             tokenizer=_FakeTokenizer(),
             sys_prompt=None,
+            combined_kv_io=True,
+            prefill_model=prefill_model,
+            prefill_size=prefill_size,
         )
+
+
+def test_liquid_reuses_shared_decoder_only_runners():
+    assert issubclass(LiquidDynamic, DynamicDecoderOnlyRunner)
+    assert issubclass(LiquidStatic, StaticDecoderOnlyRunner)
 
 
 def test_dynamic_feeds_position_ids_for_mirror_source():
