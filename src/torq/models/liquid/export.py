@@ -1469,6 +1469,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
+    def _runtime_assets_parent(self) -> Path:
+        """Export dir holding the runtime assets (config / tokenizer) that
+        ``export_torq`` stages next to the compiled vmfbs."""
+        return self._export_paths["model"].parent
+
     def export_torq(
         self,
         torq_export_dir: str | os.PathLike | None = None,
@@ -1497,7 +1502,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         )
         self._copy_runtime_assets(
             self._torq_dir,
-            self._export_paths["model"].parent,
+            self._runtime_assets_parent(),
             include_npy_data=False,
         )
         return result

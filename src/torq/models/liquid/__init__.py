@@ -250,7 +250,7 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-lm-head",
+        "--chunk-lm-head",
         action="store_true",
         default=False,
         help=(
@@ -264,19 +264,21 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         metavar="N",
         default=None,
         help=(
-            "Also export a fixed-shape decoder_model_merged_prefill.onnx LLM "
-            "decoder that processes N tokens per step (static exports only; "
-            "the vision encoder is unaffected)"
+            "Also export transformer_prefill.onnx with N tokens per step "
+            "(requires --split-lm-head; static exports only; the vision "
+            "encoder is unaffected)"
         ),
     )
     parser.add_argument(
-        "--split-decoder",
+        "--split-lm-head",
         action="store_true",
         default=False,
         help=(
-            "Also emit decoder_nolm.vmfb (decode body, hidden output) + "
-            "lm_head.vmfb (standalone hidden->logits) alongside the merged "
-            "decoder — the board's lower-TTFT split."
+            "Split the final LM head into lm_head.onnx at ONNX-export time; "
+            "the decode model becomes the body transformer.onnx and outputs "
+            "hidden states (lower-TTFT: the lm_head is skipped during "
+            "prefill). Uses its own export/split_lm_head/ tree, like the "
+            "text-only liquid export."
         ),
     )
     add_graph_edit_harness_args(parser)
