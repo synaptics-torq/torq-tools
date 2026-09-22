@@ -1050,6 +1050,26 @@ class LiquidModelExporter(OnnxModelExporterBase):
         return model, 0
 
     @staticmethod
+    def _conv_matmul_names(model: onnx.ModelProto, conv_l_cache: int) -> list[str]:
+        """Names of the MatMul nodes the conv1d replacement emitted.
+
+        ``_replace_conv1d_with_matmul`` gives each conv time-step MatMul a
+        rank-3 constant weight ``[C, conv_l_cache, 1]``; no other MatMul in
+        the model has a rank-3 weight, so the match is unambiguous.
+        """
+        inits = {i.name: i for i in model.graph.initializer}
+        names = []
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            w = inits.get(node.input[1])
+            if w is None or w.data_type != onnx.TensorProto.FLOAT:
+                continue
+            if len(w.dims) == 3 and int(w.dims[1]) == conv_l_cache and int(w.dims[2]) == 1:
+                names.append(node.name)
+        return names
+
+    @staticmethod
     def _inject_zero_bias_into_conv(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
         """LFM2.5's config has ``conv_bias: false`` so every ONNX Conv op
         ships with no bias input.  torq-compile's depthwise-conv lowering
@@ -1506,6 +1526,40 @@ class LiquidModelExporter(OnnxModelExporterBase):
             include_npy_data=False,
         )
         return result
+
+    def dynamic_quantize_models(
+        self,
+        quantize_dir: str | os.PathLike | None = None,
+        skip: list[str] | None = None,
+        analyze_nodes: bool = False,
+        **quantize_kwargs,
+    ):
+        """Dynamic quantization with the conv-block MatMuls kept out of int8.
+
+        While torq-compiler can support dynamic quantized MatMuls, these specific
+        MatMulIntegers are batch-heavy and thus inefficient to compute scales and 
+        activations for. Therefore, exclude them from being quantized.
+        """
+        skip = skip or []
+        conv_names = []
+        for comp, model_path in self._export_paths.items():
+            if comp in skip:
+                continue
+            names = self._conv_matmul_names(
+                onnx.load(model_path, load_external_data=False), self._conv_L_cache
+            )
+            if names:
+                self._logger.info(
+                    "(conv-exclude) '%s': excluding %d conv MatMul node(s) from int8 quantization",
+                    comp, len(names),
+                )
+            conv_names.extend(names)
+        if conv_names:
+            excluded = list(quantize_kwargs.pop("exclude_nodes", None) or [])
+            quantize_kwargs["exclude_nodes"] = excluded + conv_names
+        super().dynamic_quantize_models(
+            quantize_dir=quantize_dir, skip=skip, analyze_nodes=analyze_nodes, **quantize_kwargs
+        )
 
     def convert_models(
         self,
