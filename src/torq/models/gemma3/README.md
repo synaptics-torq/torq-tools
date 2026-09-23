@@ -78,6 +78,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
 | `--models-dir DIR` | Base directory for source + export models (default: `models`) |
 | `--dynamic-models` | Export dynamic (CPU) models instead of static |
+| `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling |
 | `--skip-torq` | Stop after ONNX; skip the VMFB compile |
 | `--skip-validation` | Skip ORT validation of edited ONNX |
 | `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` |
@@ -179,11 +180,19 @@ torq-quantize-model weights quantize -i model.onnx -o model_mixed_bf16.onnx \
 
 ### 4. Compile the quantized model
 
-Both DQL and dequantized-bf16 outputs are directly importable by IREE. Compile
-the quantized ONNX to a VMFB (from `torq-compiler-dev`):
+For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
+outputs are directly importable by IREE. Compile the quantized ONNX to a VMFB
+(from `torq-compiler-dev`):
 
 ```sh
-./compile_v1.5.sh /path/to/model_mixed_bf16.onnx
+model_dir="/path/to/"
+python -m iree.compiler.tools.import_onnx $model_dir/model_mixed_bf16.onnx -o $model_dir/model_mixed_bf16.mlir --data-prop  
+torq-compile $model_dir/model_mixed_bf16.mlir -o $model_dir/model.vmfb \
+    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
+    --torq-convert-dtypes --torq-convert-io-dtype \
+    --torq-enable-annotate-tied-operands \
+    --torq-enable-split-constants-optimization \
+    --iree-flow-inline-constants-max-byte-length=300000000
 ```
 
 Or via the tools' compile helper:
@@ -191,13 +200,11 @@ Or via the tools' compile helper:
 ```sh
 python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb \
     --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
+    --torq-convert-dtypes --torq-convert-io-dtype \
     --torq-enable-annotate-tied-operands \
     --torq-enable-split-constants-optimization \
     --iree-flow-inline-constants-max-byte-length=300000000
 ```
-
-> Do **not** pass `--torq-enable-torq-hl-tiling` — that flag was removed from
-> `torq-compile` (tile-and-fuse is now default) and the build fails with it.
 
 ### 5. Benchmark (optional)
 

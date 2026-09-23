@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
-# torq-compiler provides the `torq.lab` namespace imported by the model
-# exporters. It is not on PyPI until v2.2.1, so it must be installed first,
-# from the GitHub release wheel with the [onnx] extra (see README.md and the
-# CI workflow).
-torq-compiler>=2.2.0
+torq-compiler>=2.2.1
 pytest==9.1.0
 pyyaml==6.0.3
 numpy==2.4.6

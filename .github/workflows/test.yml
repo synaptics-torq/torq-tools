@@ -34,16 +34,9 @@ jobs:
           cache: pip
           cache-dependency-path: tests/requirements.txt
 
-      - name: Install torq-compiler (temporary, not on PyPI until v2.2.1)
-        # Must run before the requirements file: the [onnx] extra installs
-        # tokenizers==0.23.2 and older onnx/onnxruntime, and the later pip
-        # call switches the environment back to the supported versions.
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "torq-compiler[onnx] @ https://github.com/synaptics-torq/torq-compiler/releases/download/v2.2.0/torq_compiler-2.2.0-cp312-cp312-manylinux_2_28_x86_64.whl"
-
       - name: Install test dependencies
         run: |
+          python -m pip install --upgrade pip
           python -m pip install -r tests/requirements.txt
 
       - name: Run pytest

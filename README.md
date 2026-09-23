@@ -11,14 +11,7 @@ torq_tools_dir=$(readlink -f torq-tools)
 
 ### Compiler dependency
 
-`torq-tools` depends on the Torq compiler Python package (`torq-compiler>=2.2.0`): the model exporters use it for ONNX dtype conversion, dynamic quantization, and the `.onnx`/`.tflite` -> MLIR -> VMFB compilation flow, and the generic model tools (`torq-convert-dtype`, `torq-quantize-model`, `torq-convert-static`) ship in that package. A pip install of `torq-tools` brings it in automatically; If you use torq-tools from a source checkout or submodule without installing it, install `torq-compiler` into the same environment.
-
-> [!NOTE]
-> **Temporary (until torq-compiler v2.2.1):** `torq-compiler` is not published on PyPI yet. Install the v2.2.0 release wheel directly from GitHub **with the `onnx` extra**, and do this **before** installing `torq-tools` or any of the `requirements.txt` files:
->
-> ```bash
-> pip install "torq-compiler[onnx] @ https://github.com/synaptics-torq/torq-compiler/releases/download/v2.2.0/torq_compiler-2.2.0-cp312-cp312-manylinux_2_28_x86_64.whl"
-> ```
+`torq-tools` depends on the Torq compiler Python package (`torq-compiler>=2.2.1`): the model exporters use it for ONNX dtype conversion, dynamic quantization, and the `.onnx`/`.tflite` -> MLIR -> VMFB compilation flow, and the generic model tools (`torq-convert-dtype`, `torq-quantize-model`, `torq-convert-static`). A pip install of `torq-tools` brings it in automatically; If you use torq-tools from a source checkout or submodule without installing it, install `torq-compiler` into the same environment.
 
 Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler Python package.
 

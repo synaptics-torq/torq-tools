@@ -29,7 +29,7 @@ dependencies = [
     "polygraphy",
     "pyyaml",
     "tokenizers",
-    "torq-compiler>=2.2.0",
+    "torq-compiler>=2.2.1",
     "transformers",
 ]
 
