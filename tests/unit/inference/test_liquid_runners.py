@@ -92,6 +92,7 @@ class _DemoStatic(LiquidStatic):
         model: _FakeRunner,
         prefill_model: _FakeRunner | None = None,
         prefill_size: int | None = None,
+        lm_head: _FakeRunner | None = None,
     ):
         self._set_liquid_config(_CONFIG)
         self._kv_cache_len = 7
@@ -104,6 +105,7 @@ class _DemoStatic(LiquidStatic):
             tokenizer=_FakeTokenizer(),
             sys_prompt=None,
             combined_kv_io=True,
+            lm_head=lm_head,
             prefill_model=prefill_model,
             prefill_size=prefill_size,
         )
@@ -167,6 +169,29 @@ def test_static_feeds_attention_mask_only_when_declared():
     assert with_mask.calls[0]["attention_mask"].shape == (1, 7)
     assert "attention_mask" not in without_mask.calls[0]
     assert "attention_mask" not in unknown.calls[0]
+
+
+def test_static_runs_split_lm_head_for_decode_and_prefill_bodies():
+    decode_model = _FakeRunner(input_names=["input_ids", "position_ids"])
+    prefill_model = _FakeRunner(input_names=["input_ids", "position_ids"])
+    lm_head = _FakeRunner(input_names=["last_hidden_states"])
+    runner = _DemoStatic(
+        decode_model,
+        prefill_model=prefill_model,
+        prefill_size=2,
+        lm_head=lm_head,
+    )
+
+    runner._llm_tokens_step(prefill_model, [1, 2], 0)
+    runner._llm_tokens_step(decode_model, [3], 2)
+
+    # Both bodies emit the hidden state as their first output, so the
+    # standalone head runs for each (gemma3-style).
+    assert len(lm_head.calls) == 2
+    hidden = np.zeros((1, 1, 4), dtype=np.float32)
+    hidden[0, 0, 3] = 1.0  # the fake body's first output
+    for call in lm_head.calls:
+        assert np.array_equal(call["last_hidden_states"], hidden)
 
 
 def test_static_uses_prefill_model_for_full_chunks_then_decode_for_remainder():

@@ -490,9 +490,10 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
                 [1, self._kv_cache_len], dtype=np.int64
             )
         logits, *cache = model.infer(inputs)
-        if self._lm_head is not None and model is self._model:
-            # With a split LM head the decode model's first output is the
-            # hidden state, not logits; the prefill model stays fused.
+        if self._lm_head is not None:
+            # With a split LM head the decode model's and prefill model's
+            # first output is the hidden state, not logits; run it through
+            # the standalone head.
             logits = self._lm_head.infer({"last_hidden_states": logits})[0]
         next_token = self.sample_next_token(logits[0, -1])
         return next_token, cache

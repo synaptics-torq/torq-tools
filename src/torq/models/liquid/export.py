@@ -144,11 +144,12 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # longer needed now that tile-and-fuse is default — the exporter emits
         # a single [1024, 65536] MatMul unless --chunk-lm-head is passed.
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
-        # --split-lm-head (gemma3-style) turns the decode model into the body
-        # (lm_head dropped, last_hidden_states output) + emits a standalone
-        # lm_head.onnx (last_hidden_states->logits); it runs at ONNX-export
-        # time, so --convert-dtypes / --dynamic-quantize each apply to every
-        # component independently.
+        # --split-lm-head (gemma3-style) turns the decode model and, when
+        # exported, the batch-prefill model into bodies (lm_head dropped,
+        # last_hidden_states output) + emits a single standalone
+        # lm_head.onnx (last_hidden_states->logits) shared by both; it runs
+        # at ONNX-export time, so --convert-dtypes / --dynamic-quantize each
+        # apply to every component independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
         self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
         if self._split_lm_head and not static_models:
@@ -1338,8 +1339,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)
-        if component == "model" and self._split_lm_head:
-            self.make_lm_head_split(model_path)
+        if self._split_lm_head:
+            # Split every body, including the batch-prefill;
+            # its head input is already sliced to the final token, so the
+            # existing lm_head.onnx is reused.
+            self.make_lm_head_split(
+                model_path, write_lm_head=(component == "model")
+            )
         self._copy_runtime_assets(
             Path(model_path).parent,
             self._onnx_dir,
@@ -1600,24 +1606,25 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._convert_dir, self._export_dir, include_npy_data=False
         )
 
-    def make_lm_head_split(self, model_path: str | os.PathLike):
+    def make_lm_head_split(
+        self, model_path: str | os.PathLike, write_lm_head: bool = True
+    ):
         """Split the decoder at the lm_head boundary (gemma3-style): the
         saved model becomes the body (lm_head node(s) dropped, the hidden
-        state exposed as ``last_hidden_states`` and a standalone 
-        ``lm_head.onnx`` (``last_hidden_states`` -> logits) is written 
-        next to it, so the quantize / convert / compile stages treat 
-        the head as a first-class component.
+        state exposed as ``last_hidden_states``) and a standalone
+        ``lm_head.onnx`` (``last_hidden_states`` -> logits) is written
+        next to it, so the quantize / convert / compile stages treat the
+        head as a first-class component.
 
-        This is the lower-TTFT deployment: the body runs every step, and the
-        ``[hidden, vocab]`` lm_head MatMul (~134 MB bf16) runs only when a
-        token is actually sampled — so it is skipped during prefill (the
-        prefill model stays fused and already emits only the final token's
-        logit). Runs at ONNX-export time and takes the split boundary's dtype
-        from the model itself, so it is independent of ``--convert-dtypes``
-        and ``--dynamic-quantize``. Works on the single-MatMul head and the
-        legacy --chunk-lm-head 512-chunk split alike. Structure-based: the
-        lm_head is the node(s) producing the vocab-logits graph output, and
-        its non-weight activation input is the split boundary."""
+        Applied to every split-topology body, including the batch-prefill
+        model: its head input is already sliced to the final token by
+        TakeLastToken, so the head derived from it is identical to the
+        decode model's and ``write_lm_head=False`` reuses the existing
+        ``lm_head.onnx`` instead of re-writing it.
+        Works on the single-MatMul head and the legacy --chunk-lm-head
+        512-chunk split alike. Structure-based: the lm_head is the node(s)
+        producing the vocab-logits graph output, and its non-weight
+        activation input is the split boundary."""
         import copy
         from onnx import helper
 
@@ -1690,30 +1697,37 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._save_component_model(model, model_path)
 
         # ---- lm_head: standalone hidden -> logits ----------------------------
-        weights = [copy.deepcopy(i) for i in inits if i.name in (lm_inputs & init_names)]
-        lm_nodes = [copy.deepcopy(n) for n in lm_nodes]
-        for n in lm_nodes:
-            for i, inp in enumerate(n.input):
-                if inp == hidden_name:
-                    n.input[i] = HIDDEN_OUT
-        lm_graph = helper.make_graph(
-            lm_nodes,
-            "main",
-            [helper.make_tensor_value_info(HIDDEN_OUT, boundary, [1, 1, self._hidden_size])],
-            [helper.make_tensor_value_info(logits_name, boundary, [1, 1, self._vocab_size])],
-            weights,
-        )
-        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
-        lm_model.ir_version = model.ir_version
-        lmh_path = model_path.parent / "lm_head.onnx"
-        self._save_component_model(lm_model, lmh_path)
+        if write_lm_head:
+            weights = [copy.deepcopy(i) for i in inits if i.name in (lm_inputs & init_names)]
+            lm_nodes = [copy.deepcopy(n) for n in lm_nodes]
+            for n in lm_nodes:
+                for i, inp in enumerate(n.input):
+                    if inp == hidden_name:
+                        n.input[i] = HIDDEN_OUT
+            lm_graph = helper.make_graph(
+                lm_nodes,
+                "main",
+                [helper.make_tensor_value_info(HIDDEN_OUT, boundary, [1, 1, self._hidden_size])],
+                [helper.make_tensor_value_info(logits_name, boundary, [1, 1, self._vocab_size])],
+                weights,
+            )
+            lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
+            lm_model.ir_version = model.ir_version
+            lmh_path = model_path.parent / "lm_head.onnx"
+            self._save_component_model(lm_model, lmh_path)
 
-        self._export_paths["lm_head"] = lmh_path
-        self._logger.info(
-            "(split) '%s' is now the body (%d nodes, '%s' output); derived "
-            "lm_head (%d node(s)) -> '%s'",
-            model_path.name, len(keep_nodes), HIDDEN_OUT, len(lm_nodes), lmh_path.name,
-        )
+            self._export_paths["lm_head"] = lmh_path
+            self._logger.info(
+                "(split) '%s' is now the body (%d nodes, '%s' output); derived "
+                "lm_head (%d node(s)) -> '%s'",
+                model_path.name, len(keep_nodes), HIDDEN_OUT, len(lm_nodes), lmh_path.name,
+            )
+        else:
+            self._logger.info(
+                "(split) '%s' is now the body (%d nodes, '%s' output); "
+                "reusing the existing lm_head.onnx",
+                model_path.name, len(keep_nodes), HIDDEN_OUT,
+            )
 
 
 def export_liquid_from_args(args: argparse.Namespace):

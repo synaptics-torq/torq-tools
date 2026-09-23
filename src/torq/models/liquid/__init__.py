@@ -273,13 +273,7 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         "--split-lm-head",
         action="store_true",
         default=False,
-        help=(
-            "Split the final LM head into lm_head.onnx at ONNX-export time; "
-            "the decode model becomes the body transformer.onnx and outputs "
-            "hidden states (lower-TTFT: the lm_head is skipped during "
-            "prefill). Uses its own export/split_lm_head/ tree, like the "
-            "text-only liquid export."
-        ),
+        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
     )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)

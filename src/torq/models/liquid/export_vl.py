@@ -108,9 +108,10 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
         # --split-lm-head (gemma3-style, as in LiquidModelExporter) turns the
-        # decode model into the body (lm_head dropped, last_hidden_states
-        # output) + emits a standalone lm_head.onnx
-        # (last_hidden_states->logits); it runs at ONNX-export time, so
+        # decode model and, when exported, the batch-prefill model into
+        # bodies (lm_head dropped, last_hidden_states output) + emits a
+        # single standalone lm_head.onnx (last_hidden_states->logits) shared
+        # by both; it runs at ONNX-export time, so
         # --convert-dtypes / --dynamic-quantize each apply to every component
         # independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
@@ -567,8 +568,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
         if component not in (DECODER, DECODER_PREFILL):
             return
         self._patch_static_model(model_path, component)
-        if component == DECODER and self._split_lm_head:
-            self.make_lm_head_split(model_path)
+        if self._split_lm_head:
+            # Split every body, including the batch-prefill one (gemma3-style);
+            # its head input is already sliced to the final token, so the
+            # existing lm_head.onnx (derived from the decode model) is reused.
+            self.make_lm_head_split(
+                model_path, write_lm_head=(component == DECODER)
+            )
         # The chip runner invokes the vmfb positionally, so pin the decoder's
         # leading inputs: token_embedding (0), position_ids (1).
         self._reorder_decoder_inputs(model_path)
