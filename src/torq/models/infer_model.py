@@ -8,6 +8,7 @@ from .moonshine_streaming import add_moonshine_streaming_infer_args
 from .smollm2 import add_smollm2_infer_args
 from .gemma3 import add_gemma3_infer_args
 from .liquid import add_liquid_infer_args
+from .washingbert import add_washingbert_infer_args
 
 
 def main():
@@ -28,6 +29,9 @@ def main():
 
     liquid = model.add_parser("liquid", help="Run LFM2.5 (Liquid) inference")
     add_liquid_infer_args(liquid)
+    
+    washingbert = model.add_parser("washingbert", help="Run WashingBERT inference")
+    add_washingbert_infer_args(washingbert)
 
     args = parser.parse_args()
 
@@ -46,6 +50,9 @@ def main():
     elif args.model_name == "liquid":
         from .liquid.infer import infer_liquid
         infer_liquid(args)
+    elif args.model_name == "washingbert":
+        from .washingbert.infer import infer_washingbert
+        infer_washingbert(args)
 
 
 if __name__ == "__main__":
