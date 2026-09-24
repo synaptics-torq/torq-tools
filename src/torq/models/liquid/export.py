@@ -1341,7 +1341,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._patch_static_model(model_path, component)
         if self._split_lm_head:
             # Split every body, including the batch-prefill;
-            # its head input is already sliced to the final token, so the
+            # its hidden-state output is already sliced to the final token, so the
             # existing lm_head.onnx is reused.
             self.make_lm_head_split(
                 model_path, write_lm_head=(component == "model")
@@ -1617,8 +1617,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         head as a first-class component.
 
         Applied to every split-topology body, including the batch-prefill
-        model: its head input is already sliced to the final token by
-        TakeLastToken, so the head derived from it is identical to the
+        model: its hidden states are sliced to the final token by
+        TakeLastToken or the source model's own Slice, so the head is identical to the
         decode model's and ``write_lm_head=False`` reuses the existing
         ``lm_head.onnx`` instead of re-writing it.
         Works on the single-MatMul head and the legacy --chunk-lm-head
@@ -1641,8 +1641,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
             )
         init_names = {i.name for i in g.initializer}
+        # Newer source exports put last-token selection under /lm_head/;
+        # keep it in the body so prefill exposes one hidden state.
         lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
-                    or (n.name and "lm_head" in n.name)]
+                    or (n.name and "lm_head" in n.name
+                        and "num_logits_to_keep" not in n.name)]
         lm_produced = {o for n in lm_nodes for o in n.output}
         lm_inputs = {i for n in lm_nodes for i in n.input}
         hidden_name = next(

@@ -362,6 +362,44 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
             )
             self.assertNotIn("/model/lm_head/MatMul", {n.name for n in body.graph.node})
 
+    def test_make_lm_head_split_keeps_source_last_token_slice_in_body(self):
+        import numpy as np
+        import onnx
+        from onnx import helper, numpy_helper
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            model_path = td / "transformer_prefill.onnx"
+            model = _build_tiny_liquid_decoder()
+            model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 64
+            model.graph.node.insert(1, helper.make_node(
+                "Slice", ["normed", "starts", "ends", "axes"], ["last_normed"],
+                name="/lm_head/num_logits_to_keep/Slice",
+            ))
+            model.graph.node[2].input[0] = "last_normed"
+            model.graph.initializer.extend([
+                numpy_helper.from_array(np.array([-1], dtype=np.int64), "starts"),
+                numpy_helper.from_array(np.array([64], dtype=np.int64), "ends"),
+                numpy_helper.from_array(np.array([1], dtype=np.int64), "axes"),
+            ])
+            del model.graph.value_info[:]
+            model = onnx.shape_inference.infer_shapes(model)
+            onnx.save(model, str(model_path))
+
+            exporter = self._make_exporter(model_path)
+            exporter.make_lm_head_split(model_path)
+
+            body = onnx.load(str(model_path))
+            head = onnx.load(str(td / "lm_head.onnx"))
+            onnx.checker.check_model(body, full_check=True)
+            onnx.checker.check_model(head, full_check=True)
+            self.assertIn("/lm_head/num_logits_to_keep/Slice", {n.name for n in body.graph.node})
+            self.assertEqual([n.op_type for n in head.graph.node], ["MatMul"])
+            self.assertEqual(
+                [d.dim_value for d in body.graph.output[0].type.tensor_type.shape.dim],
+                [1, 1, self.HIDDEN],
+            )
+
     def test_apply_post_static_patches_splits_decode_and_prefill_bodies(self):
         import logging
         import onnx
