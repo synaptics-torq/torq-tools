@@ -10,12 +10,12 @@ Usage
 -----
 Run benchmark on board::
 
-    python -m torq.tools.quantization.weight_quantization.benchmark run \
+    python -m torq.utils.benchmark run \
         -m /path/to/model.vmfb --instruct-model -o results.json
 
 Compare two benchmark results::
 
-    python -m torq.tools.quantization.weight_quantization.benchmark compare \
+    python -m torq.utils.benchmark compare \
         -a results_int8.json -b results_hybrid.json -o comparison.md
 
 """
@@ -187,7 +187,7 @@ def _run_compare(args: argparse.Namespace) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="torq.tools.quantization.weight_quantization.benchmark",
+        prog="torq.utils.benchmark",
         description="Benchmark quantized models — run inference and compare results",
     )
     parser.add_argument(

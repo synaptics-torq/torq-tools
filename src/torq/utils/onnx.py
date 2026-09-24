@@ -2,19 +2,15 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
-import hashlib
 import logging
 import os
 import re
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
-from shutil import rmtree
-from typing import Union
 
 import onnx
 import onnx_graphsurgeon as gs
-import numpy as np
 from onnx import shape_inference
 
 
@@ -32,17 +28,8 @@ __all__ = [
     "check_dynamic_shapes",
     "print_onnx_model_inputs_outputs_info",
 
-    # subgraph extraction
-    "extract_boundary_tensors",
-    "extract_subgraphs",
-
-    # DType utilities
-    "DTypeLike",
-    "is_same_dtype",
-
     # Transformations
     "drop_empty_name_value_info",
-    "upgrade_model",
     "finalize_torq_ready_onnx",
 ]
 
@@ -91,7 +78,7 @@ def add_onnx_args(
         "--no-onnx-cleanup",
         action="store_true",
         default=False,
-        help="Skip the torq.tools.cleanup pipeline (collapse unrolled "
+        help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
              "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
              "exported component before dtype conversion",
     )
@@ -263,98 +250,6 @@ def print_onnx_model_inputs_outputs_info(model: onnx.ModelProto | str | os.PathL
             print(f"Output '{name}' has no known producer (invalid?)")
 
 
-# -----------------------------------------------------------------------------
-# Subgraph extraction
-# -----------------------------------------------------------------------------
-
-def extract_boundary_tensors(
-    model: onnx.ModelProto,
-    ops_chain: list[str]
-) -> list[dict[str, list | str]]:
-
-    def _unique_subgraph_id(inputs: list[str], outputs: list[str], hash_length: int = 8) -> str:
-        id_str = "|".join(inputs) + ">>" + "|".join(outputs) + ">>" + "|".join(ops_chain)
-        return hashlib.sha256(id_str.encode()).hexdigest()[:hash_length]
-
-    def _filter_tensors(tensors: list[gs.Constant | gs.Variable]) -> list[str]:
-        tensor_names: list[str] = []
-        for t in tensors:
-            if isinstance(t, gs.Variable) and t.name:
-                tensor_names.append(t.name)
-        return tensor_names
-
-    def _find_matches(curr: gs.Node, top: gs.Node, remaining: list[str]):
-        if not remaining:
-            inputs: list[str]  = _filter_tensors(top.inputs)
-            outputs: list[str] = _filter_tensors(curr.outputs)
-            if not inputs or not outputs:
-                return
-            if (subgraph_id := _unique_subgraph_id(inputs, outputs)) not in found_subgraph_ids:
-                boundary_tensors.append(
-                    {
-                        "subgraph_id": subgraph_id,
-                        "ops_chain": ops_chain,
-                        "inputs": inputs,
-                        "outputs": outputs
-                    }
-                )
-                found_subgraph_ids.add(subgraph_id)
-            return
-
-        for out_t in curr.outputs:
-            for consumer in out_t.outputs:
-                if consumer.op == remaining[0]:
-                    _find_matches(consumer, top, remaining[1:])
-
-    if not ops_chain:
-        raise ValueError("`ops` must contain at least one op type")
-    boundary_tensors = []
-    found_subgraph_ids: set[str] = set()
-    graph = gs.import_onnx(model)
-    for node in graph.nodes:
-        if node.op == ops_chain[0]:
-            _find_matches(node, node, ops_chain[1:])
-    return boundary_tensors
-
-
-def extract_subgraphs(
-    model_path: str | os.PathLike,
-    ops_chains: list[list[str]],
-    save_dir: str | os.PathLike,
-    limit: int | None = None
-) -> list[Path]:
-    model = onnx.load(model_path)
-    subgraphs_dirs: list[Path] = []
-    for ops_chain in ops_chains:
-        chain_name = "-".join(ops_chain)
-        subgraphs_dir = Path(save_dir) / chain_name
-        subgraphs_dir.mkdir(exist_ok=True, parents=True)
-        for f in subgraphs_dir.iterdir():
-            if f.is_file() and f.suffix == ".onnx" and chain_name in f.name:
-                f.unlink()
-            if f.is_dir() and chain_name in f.name:
-                rmtree(f, ignore_errors=True)
-        matches = extract_boundary_tensors(model, ops_chain)
-        for i, match in enumerate(matches):
-            if isinstance(limit, int) and i >= limit:
-                break
-            output_path = subgraphs_dir / f"{chain_name}_{i + 1}.onnx"
-            onnx.utils.extract_model(model_path, output_path, match["inputs"], match["outputs"])
-            graph = gs.import_onnx(onnx.load(output_path))
-            graph.name = "main"
-            graph = graph.cleanup(
-                remove_unused_graph_inputs=True,
-                remove_unused_node_outputs=True
-            ).toposort()
-            extracted = gs.export_onnx(graph)
-            extracted = onnx.shape_inference.infer_shapes(extracted, check_type=True, strict_mode=True)
-            onnx.checker.check_model(extracted, full_check=True)
-            onnx.save(extracted, output_path)
-        if matches:
-            subgraphs_dirs.append(subgraphs_dir)
-    return subgraphs_dirs
-
-
 def normalize_layer_name(
     name: str,
     *,
@@ -383,38 +278,6 @@ def normalize_layer_name(
         name = name.lower()
 
     return name or "unnamed"
-
-
-# -----------------------------------------------------------------------------
-# DType utilities
-# -----------------------------------------------------------------------------
-
-DTypeLike = Union[int, np.dtype, type, str, None]
-
-def is_same_dtype(typ1: DTypeLike, typ2: DTypeLike) -> bool:
-    if typ1 is typ2:
-        return True
-    if typ1 == typ2:
-        return True
-
-    def _to_np_dtype(typ: DTypeLike) -> np.dtype | None:
-        if typ is None:
-            return None
-        if isinstance(typ, np.dtype):
-            return typ
-        if isinstance(typ, int):
-            try:
-                return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(typ))
-            except (TypeError, ValueError, KeyError):
-                return None
-        try:
-            return np.dtype(typ)
-        except TypeError:
-            return None
-
-    dt1 = _to_np_dtype(typ1)
-    dt2 = _to_np_dtype(typ2)
-    return dt1 is not None and dt2 is not None and dt1 == dt2
 
 
 # -----------------------------------------------------------------------------
@@ -491,15 +354,6 @@ def finalize_torq_ready_onnx(
         logger.warning("ONNX checker warning after finalize_torq_ready_onnx: %s", exc)
 
     return work
-
-
-def upgrade_model(model: onnx.ModelProto, target_opset: int) -> onnx.ModelProto:
-    if (curr_opset := get_model_opset(model)) >= target_opset:
-        logger.info("Model already at opset %d >= %d, skipping upgrade", curr_opset, target_opset)
-        return model
-    upgraded = onnx.version_converter.convert_version(model, target_opset)
-    logger.info("Upgraded model opset to %d", target_opset)
-    return upgraded
 
 
 if __name__ == "__main__":

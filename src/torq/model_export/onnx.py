@@ -16,6 +16,14 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 from onnxruntime.transformers.optimizer import optimize_model
+from torq.lab.model_tools.dtype_conversion.onnx import (
+    convert_model
+)
+from torq.lab.quantization.onnx.dynamic import (
+    analyze_dynamic_quantization,
+    onnx_dynamic_quantize_file,
+    summarize_dynamic_quantization,
+)
 
 from ..utils.compile import export_torq
 from ..utils.onnx import (
@@ -24,15 +32,7 @@ from ..utils.onnx import (
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
 )
-from ..tools.convert_dtype.onnx import (
-    convert_model
-)
-from ..tools.cleanup.onnx import cleanup_onnx_model
-from ..tools.quantization.dynamic_quantization import (
-    analyze_dynamic_quantization,
-    dynamic_quantize_model,
-    summarize_dynamic_quantization,
-)
+from .cleanup import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
@@ -349,7 +349,7 @@ class OnnxModelExporterBase(ABC):
                 continue
             self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
             quantized_model_path = self._quantize_dir / model_path.name
-            dynamic_quantize_model(
+            onnx_dynamic_quantize_file(
                 model_path, quantized_model_path,
                 **quantize_kwargs
             )

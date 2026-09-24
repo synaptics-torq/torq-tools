@@ -78,6 +78,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
 | `--models-dir DIR` | Base directory for source + export models (default: `models`) |
 | `--dynamic-models` | Export dynamic (CPU) models instead of static |
+| `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling |
 | `--skip-torq` | Stop after ONNX; skip the VMFB compile |
 | `--skip-validation` | Skip ORT validation of edited ONNX |
 | `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` |
@@ -116,10 +117,11 @@ works unchanged.
 ## Weight quantization (int4 / int8)
 
 Quantization is a **separate step** applied to the fp32 static ONNX, using the
-`torq-quantize-model` tool (full docs:
-[`torq/tools/quantization/weight_quantization/README.md`](../../tools/quantization/weight_quantization/README.md)).
-It quantizes MatMul weights to int8 / int4 / bf16 and can emit either a
-DequantizeLinear (DQL) model or a single dequantized-bf16 model ready to compile.
+`torq-quantize-model` tool from the `torq-compiler` dependency
+(`torq.lab.quantization.onnx`; see the torq-compiler user manual for the full
+flag reference). It quantizes MatMul weights to int8 / int4 / bf16 and can
+either emit a DequantizeLinear (DQL) model or a single dequantized-bf16
+model ready to compile.
 
 ### 1. Export the fp32 static ONNX (quantization input)
 
@@ -139,18 +141,18 @@ torq-export-model gemma3 \
 
 ```sh
 # int8 (ORT-matching asymmetric uint8, block_size 32) as a DQL model
-torq-quantize-model quantize -i model.onnx -o model_int8_dql.onnx --bits 8
+torq-quantize-model weights quantize -i model.onnx -o model_int8_dql.onnx --bits 8
 
 # int4 (signed [-8,7], block_size 32)
-torq-quantize-model quantize -i model.onnx -o model_int4_dql.onnx --bits 4
+torq-quantize-model weights quantize -i model.onnx -o model_int4_dql.onnx --bits 4
 
 # Dequantized bf16 (quant error baked in, single bf16 model ready to compile).
 # Scales are truncated to bf16 BEFORE dequant so weights match runtime compute.
-torq-quantize-model quantize -i model.onnx -o model_int8_bf16.onnx \
+torq-quantize-model weights quantize -i model.onnx -o model_int8_bf16.onnx \
     --bits 8 --dequantize-weights
 
 # Keep the lm_head at full precision
-torq-quantize-model quantize -i model.onnx -o out.onnx --bits 4 --skip-layers lm_head
+torq-quantize-model weights quantize -i model.onnx -o out.onnx --bits 4 --skip-layers lm_head
 ```
 
 Output modes: `--bits N` → DQL model; `--bits N --dequantize-weights` →
@@ -165,24 +167,32 @@ the `token_embeddings.npy` (and `token_id_lut.npy` for trimmed-vocab models) fro
 the export:
 
 ```sh
-torq-quantize-model analyze -i model.onnx -o sensitivity.json \
+torq-quantize-model weights analyze -i model.onnx -o sensitivity.json \
     --config-output quant_config.json \
     --embeddings token_embeddings.npy \
     --token-lut token_id_lut.npy \
     --bits 4 8
 
 # then quantize from the config (mixed precision), dequantized to bf16
-torq-quantize-model quantize -i model.onnx -o model_mixed_bf16.onnx \
+torq-quantize-model weights quantize -i model.onnx -o model_mixed_bf16.onnx \
     --config quant_config.json --dequantize-weights
 ```
 
 ### 4. Compile the quantized model
 
-Both DQL and dequantized-bf16 outputs are directly importable by IREE. Compile
-the quantized ONNX to a VMFB (from `torq-compiler-dev`):
+For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
+outputs are directly importable by IREE. Compile the quantized ONNX to a VMFB
+(from `torq-compiler-dev`):
 
 ```sh
-./compile_v1.5.sh /path/to/model_mixed_bf16.onnx
+model_dir="/path/to/"
+python -m iree.compiler.tools.import_onnx $model_dir/model_mixed_bf16.onnx -o $model_dir/model_mixed_bf16.mlir --data-prop  
+torq-compile $model_dir/model_mixed_bf16.mlir -o $model_dir/model.vmfb \
+    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
+    --torq-convert-dtypes --torq-convert-io-dtype \
+    --torq-enable-annotate-tied-operands \
+    --torq-enable-split-constants-optimization \
+    --iree-flow-inline-constants-max-byte-length=300000000
 ```
 
 Or via the tools' compile helper:
@@ -190,22 +200,20 @@ Or via the tools' compile helper:
 ```sh
 python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb \
     --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
+    --torq-convert-dtypes --torq-convert-io-dtype \
     --torq-enable-annotate-tied-operands \
     --torq-enable-split-constants-optimization \
     --iree-flow-inline-constants-max-byte-length=300000000
 ```
-
-> Do **not** pass `--torq-enable-torq-hl-tiling` — that flag was removed from
-> `torq-compile` (tile-and-fuse is now default) and the build fails with it.
 
 ### 5. Benchmark (optional)
 
 Compare quantized variants over a standard question set:
 
 ```sh
-python -m torq.tools.quantization.weight_quantization.benchmark run \
+python -m torq.utils.benchmark run \
     -m model_int8.vmfb --instruct-model -o results_int8.json
-python -m torq.tools.quantization.weight_quantization.benchmark compare \
+python -m torq.utils.benchmark compare \
     -a results_int8.json -b results_mixed.json \
     --name-a "int8" --name-b "mixed int8/int4" -o comparison.md
 ```

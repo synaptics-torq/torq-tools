@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
+torq-compiler>=2.2.1
 pytest==9.1.0
 pyyaml==6.0.3
 numpy==2.4.6

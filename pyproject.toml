@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torq-tools"
 version = "0.9.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ "name" = "synaptics-astra", "email" = "zSvcastrateam@synaptics.com" }]
 description = "Developer tools for the Torq compiler"
 classifiers = [
@@ -22,7 +22,6 @@ dependencies = [
     "huggingface_hub",
     "ml_dtypes",
     "numpy",
-    "nvidia-modelopt",
     "onnx",
     "onnxruntime",
     "onnx_graphsurgeon",
@@ -30,6 +29,7 @@ dependencies = [
     "polygraphy",
     "pyyaml",
     "tokenizers",
+    "torq-compiler>=2.2.1",
     "transformers",
 ]
 
@@ -38,11 +38,9 @@ Homepage = "https://github.com/synaptics-torq/torq-tools"
 Issues = "https://github.com/synaptics-torq/torq-tools/issues"
 
 [project.scripts]
-torq-convert-dtype = "torq.tools.convert_dtype.__main__:main"
-torq-cleanup-model = "torq.tools.cleanup.__main__:main"
+torq-cleanup-model = "torq.model_export.cleanup.__main__:main"
 torq-export-model  = "torq.models.export_model:main"
 torq-infer-model   = "torq.models.infer_model:main"
-torq-quantize-model = "torq.tools.quantization.quantize_onnx:main"
 torq-synaptics-audio = "torq.models.synaptics_audio.__main__:main"
 
 # NOTE: moonshine_streaming is intentionally NOT declared as an extra here. It
