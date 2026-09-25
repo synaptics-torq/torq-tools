@@ -125,7 +125,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         )
 
     def _setup_dirs(self) -> list[Path]:
-        onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
+        onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir = [None] * 5
         if self._onnx_source_dir is not None:
             onnx_dir = self._onnx_source_dir
         else:
@@ -156,6 +156,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             / self._model_dtype
             / ("static" if self._static_models else "dynamic")
         )
+        quantize_dir = (
+            self._models_dir
+            / "export"
+            / "onnx"
+            / "quantized"
+            / ("static" if self._static_models else "dynamic")
+        )
         convert_dir = (
             self._models_dir 
             / "export"
@@ -170,7 +177,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / ("static" if self._static_models else "dynamic")
         )
-        return onnx_dir, export_dir, convert_dir, torq_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         unmerged_model_names: set[str] = set(MoonshineModelExporter.COMPONENTS.values())

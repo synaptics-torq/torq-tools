@@ -485,6 +485,9 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
         export_dir = (
             self._models_dir / "export" / "onnx" / self._model_dtype / "static"
         )
+        quantize_dir = (
+            self._models_dir / "export" / "onnx" / "quantized" / "static"
+        )
         convert_dir = (
             self._models_dir / "export" / "onnx" / "converted" / "static"
         )
@@ -493,7 +496,7 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             / ("converted" if self._convert_dtypes else self._model_dtype)
             / "static"
         )
-        return onnx_dir, export_dir, convert_dir, torq_dir
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _generate_source_onnx(self):
         from huggingface_hub import snapshot_download
