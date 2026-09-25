@@ -84,9 +84,6 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
             )[0]
             placed_cache = new_cache_val
         else:
-            # ORT folds Where(Equal(...), 1, 0) into a currently unsupported i1-to-float Cast.
-            # Subtracting integral positions before the supported float Cast keeps zero exact.
-            scatter_dtype = np.dtype(new_cache_val.dtype)
             chunk_offsets = gs.Constant(
                 output.name + "_chunk_offsets",
                 np.arange(self.chunk_len, dtype=np.int64).reshape(1, 1, 1, self.chunk_len),
@@ -101,57 +98,30 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
                     shape=[1, 1, 1, self.chunk_len],
                 )],
             )[0]
-            scatter_delta = self.graph.layer(
-                name=output.name + "_scatter_delta",
-                op="Sub",
+            scatter_mask = self.graph.layer(
+                name=output.name + "_scatter_mask",
+                op="Equal",
                 inputs=[time_ids, chunk_positions],
                 outputs=[gs.Variable(
-                    output.name + "_scatter_delta_values",
-                    dtype=np.int64,
-                    shape=[1, 1, self.max_tokens, self.chunk_len],
-                )],
-            )[0]
-            scatter_delta_float = self.graph.layer(
-                name=output.name + "_cast_scatter_delta",
-                op="Cast",
-                attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(scatter_dtype)},
-                inputs=[scatter_delta],
-                outputs=[gs.Variable(
-                    output.name + "_scatter_delta_float",
-                    dtype=new_cache_val.dtype,
-                    shape=[1, 1, self.max_tokens, self.chunk_len],
-                )],
-            )[0]
-            scatter_distance = self.graph.layer(
-                name=output.name + "_scatter_distance",
-                op="Abs",
-                inputs=[scatter_delta_float],
-                outputs=[gs.Variable(
-                    output.name + "_scatter_distance_values",
-                    dtype=new_cache_val.dtype,
-                    shape=[1, 1, self.max_tokens, self.chunk_len],
-                )],
-            )[0]
-            inverted_distance = self.graph.layer(
-                name=output.name + "_invert_scatter_distance",
-                op="Sub",
-                inputs=[
-                    gs.Constant(
-                        output.name + "_scatter_one",
-                        np.asarray(1, dtype=scatter_dtype),
-                    ),
-                    scatter_distance,
-                ],
-                outputs=[gs.Variable(
-                    output.name + "_inverted_scatter_distance",
-                    dtype=new_cache_val.dtype,
+                    output.name + "_scatter_mask_bool",
+                    dtype=onnx.TensorProto.BOOL,
                     shape=[1, 1, self.max_tokens, self.chunk_len],
                 )],
             )[0]
             scatter_weights = self.graph.layer(
                 name=output.name + "_scatter_weights",
-                op="Relu",
-                inputs=[inverted_distance],
+                op="Where",
+                inputs=[
+                    scatter_mask,
+                    gs.Constant(
+                        output.name + "_scatter_one",
+                        np.asarray(1, dtype=np.dtype(new_cache_val.dtype)),
+                    ),
+                    gs.Constant(
+                        output.name + "_scatter_zero",
+                        np.asarray(0, dtype=np.dtype(new_cache_val.dtype)),
+                    ),
+                ],
                 outputs=[gs.Variable(
                     output.name + "_scatter_weights_float",
                     dtype=new_cache_val.dtype,

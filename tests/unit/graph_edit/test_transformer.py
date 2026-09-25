@@ -49,12 +49,11 @@ def test_replace_dynamic_kv_cache_uses_fixed_shape_chunk_placement():
     ).transform(concat)
 
     live_ops = {node.op for node in g.nodes if node.outputs}
-    assert {"Abs", "Cast", "MatMul", "Relu", "Sub", "Where"}.issubset(live_ops)
-    assert not any(
-        node.op == "Cast" and node.inputs[0].inputs and node.i().op == "Equal"
-        for node in g.nodes
-    )
+    assert {"Add", "And", "Equal", "GreaterOrEqual", "Less", "MatMul", "Where"}.issubset(live_ops)
     assert "Pad" not in live_ops
+    scatter_mask = next(node.outputs[0] for node in g.nodes if node.name == "present.0.key_scatter_mask")
+    assert scatter_mask.dtype == onnx.TensorProto.BOOL
+    assert scatter_mask.shape == [1, 1, 4, 2]
     placed = next(node.outputs[0] for node in g.nodes if node.name == "present.0.key_place_new_kv")
     assert placed.shape == [1, 1, 4, 2]
 
