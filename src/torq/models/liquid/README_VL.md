@@ -127,13 +127,14 @@ entries instead of the fused one):
 
 ```
 models/liquid-2p5-450M-VL/export/
-├── unified/onnx/                              (default runs)
+├── unified/                                   (default runs)
 │   ├── fp32/static/
 │   │   ├── decoder_model_merged.onnx      (~1.4 GB)
 │   │   ├── vision_encoder.onnx            (~363 MB, fp32, dynamic — for ORT)
 │   │   ├── token_embeddings.npy           (~256 MB, fp32)
 │   │   ├── config.json                    ← staged (flat text config)
-│   │   └── tokenizer.json                 ← staged
+│   │   ├── tokenizer.json                 ← staged
+│   │   └── compiled/                      (f32 runs; vmfbs + one .mlir each)
 │   └── bf16/static/                        ← convert dir; also the build scratch
 │       ├── decoder_model_merged.onnx      (~676 MB)
 │       ├── vision_encoder_256.onnx        (~182 MB)   --vision-res 256 (compile input)
@@ -142,27 +143,26 @@ models/liquid-2p5-450M-VL/export/
 │       ├── decoder_image_2part_B.onnx     (~244 MB)   --image-decoder-parts
 │       ├── token_embeddings.npy           (~128 MB, bf16)
 │       ├── config.json                    ← staged (flat text config)
-│       └── tokenizer.json                 ← staged
-├── unified/iree/bf16/static/                  ← board bundle (+ one .mlir per vmfb)
-│   ├── decoder_model_merged.vmfb          (~679 MB)   single-token decoder
-│   ├── vision_encoder_256.vmfb            (~1.77 GB!)  static SigLIP encoder
-│   ├── decoder_image_2part_A.vmfb          (~336 MB)   one-shot image prefill
-│   ├── decoder_image_2part_B.vmfb          (~296 MB)
-│   ├── token_embeddings.npy               (~128 MB)   ← staged for the runner
-│   ├── config.json                                    ← staged (flat text config)
-│   └── tokenizer.json                                 ← staged
-└── split_lm_head/onnx|iree/…                  (--split-lm-head runs; same shape as
+│       ├── tokenizer.json                 ← staged
+│       └── compiled/                      ← board bundle (vmfbs + one .mlir each)
+└── split_lm_head/…                           (--split-lm-head runs; same shape as
     │                                          `unified/` above, with instead of the fused decoder):
     ├── fp32/static/
     │   ├── transformer.onnx               (~1.1 GB)   body (last_hidden_states output)
     │   ├── lm_head.onnx                   (~268 MB)   hidden -> logits
     │   ├── transformer_prefill.onnx       (with --batch-prefill N; stays fused)
     │   └── … (vision / LUT / config / tokenizer as above)
-    └── iree/bf16/static/
+    └── bf16/static/compiled/
         ├── transformer.vmfb
         ├── lm_head.vmfb
         └── transformer_prefill.vmfb       (with --batch-prefill N)
 ```
+
+Compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory of
+the variant that is actually compiled — here `bf16/static/compiled/` (the
+convert dir), since the VL run converts to bf16 before compiling. The runtime
+assets are staged into that same variant dir, so it is a self-contained
+board bundle.
 
 > **Open issue — vision vmfb size.** The 256-res encoder compiles to ~1.77 GB
 > from a 182 MB bf16 input, while every other component lands ~1:1 with its
@@ -221,13 +221,13 @@ both).
 
 ## 2. Deploy to the board (text decoder)
 
-The `iree/bf16/static/` dir of a run is self-contained for the LiquidStatic
-runner (vmfb + LUT + config + tokenizer all staged):
+The `bf16/static/` convert dir of a run is self-contained for the LiquidStatic
+runner (vmfb + LUT + config + tokenizer all staged; vmfbs in `compiled/`):
 
 ```sh
-M=models/liquid-2p5-450M-VL/export/unified/iree/bf16/static
+M=models/liquid-2p5-450M-VL/export/unified/bf16/static
 scp \
-  $M/decoder_model_merged.vmfb \
+  $M/compiled/decoder_model_merged.vmfb \
   $M/token_embeddings.npy \
   $M/config.json \
   $M/tokenizer.json \

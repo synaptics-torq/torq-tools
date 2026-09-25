@@ -90,34 +90,16 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             optimum_export_onnx(
                 onnx_dir, self._hf_repo, self._model_dtype, ["model.onnx"]
             )
-        export_dir = (
-            self._models_dir / 
-            "export" / 
-            "onnx" / 
-            self._model_dtype / 
-            ("static" if self._static_models else "dynamic")
-        )
-        quantize_dir = (
-            self._models_dir
-            / "export"
-            / "onnx"
-            / "quantized"
-            / ("static" if self._static_models else "dynamic")
-        )
-        convert_dir = (
-            self._models_dir 
-            / "export"
-            / "onnx"
-            / "converted"
-            / ("static" if self._static_models else "dynamic")
-        )
-        torq_dir = (
-            self._models_dir
-            / "export"
-            / "torq"
-            / ("converted" if self._convert_dtypes else self._model_dtype)
-            / ("static" if self._static_models else "dynamic")
-        )
+        suffix = "static" if self._static_models else "dynamic"
+        root = self._models_dir / "export"
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "converted" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
@@ -290,26 +272,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 (self._export_paths["model"].parent / "token_embeddings.npy", np.dtype(ml_dtypes.bfloat16))
             ]
         )
-
-    def export_torq(
-        self,
-        torq_export_dir: str | os.PathLike | None = None,
-        torq_compile_args: list[str] | None = None,
-        use_binary: bool = False,
-        skip: list[str] | None = None,
-        local_compile: bool = False,
-        compiler_path: str | Path | None = None,
-    ):
-        result = super().export_torq(
-            torq_export_dir=torq_export_dir,
-            torq_compile_args=torq_compile_args,
-            use_binary=use_binary,
-            skip=skip,
-            local_compile=local_compile,
-            compiler_path=compiler_path,
-        )
-        self._copy_runtime_assets(self._torq_dir, self._export_paths["model"].parent)
-        return result
 
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)

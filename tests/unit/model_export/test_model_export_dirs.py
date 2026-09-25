@@ -63,6 +63,51 @@ def test_export_onnx_resets_stale_artifacts(tmp_path):
     assert (export_dir / "model.onnx").exists()
 
 
+def test_export_onnx_resets_stale_compiled_artifacts(tmp_path):
+    """Compiled vmfbs live in the variant dir's compiled/ subdir; regenerating
+    the variant's ONNX must wipe them so no stale vmfb outlives its source."""
+    compiled = tmp_path / "export" / "compiled"
+    compiled.mkdir(parents=True)
+    stale = compiled / "model.vmfb"
+    stale.write_bytes(b"stale vmfb")
+
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
+    exporter.export_onnx(validate=False)
+
+    assert not compiled.exists()
+    assert (tmp_path / "export" / "model.onnx").exists()
+
+
+def test_dynamic_quantize_models_resets_stale_compiled_artifacts(tmp_path):
+    compiled = tmp_path / "quantize" / "compiled"
+    compiled.mkdir(parents=True)
+    stale = compiled / "model.vmfb"
+    stale.write_bytes(b"stale vmfb")
+
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
+    exporter.export_onnx(validate=False)
+    exporter.dynamic_quantize_models(skip_preprocess=True)
+
+    assert not compiled.exists()
+    assert (tmp_path / "quantize" / "model.onnx").exists()
+
+
+def test_compiled_dir_lives_inside_the_variant_dir(tmp_path):
+    """torq_dir is <variant>/compiled: export dir for f32, quantize dir for DQL,
+    convert dir when both, matching the base _setup_dirs contract."""
+    f32 = StubExporter(tmp_path, {"model": _identity_model()})
+    f32._prepare()
+    assert f32._torq_dir == tmp_path / "export" / "compiled"
+
+    dql = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
+    dql._prepare()
+    assert dql._torq_dir == tmp_path / "quantize" / "compiled"
+
+    conv = StubExporter(tmp_path, {"model": _identity_model()}, convert_dtypes=True)
+    conv._prepare()
+    assert conv._torq_dir == tmp_path / "convert" / "compiled"
+
+
 def test_construction_does_not_download_or_load_the_source_model(tmp_path):
     """`--view-graph-edits` builds an exporter purely to render its edit plan."""
     exporter = StubExporter(tmp_path, {"model": _identity_model()})

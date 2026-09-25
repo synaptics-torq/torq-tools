@@ -483,19 +483,19 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             / self._model_dtype / source_tag
         )
         export_dir = (
-            self._models_dir / "export" / "onnx" / self._model_dtype / "static"
+            self._models_dir / "export" / self._model_dtype / "static"
         )
         quantize_dir = (
-            self._models_dir / "export" / "onnx" / "quantized" / "static"
+            self._models_dir / "export" / "quantized" / "static"
         )
         convert_dir = (
-            self._models_dir / "export" / "onnx" / "converted" / "static"
+            self._models_dir / "export" / "converted" / "static"
         )
-        torq_dir = (
-            self._models_dir / "export" / "torq"
-            / ("converted" if self._convert_dtypes else self._model_dtype)
-            / "static"
-        )
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _generate_source_onnx(self):

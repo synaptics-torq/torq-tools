@@ -169,7 +169,21 @@ class OnnxModelExporterBase(ABC):
         }
 
     @abstractmethod
-    def _setup_dirs(self) -> list[Path]: ...
+    def _setup_dirs(self) -> list[Path]:
+        """Return ``(onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir)``.
+
+        ``export_dir`` / ``quantize_dir`` / ``convert_dir`` are the per-variant
+        trees (base dtype, quantized, converted); each is self-contained
+        (ONNX components + runtime assets) so it can be deployed as-is.
+
+        ``torq_dir`` is the ``compiled/`` subdirectory of the variant that is
+        actually compiled (``convert_dir`` when ``convert_dtypes``, else
+        ``quantize_dir`` when ``dynamic_quantize``, else ``export_dir``): the
+        vmfbs + MLIR live right next to their source ONNX, and since every
+        pipeline step wipes its own destination dir up front, regenerating a
+        variant's ONNX always removes its stale compiled artifacts.
+        """
+        ...
 
     @abstractmethod
     def _load_onnx(self) -> dict[str, onnx.ModelProto]: ...

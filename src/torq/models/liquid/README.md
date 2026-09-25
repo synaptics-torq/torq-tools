@@ -97,7 +97,7 @@ torq-export-model liquid \
 
 Like the other models (gemma3, smollm2), this single command **exports and
 compiles**: it produces the bf16 ONNX and then compiles it to a vmfb under
-`export/<unified|split_lm_head>/iree/bf16/static/`. Pass `--skip-torq` to stop at the ONNX.
+`export/<unified|split_lm_head>/bf16/static/compiled/`. Pass `--skip-torq` to stop at the ONNX.
 
 Flag breakdown:
 
@@ -132,18 +132,23 @@ Output on disk after a successful run. As in gemma3, the topology gets its own d
 models/liquid-2p5-350m/
 ├── source/onnx/fp32/model.onnx        (~1.4 GB — original HF safetensors, converted)
 └── export/<unified|split_lm_head>/    (--split-lm-head picks the latter)
-    ├── onnx/fp32/static/
+    ├── fp32/static/
     │   ├── model.onnx                (~1.4 GB; unified export only)
     │   ├── transformer.onnx          (~1.4 GB; split export body with last_hidden_states output)
     │   ├── lm_head.onnx              (only with --split-lm-head; ~268 MB fp32)
     │   ├── transformer_prefill.onnx  (only with --batch-prefill N; stays fused)
     │   ├── token_embeddings.npy      (~128 MB)
     │   ├── config.json
-    │   └── tokenizer.json
-    ├── onnx/quantized/static/        (only with --dynamic-quantize; int8 copy of every component)
-    ├── onnx/bf16/static/             (only with --convert-dtypes)
-    └── iree/<dtype>/static/          (only without --skip-torq; one .vmfb per component)
+    │   ├── tokenizer.json
+    │   └── compiled/                 (only without --skip-torq; one .vmfb + .mlir per component)
+    ├── quantized/static/             (only with --dynamic-quantize; int8 copy of every component)
+    └── bf16/static/                  (only with --convert-dtypes)
 ```
+
+The `compiled/` dir lives inside the variant that is actually compiled
+(`bf16/static/compiled/` with `--convert-dtypes`, `quantized/static/compiled/`
+with `--dynamic-quantize`), so each variant dir is a self-contained deployable
+unit and regenerating a variant's ONNX wipes its stale vmfbs alongside it.
 
 > [!Note]
 > The fp32 export is the right artifact to validate end-to-end through onnxruntime ("What is the capital of France?" → "The capital of France is Paris."). bf16 cannot be validated through ORT because the CPU MatMul kernel has no bf16 path; compare bf16 against fp32 via the host casting tools if you need a quality check.
@@ -154,8 +159,8 @@ models/liquid-2p5-350m/
 
 Same as gemma3/smollm2: the Section 1 export command already compiles (unless
 you pass `--skip-torq`), writing `model.vmfb` (or `transformer.vmfb` for a
-split export) to
-`export/<unified|split_lm_head>/iree/bf16/static/`. Compilation goes through the shared
+split export) to `export/<unified|split_lm_head>/<variant>/static/compiled/`
+(`<variant>` = `bf16` with `--convert-dtypes`, else the base dtype dir). Compilation goes through the shared
 `torq.utils.compile` driver (ONNX → MLIR via `iree-import-onnx`, then
 MLIR → vmfb via `torq-compile`), and the liquid export adds
 `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`
@@ -167,8 +172,8 @@ same driver directly (the output directory is created automatically):
 ```sh
 export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 python -m torq.utils.compile \
-  models/export/onnx/bf16/static/model.onnx \
-  -o models/export/iree/bf16/static/model.vmfb \
+  models/export/bf16/static/model.onnx \
+  -o models/export/bf16/static/compiled/model.vmfb \
   --compile-flags --torq-enable-transpose-optimization --torq-enable-split-constants-optimization
 ```
 

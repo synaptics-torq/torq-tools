@@ -256,39 +256,16 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # The topology level (like gemma3) keeps --split-lm-head exports in
         # their own tree so they never overwrite a unified export's artifacts.
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
-        export_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / self._model_dtype
-            / suffix
-        )
-        quantize_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / "quantized"
-            / suffix
-        )
-        convert_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / "bf16"
-            / suffix
-        )
-        iree_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "iree"
-            / ("bf16" if self._convert_dtypes else self._model_dtype)
-            / suffix
-        )
-        return onnx_dir, export_dir, quantize_dir, convert_dir, iree_dir
+        root = self._models_dir / "export" / model_topology
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "bf16" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _download_source(self, target_dir: Path):
         """Fetch the LFM2-VL ONNX components from the mirror repos.
@@ -848,22 +825,17 @@ class LiquidVLModelExporter(LiquidModelExporter):
         else:
             shutil.copy2(tokenizer, dst_dir / "tokenizer.json")
 
-    def _runtime_assets_parent(self) -> Path:
-        """The decoder (not a single `model` component) holds the runtime
-        assets that export_torq stages next to the compiled vmfbs."""
-        return self._export_paths[DECODER].parent
-
     def stage_deploy_assets(self):
-        """Place the token-embedding LUT next to the decoder vmfb.
+        """Place the token-embedding LUT in the variant dir next to compiled/.
 
         The LiquidStatic runner loads ``token_embeddings.npy``, ``config.json``
-        and ``tokenizer.json`` from the vmfb's parent directory. The config
-        and tokenizer reach the iree dir via export_torq's runtime-asset copy
-        (see ``_runtime_assets_parent``); the LUT is the one asset that
-        differs by dtype (bf16 if converted, else fp32)."""
+        and ``tokenizer.json`` from the vmfb's deploy directory. The config
+        and tokenizer are staged into the variant dir by
+        ``apply_post_static_patches``; the LUT is the one asset that differs by
+        dtype (bf16 if converted, else fp32)."""
         import shutil
 
-        dest = self._torq_dir  # export/iree/<dtype>/<static|dynamic>
+        dest = self._torq_dir.parent  # <variant>/static, next to compiled/
         if not dest.exists():
             return
 

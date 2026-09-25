@@ -219,39 +219,17 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # The topology level (like gemma3) keeps --split-lm-head exports in
         # their own tree so they never overwrite a unified export's artifacts.
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
-        export_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / self._model_dtype
-            / ("static" if self._static_models else "dynamic")
-        )
-        quantize_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / "quantized"
-            / ("static" if self._static_models else "dynamic")
-        )
-        convert_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "onnx"
-            / "bf16"
-            / ("static" if self._static_models else "dynamic")
-        )
-        iree_dir = (
-            self._models_dir
-            / "export"
-            / model_topology
-            / "iree"
-            / ("bf16" if self._convert_dtypes else self._model_dtype)
-            / ("static" if self._static_models else "dynamic")
-        )
-        return onnx_dir, export_dir, quantize_dir, convert_dir, iree_dir
+        suffix = "static" if self._static_models else "dynamic"
+        root = self._models_dir / "export" / model_topology
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "bf16" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _download_from_hf(self, target_dir: Path):
         from huggingface_hub import hf_hub_download
@@ -1495,11 +1473,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
-    def _runtime_assets_parent(self) -> Path:
-        """Export dir holding the runtime assets (config / tokenizer) that
-        ``export_torq`` stages next to the compiled vmfbs."""
-        return self._export_paths["model"].parent
-
     def export_torq(
         self,
         torq_export_dir: str | os.PathLike | None = None,
@@ -1518,7 +1491,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         ``torq.utils.compile`` driver via the base exporter.
         """
         merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
-        result = super().export_torq(
+        # Runtime assets already live in the variant dir next to compiled/.
+        return super().export_torq(
             torq_export_dir=torq_export_dir,
             torq_compile_args=merged_args,
             use_binary=use_binary,
@@ -1526,12 +1500,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             local_compile=local_compile,
             compiler_path=compiler_path,
         )
-        self._copy_runtime_assets(
-            self._torq_dir,
-            self._runtime_assets_parent(),
-            include_npy_data=False,
-        )
-        return result
 
     def dynamic_quantize_models(
         self,

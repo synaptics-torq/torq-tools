@@ -89,14 +89,23 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 ## Output layout
 
 ```
-models/<repo>/export/<full|trim>/<unified|split_lm_head>/onnx/
+models/<repo>/export/<full|trim>/<unified|split_lm_head>/
     <dtype>/static/model.onnx           ← fp32 static ONNX (quantization input)
+    quantized/static/model.onnx         ← int8 DQL model (--dynamic-quantize)
     converted/static/model.onnx         ← bf16 model (--convert-dtypes)
-    …/token_embeddings.npy              ← with --extract-embeddings
-    …/token_id_lut.npy                  ← with --trim-vocab
-models/<repo>/export/<full|trim>/<unified|split_lm_head>/torq/
-    converted/static/model.vmfb         ← compiled VMFB
+    …/static/token_embeddings.npy       ← with --extract-embeddings
+    …/static/token_id_lut.npy           ← with --trim-vocab
+    <variant>/static/compiled/model.vmfb ← compiled VMFB, co-located in the
+                                            variant dir that is compiled
 ```
+
+The compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory
+of the variant that is actually compiled — `converted/` with `--convert-dtypes`,
+else `quantized/` with `--dynamic-quantize`, else the base `<dtype>/` dir. Each
+variant dir is self-contained (ONNX + runtime assets + `compiled/`), so it can
+be deployed as-is; regenerating a variant's ONNX wipes its stale `compiled/`
+alongside it, so a compiled model can never outlive the source it was built
+from.
 
 `<full|trim>` follows `--trim-vocab`; `<unified|split_lm_head>` follows
 `--split-lm-head`. The exact paths are printed at the end of the run.
@@ -106,7 +115,7 @@ above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
 (hidden states → logits) instead:
 
 ```
-models/<repo>/export/<full|trim>/split_lm_head/onnx/<dtype>/static/
+models/<repo>/export/<full|trim>/split_lm_head/<dtype>/static/
     transformer.onnx                    ← the decoder, outputs last_hidden_states
     transformer_prefill.onnx            ← with --batch-prefill; processes N tokens and outputs the last hidden state
     lm_head.onnx                        ← standalone LM head
@@ -137,7 +146,7 @@ torq-export-model gemma3 \
     --extract-embeddings \
     --trim-vocab \
     --skip-torq
-# fp32 ONNX: models/<repo>/export/trim/unified/onnx/<dtype>/static/model.onnx
+# fp32 ONNX: models/<repo>/export/trim/unified/<dtype>/static/model.onnx
 ```
 
 ### 2. Quantize

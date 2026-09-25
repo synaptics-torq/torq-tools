@@ -77,56 +77,56 @@ def _build_tiny_liquid_decoder(hidden: int = 8, vocab: int = 16):
 class LiquidExportFilenameTests(unittest.TestCase):
     def test_text_export_uses_model_filename(self):
         exporter = LiquidModelExporter.__new__(LiquidModelExporter)
-        exporter._export_dir = Path("export/onnx/fp32/static")
+        exporter._export_dir = Path("export/fp32/static")
 
         self.assertEqual(
             exporter._export_path_for_component("model"),
-            Path("export/onnx/fp32/static/model.onnx"),
+            Path("export/fp32/static/model.onnx"),
         )
 
     def test_split_lm_head_uses_transformer_filenames(self):
         exporter = LiquidModelExporter.__new__(LiquidModelExporter)
-        exporter._export_dir = Path("export/onnx/fp32/static")
+        exporter._export_dir = Path("export/fp32/static")
         exporter._split_lm_head = True
 
         self.assertEqual(
             exporter._export_path_for_component("model"),
-            Path("export/onnx/fp32/static/transformer.onnx"),
+            Path("export/fp32/static/transformer.onnx"),
         )
         self.assertEqual(
             exporter._export_path_for_component("model_prefill"),
-            Path("export/onnx/fp32/static/transformer_prefill.onnx"),
+            Path("export/fp32/static/transformer_prefill.onnx"),
         )
 
     def test_vl_batch_prefill_uses_distinct_decoder_filename(self):
         exporter = LiquidVLModelExporter.__new__(LiquidVLModelExporter)
-        exporter._export_dir = Path("export/onnx/fp32/static")
+        exporter._export_dir = Path("export/fp32/static")
 
         self.assertEqual(
             exporter._export_path_for_component(DECODER),
-            Path("export/onnx/fp32/static/decoder_model_merged.onnx"),
+            Path("export/fp32/static/decoder_model_merged.onnx"),
         )
         self.assertEqual(
             exporter._export_path_for_component(DECODER_PREFILL),
-            Path("export/onnx/fp32/static/decoder_model_merged_prefill.onnx"),
+            Path("export/fp32/static/decoder_model_merged_prefill.onnx"),
         )
 
     def test_vl_split_lm_head_uses_transformer_filenames(self):
         exporter = LiquidVLModelExporter.__new__(LiquidVLModelExporter)
-        exporter._export_dir = Path("export/split_lm_head/onnx/fp32/static")
+        exporter._export_dir = Path("export/split_lm_head/fp32/static")
         exporter._split_lm_head = True
 
         self.assertEqual(
             exporter._export_path_for_component(DECODER),
-            Path("export/split_lm_head/onnx/fp32/static/transformer.onnx"),
+            Path("export/split_lm_head/fp32/static/transformer.onnx"),
         )
         self.assertEqual(
             exporter._export_path_for_component(DECODER_PREFILL),
-            Path("export/split_lm_head/onnx/fp32/static/transformer_prefill.onnx"),
+            Path("export/split_lm_head/fp32/static/transformer_prefill.onnx"),
         )
         self.assertEqual(
             exporter._export_path_for_component(VISION),
-            Path("export/split_lm_head/onnx/fp32/static/vision_encoder.onnx"),
+            Path("export/split_lm_head/fp32/static/vision_encoder.onnx"),
         )
 
 
@@ -585,6 +585,7 @@ class LiquidVLRuntimeAssetTests(unittest.TestCase):
             _onnx_dir=source_dir,
             _models_dir=self.tmp,
             _config_dict=_CONFIG,
+            _conv_L_cache=_CONFIG.get("conv_L_cache", 3),
             _split_lm_head=False,
             _simulate_bf16=False,
         )
@@ -618,12 +619,6 @@ class LiquidVLRuntimeAssetTests(unittest.TestCase):
 
         self.assertEqual(json.loads((export_dir / "config.json").read_text()), _CONFIG)
         self.assertEqual((export_dir / "tokenizer.json").read_text(), "vl-tokenizer")
-
-    def test_runtime_assets_parent_is_decoder_export_dir(self):
-        export_dir = self.tmp / "export" / "split_lm_head" / "onnx" / "fp32" / "static"
-        exporter = self._vl_exporter(_export_paths={DECODER: export_dir / "transformer.onnx"})
-
-        self.assertEqual(exporter._runtime_assets_parent(), export_dir)
 
     def test_dynamic_quantization_updates_decoder_path_and_stages_assets(self):
         import onnx

@@ -149,34 +149,19 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                     subfolder=f"onnx/merged/{self._model_size}/{self._model_dtype}",
                     local_dir=self._models_dir / "source",
                 )
-        export_dir = (
-            self._models_dir
-            / "export"
-            / "onnx"
-            / self._model_dtype
-            / ("static" if self._static_models else "dynamic")
-        )
-        quantize_dir = (
-            self._models_dir
-            / "export"
-            / "onnx"
-            / "quantized"
-            / ("static" if self._static_models else "dynamic")
-        )
-        convert_dir = (
-            self._models_dir 
-            / "export"
-            / "onnx"
-            / "converted"
-            / ("static" if self._static_models else "dynamic")
-        )
-        torq_dir = (
-            self._models_dir
-            / "export"
-            / "torq"
-            / ("converted" if self._convert_dtypes else self._model_dtype)
-            / ("static" if self._static_models else "dynamic")
-        )
+        suffix = "static" if self._static_models else "dynamic"
+        root = self._models_dir / "export"
+        export_dir = root / self._model_dtype / suffix
+        # DQL output lives under 'dql', not 'quantized': moonshine's
+        # `-d quantized` is itself a (pre-quantized source) model dtype, so a
+        # 'quantized' variant dir would collide with it.
+        quantize_dir = root / "dql" / suffix
+        convert_dir = root / "converted" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
