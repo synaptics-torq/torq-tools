@@ -145,7 +145,7 @@ Example: run Moonshine Streaming inference (point `-m` at an export dir containi
 `encoder.onnx`, `decoder.onnx`, the `*.npy` LUTs and `tokenizer.json`):
 ```bash
 python -m src.torq.models.moonshine_streaming.infer apostle.wav \
-  -m models/UsefulSensors/moonshine-streaming-tiny/export/onnx/float/static -s tiny
+  -m models/UsefulSensors/moonshine-streaming-tiny/export/float/static -s tiny
 ```
 
 ### CLI usage

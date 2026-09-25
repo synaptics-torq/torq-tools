@@ -70,8 +70,8 @@ torq-export-model liquid-vl \
 ```
 
 That produces the text decoder only. To produce the **whole board bundle** in
-one run — single-token decoder, its lower-TTFT split, the static vision encoder
-and the image-prefill parts — add the three artifact flags (see
+one run — single-token decoder, the static vision encoder and the
+image-prefill parts — add the two artifact flags (see
 [Artifacts](#artifacts-what-each-flag-produces)):
 
 ```sh
@@ -81,9 +81,12 @@ torq-export-model liquid-vl \
   --convert-dtypes \
   --skip-validation \
   --vision-res 256 \
-  --split-decoder \
   --image-decoder-parts
 ```
+
+The lower-TTFT body/head split (`--split-lm-head`) exports into its **own**
+`export/split_lm_head/…` tree (like the text-only liquid export), so it is a
+second run rather than an extra flag on the one above:
 
 Add `--skip-torq` to stop at the ONNX.
 
@@ -101,7 +104,10 @@ VL-specific flags (everything else matches `torq-export-model liquid`):
 |---|---|
 | `--models-dir` | base dir; reads `<dir>/source/onnx/fp32/` and writes `<dir>/export/` |
 | `--vision-res {128,256}` | build + compile the **static** SigLIP encoder (`vision_encoder_<res>.vmfb`); 256 → 64 image tokens, 128 → 16 |
-| `--split-decoder` | also emit `decoder_nolm.vmfb` + `lm_head.vmfb` (lower-TTFT split) |
+| `--split-lm-head` | gemma3-style split at ONNX-export time: the decoder becomes the body `transformer.onnx` (`last_hidden_states` output) + a first-class `lm_head.onnx` (hidden→logits). Lower-TTFT as the head runs only when sampling. Static exports only |
+| `--chunk-lm-head` | revert to the legacy 512-chunk lm_head MatMul split (default: a single `[1024, 65536]` MatMul; tile-and-fuse handles it) |
+| `--batch-prefill N` | also emit the fixed-shape `transformer_prefill.onnx` LLM decoder (N tokens per step, stays fused); requires `--split-lm-head`; static exports only; the vision encoder is unaffected |
+| `--dynamic-quantize` | int8 dynamic-quantize every exported component (decoder, prefill, head, vision); `--dynamic-quantization-skip-model COMPONENT…` exempts components |
 | `--image-decoder-parts [N]` | build + compile the one-shot image-prefill decoder, split into N layer parts (bare = 2) |
 | `--compile-vision` | compile the *dynamic* encoder as-is (experimental; dynamic shapes + exotic ops — prefer `--vision-res`) |
 | `--skip-torq` | stop after ONNX export |
@@ -115,35 +121,48 @@ VL-specific flags (everything else matches `torq-export-model liquid`):
 > shape-fold iteration cap accordingly (the 350m path is untouched).
 
 Output on disk after the **full-bundle** run above (a default run produces the
-same tree minus the vision / split / image-part entries):
+same tree minus the vision / image-part entries; a `--split-lm-head` run
+produces the same tree under `export/split_lm_head/` with the split decoder
+entries instead of the fused one):
 
 ```
 models/liquid-2p5-450M-VL/export/
-├── onnx/
+├── unified/                                   (default runs)
 │   ├── fp32/static/
 │   │   ├── decoder_model_merged.onnx      (~1.4 GB)
 │   │   ├── vision_encoder.onnx            (~363 MB, fp32, dynamic — for ORT)
-│   │   └── token_embeddings.npy           (~256 MB, fp32)
+│   │   ├── token_embeddings.npy           (~256 MB, fp32)
+│   │   ├── config.json                    ← staged (flat text config)
+│   │   ├── tokenizer.json                 ← staged
+│   │   └── compiled/                      (f32 runs; vmfbs + one .mlir each)
 │   └── bf16/static/                        ← convert dir; also the build scratch
 │       ├── decoder_model_merged.onnx      (~676 MB)
-│       ├── decoder_nolm.onnx              (~548 MB)   --split-decoder
-│       ├── lm_head.onnx                   (~128 MB)   --split-decoder
 │       ├── vision_encoder_256.onnx        (~182 MB)   --vision-res 256 (compile input)
 │       ├── vision_encoder_256.fp32.onnx   (~363 MB)   fp32 static build (ORT reference)
 │       ├── decoder_image_2part_A.onnx     (~277 MB)   --image-decoder-parts
 │       ├── decoder_image_2part_B.onnx     (~244 MB)   --image-decoder-parts
-│       └── token_embeddings.npy           (~128 MB, bf16)
-└── iree/bf16/static/                       ← board bundle (+ one .mlir per vmfb)
-    ├── decoder_model_merged.vmfb          (~679 MB)   single-token decoder
-    ├── decoder_nolm.vmfb                  (~550 MB)
-    ├── lm_head.vmfb                       (~128 MB)
-    ├── vision_encoder_256.vmfb            (~1.77 GB!)  static SigLIP encoder
-    ├── decoder_image_2part_A.vmfb          (~336 MB)   one-shot image prefill
-    ├── decoder_image_2part_B.vmfb          (~296 MB)
-    ├── token_embeddings.npy               (~128 MB)   ← staged for the runner
-    ├── config.json                                    ← staged (flat text config)
-    └── tokenizer.json                                 ← staged
+│       ├── token_embeddings.npy           (~128 MB, bf16)
+│       ├── config.json                    ← staged (flat text config)
+│       ├── tokenizer.json                 ← staged
+│       └── compiled/                      ← board bundle (vmfbs + one .mlir each)
+└── split_lm_head/…                           (--split-lm-head runs; same shape as
+    │                                          `unified/` above, with instead of the fused decoder):
+    ├── fp32/static/
+    │   ├── transformer.onnx               (~1.1 GB)   body (last_hidden_states output)
+    │   ├── lm_head.onnx                   (~268 MB)   hidden -> logits
+    │   ├── transformer_prefill.onnx       (with --batch-prefill N; stays fused)
+    │   └── … (vision / LUT / config / tokenizer as above)
+    └── bf16/static/compiled/
+        ├── transformer.vmfb
+        ├── lm_head.vmfb
+        └── transformer_prefill.vmfb       (with --batch-prefill N)
 ```
+
+Compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory of
+the variant that is actually compiled — here `bf16/static/compiled/` (the
+convert dir), since the VL run converts to bf16 before compiling. The runtime
+assets are staged into that same variant dir, so it is a self-contained
+board bundle.
 
 > **Open issue — vision vmfb size.** The 256-res encoder compiles to ~1.77 GB
 > from a 182 MB bf16 input, while every other component lands ~1:1 with its
@@ -169,46 +188,57 @@ runner in `torq-examples` with `token_embeddings.npy`.
 ### Artifacts (what each flag produces)
 
 The board's deployment bundle (downloaded from `Synaptics/liquidAI-LFM2-VLM`)
-is reproducible from this command, one flag per artifact:
+is reproducible from this command, one flag per artifact. Note that the
+lower-TTFT split exports into its **own tree** (`export/split_lm_head/…`,
+gemma3-style), so the fused decoder and the body/head pair come from two runs:
 
 | board vmfb / file | produced by |
 |---|---|
-| `decoder_model_merged.vmfb` (a.k.a. `decoder_main.vmfb`) | default (the merged decoder + lm_head) |
-| `decoder_nolm.vmfb` + `lm_head.vmfb` | `--split-decoder` (lower-TTFT body/lm_head split) |
+| `decoder_model_merged.vmfb` (a.k.a. `decoder_main.vmfb`) | default unified run (the merged decoder + lm_head) |
+| `transformer.vmfb` + `lm_head.vmfb` | `--split-lm-head` (lower-TTFT body/lm_head split; supersedes the legacy `decoder_nolm.vmfb` of `--split-decoder`) |
+| `transformer_prefill.vmfb` (N-token prefill) | `--split-lm-head --batch-prefill N` |
 | `vision_encoder_256.vmfb` (64 tokens) / `vision_encoder_128.vmfb` (16 tokens) | `--vision-res 256` / `--vision-res 128` (static SigLIP encoder; compile is heavy but succeeds). One res per run. The bundle ships the 128 build under the legacy name `vision_encoder.vmfb`; rename after export if the runner is pointed at that name. |
 | `decoder_image_2part_A/B.vmfb` (one-shot image prefill) | `--image-decoder-parts` (bare = 2-part, the shipping split; `3` / `5` are alternates) |
-| `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically |
+| `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically (export, convert, and iree dirs) |
 
-Every board artifact is reproducible from one `torq-export-model liquid-vl`
-invocation — the three flags compose, so the full-bundle command in §1 emits all
-six vmfbs in a single run. Compile is heavy for the vision encoder and the
+Every board artifact from one topology is reproducible from a single
+`torq-export-model liquid-vl` invocation — the flags compose, so the
+full-bundle command in §1 emits the vision and image-part vmfbs alongside the
+fused decoder in one run. Compile is heavy for the vision encoder and the
 image-decoder parts (`--torq-max-nss-programs-size` is raised automatically for
 both).
 
-> The vision encoder, the `decoder_nolm`/`lm_head` split and the image-decoder
-> parts are all built during `convert_models`, i.e. *after* `export_onnx`'s
-> static-shape verification loop has run, so each is checked by
-> `_verify_static_build` as it is registered: graph I/O dims must be concrete and
-> no tensor may carry a symbolic dim. It logs the verified I/O per component —
-> a quick way to confirm e.g. that the 256-res encoder really is
-> `pixel_values [1, 256, 768] -> [64, 1024]` (64 image tokens).
+> The vision encoder and the image-decoder parts are built during
+> `convert_models`, i.e. *after* `export_onnx`'s static-shape verification loop
+> has run, so each is checked by `_verify_static_build` as it is registered:
+> graph I/O dims must be concrete and no tensor may carry a symbolic dim. It
+> logs the verified I/O per component — a quick way to confirm e.g. that the
+> 256-res encoder really is `pixel_values [1, 256, 768] -> [64, 1024]` (64
+> image tokens). The `--split-lm-head` body/head pair is verified in the
+> `export_onnx` loop like every other component.
 
 ---
 
 ## 2. Deploy to the board (text decoder)
 
-The `iree/bf16/static/` dir is self-contained for the LiquidStatic runner
-(vmfb + LUT + config + tokenizer all staged):
+The `bf16/static/` convert dir of a run is self-contained for the LiquidStatic
+runner (vmfb + LUT + config + tokenizer all staged; vmfbs in `compiled/`):
 
 ```sh
-M=models/liquid-2p5-450M-VL/export/iree/bf16/static
+M=models/liquid-2p5-450M-VL/export/unified/bf16/static
 scp \
-  $M/decoder_model_merged.vmfb \
+  $M/compiled/decoder_model_merged.vmfb \
   $M/token_embeddings.npy \
   $M/config.json \
   $M/tokenizer.json \
   <board-user>@<board-host>:/path/to/torq-examples/models/Synaptics/LFM2-VL-450M-torq/
 ```
+
+For the lower-TTFT split deployment, point the runner at the split tree's body
+`transformer.vmfb` instead and copy `lm_head.vmfb` alongside it —
+`LiquidStatic` auto-loads the head from the body's directory and chains it
+onto decode steps (the prefill, when present, stays fused and is skipped by
+the head).
 
 Then run the text decoder on the board with the LFM2.5 runner, pointing `-m`
 at the VL decoder vmfb (the runner feeds `token_embedding` from the staged

@@ -122,6 +122,8 @@ Users then get `--apply-graph-edit NAME[:ARGS]` (repeatable, YAML args), `--appl
 
 The harness core and registry live in `src/torq/graph_edit/harness.py`; add unit coverage under `tests/unit/graph_edit/test_harness.py`.
 
+`OnnxGraphEditor` supports per-edit intermediate dumps for manual graph inspection: pass `dump_path` and `dump_after_edit` (``"all"`` or a comma-separated edit-name list), and the editor writes the current graph after each matching edit as `<export-dir>/intermediates/0001_<EditName>_<component>.onnx`. Each editor continues from the highest index already written for its component, so snapshots stay ordered across static and post-static editor instances. Dump weights are always externalized before their `.data` sidecar is discarded, leaving lightweight structural snapshots regardless of `--split-weights`. The shared CLI flags `--dump-after-edit[=EDITS]` (graph-edit harness args) and `--split-weights` (ONNX args) remain orthogonal: `GraphEditHarness` stores the dump trigger (validated like the other edit names), while `OnnxModelExporterBase` stores `split_weights` for final component exports only. An exporter opts in by (a) passing `split_weights=args.split_weights` through to its `super().__init__`, (b) adding `**self._editor_dump_kwargs(final_path)` at each `OnnxGraphEditor` construction site (the kwargs stay empty when the flag is off), and (c) routing any post-export component re-saves through `self._save_component_model` so `--split-weights` splits the final export (tensor data above 1024 bytes goes to the adjacent `<model>.onnx.data`; see `save_onnx_split_weights` in `torq/utils/onnx.py`).
+
 
 ## Tools and Utilities
 

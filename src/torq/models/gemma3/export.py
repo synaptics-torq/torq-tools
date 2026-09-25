@@ -58,6 +58,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         hf_repo: str | None = None,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -67,6 +68,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         split_lm_head: bool = False,
         trim_vocab_groups: list[str] | None = None,
         trim_byte_fallback: bool = True,
+        split_weights: bool = False,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -122,6 +124,21 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             raise ValueError("`--trim-vocab` is currently supported only for static Gemma exports")
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static Gemma exports")
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not self._split_lm_head:
+                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+        self._batch_prefill = batch_prefill
+
+        opt_config = ORTOptimizerConfig(
+            num_heads=self._config.num_attention_heads,
+            hidden_size=self._config.hidden_size,
+        )
 
         super().__init__(
             "fp32",
@@ -131,14 +148,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             show_model_info=show_model_info,
             dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
-            opt_configs={"model": ORTOptimizerConfig(
-                num_heads=self._config.num_attention_heads,
-                hidden_size=self._config.hidden_size
-            )}
+            opt_configs={"model": opt_config, "model_prefill": opt_config},
+            split_weights=split_weights,
         )
 
     def _setup_dirs(self) -> list[Path]:
-        onnx_dir, export_dir, convert_dir, torq_dir = [None] * 4
+        onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir = [None] * 5
         if self._onnx_source_dir is not None:
             onnx_dir = self._onnx_source_dir
         else:
@@ -171,42 +186,16 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._vocab_size = int(self._config.vocab_size)
         model_type = "trim" if self._trim_vocab else "full"
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
-        export_dir = (
-            self._models_dir / 
-            "export" / 
-            model_type /
-            model_topology /
-            "onnx" / 
-            self._model_dtype / 
-            ("static" if self._static_models else "dynamic")
-        )
-        quantize_dir = (
-            self._models_dir 
-            / "export"
-            / model_type
-            / model_topology
-            / "onnx"
-            / "quantized"
-            / ("static" if self._static_models else "dynamic")
-        )
-        convert_dir = (
-            self._models_dir 
-            / "export"
-            / model_type
-            / model_topology
-            / "onnx"
-            / "converted"
-            / ("static" if self._static_models else "dynamic")
-        )
-        torq_dir = (
-            self._models_dir
-            / "export"
-            / model_type
-            / model_topology
-            / "torq"
-            / ("converted" if self._convert_dtypes else self._model_dtype)
-            / ("static" if self._static_models else "dynamic")
-        )
+        suffix = "static" if self._static_models else "dynamic"
+        root = self._models_dir / "export" / model_type / model_topology
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "converted" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
@@ -227,6 +216,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
     def _export_path_for_component(self, component: str) -> Path:
         if component == "model":
             return self._export_dir / self._export_model_filenames[0]
+        if component == "model_prefill":
+            return self._export_dir / "transformer_prefill.onnx"
         return super()._export_path_for_component(component)
 
     def _resolve_source_asset_path(self, asset_name: str) -> Path:
@@ -322,10 +313,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("RemoveIsNaN"),
         ]
         blocks["model.static (KV cache)"] = [
-            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
-            EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
+            EditSpec(
+                "MaskFutureAttentionScores",
+                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+            ),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
-            EditSpec("ConvertToStaticIndex"),
+            EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
         ]
 
         patch = [
@@ -341,7 +335,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             patch.append(EditSpec(
                 "ExtractConstantLUT",
-                ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+                ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             ))
             patch.append(EditSpec(
                 "ComputeDequantizedLUT", (ctx("embeddings_path"), ctx("export_dtype"))
@@ -356,10 +350,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch (split LM head)"] = [
                 EditSpec("SplitLMHead", (ctx("lm_head_path"), "logits", "last_hidden_states"))
             ]
+        if self._batch_prefill is not None:
+            blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
     def _make_model_static(
-        self, model: onnx.ModelProto
+        self, model: onnx.ModelProto, component: str = "model", chunk_len: int = 1
     ) -> onnx.ModelProto:
         """
         Make model static by replacing dynamic dimensions with fixed values and applying necessary transformations.
@@ -382,8 +378,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
-        editor = Gemma3OnnxGraphEditor(graph, self._onnx_export_dtype)
-        editor.fix_io(self._max_gen_tokens)
+        editor = Gemma3OnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
+        )
+        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
 
         blocks = self.graph_edit_blocks()
         # Remove redundant Cast + isNaN ops
@@ -411,15 +411,20 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 "cur_len": cur_len,
                 "max_tokens": self._max_gen_tokens,
                 "export_dtype": self._onnx_export_dtype,
+                "chunk_len": chunk_len,
             },
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return new_model
 
-    def _patch_static_model(self, model_path: str | os.PathLike):
+    def _patch_static_model(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
-        editor = Gemma3OnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+        editor = Gemma3OnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         blocks = self.graph_edit_blocks()
         embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
@@ -427,6 +432,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch"], self._harness,
             {
                 "embeddings_path": embeddings_npy,
+                "save_embeddings_path": embeddings_npy if component == "model" else None,
                 "export_dtype": self._onnx_export_dtype,
             }
         )
@@ -450,11 +456,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._harness,
                 {
                     "kept_token_ids": np.array(spec.kept_model_ids, dtype=np.int64),
-                    "token_id_lut_path": token_id_lut_path,
+                    "token_id_lut_path": token_id_lut_path if component == "model" else None,
                 },
             )
 
         editor.reorder_graph_input("position_ids", 1)
+
+        if component == "model_prefill":
+            editor.apply_specs(blocks["model.patch (batch prefill)"], self._harness)
 
         if self._split_lm_head:
             lm_head_path = Path(model_path).parent / self._export_model_filenames[1]
@@ -465,20 +474,29 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             )
             lm_head_model = onnx.load(lm_head_path)
             lm_head_model.ir_version = model.ir_version
-            onnx.save(self.check_model(lm_head_model), lm_head_path)
+            self._save_component_model(self.check_model(lm_head_model), lm_head_path)
             self._export_paths["lm_head"] = lm_head_path
             self._logger.info("(lm_head) Saved split LM head to '%s'", str(lm_head_path))
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
-        onnx.save(new_model, model_path)
+        self._save_component_model(new_model, model_path)
 
     def make_static(self):
+        source_model = self.check_model(self._components["model"])
         self._logger.info("(model) Making graph static...")
-        self._components["model"] = self.check_model(self._components["model"])
-        self._components["model"] = self._make_model_static(self._components["model"])
+        self._components["model"] = self._make_model_static(source_model)
+        if self._batch_prefill is not None:
+            self._logger.info(
+                "(model_prefill) Making graph static with %d tokens...", self._batch_prefill
+            )
+            self._components["model_prefill"] = self._make_model_static(
+                source_model,
+                component="model_prefill",
+                chunk_len=self._batch_prefill,
+            )
 
-    def apply_post_static_patches(self, model_path: str | os.PathLike, _):
-        self._patch_static_model(model_path)
+    def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
+        self._patch_static_model(model_path, component)
         self._copy_runtime_assets(
             Path(model_path).parent,
             self._onnx_dir,
@@ -498,10 +516,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             repo_id=self._hf_repo,
             n_iters=n_iters,
             lm_head_path=self._export_paths.get("lm_head"),
+            prefill_model_path=self._export_paths.get("model_prefill"),
+            prefill_size=self._batch_prefill,
         )
 
     def convert_models(
-        self, 
+        self,
         convert_dir: str | os.PathLike | None = None,
         preserve_io: bool = False,
     ):
@@ -518,26 +538,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
         return result
 
-    def export_torq(
-        self,
-        torq_export_dir: str | os.PathLike | None = None,
-        torq_compile_args: list[str] | None = None,
-        use_binary: bool = False,
-        skip: list[str] | None = None,
-        local_compile: bool = False,
-        compiler_path: str | Path | None = None,
-    ):
-        result = super().export_torq(
-            torq_export_dir=torq_export_dir,
-            torq_compile_args=torq_compile_args,
-            use_binary=use_binary,
-            skip=skip,
-            local_compile=local_compile,
-            compiler_path=compiler_path,
-        )
-        self._copy_runtime_assets(self._torq_dir, self._export_paths["model"].parent)
-        return result
-
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = Gemma3ModelExporter(
@@ -549,6 +549,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         hf_repo=args.hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=args.batch_prefill,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
@@ -558,6 +559,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         split_lm_head=args.split_lm_head,
         trim_vocab_groups=args.trim_vocab_groups,
         trim_byte_fallback=args.trim_byte_fallback,
+        split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )

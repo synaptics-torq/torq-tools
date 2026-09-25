@@ -97,7 +97,7 @@ torq-export-model liquid \
 
 Like the other models (gemma3, smollm2), this single command **exports and
 compiles**: it produces the bf16 ONNX and then compiles it to a vmfb under
-`export/iree/bf16/static/`. Pass `--skip-torq` to stop at the ONNX.
+`export/<unified|split_lm_head>/bf16/static/compiled/`. Pass `--skip-torq` to stop at the ONNX.
 
 Flag breakdown:
 
@@ -109,37 +109,46 @@ Flag breakdown:
 | `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
 | `--instruct-model` | use the instruction-tuned variant (this is what enables ChatML at inference) |
 | `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
+| `--dynamic-quantize` | dynamically quantize every exported component to int8 weights; `--dynamic-quantization-skip-model COMPONENT…` exempts components (e.g. keep the `lm_head` fp32) |
+| `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. |
 | `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
 | `--compile-flags …` | extra flags forwarded to `torq-compile` (must be last). The liquid export already adds `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`. |
 
-Two opt-out flags for the chip-specific rewrites:
+Opt-out flags for the chip-specific rewrites:
 
 | flag | meaning |
 |---|---|
 | `--keep-conv1d` | leave the original depthwise Conv1D in place (useful for CPU/ORT targets) |
-| `--split-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
+| `--chunk-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
+| `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step; requires `--split-lm-head` (see [Batched prefill](#3-batched-prefill)) |
 
 > [!Note]
-> `--split-lm-head` here is **not** the gemma3 flag of the same name. This one chunks the lm_head MatMul *within* the single exported model; gemma3's extracts the lm_head into a separate `lm_head.onnx` file. Neither affects the other's export.
+> `--split-lm-head` is the same concept as gemma3's flag of the same name: the lm_head is extracted into a separate file so the body (hidden output) and the head (hidden→logits) can be deployed independently.
 
-Output on disk after a successful run:
+Output on disk after a successful run. As in gemma3, the topology gets its own directory level so a split export never overwrites a unified one (`export/unified/…` vs `export/split_lm_head/…`):
 
 ```
 models/liquid-2p5-350m/
 ├── source/onnx/fp32/model.onnx        (~1.4 GB — original HF safetensors, converted)
-└── export/onnx/
+└── export/<unified|split_lm_head>/    (--split-lm-head picks the latter)
     ├── fp32/static/
-    │   ├── model.onnx                (~1.4 GB)
+    │   ├── model.onnx                (~1.4 GB; unified export only)
+    │   ├── transformer.onnx          (~1.4 GB; split export body with last_hidden_states output)
+    │   ├── lm_head.onnx              (only with --split-lm-head; ~268 MB fp32)
+    │   ├── transformer_prefill.onnx  (only with --batch-prefill N; stays fused)
     │   ├── token_embeddings.npy      (~128 MB)
     │   ├── config.json
-    │   └── tokenizer.json
-    └── bf16/static/
-        ├── model.onnx                (~700 MB)
-        ├── token_embeddings.npy      (~128 MB)
-        ├── config.json
-        └── tokenizer.json
+    │   ├── tokenizer.json
+    │   └── compiled/                 (only without --skip-torq; one .vmfb + .mlir per component)
+    ├── quantized/static/             (only with --dynamic-quantize; int8 copy of every component)
+    └── bf16/static/                  (only with --convert-dtypes)
 ```
+
+The `compiled/` dir lives inside the variant that is actually compiled
+(`bf16/static/compiled/` with `--convert-dtypes`, `quantized/static/compiled/`
+with `--dynamic-quantize`), so each variant dir is a self-contained deployable
+unit and regenerating a variant's ONNX wipes its stale vmfbs alongside it.
 
 > [!Note]
 > The fp32 export is the right artifact to validate end-to-end through onnxruntime ("What is the capital of France?" → "The capital of France is Paris."). bf16 cannot be validated through ORT because the CPU MatMul kernel has no bf16 path; compare bf16 against fp32 via the host casting tools if you need a quality check.
@@ -149,8 +158,9 @@ models/liquid-2p5-350m/
 ## 2. Compile: bf16 ONNX → Torq vmfb
 
 Same as gemma3/smollm2: the Section 1 export command already compiles (unless
-you pass `--skip-torq`), writing `model.vmfb` to
-`export/iree/bf16/static/`. Compilation goes through the shared
+you pass `--skip-torq`), writing `model.vmfb` (or `transformer.vmfb` for a
+split export) to `export/<unified|split_lm_head>/<variant>/static/compiled/`
+(`<variant>` = `bf16` with `--convert-dtypes`, else the base dtype dir). Compilation goes through the shared
 `torq.utils.compile` driver (ONNX → MLIR via `iree-import-onnx`, then
 MLIR → vmfb via `torq-compile`), and the liquid export adds
 `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`
@@ -162,8 +172,8 @@ same driver directly (the output directory is created automatically):
 ```sh
 export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 python -m torq.utils.compile \
-  models/export/onnx/bf16/static/model.onnx \
-  -o models/export/iree/bf16/static/model.vmfb \
+  models/export/bf16/static/model.onnx \
+  -o models/export/bf16/static/compiled/model.vmfb \
   --compile-flags --torq-enable-transpose-optimization --torq-enable-split-constants-optimization
 ```
 
@@ -179,5 +189,30 @@ Notes:
 
 Output: `model.vmfb` (~712 MB for the full bf16 build, ~553 MB without
 lm_head, ~258 MB without FFN).
+
+---
+
+## 3. Batched prefill
+
+`--batch-prefill N` requires `--split-lm-head` and additionally emits
+`transformer_prefill.onnx`: the same static decoder with its token input pinned to
+exactly N positions. It takes `input_ids` / `token_embedding` of shape
+`[1, N]` / `[1, N, hidden]` plus a `position_ids [1, 1]` holding the chunk's
+*start* position, updates N consecutive KV-cache rows in one step, and emits
+the final position's logit (`logits [1, 1, vocab]`). The short-conv stack and
+the attention layers handle the chunk natively; RoPE rotates each sequence row
+by its own position, and the causal mask covers the N query rows. The decode
+model and the prefill model share KV-cache I/O shapes, so they can be driven
+alternately on the same cache state. The prefill component is converted to
+bf16 and compiled to the matching `*_prefill.vmfb` alongside the decode model by the
+same command.
+
+Inference (`LiquidStatic`) picks up the matching `*_prefill.onnx` /
+`*_prefill.vmfb` automatically when it sits next to the decode model, reading N from the
+prefill model's input metadata (pass `prefill_size=` explicitly for vmfb,
+which reports no shapes). Prompt processing then runs every complete N-token
+chunk through the prefill model and falls back to single-token decode for any
+remainder; generation always uses the decode model. Export validation compares
+the chunked runner against the unedited dynamic source ONNX.
 
 ---

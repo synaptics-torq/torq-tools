@@ -93,6 +93,12 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states"
     )
     parser.add_argument(
+        "--batch-prefill",
+        type=int,
+        metavar="N",
+        help="Export transformer_prefill.onnx with a fixed N-token prefill; requires --split-lm-head",
+    )
+    parser.add_argument(
         "--trim-vocab-groups",
         type=str,
         nargs="+",

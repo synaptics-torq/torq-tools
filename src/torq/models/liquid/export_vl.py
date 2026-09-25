@@ -49,6 +49,7 @@ from ...model_export.onnx import OnnxModelExporterBase
 # Component keys — match the source ONNX filenames so the base exporter writes
 # ``<comp>.onnx`` back out under the same names.
 DECODER = "decoder_model_merged"
+DECODER_PREFILL = "decoder_model_merged_prefill"
 VISION = "vision_encoder"
 EMBED_FILE = "embed_tokens.onnx"
 
@@ -86,10 +87,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
         *,
         instruct_model: bool = False,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
+        split_weights: bool = False,
         compile_vision: bool = False,
         keep_individual_kv_io: bool = False,
         static_models: bool = True,
@@ -103,6 +107,29 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._extract_embeddings = False
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
+        # --split-lm-head (gemma3-style, as in LiquidModelExporter) turns the
+        # decode model and, when exported, the batch-prefill model into
+        # bodies (lm_head dropped, last_hidden_states output) + emits a
+        # single standalone lm_head.onnx (last_hidden_states->logits) shared
+        # by both; it runs at ONNX-export time, so
+        # --convert-dtypes / --dynamic-quantize each apply to every component
+        # independently.
+        self._split_lm_head = edit_args.get("split_lm_head", False)
+        self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
+        if self._split_lm_head and not static_models:
+            raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not self._split_lm_head:
+                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+            if not static_models:
+                raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
+        self._batch_prefill = batch_prefill
         self._onnx_source_dir = onnx_source_dir
         self._model_size = "450m-vl"
         self._hf_repo = HF_REPO_VL
@@ -118,10 +145,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
-        self._split_lm_head = edit_args.get("split_lm_head", False)
-        # Also emit decoder_nolm.vmfb (body) + lm_head.vmfb (the board's
-        # lower-TTFT split) alongside the merged decoder.
-        self._split_decoder = edit_args.get("split_decoder", False)
 
         # --- resolve the text-decoder architecture config -------------------
         self._config_dict = self._resolve_text_config(onnx_source_dir, models_dir)
@@ -151,7 +174,9 @@ class LiquidVLModelExporter(LiquidModelExporter):
             self._config_dict,
             Path(models_dir),
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
             opt_configs={},  # LFM2 custom ops break the ORT bert optimizer
         )
 
@@ -228,13 +253,19 @@ class LiquidVLModelExporter(LiquidModelExporter):
             )
 
         suffix = "static" if self._static_models else "dynamic"
-        export_dir = self._models_dir / "export" / "onnx" / self._model_dtype / suffix
-        convert_dir = self._models_dir / "export" / "onnx" / "bf16" / suffix
-        iree_dir = (
-            self._models_dir / "export" / "iree"
-            / ("bf16" if self._convert_dtypes else self._model_dtype) / suffix
-        )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        # The topology level (like gemma3) keeps --split-lm-head exports in
+        # their own tree so they never overwrite a unified export's artifacts.
+        model_topology = "split_lm_head" if self._split_lm_head else "unified"
+        root = self._models_dir / "export" / model_topology
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "bf16" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _download_source(self, target_dir: Path):
         """Fetch the LFM2-VL ONNX components from the mirror repos.
@@ -288,6 +319,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
         )
 
     # -------------------------------------------------------------------- load
+    def _export_path_for_component(self, component: str) -> Path:
+        if getattr(self, "_split_lm_head", False):
+            # gemma3/base filenames for the split topology: the body is
+            # transformer.onnx (not the fused decoder_model_merged.onnx).
+            filenames = {
+                DECODER: "transformer.onnx",
+                DECODER_PREFILL: "transformer_prefill.onnx",
+            }
+            if component in filenames:
+                return self._export_dir / filenames[component]
+        return super()._export_path_for_component(component)
+
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         components: dict[str, onnx.ModelProto] = {DECODER: self._load_decoder()}
 
@@ -341,6 +384,15 @@ class LiquidVLModelExporter(LiquidModelExporter):
         replacement, exactly as LiquidModelExporter._load_onnx does for the
         single 350m model — but rename ``inputs_embeds`` to ``token_embedding``
         so the existing LiquidStatic runner / chip demo feed it unchanged."""
+        return self._convert_decoder(chunk_len=1, component=DECODER)
+
+    def _convert_decoder(self, chunk_len: int = 1, component: str = DECODER) -> onnx.ModelProto:
+        """Convert the VL decoder source ONNX (custom ops -> standard ONNX).
+
+        `chunk_len` selects the RoPE position layout the GQA decomposition
+        emits: 1 for single-token decode steps, N for the fixed-size batched
+        prefill step.
+        """
         model_path = self._onnx_dir / f"{DECODER}.onnx"
         self._val_model_path = model_path
 
@@ -354,12 +406,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
             if inp.name == "inputs_embeds":
                 inp.name = "token_embedding"
 
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
+        )
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
         self._logger.info("Replacing GroupQueryAttention ops...")
-        editor.apply_specs(blocks["source.convert (attention)"], self._harness)
+        editor.apply_specs(
+            blocks["source.convert (attention)"], self._harness, {"chunk_len": chunk_len}
+        )
         editor.graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
         ).toposort()
@@ -448,6 +506,22 @@ class LiquidVLModelExporter(LiquidModelExporter):
             import copy
             self._dynamic_decoder = copy.deepcopy(self._components[DECODER])
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
+        if self._batch_prefill is not None:
+            self._logger.info(
+                "(%s) Making graph static with %d tokens...",
+                DECODER_PREFILL, self._batch_prefill,
+            )
+            prefill_model = self._convert_decoder(
+                chunk_len=self._batch_prefill, component=DECODER_PREFILL
+            )
+            self._components[DECODER_PREFILL] = self.check_model(
+                prefill_model, skip_data_prop=True
+            )
+            self._components[DECODER_PREFILL] = self._make_model_static(
+                self._components[DECODER_PREFILL],
+                component=DECODER_PREFILL,
+                chunk_len=self._batch_prefill,
+            )
 
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
@@ -468,13 +542,21 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return component == VISION and not self._compile_vision
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
-        if component != DECODER:
+        if component not in (DECODER, DECODER_PREFILL):
             return
-        self._patch_static_model(model_path)
+        self._patch_static_model(model_path, component)
+        if self._split_lm_head:
+            # Split every body, including the batch-prefill one (gemma3-style);
+            # its head input is already sliced to the final token, so the
+            # existing lm_head.onnx (derived from the decode model) is reused.
+            self.make_lm_head_split(
+                model_path, write_lm_head=(component == DECODER)
+            )
         # The chip runner invokes the vmfb positionally, so pin the decoder's
         # leading inputs: token_embedding (0), position_ids (1).
         self._reorder_decoder_inputs(model_path)
-        if self._simulate_bf16:
+        self._stage_runtime_assets(Path(model_path).parent)
+        if self._simulate_bf16 and component == DECODER:
             self._logger.info("(model) Creating bf16-simulated copy...")
             sim_dir = Path(model_path).parent.parent / "bf16_sim" / "static"
             sim_dir.mkdir(parents=True, exist_ok=True)
@@ -486,8 +568,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
                 shutil.copy2(emb_src, sim_dir / "token_embeddings.npy")
             self._simulate_bf16_precision(sim_path)
 
-    @staticmethod
-    def _reorder_decoder_inputs(model_path: str | os.PathLike):
+    def _reorder_decoder_inputs(self, model_path: str | os.PathLike):
         """Pin ``token_embedding`` then ``position_ids`` as the first two graph
         inputs (the rest keep their order)."""
         order = ["token_embedding", "position_ids"]
@@ -497,7 +578,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         rest = [i for i in model.graph.input if i.name not in set(order)]
         del model.graph.input[:]
         model.graph.input.extend(front + rest)
-        onnx.save(model, model_path)
+        self._save_component_model(model, model_path)
 
     # ----------------------------------------------------------------- convert
     def convert_models(
@@ -542,12 +623,10 @@ class LiquidVLModelExporter(LiquidModelExporter):
             emb = np.load(emb_src).astype(ml_dtypes.bfloat16)
             np.save(self._convert_dir / "token_embeddings.npy", emb)
             self._logger.info("(ONNX-convert) Wrote bf16 token_embeddings.npy")
+        self._stage_runtime_assets(self._convert_dir)
 
         if self._vision_res and vision_src:
             self._make_static_vision(vision_src)
-
-        if self._split_decoder:
-            self._make_decoder_split()
 
         if self._image_decoder_parts:
             self._make_image_decoder_parts()
@@ -679,86 +758,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         }
         self._logger.info("(%s) Verified static shapes; I/O %s", component, json.dumps(io))
 
-    def _make_decoder_split(self):
-        """Split the converted bf16 decoder into ``decoder_nolm`` (body, hidden
-        output) + ``lm_head`` (standalone hidden->logits), and register both so
-        export_torq compiles ``decoder_nolm.vmfb`` + ``lm_head.vmfb`` — the
-        board's lower-TTFT deployment (decode body on NPU, lm_head applied only
-        when sampling).
-
-        Structure-based (no hard-coded names): the lm_head is the node that
-        produces the vocab-logits graph output; its activation input is the
-        split boundary. Works whether the lm_head is a folded single MatMul or
-        the 512-chunk split.
-        """
-        import copy
-        from onnx import helper, TensorProto
-
-        src_path = self._export_paths[DECODER]
-        model = onnx.load(src_path, load_external_data=True)
-        g = model.graph
-        bf16 = TensorProto.BFLOAT16
-
-        logits_name = "logits"
-        if not any(o.name == logits_name for o in g.output):
-            logits_name = next(
-                o.name for o in g.output
-                if o.type.tensor_type.shape.dim
-                and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
-            )
-        init_names = {i.name for i in g.initializer}
-        lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
-                    or (n.name and "lm_head" in n.name)]
-        # The activation feeding the lm_head (the final-norm hidden state): an
-        # lm_head input that no other lm_head node produces and isn't a weight.
-        lm_produced = {o for n in lm_nodes for o in n.output}
-        lm_inputs = {i for n in lm_nodes for i in n.input}
-        hidden_name = next(
-            i for i in lm_inputs
-            if i and i not in init_names and i not in lm_produced
-        )
-        lm_node_names = {n.name for n in lm_nodes}
-
-        # ---- decoder_nolm: drop lm_head node(s), expose hidden as output -----
-        body = onnx.ModelProto()
-        body.CopyFrom(model)
-        bg = body.graph
-        del bg.node[:]
-        bg.node.extend([n for n in g.node if n.name not in lm_node_names])
-        outs = [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])]
-        outs += [o for o in g.output if o.name != logits_name]
-        del bg.output[:]
-        bg.output.extend(outs)
-        used = {i for n in bg.node for i in n.input}
-        del bg.initializer[:]
-        bg.initializer.extend([i for i in g.initializer if i.name in used])
-        nolm_path = self._convert_dir / "decoder_nolm.onnx"
-        onnx.save(body, str(nolm_path), save_as_external_data=False)
-
-        # ---- lm_head: standalone hidden -> logits ---------------------------
-        weights = [copy.deepcopy(i) for i in g.initializer
-                   if i.name in (lm_inputs & init_names)]
-        lm_graph = helper.make_graph(
-            [copy.deepcopy(n) for n in lm_nodes],
-            "main",
-            [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])],
-            [helper.make_tensor_value_info(logits_name, bf16, [1, 1, self._vocab_size])],
-            weights,
-        )
-        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
-        lm_model.ir_version = model.ir_version
-        lmh_path = self._convert_dir / "lm_head.onnx"
-        onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
-
-        self._verify_static_build("decoder_nolm", nolm_path)
-        self._verify_static_build("lm_head", lmh_path)
-        self._export_paths["decoder_nolm"] = nolm_path
-        self._export_paths["lm_head"] = lmh_path
-        self._logger.info(
-            "(split) derived decoder_nolm (%d nodes) + lm_head (%d node(s)) from '%s'",
-            len(bg.node), len(lm_nodes), src_path.name,
-        )
-
     # ------------------------------------------------------------------ compile
     def export_torq(self, *args, skip: list[str] | None = None,
                     torq_compile_args: list[str] | None = None, **kwargs):
@@ -777,61 +776,75 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return super().export_torq(*args, skip=skip, torq_compile_args=extra, **kwargs)
 
     # ------------------------------------------------------- deployment assets
-    def stage_deploy_assets(self):
-        """Place the runner's sidecar files next to the decoder vmfb.
+    def _find_tokenizer(self) -> Path | None:
+        """Resolve tokenizer.json: source dir → local 350m → HF."""
+        tok = self._onnx_dir / "tokenizer.json"
+        if tok.exists():
+            return tok
+        cand = (
+            self._models_dir.parent / "liquid-2p5-350m"
+            / "source" / "onnx" / "fp32" / "tokenizer.json"
+        )
+        if cand.exists():
+            return cand
+        try:
+            from huggingface_hub import hf_hub_download
+            for repo in (HF_REPO_VL, HF_REPO_TEXT_FALLBACK):
+                try:
+                    return Path(hf_hub_download(repo, "tokenizer.json"))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
 
-        The LiquidStatic runner loads ``token_embeddings.npy``, ``config.json``
-        and ``tokenizer.json`` from the vmfb's parent directory. The LFM2-VL
-        source ships no config/tokenizer, so we write the resolved text config
-        and copy a tokenizer (from the source dir, else the local 350m, else
-        HF) into the iree output dir."""
+    def _stage_runtime_assets(self, dst_dir: str | os.PathLike) -> None:
+        """Write the runner's sidecar files (flat text config + tokenizer)
+        into dst_dir, creating it if needed.
+
+        The LFM2-VL source ships no config.json next to the ONNX (and the VL
+        repo's nests the text-decoder params under ``text_config``), while the
+        runner wants the flat LFM2.5-style config — so the *resolved*
+        ``_config_dict`` is written rather than a source file copied."""
         import shutil
 
-        dest = self._torq_dir  # export/iree/<dtype>/<static|dynamic>
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        if not (dst_dir / "config.json").exists():
+            try:
+                with open(dst_dir / "config.json", "w") as f:
+                    json.dump(self._config_dict, f, indent=2)
+            except Exception as e:
+                self._logger.warning("Could not write config.json to '%s': %s", dst_dir, e)
+        tokenizer = self._find_tokenizer()
+        if tokenizer is None:
+            self._logger.warning(
+                "No tokenizer.json found for LFM2-VL; place one next to the "
+                "exported model before running the demo."
+            )
+        else:
+            shutil.copy2(tokenizer, dst_dir / "tokenizer.json")
+
+    def stage_deploy_assets(self):
+        """Place the token-embedding LUT in the variant dir next to compiled/.
+
+        The LiquidStatic runner loads ``token_embeddings.npy``, ``config.json``
+        and ``tokenizer.json`` from the vmfb's deploy directory. The config
+        and tokenizer are staged into the variant dir by
+        ``apply_post_static_patches``; the LUT is the one asset that differs by
+        dtype (bf16 if converted, else fp32)."""
+        import shutil
+
+        dest = self._torq_dir.parent  # <variant>/static, next to compiled/
         if not dest.exists():
             return
 
-        # token-embedding LUT (bf16 if converted, else fp32)
         lut = (self._convert_dir / "token_embeddings.npy")
         if not lut.exists():
             lut = self._embed_lut_path()
         if lut.exists():
             shutil.copy2(lut, dest / "token_embeddings.npy")
-
-        # resolved (flat) text config
-        try:
-            with open(dest / "config.json", "w") as f:
-                json.dump(self._config_dict, f, indent=2)
-        except Exception as e:
-            self._logger.warning("Could not write config.json: %s", e)
-
-        # tokenizer.json: source dir → local 350m → HF
-        tok_src = self._onnx_dir / "tokenizer.json"
-        if not tok_src.exists():
-            cand = (
-                self._models_dir.parent / "liquid-2p5-350m"
-                / "source" / "onnx" / "fp32" / "tokenizer.json"
-            )
-            tok_src = cand if cand.exists() else None
-        if tok_src is None:
-            try:
-                from huggingface_hub import hf_hub_download
-                for repo in (HF_REPO_VL, HF_REPO_TEXT_FALLBACK):
-                    try:
-                        tok_src = Path(hf_hub_download(repo, "tokenizer.json"))
-                        break
-                    except Exception:
-                        continue
-            except Exception:
-                tok_src = None
-        if tok_src is not None and Path(tok_src).exists():
-            shutil.copy2(tok_src, dest / "tokenizer.json")
-            self._logger.info("Staged deploy assets (LUT, config, tokenizer) -> '%s'", dest)
-        else:
-            self._logger.warning(
-                "No tokenizer.json found for LFM2-VL; place one next to the vmfb "
-                "before running the demo."
-            )
+            self._logger.info("Staged token-embedding LUT -> '%s'", dest)
 
     # --------------------------------------------------------------- validation
     def validate_onnx(self, n_iters: int = 3):
@@ -850,18 +863,21 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     exporter = LiquidVLModelExporter(
         instruct_model=args.instruct_model,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=args.batch_prefill,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
+        split_weights=args.split_weights,
         compile_vision=args.compile_vision,
         keep_individual_kv_io=args.keep_individual_kv_io,
         static_models=not args.dynamic_models,
         broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
+        chunk_lm_head=args.chunk_lm_head,
         split_lm_head=args.split_lm_head,
-        split_decoder=args.split_decoder,
         vision_res=args.vision_res,
         image_decoder_parts=args.image_decoder_parts,
     )
@@ -870,6 +886,13 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:

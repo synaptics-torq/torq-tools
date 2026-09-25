@@ -117,11 +117,14 @@ class LiquidModelExporter(OnnxModelExporterBase):
         static_models: bool = True,
         *,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
         model_dtype: str = "fp32",
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
+        dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
+        split_weights: bool = False,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -139,9 +142,30 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # short conv, so by default we replace each depthwise Conv1D with a
         # bit-exact batched-MatMul chain.  The 512-chunk lm_head split is no
         # longer needed now that tile-and-fuse is default — the exporter emits
-        # a single [1024, 65536] MatMul unless --split-lm-head is passed.
+        # a single [1024, 65536] MatMul unless --chunk-lm-head is passed.
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
+        # --split-lm-head (gemma3-style) turns the decode model and, when
+        # exported, the batch-prefill model into bodies (lm_head dropped,
+        # last_hidden_states output) + emits a single standalone
+        # lm_head.onnx (last_hidden_states->logits) shared by both; it runs
+        # at ONNX-export time, so --convert-dtypes / --dynamic-quantize each
+        # apply to every component independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
+        self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
+        if self._split_lm_head and not static_models:
+            raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not self._split_lm_head:
+                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+            if not static_models:
+                raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
+        self._batch_prefill = batch_prefill
 
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
@@ -177,7 +201,9 @@ class LiquidModelExporter(OnnxModelExporterBase):
             # is reused instead of re-downloaded, and matches the README paths.
             Path(models_dir) / f"liquid-2p5-{model_size}",
             show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
             # LFM2's custom ops break the ORT bert optimizer; skip it.
             opt_configs={},
         )
@@ -190,28 +216,20 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if not onnx_dir.exists() or not any(onnx_dir.glob("model.onnx*")):
             self._download_from_hf(onnx_dir)
 
-        export_dir = (
-            self._models_dir
-            / "export"
-            / "onnx"
-            / self._model_dtype
-            / ("static" if self._static_models else "dynamic")
-        )
-        convert_dir = (
-            self._models_dir
-            / "export"
-            / "onnx"
-            / "bf16"
-            / ("static" if self._static_models else "dynamic")
-        )
-        iree_dir = (
-            self._models_dir
-            / "export"
-            / "iree"
-            / ("bf16" if self._convert_dtypes else self._model_dtype)
-            / ("static" if self._static_models else "dynamic")
-        )
-        return onnx_dir, export_dir, convert_dir, iree_dir
+        # The topology level (like gemma3) keeps --split-lm-head exports in
+        # their own tree so they never overwrite a unified export's artifacts.
+        model_topology = "split_lm_head" if self._split_lm_head else "unified"
+        suffix = "static" if self._static_models else "dynamic"
+        root = self._models_dir / "export" / model_topology
+        export_dir = root / self._model_dtype / suffix
+        quantize_dir = root / "quantized" / suffix
+        convert_dir = root / "bf16" / suffix
+        # Compiled artifacts live in the variant that is actually compiled
+        # (see the base class contract for _setup_dirs).
+        variant_dir = convert_dir if self._convert_dtypes else (
+            quantize_dir if self._dynamic_quantize else export_dir)
+        torq_dir = variant_dir / "compiled"
+        return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
     def _download_from_hf(self, target_dir: Path):
         from huggingface_hub import hf_hub_download
@@ -257,50 +275,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         )
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
-        from onnx.external_data_helper import (
-            load_external_data_for_model,
-            convert_model_to_external_data,
-        )
-
-        model_path = self._onnx_dir / "model.onnx"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
-        # Reference for validation is the original (unmodified) source model
-        self._val_model_path = model_path
-
-        # Load weights inline so subsequent edits / saves don't need external
-        # data file resolution.
-        model = onnx.load(model_path, load_external_data=True)
-        orig_ir = model.ir_version
-
-        graph = gs.import_onnx(model)
-        graph.name = "main"
-
-        # Replace ORT custom ops with standard ONNX ops in the source graph.
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
-        blocks = self.graph_edit_blocks()
-        self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
-        editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
-        self._logger.info("Folding external RotaryEmbedding ops into GQA...")
-        self._fold_external_rotary_into_gqa(editor.graph)
-        self._logger.info("Replacing GroupQueryAttention ops...")
-        editor.apply_specs(blocks["source.convert (attention)"], self._harness)
-
-        editor.graph.cleanup(
-            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
-        ).toposort()
-        model = gs.export_onnx(editor.graph)
-        model.ir_version = orig_ir
-
-        # Drop the com.microsoft opset import if no custom ops remain.
-        has_ms_ops = any(n.domain == "com.microsoft" for n in model.graph.node)
-        if not has_ms_ops:
-            for opset in list(model.opset_import):
-                if opset.domain == "com.microsoft":
-                    model.opset_import.remove(opset)
-        else:
-            remaining = sorted({n.op_type for n in model.graph.node if n.domain == "com.microsoft"})
-            self._logger.warning("Keeping com.microsoft opset; remaining ops: %s", remaining)
+        model = self._convert_source_model(chunk_len=1, component="model")
 
         # Save the converted dynamic ONNX as a single self-contained file
         # (weights inline, no external .onnx_data) so it can be opened in
@@ -325,6 +300,73 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._logger.warning("Could not save single-file source model: %s", e)
 
         return {"model": model}
+
+    def _export_path_for_component(self, component: str) -> Path:
+        if getattr(self, "_split_lm_head", False):
+            filenames = {
+                "model": "transformer.onnx",
+                "model_prefill": "transformer_prefill.onnx",
+            }
+            if component in filenames:
+                return self._export_dir / filenames[component]
+        return super()._export_path_for_component(component)
+
+    def _convert_source_model(
+        self, chunk_len: int = 1, component: str = "model"
+    ) -> onnx.ModelProto:
+        """Load the source ONNX and replace its com.microsoft custom ops.
+
+        `chunk_len` selects the RoPE position layout the GQA decomposition
+        emits: 1 for single-token decode steps, N for the fixed-size batched
+        prefill step.  Called once per component because the two layouts
+        differ.
+        """
+        model_path = self._onnx_dir / "model.onnx"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
+        # Reference for validation is the original (unmodified) source model
+        self._val_model_path = model_path
+
+        # Load weights inline so subsequent edits / saves don't need external
+        # data file resolution.
+        model = onnx.load(model_path, load_external_data=True)
+        orig_ir = model.ir_version
+
+        graph = gs.import_onnx(model)
+        graph.name = "main"
+
+        # Replace ORT custom ops with standard ONNX ops in the source graph.
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
+        )
+        blocks = self.graph_edit_blocks()
+        self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
+        editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
+        self._logger.info("Folding external RotaryEmbedding ops into GQA...")
+        self._fold_external_rotary_into_gqa(editor.graph)
+        self._logger.info("Replacing GroupQueryAttention ops...")
+        editor.apply_specs(
+            blocks["source.convert (attention)"], self._harness, {"chunk_len": chunk_len}
+        )
+
+        editor.graph.cleanup(
+            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+        ).toposort()
+        model = gs.export_onnx(editor.graph)
+        model.ir_version = orig_ir
+
+        # Drop the com.microsoft opset import if no custom ops remain.
+        has_ms_ops = any(n.domain == "com.microsoft" for n in model.graph.node)
+        if not has_ms_ops:
+            for opset in list(model.opset_import):
+                if opset.domain == "com.microsoft":
+                    model.opset_import.remove(opset)
+        else:
+            remaining = sorted({n.op_type for n in model.graph.node if n.domain == "com.microsoft"})
+            self._logger.warning("Keeping com.microsoft opset; remaining ops: %s", remaining)
+        return model
 
     @staticmethod
     def sanitize_onnx_names(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -470,6 +512,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "source.convert (attention)": [
                 EditSpec("ReplaceGroupQueryAttention", (
                     self._num_attention_heads, self._num_key_value_heads, self._head_dim,
+                    ctx("chunk_len"),
                 )),
             ],
             "model.static": [
@@ -477,10 +520,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 EditSpec("RemoveIsNaN"),
             ],
             "model.static (KV cache)": [
-                EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
-                EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+                EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
+                EditSpec(
+                    "MaskFutureAttentionScores",
+                    (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+                ),
                 EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
-                EditSpec("ConvertToStaticIndex"),
+                EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
             ],
         }
         patch = [
@@ -495,16 +541,27 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             blocks["model.patch (embeddings)"] = [EditSpec(
                 "ExtractConstantLUT",
-                ((self._vocab_size, self._hidden_size), ctx("embeddings_path"), "token_embedding"),
+                ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             )]
+        if self._batch_prefill is not None:
+            blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
-    def _make_model_static(self, model: onnx.ModelProto) -> onnx.ModelProto:
+    def _make_model_static(
+        self,
+        model: onnx.ModelProto,
+        component: str = "model",
+        chunk_len: int = 1,
+    ) -> onnx.ModelProto:
         graph: gs.Graph = gs.import_onnx(model)
-        editor = LiquidOnnxGraphEditor(graph, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor(
+            graph,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component(component)),
+        )
 
         # Fix all dynamic IO dims first.
-        editor.fix_io(self._max_gen_tokens)
+        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
 
         # Fold `num_logits_to_keep` -> constant 1 (autoregressive decode).
         editor.fold_num_logits_to_keep(1)
@@ -559,6 +616,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "cur_len": cur_len,
                 "max_tokens": self._max_gen_tokens,
                 "export_dtype": self._onnx_export_dtype,
+                "chunk_len": chunk_len,
             },
         )
 
@@ -971,6 +1029,26 @@ class LiquidModelExporter(OnnxModelExporterBase):
         return model, 0
 
     @staticmethod
+    def _conv_matmul_names(model: onnx.ModelProto, conv_l_cache: int) -> list[str]:
+        """Names of the MatMul nodes the conv1d replacement emitted.
+
+        ``_replace_conv1d_with_matmul`` gives each conv time-step MatMul a
+        rank-3 constant weight ``[C, conv_l_cache, 1]``; no other MatMul in
+        the model has a rank-3 weight, so the match is unambiguous.
+        """
+        inits = {i.name: i for i in model.graph.initializer}
+        names = []
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            w = inits.get(node.input[1])
+            if w is None or w.data_type != onnx.TensorProto.FLOAT:
+                continue
+            if len(w.dims) == 3 and int(w.dims[1]) == conv_l_cache and int(w.dims[2]) == 1:
+                names.append(node.name)
+        return names
+
+    @staticmethod
     def _inject_zero_bias_into_conv(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
         """LFM2.5's config has ``conv_bias: false`` so every ONNX Conv op
         ships with no bias input.  torq-compile's depthwise-conv lowering
@@ -1118,9 +1196,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
         )
         return model
 
-    def _patch_static_model(self, model_path: str | os.PathLike):
+    def _patch_static_model(self, model_path: str | os.PathLike, component: str):
         model = onnx.load(model_path)
-        editor = LiquidOnnxGraphEditor.from_onnx(model, self._onnx_export_dtype)
+        editor = LiquidOnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
+        )
 
         editor.apply_specs(self.graph_edit_blocks()["model.patch"], self._harness)
 
@@ -1135,7 +1217,9 @@ class LiquidModelExporter(OnnxModelExporterBase):
             editor.apply_specs(
                 self.graph_edit_blocks()["model.patch (embeddings)"],
                 self._harness,
-                {"embeddings_path": embeddings_npy},
+                # Only the decode component writes the LUT; the prefill pass
+                # reuses it.
+                {"save_embeddings_path": embeddings_npy if component == "model" else None},
             )
             editor.reorder_graph_input("token_embedding", 0)
 
@@ -1167,8 +1251,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if n_bias:
             self._logger.info("(conv-bias) Injected zero bias into %d Conv op(s)", n_bias)
         # lm_head: default to a single [1024, 65536] MatMul (tile-and-fuse
-        # handles it); --split-lm-head keeps the legacy 512-chunk split.
-        if self._split_lm_head:
+        # handles it); --chunk-lm-head keeps the legacy 512-chunk split.
+        if self._chunk_lm_head:
             new_model, n_chunks = self._split_lm_head_matmul(new_model, chunk_size=128)
             if n_chunks:
                 self._logger.info("(lm-head) Split lm_head MatMul into %d chunks", n_chunks)
@@ -1187,7 +1271,26 @@ class LiquidModelExporter(OnnxModelExporterBase):
             )
         except Exception as e:
             self._logger.warning("(lm-head) shape inference after split: %s", e)
-        onnx.save(new_model, model_path)
+
+        if component.endswith("_prefill"):
+            # The prefill model's LM head only needs the final position's
+            # logit; slice its input before the head.  No-op when the head
+            # isn't a direct MatMul (chunked --chunk-lm-head or a
+            # num_logits_to_keep slice), which already emits last-token logits.
+            new_model = self._take_last_token(new_model, Path(model_path))
+
+        self._save_component_model(new_model, model_path)
+
+    def _take_last_token(self, model: onnx.ModelProto, model_path: Path) -> onnx.ModelProto:
+        editor = LiquidOnnxGraphEditor.from_onnx(
+            model,
+            self._onnx_export_dtype,
+            **self._editor_dump_kwargs(model_path),
+        )
+        editor.apply_specs(
+            self.graph_edit_blocks()["model.patch (batch prefill)"], self._harness
+        )
+        return editor.to_onnx(override_ir=model.ir_version, strict_mode=False)
 
     def make_static(self):
         self._logger.info("(model) Making graph static...")
@@ -1195,9 +1298,37 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._components["model"], skip_data_prop=True
         )
         self._components["model"] = self._make_model_static(self._components["model"])
+        if self._batch_prefill is not None:
+            self._logger.info(
+                "(model_prefill) Making graph static with %d tokens...",
+                self._batch_prefill,
+            )
+            prefill_model = self._convert_source_model(
+                chunk_len=self._batch_prefill, component="model_prefill"
+            )
+            self._components["model_prefill"] = self.check_model(
+                prefill_model, skip_data_prop=True
+            )
+            self._components["model_prefill"] = self._make_model_static(
+                self._components["model_prefill"],
+                component="model_prefill",
+                chunk_len=self._batch_prefill,
+            )
 
-    def apply_post_static_patches(self, model_path: str | os.PathLike, _):
-        self._patch_static_model(model_path)
+    def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
+        self._patch_static_model(model_path, component)
+        if self._split_lm_head:
+            # Split every body, including the batch-prefill;
+            # its hidden-state output is already sliced to the final token, so the
+            # existing lm_head.onnx is reused.
+            self.make_lm_head_split(
+                model_path, write_lm_head=(component == "model")
+            )
+        self._copy_runtime_assets(
+            Path(model_path).parent,
+            self._onnx_dir,
+            include_npy_data=False,
+        )
         if self._simulate_bf16:
             self._logger.info("(model) Creating bf16-simulated copy...")
             sim_dir = Path(model_path).parent.parent / "bf16_sim" / "static"
@@ -1281,15 +1412,25 @@ class LiquidModelExporter(OnnxModelExporterBase):
         cfg_path = str(local_cfg) if local_cfg.exists() else None
         tok_path = str(local_tok) if local_tok.exists() else None
 
+        val_max_inp_len = None
         if self._static_models:
+            # Instruct warm-up consumes the prompt budget, so instruct prompts
+            # are left unpadded; base-model prompts are padded to exactly one
+            # chunk so the prefill graph is guaranteed to run.
+            if self._batch_prefill is not None and not self._instruct_model:
+                val_max_inp_len = self._batch_prefill
             runner = LiquidStatic.from_onnx(
                 self._export_paths["model"],
                 self._max_gen_tokens,
+                max_inp_len=val_max_inp_len,
                 n_threads=n_threads,
                 instruct_model=self._instruct_model,
                 repo_id=self._hf_repo,
                 config_path=cfg_path,
                 tokenizer_path=tok_path,
+                prefill_model_path=self._export_paths.get("model_prefill"),
+                prefill_size=self._batch_prefill,
+                lm_head_path=self._export_paths.get("lm_head"),
             )
         else:
             runner = LiquidDynamic.from_onnx(
@@ -1305,6 +1446,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             val_runner = LiquidDynamic.from_onnx(
                 self._val_model_path,
                 max_gen_tokens=self._max_gen_tokens,
+                max_inp_len=val_max_inp_len,
                 n_threads=n_threads,
                 instruct_model=self._instruct_model,
                 repo_id=self._hf_repo,
@@ -1349,6 +1491,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         ``torq.utils.compile`` driver via the base exporter.
         """
         merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
+        # Runtime assets already live in the variant dir next to compiled/.
         return super().export_torq(
             torq_export_dir=torq_export_dir,
             torq_compile_args=merged_args,
@@ -1356,6 +1499,40 @@ class LiquidModelExporter(OnnxModelExporterBase):
             skip=skip,
             local_compile=local_compile,
             compiler_path=compiler_path,
+        )
+
+    def dynamic_quantize_models(
+        self,
+        quantize_dir: str | os.PathLike | None = None,
+        skip: list[str] | None = None,
+        analyze_nodes: bool = False,
+        **quantize_kwargs,
+    ):
+        """Dynamic quantization with the conv-block MatMuls kept out of int8.
+
+        While torq-compiler can support dynamic quantized MatMuls, these specific
+        MatMulIntegers are batch-heavy and thus inefficient to compute scales and 
+        activations for. Therefore, exclude them from being quantized.
+        """
+        skip = skip or []
+        conv_names = []
+        for comp, model_path in self._export_paths.items():
+            if comp in skip:
+                continue
+            names = self._conv_matmul_names(
+                onnx.load(model_path, load_external_data=False), self._conv_L_cache
+            )
+            if names:
+                self._logger.info(
+                    "(conv-exclude) '%s': excluding %d conv MatMul node(s) from int8 quantization",
+                    comp, len(names),
+                )
+            conv_names.extend(names)
+        if conv_names:
+            excluded = list(quantize_kwargs.pop("exclude_nodes", None) or [])
+            quantize_kwargs["exclude_nodes"] = excluded + conv_names
+        super().dynamic_quantize_models(
+            quantize_dir=quantize_dir, skip=skip, analyze_nodes=analyze_nodes, **quantize_kwargs
         )
 
     def convert_models(
@@ -1393,26 +1570,36 @@ class LiquidModelExporter(OnnxModelExporterBase):
             if emb_src.exists():
                 emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
                 np.save(self._convert_dir / emb_src.name, emb_data)
+        self._copy_runtime_assets(
+            self._convert_dir, self._export_dir, include_npy_data=False
+        )
 
-    def make_decoder_split(self):
-        """Split the (bf16) decoder into ``body`` (decoder minus lm_head, hidden
-        output) + ``lm_head`` (standalone hidden->logits), registering both so
-        ``export_torq`` also compiles ``body.vmfb`` + ``lm_head.vmfb``.
+    def make_lm_head_split(
+        self, model_path: str | os.PathLike, write_lm_head: bool = True
+    ):
+        """Split the decoder at the lm_head boundary (gemma3-style): the
+        saved model becomes the body (lm_head node(s) dropped, the hidden
+        state exposed as ``last_hidden_states``) and a standalone
+        ``lm_head.onnx`` (``last_hidden_states`` -> logits) is written
+        next to it, so the quantize / convert / compile stages treat the
+        head as a first-class component.
 
-        This is the lower-TTFT deployment: the body runs every step, and the
-        ``[hidden, vocab]`` lm_head MatMul (~134 MB bf16) runs only when a token
-        is actually sampled — so it is **skipped during prefill** (every prefill
-        token except the last needs no logits). Requires ``--convert-dtypes``
-        (splits the converted bf16 model). Structure-based: the lm_head is the
-        node(s) producing the vocab-logits graph output, and its non-weight
+        Applied to every split-topology body, including the batch-prefill
+        model: its hidden states are sliced to the final token by
+        TakeLastToken or the source model's own Slice, so the head is identical to the
+        decode model's and ``write_lm_head=False`` reuses the existing
+        ``lm_head.onnx`` instead of re-writing it.
+        Works on the single-MatMul head and the legacy --chunk-lm-head
+        512-chunk split alike. Structure-based: the lm_head is the node(s)
+        producing the vocab-logits graph output, and its non-weight
         activation input is the split boundary."""
         import copy
-        from onnx import helper, TensorProto
+        from onnx import helper
 
-        src_path = self._export_paths["model"]
-        model = onnx.load(str(src_path), load_external_data=True)
+        model_path = Path(model_path)
+        HIDDEN_OUT = "last_hidden_states"
+        model = onnx.load(str(model_path), load_external_data=True)
         g = model.graph
-        bf16 = TensorProto.BFLOAT16
 
         logits_name = "logits"
         if not any(o.name == logits_name for o in g.output):
@@ -1422,8 +1609,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 and o.type.tensor_type.shape.dim[-1].dim_value == self._vocab_size
             )
         init_names = {i.name for i in g.initializer}
+        # Newer source exports put last-token selection under /lm_head/;
+        # keep it in the body so prefill exposes one hidden state.
         lm_nodes = [n for n in g.node if any(o == logits_name for o in n.output)
-                    or (n.name and "lm_head" in n.name)]
+                    or (n.name and "lm_head" in n.name
+                        and "num_logits_to_keep" not in n.name)]
         lm_produced = {o for n in lm_nodes for o in n.output}
         lm_inputs = {i for n in lm_nodes for i in n.input}
         hidden_name = next(
@@ -1431,44 +1621,84 @@ class LiquidModelExporter(OnnxModelExporterBase):
             if i and i not in init_names and i not in lm_produced
         )
         lm_node_names = {n.name for n in lm_nodes}
+        # Boundary dtype comes from the model (fp32 at export time; each later
+        # stage re-derives its own copies), not assumed.
+        dtypes = {
+            vi.name: vi.type.tensor_type.elem_type
+            for vi in list(g.value_info) + list(g.input) + list(g.output)
+        }
+        dtypes.update(
+            {i.name: i.data_type for i in g.initializer if i.name not in dtypes}
+        )
+        boundary = dtypes.get(hidden_name, self._onnx_export_dtype)
 
-        # ---- body: drop lm_head node(s), expose the hidden state as output ----
-        body = onnx.ModelProto()
-        body.CopyFrom(model)
-        bg = body.graph
-        del bg.node[:]
-        bg.node.extend([n for n in g.node if n.name not in lm_node_names])
-        outs = [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])]
+        # ---- body: drop the lm_head node(s) and expose the hidden state ----
+        keep_nodes = [n for n in g.node if n.name not in lm_node_names]
+        # The hidden state's only consumer is the dropped lm_head chain, so it
+        # can be renamed in place.
+        if any(hidden_name in n.input for n in keep_nodes):
+            raise ValueError(
+                f"split boundary '{hidden_name}' feeds other nodes; refusing "
+                f"to rename it to '{HIDDEN_OUT}'"
+            )
+        producer = next(n for n in keep_nodes if hidden_name in n.output)
+        for i, out in enumerate(producer.output):
+            if out == hidden_name:
+                producer.output[i] = HIDDEN_OUT
+        del g.node[:]
+        g.node.extend(keep_nodes)
+        outs = [helper.make_tensor_value_info(HIDDEN_OUT, boundary, [1, 1, self._hidden_size])]
         outs += [o for o in g.output if o.name != logits_name]
-        del bg.output[:]
-        bg.output.extend(outs)
-        used = {i for n in bg.node for i in n.input}
-        del bg.initializer[:]
-        bg.initializer.extend([i for i in g.initializer if i.name in used])
-        body_path = self._convert_dir / "body.onnx"
-        onnx.save(body, str(body_path), save_as_external_data=False)
+        del g.output[:]
+        g.output.extend(outs)
+        inits = list(g.initializer)
+        used = {i for n in g.node for i in n.input}
+        del g.initializer[:]
+        g.initializer.extend([i for i in inits if i.name in used])
+        # Drop value_info entries the trimmed graph no longer defines.
+        defined = {
+            o
+            for n in g.node
+            for o in n.output
+            if o
+        } | {i.name for i in g.input} | {i.name for i in g.initializer}
+        value_info = list(g.value_info)
+        del g.value_info[:]
+        g.value_info.extend(vi for vi in value_info if vi.name in defined)
+        self._save_component_model(model, model_path)
 
-        # ---- lm_head: standalone hidden -> logits -----------------------------
-        weights = [copy.deepcopy(i) for i in g.initializer
-                   if i.name in (lm_inputs & init_names)]
-        lm_graph = helper.make_graph(
-            [copy.deepcopy(n) for n in lm_nodes],
-            "main",
-            [helper.make_tensor_value_info(hidden_name, bf16, [1, 1, self._hidden_size])],
-            [helper.make_tensor_value_info(logits_name, bf16, [1, 1, self._vocab_size])],
-            weights,
-        )
-        lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
-        lm_model.ir_version = model.ir_version
-        lmh_path = self._convert_dir / "lm_head.onnx"
-        onnx.save(lm_model, str(lmh_path), save_as_external_data=False)
+        # ---- lm_head: standalone hidden -> logits ----------------------------
+        if write_lm_head:
+            weights = [copy.deepcopy(i) for i in inits if i.name in (lm_inputs & init_names)]
+            lm_nodes = [copy.deepcopy(n) for n in lm_nodes]
+            for n in lm_nodes:
+                for i, inp in enumerate(n.input):
+                    if inp == hidden_name:
+                        n.input[i] = HIDDEN_OUT
+            lm_graph = helper.make_graph(
+                lm_nodes,
+                "main",
+                [helper.make_tensor_value_info(HIDDEN_OUT, boundary, [1, 1, self._hidden_size])],
+                [helper.make_tensor_value_info(logits_name, boundary, [1, 1, self._vocab_size])],
+                weights,
+            )
+            lm_model = helper.make_model(lm_graph, opset_imports=list(model.opset_import))
+            lm_model.ir_version = model.ir_version
+            lmh_path = model_path.parent / "lm_head.onnx"
+            self._save_component_model(lm_model, lmh_path)
 
-        self._export_paths["body"] = body_path
-        self._export_paths["lm_head"] = lmh_path
-        self._logger.info(
-            "(split) derived body (%d nodes) + lm_head (%d node(s)) from '%s'",
-            len(bg.node), len(lm_nodes), src_path.name,
-        )
+            self._export_paths["lm_head"] = lmh_path
+            self._logger.info(
+                "(split) '%s' is now the body (%d nodes, '%s' output); derived "
+                "lm_head (%d node(s)) -> '%s'",
+                model_path.name, len(keep_nodes), HIDDEN_OUT, len(lm_nodes), lmh_path.name,
+            )
+        else:
+            self._logger.info(
+                "(split) '%s' is now the body (%d nodes, '%s' output); "
+                "reusing the existing lm_head.onnx",
+                model_path.name, len(keep_nodes), HIDDEN_OUT,
+            )
 
 
 def export_liquid_from_args(args: argparse.Namespace):
@@ -1480,14 +1710,18 @@ def export_liquid_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=args.batch_prefill,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
+        dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
+        split_weights=args.split_weights,
         broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
+        chunk_lm_head=args.chunk_lm_head,
         split_lm_head=args.split_lm_head,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
@@ -1495,10 +1729,15 @@ def export_liquid_from_args(args: argparse.Namespace):
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    if args.dynamic_quantize:
+        exporter.dynamic_quantize_models(
+            skip=args.dynamic_quantization_skip_model,
+            analyze_nodes=args.dynamic_quantize_analyze_nodes,
+            uint8_weights=args.dynamic_quantize_uint8_weights,
+            per_tensor=args.dynamic_quantize_per_tensor,
+        )
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
-        if getattr(args, "split_decoder", False):
-            exporter.make_decoder_split()
     if not args.skip_torq:
         exporter.export_torq(
             torq_compile_args=args.compile_flags or [],

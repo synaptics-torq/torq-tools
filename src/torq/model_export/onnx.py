@@ -31,6 +31,7 @@ from ..utils.onnx import (
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
+    save_onnx_split_weights,
 )
 from .cleanup import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
@@ -72,6 +73,7 @@ class OnnxModelExporterBase(ABC):
         convert_dtypes: bool = False,
         opt_configs: Mapping[str, ORTOptimizerConfig] | None = None,
         skip_export: list[str] | None = None,
+        split_weights: bool = False,
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
 
@@ -89,6 +91,11 @@ class OnnxModelExporterBase(ABC):
         except KeyError:
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
+        # --split-weights: export component files with tensor data above 1024
+        # bytes in an external <model>.onnx.data file (see
+        # save_onnx_split_weights); also the storage form for --dump-after-edit
+        # files.
+        self._split_weights = split_weights
         # Directory setup (which downloads or optimum-exports the source model)
         # and loading that source ONNX are deferred to _prepare(), so read-only
         # commands like --view-graph-edits can build an exporter without hitting
@@ -162,7 +169,21 @@ class OnnxModelExporterBase(ABC):
         }
 
     @abstractmethod
-    def _setup_dirs(self) -> list[Path]: ...
+    def _setup_dirs(self) -> list[Path]:
+        """Return ``(onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir)``.
+
+        ``export_dir`` / ``quantize_dir`` / ``convert_dir`` are the per-variant
+        trees (base dtype, quantized, converted); each is self-contained
+        (ONNX components + runtime assets) so it can be deployed as-is.
+
+        ``torq_dir`` is the ``compiled/`` subdirectory of the variant that is
+        actually compiled (``convert_dir`` when ``convert_dtypes``, else
+        ``quantize_dir`` when ``dynamic_quantize``, else ``export_dir``): the
+        vmfbs + MLIR live right next to their source ONNX, and since every
+        pipeline step wipes its own destination dir up front, regenerating a
+        variant's ONNX always removes its stale compiled artifacts.
+        """
+        ...
 
     @abstractmethod
     def _load_onnx(self) -> dict[str, onnx.ModelProto]: ...
@@ -194,7 +215,7 @@ class OnnxModelExporterBase(ABC):
         optimized_model = onnx.shape_inference.infer_shapes(
             optimized_model, check_type=True, strict_mode=True, data_prop=False
         )
-        onnx.save(optimized_model, model_path)
+        self._save_component_model(optimized_model, model_path)
 
     @abstractmethod
     def make_static(self): ...
@@ -217,6 +238,34 @@ class OnnxModelExporterBase(ABC):
 
     def _export_path_for_component(self, component: str) -> Path:
         return self._export_dir / f"{component}.onnx"
+
+    def _save_component_model(self, model: onnx.ModelProto, path: str | os.PathLike) -> None:
+        """Save an exported component, honoring ``--split-weights``."""
+        if self._split_weights:
+            save_onnx_split_weights(model, path)
+        else:
+            onnx.save(model, str(path))
+
+    def _editor_dump_kwargs(self, final_path: Path) -> dict:
+        """Editor kwargs enabling per-edit graph dumps next to the final model file.
+
+        The dump trigger comes from the attached graph-edit harness
+        (``--dump-after-edit``). Dumps land in ``<export-dir>/intermediates``
+        so the final export (and later pipeline steps) never clobbers them.
+        """
+        harness = self._harness
+        if harness is None or harness.dump_after_edit is None:
+            return {}
+        return {
+            "dump_path": final_path.parent / "intermediates" / final_path.name,
+            "dump_after_edit": harness.dump_after_edit,
+        }
+
+    def _copy_external_data(self, src: str | os.PathLike, dst: Path) -> None:
+        """Copy the ``<src>.data`` file next to ``dst`` when present."""
+        data_src = Path(src).with_name(Path(src).name + ".data")
+        if data_src.exists():
+            shutil.copy2(data_src, dst.parent / data_src.name)
 
     @staticmethod
     def sanitize_onnx_names(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -289,7 +338,7 @@ class OnnxModelExporterBase(ABC):
                     )
             self._logger.info("(%s) Checking model...", comp)
             model = self.check_model(model)
-            onnx.save(model, self._export_paths[comp])
+            self._save_component_model(model, self._export_paths[comp])
             self._logger.info("(%s) Optimizing model...", comp)
             if (opt_config := self._opt_configs.get(comp)):
                 self.optimize_model(self._export_paths[comp], opt_config)
@@ -346,6 +395,7 @@ class OnnxModelExporterBase(ABC):
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._quantize_dir))
+                self._copy_external_data(model_path, self._export_paths[comp])
                 continue
             self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
             quantized_model_path = self._quantize_dir / model_path.name
@@ -395,6 +445,7 @@ class OnnxModelExporterBase(ABC):
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._convert_dir))
+                self._copy_external_data(model_path, self._export_paths[comp])
                 continue
             self._logger.info("(ONNX-convert) Converting model '%s' to dtype bf16...", str(model_path))
             converted_model_path = self._convert_dir / model_path.name

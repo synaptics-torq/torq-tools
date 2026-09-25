@@ -22,6 +22,7 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
     Args:
         cur_len (gs.Variable): Graph input to represent current sequence length
         max_tokens (int): Maximum sequence length
+        chunk_len (int): Number of consecutive cache rows to update
 
     Raises:
         ValueError: If Concat node doesn't have expected attributes
@@ -35,8 +36,11 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
 
     cur_len: gs.Variable
     max_tokens: int
+    chunk_len: int = 1
 
     def __post_init__(self):
+        if not 1 <= self.chunk_len <= self.max_tokens:
+            raise ValueError("chunk_len must be between 1 and max_tokens")
         self.output_names = {o.name for o in self.graph.outputs}
         return super().__post_init__()
 
@@ -62,28 +66,111 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
         past_cache_vals, new_cache_val = node.inputs
         output = node.outputs[0]
 
-        # create mask for current position
         mask_shape = [1, 1, self.max_tokens, 1]
         if not (time_ids := self.graph.tensors().get("time_ids")):
             time_ids = gs.Constant(
                 "time_ids", np.arange(self.max_tokens, dtype=np.int64).reshape(*mask_shape)
             )
-        mask = self.graph.layer(
-            name=output.name + "_update_mask",
-            op="Equal",
-            inputs=[time_ids, self.cur_len],
-            outputs=[
-                gs.Variable(
-                    f"{output.name}_mask_eq", dtype=onnx.TensorProto.BOOL, shape=mask_shape
-                )
-            ],
-        )[0]
+        if self.chunk_len == 1:
+            mask = self.graph.layer(
+                name=output.name + "_update_mask",
+                op="Equal",
+                inputs=[time_ids, self.cur_len],
+                outputs=[
+                    gs.Variable(
+                        f"{output.name}_mask_eq", dtype=onnx.TensorProto.BOOL, shape=mask_shape
+                    )
+                ],
+            )[0]
+            placed_cache = new_cache_val
+        else:
+            chunk_offsets = gs.Constant(
+                output.name + "_chunk_offsets",
+                np.arange(self.chunk_len, dtype=np.int64).reshape(1, 1, 1, self.chunk_len),
+            )
+            chunk_positions = self.graph.layer(
+                name=output.name + "_chunk_positions",
+                op="Add",
+                inputs=[self.cur_len, chunk_offsets],
+                outputs=[gs.Variable(
+                    output.name + "_chunk_position_values",
+                    dtype=np.int64,
+                    shape=[1, 1, 1, self.chunk_len],
+                )],
+            )[0]
+            scatter_mask = self.graph.layer(
+                name=output.name + "_scatter_mask",
+                op="Equal",
+                inputs=[time_ids, chunk_positions],
+                outputs=[gs.Variable(
+                    output.name + "_scatter_mask_bool",
+                    dtype=onnx.TensorProto.BOOL,
+                    shape=[1, 1, self.max_tokens, self.chunk_len],
+                )],
+            )[0]
+            scatter_weights = self.graph.layer(
+                name=output.name + "_scatter_weights",
+                op="Where",
+                inputs=[
+                    scatter_mask,
+                    gs.Constant(
+                        output.name + "_scatter_one",
+                        np.asarray(1, dtype=np.dtype(new_cache_val.dtype)),
+                    ),
+                    gs.Constant(
+                        output.name + "_scatter_zero",
+                        np.asarray(0, dtype=np.dtype(new_cache_val.dtype)),
+                    ),
+                ],
+                outputs=[gs.Variable(
+                    output.name + "_scatter_weights_float",
+                    dtype=new_cache_val.dtype,
+                    shape=[1, 1, self.max_tokens, self.chunk_len],
+                )],
+            )[0]
+            placed_cache = self.graph.layer(
+                name=output.name + "_place_new_kv",
+                op="MatMul",
+                inputs=[scatter_weights, new_cache_val],
+                outputs=[gs.Variable(
+                    output.name + "_placed_new",
+                    dtype=new_cache_val.dtype,
+                    shape=list(past_cache_vals.shape),
+                )],
+            )[0]
+            chunk_end = self.graph.layer(
+                name=output.name + "_chunk_end",
+                op="Add",
+                inputs=[
+                    self.cur_len,
+                    gs.Constant(output.name + "_chunk_len", np.asarray([self.chunk_len], dtype=np.int64)),
+                ],
+                outputs=[gs.Variable(output.name + "_chunk_end_value", dtype=np.int64, shape=[1])],
+            )[0]
+            at_or_after_start = self.graph.layer(
+                name=output.name + "_at_or_after_start",
+                op="GreaterOrEqual",
+                inputs=[time_ids, self.cur_len],
+                outputs=[gs.Variable(output.name + "_ge_start", dtype=onnx.TensorProto.BOOL, shape=mask_shape)],
+            )[0]
+            before_end = self.graph.layer(
+                name=output.name + "_before_end",
+                op="Less",
+                inputs=[time_ids, chunk_end],
+                outputs=[gs.Variable(output.name + "_lt_end", dtype=onnx.TensorProto.BOOL, shape=mask_shape)],
+            )[0]
+            mask = self.graph.layer(
+                name=output.name + "_update_mask",
+                op="And",
+                inputs=[at_or_after_start, before_end],
+                outputs=[gs.Variable(output.name + "_mask_range", dtype=onnx.TensorProto.BOOL, shape=mask_shape)],
+            )[0]
 
         # blend new value into cache using the mask
         self.graph.layer(
             name=output.name + "_blend_kv",
             op="Where",
-            inputs=[mask, new_cache_val, past_cache_vals],
+            inputs=[mask, placed_cache, past_cache_vals],
             outputs=[output],
         )
 
@@ -120,16 +207,20 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
             shape's last dim is ``max_tokens``/``max_tokens + 1``. Off by
             default to preserve exact matching for existing (non-dynamo)
             exports.
+        chunk_len (int): Number of consecutive query rows to mask
     """
 
     cur_len: gs.Variable
     max_tokens: int
     export_dtype: onnx.TensorProto.DataType
     match_shape_fallback: bool = False
+    chunk_len: int = 1
 
     def __post_init__(self):
         if self.export_dtype not in onnx.TensorProto.DataType.values():
             raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
+        if not 1 <= self.chunk_len <= self.max_tokens:
+            raise ValueError("chunk_len must be between 1 and max_tokens")
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
@@ -168,10 +259,30 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
                 "attn_mask_block", np.asarray(max_float, dtype=np.float32),
                 export_dtype=self.export_dtype
             )
+        query_positions = self.cur_len
+        if self.chunk_len > 1:
+            query_positions = self.graph.layer(
+                name=node.name + "_query_positions",
+                op="Add",
+                inputs=[
+                    self.cur_len,
+                    gs.Constant(
+                        node.name + "_query_offsets",
+                        np.arange(self.chunk_len, dtype=np.int64).reshape(1, 1, self.chunk_len, 1),
+                    ),
+                ],
+                outputs=[gs.Variable(
+                    node.name + "_query_position_values",
+                    dtype=np.int64,
+                    shape=[1, 1, self.chunk_len, 1],
+                )],
+            )[0]
+            mask_shape = [1, 1, self.chunk_len, self.max_tokens]
+
         mask_lte = self.graph.layer(
             name=node.name + "_lte_cur_len",
             op="LessOrEqual",
-            inputs=[time_axis, self.cur_len],
+            inputs=[time_axis, query_positions],
             outputs=[
                 gs.Variable(
                     node.name + "_less", dtype=onnx.TensorProto.BOOL, shape=mask_shape
@@ -254,16 +365,27 @@ class ConvertToStaticIndex(OnnxGraphEdit):
     """
     Convert dynamic Range-based indexing to static indexing if `index = Range(start, start + 1, 1)`.
 
-    Replaces redundant index computation `Range(start, start + 1, 1)` by wiring consumers to directly accept `start`.
+    Replaces a runtime-sized range with a fixed-shape position vector.
+
+    Args:
+        chunk_len (int): Number of consecutive positions in the fixed vector
 
     Raises:
         ValueError: If Range limit is not produced by an `Add` op
         ValueError: If Range start and limit don't share a common producer
 
     Notes:
-        - Directly connects Range start to consumers of Range node
+        - For one token, directly connects Range start to consumers
+        - For a token chunk, connects consumers to start plus constant offsets
         - Disconnects Range node from the graph
     """
+
+    chunk_len: int = 1
+
+    def __post_init__(self):
+        if self.chunk_len < 1:
+            raise ValueError("chunk_len must be positive")
+        return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
         return (
@@ -285,11 +407,29 @@ class ConvertToStaticIndex(OnnxGraphEdit):
                 f"Range node and limit node must have common producer for dynamic range replacement"
             )
         range_out: gs.Variable = node.outputs[0]
+        replacement = start
+        if self.chunk_len > 1:
+            replacement = self.graph.layer(
+                name=node.name + "_static_positions",
+                op="Add",
+                inputs=[
+                    start,
+                    gs.Constant(
+                        node.name + "_offsets",
+                        np.arange(self.chunk_len, dtype=np.int64),
+                    ),
+                ],
+                outputs=[gs.Variable(
+                    range_out.name + "_static",
+                    dtype=np.int64,
+                    shape=[self.chunk_len],
+                )],
+            )[0]
         consumers: list[gs.Node] = list(range_out.outputs)
         for consumer in consumers:
             for i, inp in enumerate(consumer.inputs):
                 if inp is range_out:
-                    consumer.inputs[i] = start
+                    consumer.inputs[i] = replacement
 
         # disconnect Range node
         node.inputs.clear()

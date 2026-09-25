@@ -37,6 +37,27 @@ def test_replace_dynamic_kv_cache_replaces_output_concat_with_where():
     assert {"Equal", "Where"}.issubset({node.op for node in g.nodes if node.outputs})
 
 
+def test_replace_dynamic_kv_cache_uses_fixed_shape_chunk_placement():
+    past = gs.Variable("past", dtype=np.float32, shape=[1, 1, 4, 2])
+    new = gs.Variable("new", dtype=np.float32, shape=[1, 1, 2, 2])
+    present = gs.Variable("present.0.key", dtype=np.float32, shape=[1, 1, 4, 2])
+    concat = gs.Node("Concat", "present_concat", inputs=[past, new], outputs=[present], attrs={"axis": -2})
+    g = graph(nodes=[concat], inputs=[past, new], outputs=[present])
+
+    ReplaceDynamicKVCache(
+        g, "unit", cur_len=gs.Variable("cur_len", dtype=np.int64, shape=[1]), max_tokens=4, chunk_len=2
+    ).transform(concat)
+
+    live_ops = {node.op for node in g.nodes if node.outputs}
+    assert {"Add", "And", "Equal", "GreaterOrEqual", "Less", "MatMul", "Where"}.issubset(live_ops)
+    assert "Pad" not in live_ops
+    scatter_mask = next(node.outputs[0] for node in g.nodes if node.name == "present.0.key_scatter_mask")
+    assert scatter_mask.dtype == onnx.TensorProto.BOOL
+    assert scatter_mask.shape == [1, 1, 4, 2]
+    placed = next(node.outputs[0] for node in g.nodes if node.name == "present.0.key_place_new_kv")
+    assert placed.shape == [1, 1, 4, 2]
+
+
 def test_mask_future_attention_scores_inserts_bias_add_when_producer_is_not_add():
     scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
     pre_softmax = gs.Variable("pre_softmax", dtype=np.float32, shape=[1, 1, 1, 4])
@@ -114,6 +135,23 @@ def test_convert_to_static_index_rewires_range_consumers_to_start():
 
     assert identity.inputs[0] is start
     assert range_node.outputs == []
+
+
+def test_convert_to_static_index_builds_fixed_chunk_positions():
+    start = gs.Variable("start", dtype=np.int64, shape=[])
+    limit = gs.Variable("limit", dtype=np.int64, shape=[])
+    rng = gs.Variable("range", dtype=np.int64, shape=[3])
+    out = gs.Variable("out", dtype=np.int64, shape=[3])
+    add = gs.Node("Add", "limit_add", inputs=[start, gs.Constant("three", np.array(3, dtype=np.int64))], outputs=[limit])
+    range_node = gs.Node("Range", "range", inputs=[start, limit, gs.Constant("delta", np.array(1, dtype=np.int64))], outputs=[rng])
+    identity = gs.Node("Identity", "use", inputs=[rng], outputs=[out])
+    g = graph(nodes=[add, range_node, identity], inputs=[start], outputs=[out])
+
+    ConvertToStaticIndex(g, "unit", chunk_len=3).transform(range_node)
+
+    assert identity.inputs[0].shape == [3]
+    assert range_node.outputs == []
+    assert all(node.op != "Range" for node in g.nodes if node.outputs)
 
 
 def test_retarget_cross_attention_key_layout_updates_producer_permutation_and_shape():
