@@ -60,13 +60,17 @@ all in one command:
 ```sh
 source .venv/bin/activate
 cd torq-tools-dev
-export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
+# Pin the compiler explicitly. TORQ_COMPILER_PATH is NOT enough: the driver
+# prefers the iree.compiler python API and ignores the env var (see the
+# compiler-pinning note below).
+C=/path/to/iree-build/third_party/iree/tools/torq-compile
 
 torq-export-model liquid-vl \
   --models-dir models/liquid-2p5-450M-VL \
   --instruct-model \
   --convert-dtypes \
-  --skip-validation
+  --skip-validation \
+  --use-binary --compiler-path $C
 ```
 
 That produces the text decoder only. To produce the **whole board bundle** in
@@ -82,7 +86,8 @@ torq-export-model liquid-vl \
   --skip-validation \
   --vision-res 256 \
   --split-decoder \
-  --image-decoder-parts
+  --image-decoder-parts \
+  --use-binary --compiler-path $C
 ```
 
 Add `--skip-torq` to stop at the ONNX.
@@ -137,7 +142,7 @@ models/liquid-2p5-450M-VL/export/
     ├── decoder_model_merged.vmfb          (~679 MB)   single-token decoder
     ├── decoder_nolm.vmfb                  (~550 MB)
     ├── lm_head.vmfb                       (~128 MB)
-    ├── vision_encoder_256.vmfb            (~1.77 GB!)  static SigLIP encoder
+    ├── vision_encoder_256.vmfb            (~192 MB)   static SigLIP encoder
     ├── decoder_image_2part_A.vmfb          (~336 MB)   one-shot image prefill
     ├── decoder_image_2part_B.vmfb          (~296 MB)
     ├── token_embeddings.npy               (~128 MB)   ← staged for the runner
@@ -145,16 +150,25 @@ models/liquid-2p5-450M-VL/export/
     └── tokenizer.json                                 ← staged
 ```
 
-> **Open issue — vision vmfb size.** The 256-res encoder compiles to ~1.77 GB
-> from a 182 MB bf16 input, while every other component lands ~1:1 with its
-> ONNX. The bundle on HuggingFace ships it at roughly 200 MB, and the board has
-> only ~1.9 GB of RAM, so this build is too big to deploy as-is. Prime suspect is
-> `--torq-max-nss-programs-size 402653184`: `export_torq` adds it as soon as
-> `--vision-res` *or* `--image-decoder-parts` is set, and the base exporter
-> passes one flag list to *every* component, so the encoder gets a 384 MB program
-> budget it may simply be filling. If confirmed, scope the flag to the
-> image-decoder parts only. Compile the ONNX by hand without the flag to compare
-> before trusting a `--vision-res` vmfb on the board.
+> **Pin the compiler, or the vision encoder bloats 9x.** `torq.utils.compile`
+> prefers the `iree.compiler` **Python API** and only falls back to the
+> `torq-compile` binary, so `TORQ_COMPILER_PATH` is *silently ignored* — a stale
+> compiler inside the installed python package will compile the whole bundle
+> while you believe you are on your current build. Measured on the same
+> `vision_encoder_256.mlir`, same flags, two compiler builds five weeks apart:
+>
+> | compiler | vmfb | compile time |
+> |---|---|---|
+> | stale build (python-package copy) | 1769.6 MB | ~10 min |
+> | current `main` | 192.2 MB | 14 s |
+> | shipped on HuggingFace | 193.5 MB | — |
+>
+> The board has ~1.9 GB of RAM, so the bloated build is undeployable — and it is
+> silent, since the compile succeeds. Pass `--use-binary --compiler-path
+> <iree-build>/third_party/iree/tools/torq-compile` to force a known compiler,
+> and sanity-check the vision vmfb against ~193 MB before shipping it. Neither
+> the NSS-program cap nor the builder's `split_matmul` / `ln_expand` transforms
+> are involved; all three were ruled out by A/B compiles.
 
 Each compile also leaves its imported `<component>.mlir` next to the vmfb
 (collectively ~3.7 GB for the full bundle); they are not needed on the board.
