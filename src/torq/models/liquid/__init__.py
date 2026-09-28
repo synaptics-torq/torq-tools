@@ -313,3 +313,53 @@ def add_liquid_infer_args(parser: argparse.ArgumentParser):
     )
     add_common_args(parser)
     add_logging_args(parser)
+
+
+def add_liquid_encoder_export_args(parser: argparse.ArgumentParser):
+    """Export args for LFM2.5-Encoder (bidirectional encoder, MLM head)."""
+    parser.add_argument(
+        "-s",
+        "--model-size",
+        type=str,
+        choices=MODEL_SIZES,
+        default="230m",
+        help="LFM2.5-Encoder model size to export (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        nargs="+",
+        default=[256],
+        metavar="S",
+        help="Static sequence length(s) to export (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        metavar="DIR",
+        help="Base directory for source and export models (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--skip-torq",
+        action="store_true",
+        default=False,
+        help="Skip compiling the exported ONNX to a Torq vmfb",
+    )
+    parser.add_argument(
+        "--keep-conv1d",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep the depthwise Conv1D nodes (default: replace with a "
+            "shift+mul+add chain that lowers to NSS elementwise kernels)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        default=False,
+        help="Skip ORT-vs-torch and pad-masking validation of the export",
+    )
+    add_logging_args(parser)
+    add_torq_args(parser)
