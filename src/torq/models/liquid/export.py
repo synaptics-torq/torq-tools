@@ -111,7 +111,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
     def __init__(
         self,
         model_size: Literal["350m", "230m"] = "350m",
-        instruct_model: bool = False,
         extract_embeddings: bool = False,
         keep_individual_kv_io: bool = False,
         static_models: bool = True,
@@ -127,7 +126,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         split_weights: bool = False,
         **edit_args
     ):
-        self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
         self._max_gen_tokens = max_gen_tokens
@@ -1412,19 +1410,14 @@ class LiquidModelExporter(OnnxModelExporterBase):
         cfg_path = str(local_cfg) if local_cfg.exists() else None
         tok_path = str(local_tok) if local_tok.exists() else None
 
-        val_max_inp_len = None
         if self._static_models:
-            # Instruct warm-up consumes the prompt budget, so instruct prompts
-            # are left unpadded; base-model prompts are padded to exactly one
-            # chunk so the prefill graph is guaranteed to run.
-            if self._batch_prefill is not None and not self._instruct_model:
-                val_max_inp_len = self._batch_prefill
+            # LFM2.5 is always exported instruct: the ChatML warm-up consumes
+            # the prompt budget, so validation prompts are left unpadded.
             runner = LiquidStatic.from_onnx(
                 self._export_paths["model"],
                 self._max_gen_tokens,
-                max_inp_len=val_max_inp_len,
                 n_threads=n_threads,
-                instruct_model=self._instruct_model,
+                instruct_model=True,
                 repo_id=self._hf_repo,
                 config_path=cfg_path,
                 tokenizer_path=tok_path,
@@ -1437,7 +1430,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 self._export_paths["model"],
                 max_gen_tokens=self._max_gen_tokens,
                 n_threads=n_threads,
-                instruct_model=self._instruct_model,
+                instruct_model=True,
                 repo_id=self._hf_repo,
                 config_path=cfg_path,
                 tokenizer_path=tok_path,
@@ -1446,9 +1439,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
             val_runner = LiquidDynamic.from_onnx(
                 self._val_model_path,
                 max_gen_tokens=self._max_gen_tokens,
-                max_inp_len=val_max_inp_len,
                 n_threads=n_threads,
-                instruct_model=self._instruct_model,
+                instruct_model=True,
                 repo_id=self._hf_repo,
                 config_path=cfg_path,
                 tokenizer_path=tok_path,
@@ -1705,7 +1697,6 @@ def export_liquid_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = LiquidModelExporter(
         args.model_size,
-        args.instruct_model,
         args.extract_embeddings,
         args.keep_individual_kv_io,
         not args.dynamic_models,

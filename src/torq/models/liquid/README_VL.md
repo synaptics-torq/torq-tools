@@ -64,7 +64,6 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 
 torq-export-model liquid-vl \
   --models-dir models/liquid-2p5-450M-VL \
-  --instruct-model \
   --convert-dtypes \
   --skip-validation
 ```
@@ -77,7 +76,6 @@ image-prefill parts — add the two artifact flags (see
 ```sh
 torq-export-model liquid-vl \
   --models-dir models/liquid-2p5-450M-VL \
-  --instruct-model \
   --convert-dtypes \
   --skip-validation \
   --vision-res 256 \

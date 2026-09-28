@@ -65,7 +65,9 @@ the flag table below).
 The exporter is the `liquid` subcommand of `torq-export-model` (installed by
 this package). It downloads the HF model on first run (or reuses the source
 from Section 0), applies all the LFM2.5 graph fix-ups required for the
-SL2610, and emits both fp32 and bf16 static ONNX models.
+SL2610, and emits both fp32 and bf16 static ONNX models. LFM2.5 has no
+separate base (non-instruct) checkpoint, so the export validation always
+uses instruct (ChatML) inference semantics.
 
 Graph transforms applied automatically (each one used to be a separate
 host-side script; they now live as static methods on
@@ -90,7 +92,6 @@ cd torq-tools-dev
 
 torq-export-model liquid \
   --models-dir models \
-  --instruct-model \
   --convert-dtypes \
   --extract-embeddings
 ```
@@ -107,7 +108,6 @@ Flag breakdown:
 | `-s, --model-size {350m,230m}` | which LFM2.5 size to export (default: `350m`). `230m` pulls from `LiquidAI/LFM2.5-230M-ONNX` and reads/writes under `<dir>/liquid-2p5-230m/` |
 | `--models-dir` | base dir; the exporter reads from `<dir>/liquid-2p5-<size>/source/` and writes to `<dir>/liquid-2p5-<size>/export/` |
 | `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
-| `--instruct-model` | use the instruction-tuned variant (this is what enables ChatML at inference) |
 | `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
 | `--dynamic-quantize` | dynamically quantize every exported component to int8 weights; `--dynamic-quantization-skip-model COMPONENT…` exempts components (e.g. keep the `lm_head` fp32) |
 | `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. |

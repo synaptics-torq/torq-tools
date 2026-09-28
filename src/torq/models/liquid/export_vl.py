@@ -85,7 +85,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
     def __init__(
         self,
         *,
-        instruct_model: bool = False,
         max_gen_tokens: int = 256,
         batch_prefill: int | None = None,
         models_dir: str | os.PathLike = "models",
@@ -100,7 +99,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         **edit_args,
     ):
         # --- LFM2.5 exporter knobs (mirror LiquidModelExporter.__init__) ----
-        self._instruct_model = instruct_model
         # The VL decoder takes inputs_embeds directly; there is no Gather to
         # extract.  The token-embedding LUT lives in embed_tokens.onnx and is
         # handled separately (see _extract_embed_lut).
@@ -861,7 +859,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
 def export_liquid_vl_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = LiquidVLModelExporter(
-        instruct_model=args.instruct_model,
         max_gen_tokens=args.max_gen_tokens,
         batch_prefill=args.batch_prefill,
         models_dir=args.models_dir,

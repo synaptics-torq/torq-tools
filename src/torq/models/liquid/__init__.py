@@ -38,12 +38,6 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         help="LFM2.5 (Liquid) model size to export (default: %(default)s)",
     )
     parser.add_argument(
-        "--instruct-model",
-        action="store_true",
-        default=False,
-        help="Export instruct model variant"
-    )
-    parser.add_argument(
         "--model-dtype",
         type=str,
         choices=MODEL_DTYPES,
@@ -153,12 +147,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         type=int,
         default=DEFAULT_GEN_TOKENS,
         help="Maximum number of tokens to generate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--instruct-model",
-        action="store_true",
-        default=False,
-        help="Export instruct model variant",
     )
     add_onnx_args(
         parser,
