@@ -9,6 +9,7 @@ constructing an exporter -- otherwise read-only commands like
 """
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -76,6 +77,65 @@ def test_export_onnx_resets_stale_compiled_artifacts(tmp_path):
 
     assert not compiled.exists()
     assert (tmp_path / "export" / "model.onnx").exists()
+
+
+def test_export_onnx_for_quantized_run_preserves_base_compiled_dir(tmp_path):
+    """A quantized run only regenerates the base-dtype ONNX as its *input*: the base
+    variant's own compiled/ (from an earlier plain run) must survive, while
+    other stale artifacts in the base dir are still wiped."""
+    compiled = tmp_path / "export" / "compiled"
+    compiled.mkdir(parents=True)
+    vmfb = compiled / "model.vmfb"
+    vmfb.write_bytes(b"fp32 vmfb")
+    stale = tmp_path / "export" / "stale_lm_head.onnx"
+    stale.write_bytes(b"stale")
+
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
+    exporter.export_onnx(validate=False)
+
+    assert (tmp_path / "export" / "model.onnx").exists()
+    assert vmfb.read_bytes() == b"fp32 vmfb"
+    assert not stale.exists()
+
+
+def test_export_onnx_for_convert_run_preserves_base_compiled_dir(tmp_path):
+    compiled = tmp_path / "export" / "compiled"
+    compiled.mkdir(parents=True)
+    vmfb = compiled / "model.vmfb"
+    vmfb.write_bytes(b"fp32 vmfb")
+
+    exporter = StubExporter(tmp_path, {"model": _identity_model()}, convert_dtypes=True)
+    exporter.export_onnx(validate=False)
+
+    assert (tmp_path / "export" / "model.onnx").exists()
+    assert vmfb.read_bytes() == b"fp32 vmfb"
+
+
+def test_quantized_run_after_plain_run_preserves_plain_compiled(tmp_path, monkeypatch):
+    """Regression for the co-located layout: a quantized run regenerates the base
+    dtype ONNX (its input) and used to wipe the base variant's compiled/ dir
+    left behind by the earlier plain run. Both variants' vmfbs must coexist."""
+    import torq.model_export.onnx as me
+
+    def fake_export_torq(input_model, output_dir, **kwargs):
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / (Path(input_model).stem + ".vmfb")).write_bytes(b"vmfb")
+
+    monkeypatch.setattr(me, "export_torq", fake_export_torq)
+
+    plain = StubExporter(tmp_path, {"model": _identity_model()})
+    plain.export_onnx(validate=False)
+    plain.export_torq()
+    assert (tmp_path / "export" / "compiled" / "model.vmfb").exists()
+
+    dql = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
+    dql.export_onnx(validate=False)
+    dql.dynamic_quantize_models(skip_preprocess=True)
+    dql.export_torq()
+
+    assert (tmp_path / "export" / "compiled" / "model.vmfb").read_bytes() == b"vmfb"
+    assert (tmp_path / "quantize" / "compiled" / "model.vmfb").read_bytes() == b"vmfb"
 
 
 def test_dynamic_quantize_models_resets_stale_compiled_artifacts(tmp_path):

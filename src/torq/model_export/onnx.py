@@ -311,7 +311,21 @@ class OnnxModelExporterBase(ABC):
         # an exporter (e.g. to render --view-graph-edits) never destroys a
         # previous export's artifacts. Mirrors convert_models/export_torq.
         if self._export_dir.exists():
-            shutil.rmtree(self._export_dir, ignore_errors=True)
+            if self._torq_dir == self._export_dir / "compiled":
+                # This run compiles the base variant: wipe the whole dir so the
+                # regenerated ONNX drops its stale compiled/ artifacts.
+                shutil.rmtree(self._export_dir, ignore_errors=True)
+            else:
+                # A quantized/convert run only regenerates the base-dtype ONNX as its
+                # input and compiles elsewhere: keep the base variant's own
+                # compiled/ from an earlier plain run, wipe everything else.
+                for child in self._export_dir.iterdir():
+                    if child.name == "compiled":
+                        continue
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink()
         self._export_dir.mkdir(parents=True, exist_ok=True)
 
         if self._static_models:
