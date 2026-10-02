@@ -171,12 +171,27 @@ def test_from_args_collects_flags_files_and_excludes(tmp_path):
         exclude_graph_edit=["CollapseReshapeChain"],
         exclude_graph_edits_from_file=str(ex_file),
         view_graph_edits=True,
+        dump_after_edit="all",
     )
     h = GraphEditHarness.from_args(args)
     assert h.apply_flag == [EditSpec("EliminateTranspose")]
     assert h.apply_file == [EditSpec("FoldScalarMatMul")]
     assert h.exclude == {"CollapseReshapeChain", "RemoveIsNaN"}
     assert h.view is True
+    assert h.dump_after_edit == "all"
+
+
+def test_from_args_defaults_dump_after_edit_to_absent():
+    h = GraphEditHarness.from_args(_NS())
+    assert h.dump_after_edit is None
+
+
+def test_finalize_rejects_unknown_dump_edit_names():
+    with pytest.raises(ValueError, match="NoSuchDumpEdit"):
+        GraphEditHarness(dump_after_edit="FoldScalarMatMul,NoSuchDumpEdit").finalize([])
+    # "all" (or a list of known names) validates fine
+    GraphEditHarness(dump_after_edit="all").finalize([])
+    GraphEditHarness(dump_after_edit="FoldScalarMatMul,EliminateTranspose").finalize([])
 
 
 def test_render_graph_edit_plan_shows_context_refs():

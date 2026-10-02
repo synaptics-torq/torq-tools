@@ -38,12 +38,6 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         help="LFM2.5 (Liquid) model size to export (default: %(default)s)",
     )
     parser.add_argument(
-        "--instruct-model",
-        action="store_true",
-        default=False,
-        help="Export instruct model variant"
-    )
-    parser.add_argument(
         "--model-dtype",
         type=str,
         choices=MODEL_DTYPES,
@@ -111,7 +105,7 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-lm-head",
+        "--chunk-lm-head",
         action="store_true",
         default=False,
         help=(
@@ -120,15 +114,20 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-decoder",
+        "--batch-prefill",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "Also export transformer_prefill.onnx with N tokens per step "
+            "(requires --split-lm-head; static exports only)"
+        ),
+    )
+    parser.add_argument(
+        "--split-lm-head",
         action="store_true",
         default=False,
-        help=(
-            "Also emit body.vmfb (decoder minus lm_head, hidden output) + "
-            "lm_head.vmfb (standalone hidden->logits) alongside the fused "
-            "model.vmfb — the lower-TTFT split where the lm_head is skipped "
-            "during prefill. Requires --convert-dtypes."
-        ),
+        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
     )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)
@@ -148,12 +147,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         type=int,
         default=DEFAULT_GEN_TOKENS,
         help="Maximum number of tokens to generate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--instruct-model",
-        action="store_true",
-        default=False,
-        help="Export instruct model variant",
     )
     add_onnx_args(
         parser,
@@ -245,7 +238,7 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-lm-head",
+        "--chunk-lm-head",
         action="store_true",
         default=False,
         help=(
@@ -254,14 +247,21 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--split-decoder",
+        "--batch-prefill",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "Also export transformer_prefill.onnx with N tokens per step "
+            "(requires --split-lm-head; static exports only; the vision "
+            "encoder is unaffected)"
+        ),
+    )
+    parser.add_argument(
+        "--split-lm-head",
         action="store_true",
         default=False,
-        help=(
-            "Also emit decoder_nolm.vmfb (decode body, hidden output) + "
-            "lm_head.vmfb (standalone hidden->logits) alongside the merged "
-            "decoder — the board's lower-TTFT split."
-        ),
+        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
     )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)

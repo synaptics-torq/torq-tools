@@ -46,6 +46,10 @@ class InferenceRunner(ABC):
     def infer_time_ms(self) -> float:
         return self._infer_time_ms
 
+    @property
+    def input_shapes(self) -> Mapping[str, Sequence[int | str | None]]:
+        return {}
+
     @abstractmethod
     def _infer(self, inputs: Sequence[npt.NDArray] | Mapping[str, npt.NDArray]) -> Sequence[npt.NDArray]:
         ...
@@ -72,6 +76,10 @@ class ORTInferenceRunner(InferenceRunner):
             self._opts.intra_op_num_threads = n_threads
             self._opts.inter_op_num_threads = n_threads
         self._sess = ort.InferenceSession(self._model_path, self._opts, providers=['CPUExecutionProvider'])
+
+    @property
+    def input_shapes(self) -> Mapping[str, Sequence[int | str | None]]:
+        return {value.name: value.shape for value in self._sess.get_inputs()}
 
     def _infer(self, inputs: list[npt.NDArray] | dict[str, npt.NDArray]) -> list[npt.NDArray]:
         return [np.asarray(o) for o in self._sess.run(None, inputs)]

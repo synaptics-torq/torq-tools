@@ -32,7 +32,7 @@ from torq.lab.model_tools.dtype_conversion.onnx import convert_model
 
 from .export import LiquidModelExporter as L
 
-SRC = "models/liquid-2p5-450M-VL/export/onnx/fp32/static/vision_encoder.onnx"
+SRC = "models/liquid-2p5-450M-VL/export/fp32/static/vision_encoder.onnx"
 HEADS, HD = 12, 64
 
 

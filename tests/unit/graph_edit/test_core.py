@@ -199,3 +199,145 @@ def test_common_graph_edit_mixin_artifact_methods_delegate(tmp_path):
         "ExtractConstantLUT",
         "SplitLMHead",
     ]
+
+
+# -----------------------------------------------------------------------------
+# Per-edit intermediate dumps (OnnxGraphEditor.dump_path / dump_after_edit)
+# -----------------------------------------------------------------------------
+
+class RenameFinalOutput(OnnxGraphEdit):
+    def match(self, node: gs.Node) -> bool:
+        return node.name == "id2"
+
+    def transform(self, node: gs.Node):
+        node.outputs[0].name = "y2_renamed"
+
+
+class AppendIdentity(OnnxGraphEdit):
+    def match(self, node: gs.Node) -> bool:
+        return node.name == "id2"
+
+    def transform(self, node: gs.Node):
+        out = gs.Variable("y3", dtype=np.float32, shape=[1])
+        self.graph.layer(name="id3", op="Identity", inputs=[node.outputs[0]], outputs=[out])
+        self.graph.outputs[self.graph.outputs.index(node.outputs[0])] = out
+
+
+class RenameMatMulOutput(OnnxGraphEdit):
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "MatMul"
+
+    def transform(self, node: gs.Node):
+        node.outputs[0].name = "y_renamed"
+
+
+def _identity_chain_graph() -> gs.Graph:
+    x = gs.Variable("x", dtype=np.float32, shape=[1])
+    y1 = gs.Variable("y1", dtype=np.float32, shape=[1])
+    y2 = gs.Variable("y2", dtype=np.float32, shape=[1])
+    id1 = gs.Node("Identity", "id1", inputs=[x], outputs=[y1])
+    id2 = gs.Node("Identity", "id2", inputs=[y1], outputs=[y2])
+    return graph(nodes=[id1, id2], inputs=[x], outputs=[y2])
+
+
+def test_editor_does_not_dump_without_dump_path(tmp_path):
+    editor = OnnxGraphEditor(_identity_chain_graph(), "unit")
+
+    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_editor_dump_after_every_edit_uses_numbered_paths(tmp_path):
+    dump = tmp_path / "model.onnx"
+    editor = OnnxGraphEditor(
+        _identity_chain_graph(), "unit", dump_path=dump, dump_after_edit="all"
+    )
+
+    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
+    first_dump = tmp_path / "0001_RenameFinalOutput_model.onnx"
+    assert onnx.load(first_dump).graph.output[0].name == "y2_renamed"
+
+    editor.apply_edit(AppendIdentity(editor.graph, "unit"))
+    second_dump = tmp_path / "0002_AppendIdentity_model.onnx"
+    dumped = onnx.load(second_dump)
+    assert [n.name for n in dumped.graph.node] == ["id1", "id2", "id3"]
+    assert dumped.graph.output[0].name == "y3"
+    assert onnx.load(first_dump).graph.output[0].name == "y2_renamed"
+
+
+def test_editor_dump_continues_numbering_across_editor_instances(tmp_path):
+    dump = tmp_path / "model.onnx"
+    first = OnnxGraphEditor(
+        _identity_chain_graph(), "unit", dump_path=dump, dump_after_edit="all"
+    )
+    first.apply_edit(RenameFinalOutput(first.graph, "unit"))
+
+    second = OnnxGraphEditor(
+        _identity_chain_graph(), "unit", dump_path=dump, dump_after_edit="all"
+    )
+    second.apply_edit(AppendIdentity(second.graph, "unit"))
+
+    assert (tmp_path / "0001_RenameFinalOutput_model.onnx").exists()
+    assert (tmp_path / "0002_AppendIdentity_model.onnx").exists()
+
+
+def test_editor_dump_only_for_named_edits(tmp_path):
+    dump = tmp_path / "model.onnx"
+    editor = OnnxGraphEditor(
+        _identity_chain_graph(), "unit", dump_path=dump,
+        dump_after_edit="RenameFinalOutput",
+    )
+
+    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
+    editor.apply_edit(AppendIdentity(editor.graph, "unit"))
+
+    dumped = onnx.load(tmp_path / "0001_RenameFinalOutput_model.onnx")
+    assert [n.name for n in dumped.graph.node] == ["id1", "id2"]
+    assert dumped.graph.output[0].name == "y2_renamed"
+
+
+def test_editor_dump_never_writes_for_unmatched_name(tmp_path):
+    dump = tmp_path / "model.onnx"
+    editor = OnnxGraphEditor(
+        _identity_chain_graph(), "unit", dump_path=dump, dump_after_edit="NoSuchEdit"
+    )
+
+    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def _matmul_graph(weight: np.ndarray) -> gs.Graph:
+    x = gs.Variable("x", dtype=np.float32, shape=[1, weight.shape[0]])
+    y = gs.Variable("y", dtype=np.float32, shape=[1, weight.shape[1]])
+    mm = gs.Node("MatMul", "mm", inputs=[x, gs.Constant("w", weight)], outputs=[y])
+    return graph(nodes=[mm], inputs=[x], outputs=[y])
+
+
+@pytest.mark.parametrize("split_weights", [False, True])
+def test_editor_dump_externalizes_and_discards_weights(tmp_path, split_weights):
+    dump = tmp_path / "model.onnx"
+    weight = np.arange(16, dtype=np.float32).reshape(4, 4)
+    editor = OnnxGraphEditor(
+        _matmul_graph(weight), "unit",
+        dump_path=dump, dump_after_edit="all", split_weights=split_weights,
+    )
+
+    editor.apply_edit(RenameMatMulOutput(editor.graph, "unit"))
+    editor.apply_edit(RenameMatMulOutput(editor.graph, "unit"))
+
+    first_dump = tmp_path / "0001_RenameMatMulOutput_model.onnx"
+    second_dump = tmp_path / "0002_RenameMatMulOutput_model.onnx"
+    assert first_dump.exists()
+    assert second_dump.exists()
+    assert not list(tmp_path.glob("*.data"))
+    # The .onnx carries no tensor payload, only a reference to discarded data.
+    unloaded = onnx.load(first_dump, load_external_data=False)
+    init = unloaded.graph.initializer[0]
+    assert not init.raw_data
+    assert dict((e.key, e.value) for e in init.external_data) == {
+        "location": "0001_RenameMatMulOutput_model.onnx.data",
+        "offset": "0",
+        "length": str(weight.nbytes),
+    }

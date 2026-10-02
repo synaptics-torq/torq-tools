@@ -185,19 +185,23 @@ def _gqa_reference(q, k, v, past_k, past_v, cos_cache, sin_cache, pos,
     B, S = q.shape[0], q.shape[1]
     # RoPE angles are recomputed from inv_freq = atan2(sin[1], cos[1]).
     inv_freq = np.arctan2(sin_cache[1], cos_cache[1]).astype(np.float32)
-    angles = (inv_freq * np.float32(pos)).astype(np.float32)
-    angles_full = np.concatenate([angles, angles]).astype(np.float32)
-    cos = np.cos(angles_full).astype(np.float32)
+    # `pos` is the chunk-start position (scalar) or one position per row.
+    pos_rows = np.atleast_1d(np.asarray(pos, dtype=np.float32))
+    assert pos_rows.shape[0] == S, f"expected {S} positions, got {pos_rows.shape[0]}"
+    angles = (pos_rows[:, None] * inv_freq[None, :]).astype(np.float32)   # (S, hd//2)
+    angles_full = np.concatenate([angles, angles], axis=-1).astype(np.float32)
+    cos = np.cos(angles_full).astype(np.float32)                          # (S, hd)
     sin = np.sin(angles_full).astype(np.float32)
 
     def split_heads(t, heads):
         return t.reshape(B, S, heads, hd).transpose(0, 2, 1, 3)
 
     def rope(x):
-        mul_cos = x * cos
+        # x: (heads, S, hd); rotate row t by position t.
+        mul_cos = x * cos[None]
         x1, x2 = x[..., : hd // 2], x[..., hd // 2:]
         rotated = np.concatenate([-x2, x1], axis=-1)
-        return mul_cos + rotated * sin
+        return (mul_cos + rotated * sin[None]).astype(np.float32)
 
     Q = rope(split_heads(q, nh))
     K = rope(split_heads(k, kvh))
@@ -292,3 +296,79 @@ def test_group_query_attention_matches_reference():
     np.testing.assert_allclose(got_attn, ref_attn, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(got_pk, ref_pk, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(got_pv, ref_pv, rtol=1e-4, atol=1e-5)
+
+
+def test_group_query_attention_chunk_matches_reference():
+    """Batched prefill: each query/key row is rotated by its own position."""
+    rng = np.random.default_rng(3)
+    B, S = 1, 2                     # S == chunk_len
+    nh, kvh, hd = 4, 2, 4
+    past_len = 2
+    pos_start = past_len            # seqlen_k = chunk start position
+    scale = 1.0 / (hd ** 0.5)
+
+    max_seq = 8
+    inv_freq = np.array([0.5, 0.2], dtype=np.float32)      # length hd//2
+    j = np.arange(max_seq, dtype=np.float32)[:, None]
+    cos_cache = np.cos(j * inv_freq).astype(np.float32)     # (max_seq, hd//2)
+    sin_cache = np.sin(j * inv_freq).astype(np.float32)
+
+    q_val = rng.standard_normal((B, S, nh * hd)).astype(np.float32)
+    k_val = rng.standard_normal((B, S, kvh * hd)).astype(np.float32)
+    v_val = rng.standard_normal((B, S, kvh * hd)).astype(np.float32)
+    pk_val = rng.standard_normal((B, kvh, past_len, hd)).astype(np.float32)
+    pv_val = rng.standard_normal((B, kvh, past_len, hd)).astype(np.float32)
+    slk_val = np.array([pos_start], dtype=np.int32)
+
+    q = gs.Variable("q", np.float32, [B, S, nh * hd])
+    k = gs.Variable("k", np.float32, [B, S, kvh * hd])
+    v = gs.Variable("v", np.float32, [B, S, kvh * hd])
+    pk = gs.Variable("past_key", np.float32, [B, kvh, past_len, hd])
+    pv = gs.Variable("past_value", np.float32, [B, kvh, past_len, hd])
+    slk = gs.Variable("seqlen_k", np.int32, [1])
+    tsl = gs.Constant("total_seq_len", np.array([pos_start + S], dtype=np.int32))
+    cosc = gs.Constant("cos_cache", cos_cache)
+    sinc = gs.Constant("sin_cache", sin_cache)
+
+    attn = gs.Variable("attn", np.float32)
+    present_key = gs.Variable("present_key", np.float32)
+    present_value = gs.Variable("present_value", np.float32)
+    gqa = gs.Node(
+        "GroupQueryAttention", "layer/attn/GroupQueryAttention",
+        inputs=[q, k, v, pk, pv, slk, tsl, cosc, sinc],
+        outputs=[attn, present_key, present_value],
+        attrs={"num_heads": nh, "kv_num_heads": kvh}, domain="com.microsoft",
+    )
+    attn_out = gs.Variable("attn_out", np.float32)
+    ident = gs.Node("Identity", "attn_identity", inputs=[attn], outputs=[attn_out])
+
+    g = graph(
+        nodes=[gqa, ident],
+        inputs=[q, k, v, pk, pv, slk],
+        outputs=[attn_out, present_key, present_value],
+        opset=OPSET,
+    )
+    ReplaceGroupQueryAttention(
+        g, "test", num_heads=nh, kv_num_heads=kvh, head_dim=hd, chunk_len=S
+    ).transform(gqa)
+
+    feeds = {
+        "q": q_val, "k": k_val, "v": v_val,
+        "past_key": pk_val, "past_value": pv_val, "seqlen_k": slk_val,
+    }
+    actual = _run(g, feeds)
+    ref_attn, ref_pk, ref_pv = _gqa_reference(
+        q_val, k_val, v_val, pk_val, pv_val,
+        cos_cache, sin_cache, [pos_start + t for t in range(S)], nh, kvh, hd, scale,
+    )
+
+    got_attn, got_pk, got_pv = list(actual.values())
+    np.testing.assert_allclose(got_attn, ref_attn, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(got_pk, ref_pk, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(got_pv, ref_pv, rtol=1e-4, atol=1e-5)
+
+
+def test_group_query_attention_chunk_must_be_positive():
+    with pytest.raises(ValueError, match="chunk_len"):
+        ReplaceGroupQueryAttention(None, "test", num_heads=1, kv_num_heads=1,
+                                   head_dim=2, chunk_len=0)

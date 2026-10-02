@@ -99,7 +99,7 @@ def _require_lm_head(node: gs.Node, output_name: str) -> _LMHead:
 class ExtractConstantLUT(OnnxGraphEdit):
 
     lut_shape: tuple[int, ...]
-    save_to: os.PathLike | str
+    save_to: os.PathLike | str | None
     inp_name: str | None = None
 
     def match(self, node: gs.Node) -> bool:
@@ -131,9 +131,10 @@ class ExtractConstantLUT(OnnxGraphEdit):
             if not isinstance(lut_data, np.ndarray):
                 raise ValueError(f"Invalid Constant data type: {type(lut_data)}")
         
-        self.save_to = Path(self.save_to)
-        self.save_to.parent.mkdir(parents=True, exist_ok=True)
-        np.save(self.save_to, lut_data)
+        if self.save_to is not None:
+            self.save_to = Path(self.save_to)
+            self.save_to.parent.mkdir(parents=True, exist_ok=True)
+            np.save(self.save_to, lut_data)
 
         if not self.inp_name:
             self.inp_name = f"extracted_lut_{normalize_layer_name(node.name)}_input"
@@ -407,6 +408,48 @@ class TrimLMHeadVocab(OnnxGraphEdit):
             "Trimmed LM head vocab: %d -> %d tokens (argmax=%s)",
             vocab_size, kept_count, self.include_argmax,
         )
+
+
+@dataclass
+class TakeLastToken(OnnxGraphEdit):
+    """Slice the LM head input to the final sequence position."""
+
+    output_name: str = "logits"
+
+    def match(self, node: gs.Node) -> bool:
+        return _match_lm_head(node, self.output_name) is not None
+
+    def transform(self, node: gs.Node):
+        lm_head = _require_lm_head(node, self.output_name)
+        hidden_states = lm_head.hidden_states
+        if hidden_states.shape is None or len(hidden_states.shape) < 2:
+            raise ValueError(f"Expected ranked hidden states, got shape {hidden_states.shape}")
+        seq_len = hidden_states.shape[-2]
+        if not isinstance(seq_len, int):
+            raise ValueError(f"Expected static hidden-state sequence length, got {seq_len}")
+        if seq_len == 1:
+            return
+
+        sliced_shape = list(hidden_states.shape)
+        sliced_shape[-2] = 1
+        sliced = self.graph.layer(
+            name=hidden_states.name + "_last_token",
+            op="Slice",
+            inputs=[hidden_states, [seq_len - 1], [seq_len], [-2]],
+            outputs=[gs.Variable(
+                hidden_states.name + "_last",
+                dtype=hidden_states.dtype,
+                shape=sliced_shape,
+            )],
+        )[0]
+        for lm_head_node in lm_head.nodes:
+            for idx, inp in enumerate(lm_head_node.inputs):
+                if inp is hidden_states:
+                    lm_head_node.inputs[idx] = sliced
+            for output in lm_head_node.outputs:
+                if output.shape and len(output.shape) >= 2 and output.shape[-2] == seq_len:
+                    output.shape = list(output.shape[:-2]) + [1, output.shape[-1]]
+
 
 @dataclass
 class SplitLMHead(OnnxGraphEdit):
