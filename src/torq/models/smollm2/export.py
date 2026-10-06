@@ -15,7 +15,7 @@ from transformers import AutoConfig
 
 from . import add_smollm2_export_args
 from ._graph import SmolLM2OnnxGraphEditor
-from ._inference import SmolLM2Dynamic, SmolLM2Static
+from ._inference import SmolLM2Dynamic, SmolLM2Static, _repo_id_for_size
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
@@ -53,9 +53,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
         )
-        self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
-        if self._instruct_model:
-            self._hf_repo += "-Instruct"
+        self._hf_repo = _repo_id_for_size(model_size, instruct_model)
         self._config = AutoConfig.from_pretrained(
             self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
             local_files_only=self._onnx_source_dir is not None,

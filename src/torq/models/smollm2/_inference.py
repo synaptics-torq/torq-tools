@@ -31,11 +31,15 @@ from ...inference.transformers import (
 DEFAULT_SYS_PROMPT: Final[str] = "You are a helpful AI assistant named SmolLM. Provide all answers as concise responses; use as few words as possible and avoid extra explanation."
 
 
-def _default_repo_id(instruct_model: bool) -> str:
-    repo_id = "HuggingFaceTB/SmolLM2-135M"
+def _repo_id_for_size(model_size: str, instruct_model: bool) -> str:
+    repo_id = f"HuggingFaceTB/SmolLM2-{model_size}"
     if instruct_model:
         repo_id += "-Instruct"
     return repo_id
+
+
+def _default_repo_id(instruct_model: bool) -> str:
+    return _repo_id_for_size("135M", instruct_model)
 
 
 def _hf_hub_download(repo_id: str, filename: str) -> str:
@@ -101,18 +105,21 @@ class SmolLM2Dynamic(SmolLM2Base, DynamicDecoderOnlyRunner):
         max_gen_tokens: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ):
         repo_id = repo_id or _default_repo_id(instruct_model)
+        if config_path is None:
+            config_path = _hf_hub_download(repo_id, "config.json")
+        if tokenizer_path is None:
+            tokenizer_path = _hf_hub_download(repo_id, "tokenizer.json")
         DynamicDecoderOnlyRunner.__init__(
             self,
             model,
-            ModelConfig.from_json_config(
-                _hf_hub_download(repo_id, "config.json"),
-                instruct_model,
-            ),
+            ModelConfig.from_json_config(config_path, instruct_model),
             max_prompt_tokens,
             max_gen_tokens,
-            _load_tokenizer(_hf_hub_download(repo_id, "tokenizer.json")),
+            _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
             include_position_ids=True,
         )
@@ -126,6 +133,8 @@ class SmolLM2Dynamic(SmolLM2Base, DynamicDecoderOnlyRunner):
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Dynamic":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
@@ -133,6 +142,8 @@ class SmolLM2Dynamic(SmolLM2Base, DynamicDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
         )
 
     @classmethod
@@ -144,6 +155,8 @@ class SmolLM2Dynamic(SmolLM2Base, DynamicDecoderOnlyRunner):
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Dynamic":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
@@ -151,6 +164,8 @@ class SmolLM2Dynamic(SmolLM2Base, DynamicDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
         )
 
 
@@ -163,18 +178,21 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ):
         repo_id = repo_id or _default_repo_id(instruct_model)
+        if config_path is None:
+            config_path = _hf_hub_download(repo_id, "config.json")
+        if tokenizer_path is None:
+            tokenizer_path = _hf_hub_download(repo_id, "tokenizer.json")
         StaticDecoderOnlyRunner.__init__(
             self,
             model,
-            ModelConfig.from_json_config(
-                _hf_hub_download(repo_id, "config.json"),
-                instruct_model,
-            ),
+            ModelConfig.from_json_config(config_path, instruct_model),
             max_prompt_tokens,
             max_gen_tokens,
-            _load_tokenizer(_hf_hub_download(repo_id, "tokenizer.json")),
+            _load_tokenizer(tokenizer_path),
             DEFAULT_SYS_PROMPT if instruct_model else None,
             combined_kv_io=combined_kv_io,
             token_embeddings=self._find_token_embeddings(model.model_path),
@@ -190,6 +208,8 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Static":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
@@ -198,6 +218,8 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
             instruct_model=instruct_model,
             repo_id=repo_id,
             combined_kv_io=combined_kv_io,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
         )
 
     @classmethod
@@ -210,6 +232,8 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         instruct_model: bool = False,
         repo_id: str | None = None,
         combined_kv_io: bool = True,
+        config_path: str | os.PathLike | None = None,
+        tokenizer_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Static":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
@@ -218,6 +242,8 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
             instruct_model=instruct_model,
             repo_id=repo_id,
             combined_kv_io=combined_kv_io,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
         )
 
     @staticmethod
