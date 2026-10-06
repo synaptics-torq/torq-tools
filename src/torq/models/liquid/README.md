@@ -137,7 +137,7 @@ models/liquid-2p5-350m/
     │   ├── transformer.onnx          (~1.4 GB; split export body with last_hidden_states output)
     │   ├── lm_head.onnx              (only with --split-lm-head; ~268 MB fp32)
     │   ├── transformer_prefill.onnx  (only with --batch-prefill N; stays fused)
-    │   ├── token_embeddings.npy      (~128 MB)
+    │   ├── token_embeddings.npy      (~128 MB, fp32; for host inference)
     │   ├── config.json
     │   ├── tokenizer.json
     │   └── compiled/                 (only without --skip-torq; one .vmfb + .mlir per component)
@@ -149,6 +149,11 @@ The `compiled/` dir lives inside the variant that is actually compiled
 (`bf16/static/compiled/` with `--convert-dtypes`, `quantized/static/compiled/`
 with `--dynamic-quantize`), so each variant dir is a self-contained deployable
 unit and regenerating a variant's ONNX wipes its stale vmfbs alongside it.
+When the effective compile flags convert the vmfb I/O (`--torq-convert-io-dtype` —
+always, for LFM2.5's flag set), the pipeline also stages the LUT in the runtime
+dtype (bf16) into `compiled/`, next to the vmfb that consumes it. That copy is
+the one to ship to the board; the variant-root `token_embeddings.npy` stays
+fp32 for the host runner.
 
 > [!Note]
 > The fp32 export is the right artifact to validate end-to-end through onnxruntime ("What is the capital of France?" → "The capital of France is Paris."). bf16 cannot be validated through ORT because the CPU MatMul kernel has no bf16 path; compare bf16 against fp32 via the host casting tools if you need a quality check.

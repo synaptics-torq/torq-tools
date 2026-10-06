@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
@@ -146,6 +147,28 @@ class OnnxModelExporterBase(ABC):
             if not src_path.exists():
                 continue
             shutil.copy2(src_path, dst_dir / asset_name)
+
+    # Dtypes --torq-convert-io-dtype converts the vmfb I/O to.
+    _RUNTIME_DTYPE_MAP: Final[dict[str, type]] = {
+        "float32": ml_dtypes.bfloat16,
+        "int64": np.int32,
+    }
+
+    def _stage_runtime_dtype_artefacts(self, variant_roots: set[Path]) -> None:
+        """Copy each variant's ``.npy`` artefacts into ``self._torq_dir`` in
+        the runtime dtype the compiled vmfbs expect.
+        """
+        for root in sorted(variant_roots):
+            for npy in sorted(root.glob("*.npy")):
+                data = np.load(npy)
+                data = data.astype(
+                    self._RUNTIME_DTYPE_MAP.get(data.dtype.name, data.dtype), copy=False
+                )
+                dst = self._torq_dir / npy.name
+                np.save(dst, data)
+                self._logger.info(
+                    "(Torq-export) Staged '%s' (%s) -> '%s'", npy.name, data.dtype, dst
+                )
 
     @property
     def export_dir(self) -> Path:
@@ -535,3 +558,12 @@ class OnnxModelExporterBase(ABC):
                 compiler_path=compiler_path,
             )
             self._logger.info("(Torq-export) Successfully exported '%s/%s.vmfb'", str(self._torq_dir), onnx_path.stem)
+        if "--torq-convert-io-dtype" in (torq_compile_args or []):
+            # The vmfb I/O is converted by the compiler: stage the matching
+            # runtime-dtype artefacts next to the vmfbs.
+            roots = {
+                Path(onnx_path).parent
+                for comp, onnx_path in self._export_paths.items()
+                if comp not in skip
+            }
+            self._stage_runtime_dtype_artefacts(roots)

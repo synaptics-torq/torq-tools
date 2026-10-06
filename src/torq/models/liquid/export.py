@@ -1557,14 +1557,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._logger.info("(ONNX-convert) Wrote '%s'", converted_model_path)
             self._export_paths[comp] = converted_model_path
 
-        if self._extract_embeddings:
-            emb_src = self._export_dir / "token_embeddings.npy"
-            if emb_src.exists():
-                emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
-                np.save(self._convert_dir / emb_src.name, emb_data)
-        self._copy_runtime_assets(
-            self._convert_dir, self._export_dir, include_npy_data=False
-        )
+        self._copy_runtime_assets(self._convert_dir, self._export_dir)
 
     def make_lm_head_split(
         self, model_path: str | os.PathLike, write_lm_head: bool = True

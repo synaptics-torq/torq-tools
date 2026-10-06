@@ -193,8 +193,11 @@ torq-quantize-model weights quantize -i model.onnx -o model_mixed_bf16.onnx \
 ### 4. Compile the quantized model
 
 For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
-outputs are directly importable by IREE. Compile the quantized ONNX to a VMFB
-(from `torq-compiler-dev`):
+outputs are directly importable by IREE. (The pipeline's `export_torq` stages
+the `.npy` artefacts in the runtime dtype next to the compiled vmfb when
+`--torq-convert-io-dtype` is passed; a standalone compile doesn't — convert
+them manually if you change the vmfb I/O dtype.) Compile the quantized ONNX to
+a VMFB (from `torq-compiler-dev`):
 
 ```sh
 model_dir="/path/to/"

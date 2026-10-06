@@ -139,10 +139,12 @@ models/liquid-2p5-450M-VL/export/
 │       ├── vision_encoder_256.fp32.onnx   (~363 MB)   fp32 static build (ORT reference)
 │       ├── decoder_image_2part_A.onnx     (~277 MB)   --image-decoder-parts
 │       ├── decoder_image_2part_B.onnx     (~244 MB)   --image-decoder-parts
-│       ├── token_embeddings.npy           (~128 MB, bf16)
+│       ├── token_embeddings.npy           (~256 MB)   fp32, for host inference
 │       ├── config.json                    ← staged (flat text config)
 │       ├── tokenizer.json                 ← staged
-│       └── compiled/                      ← board bundle (vmfbs + one .mlir each)
+│       └── compiled/                      ← board bundle (vmfbs + one .mlir each, plus the
+│                                            bf16 token_embeddings.npy staged when the
+│                                            compile flags convert the vmfb I/O)
 └── split_lm_head/…                           (--split-lm-head runs; same shape as
     │                                          `unified/` above, with instead of the fused decoder):
     ├── fp32/static/
@@ -197,7 +199,7 @@ gemma3-style), so the fused decoder and the body/head pair come from two runs:
 | `transformer_prefill.vmfb` (N-token prefill) | `--split-lm-head --batch-prefill N` |
 | `vision_encoder_256.vmfb` (64 tokens) / `vision_encoder_128.vmfb` (16 tokens) | `--vision-res 256` / `--vision-res 128` (static SigLIP encoder; compile is heavy but succeeds). One res per run. The bundle ships the 128 build under the legacy name `vision_encoder.vmfb`; rename after export if the runner is pointed at that name. |
 | `decoder_image_2part_A/B.vmfb` (one-shot image prefill) | `--image-decoder-parts` (bare = 2-part, the shipping split; `3` / `5` are alternates) |
-| `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically (export, convert, and iree dirs) |
+| `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically (fp32 canonical in the export/convert dirs; bf16 copy in `compiled/` when the compile flags convert the vmfb I/O) |
 
 Every board artifact from one topology is reproducible from a single
 `torq-export-model liquid-vl` invocation — the flags compose, so the
@@ -220,13 +222,15 @@ both).
 ## 2. Deploy to the board (text decoder)
 
 The `bf16/static/` convert dir of a run is self-contained for the LiquidStatic
-runner (vmfb + LUT + config + tokenizer all staged; vmfbs in `compiled/`):
+runner (vmfb + LUT + config + tokenizer all staged; the board LUT — bf16, the
+runtime dtype the compiled vmfb expects — sits in `compiled/` next to the
+vmfb):
 
 ```sh
 M=models/liquid-2p5-450M-VL/export/unified/bf16/static
 scp \
   $M/compiled/decoder_model_merged.vmfb \
-  $M/token_embeddings.npy \
+  $M/compiled/token_embeddings.npy \
   $M/config.json \
   $M/tokenizer.json \
   <board-user>@<board-host>:/path/to/torq-examples/models/Synaptics/LFM2-VL-450M-torq/

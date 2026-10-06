@@ -31,16 +31,19 @@ export of LFM2-VL ships **three** separate components:
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
-import ml_dtypes
 from torq.utils.logging import configure_logging
 from torq.utils.onnx import check_dynamic_shapes
 
-from .export import LiquidModelExporter, LIQUID_TORQ_FLAGS  # noqa: F401  (import triggers gs bf16 patch)
+from .export import (
+    LIQUID_TORQ_FLAGS,  # noqa: F401  (import triggers gs bf16 patch)
+    LiquidModelExporter,
+)
 from ._graph import LiquidOnnxGraphEditor
 from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import (
@@ -619,11 +622,12 @@ class LiquidVLModelExporter(LiquidModelExporter):
             _convert_dtype(model_path, converted, "bf16", convert_io=not preserve_io)
             self._export_paths[comp] = converted
 
+        # The convert variant carries the canonical (fp32) LUT next to its
+        # ONNX; export_torq stages the runtime-dtype copy in compiled/ when
+        # the compile flags convert the vmfb I/O.
         emb_src = self._embed_lut_path()
         if emb_src.exists():
-            emb = np.load(emb_src).astype(ml_dtypes.bfloat16)
-            np.save(self._convert_dir / "token_embeddings.npy", emb)
-            self._logger.info("(ONNX-convert) Wrote bf16 token_embeddings.npy")
+            shutil.copy2(emb_src, self._convert_dir / emb_src.name)
         self._stage_runtime_assets(self._convert_dir)
 
         if self._vision_res and vision_src:
@@ -852,27 +856,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         else:
             shutil.copy2(tokenizer, dst_dir / "tokenizer.json")
 
-    def stage_deploy_assets(self):
-        """Place the token-embedding LUT in the variant dir next to compiled/.
-
-        The LiquidStatic runner loads ``token_embeddings.npy``, ``config.json``
-        and ``tokenizer.json`` from the vmfb's deploy directory. The config
-        and tokenizer are staged into the variant dir by
-        ``apply_post_static_patches``; the LUT is the one asset that differs by
-        dtype (bf16 if converted, else fp32)."""
-        import shutil
-
-        dest = self._torq_dir.parent  # <variant>/static, next to compiled/
-        if not dest.exists():
-            return
-
-        lut = (self._convert_dir / "token_embeddings.npy")
-        if not lut.exists():
-            lut = self._embed_lut_path()
-        if lut.exists():
-            shutil.copy2(lut, dest / "token_embeddings.npy")
-            self._logger.info("Staged token-embedding LUT -> '%s'", dest)
-
     # --------------------------------------------------------------- validation
     def validate_onnx(self, n_iters: int = 3):
         # Full VL validation needs image inputs + the merged vision/text
@@ -928,7 +911,6 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
             local_compile=args.local_compile,
             compiler_path=args.compiler_path,
         )
-        exporter.stage_deploy_assets()
 
 
 def main():

@@ -9,6 +9,7 @@ liquid-vl — all funnel through the base ``export_torq``) must add
 ``--torq-max-nss-programs-size`` without the user having to.
 """
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
@@ -70,3 +71,33 @@ def test_existing_nss_flag_is_not_duplicated(tmp_path, monkeypatch):
     )
 
     assert calls == [["--torq-max-nss-programs-size", "999"]]
+
+
+def test_convert_io_flag_stages_runtime_dtype_artefacts(tmp_path, monkeypatch):
+    _fake_compile(monkeypatch)
+    exporter = _exporter(tmp_path)
+    lut = np.arange(8, dtype=np.float32).reshape(2, 4)
+    np.save(exporter.export_dir / "token_embeddings.npy", lut)
+    np.save(exporter.export_dir / "pos_ids.npy", np.arange(4, dtype=np.int64))
+
+    exporter.export_torq(torq_compile_args=["--torq-convert-io-dtype"])
+
+    compiled = exporter.export_dir / "compiled"
+    expected = tmp_path / "expected.npy"
+    np.save(expected, lut.astype(ml_dtypes.bfloat16))
+    assert (compiled / "token_embeddings.npy").read_bytes() == expected.read_bytes()
+    assert np.load(compiled / "pos_ids.npy").dtype == np.int32
+    assert np.load(exporter.export_dir / "token_embeddings.npy").dtype == np.float32
+    assert np.load(exporter.export_dir / "pos_ids.npy").dtype == np.int64
+
+
+def test_artefact_staging_requires_the_io_flag(tmp_path, monkeypatch):
+    """Internal weight conversion (--torq-convert-dtypes) leaves the vmfb I/O
+    fp32, so nothing is staged."""
+    _fake_compile(monkeypatch)
+    exporter = _exporter(tmp_path)
+    np.save(exporter.export_dir / "token_embeddings.npy", np.zeros((2, 4), dtype=np.float32))
+
+    exporter.export_torq(torq_compile_args=["--torq-convert-dtypes"])
+
+    assert not (exporter.export_dir / "compiled" / "token_embeddings.npy").exists()
