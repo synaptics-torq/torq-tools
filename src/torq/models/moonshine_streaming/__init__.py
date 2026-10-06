@@ -60,9 +60,9 @@ def add_moonshine_streaming_export_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--extract-embeddings",
-        action="store_true",
-        default=False,
-        help="Extract large embeddings tables into external .npy data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Extract large embeddings tables into external .npy data (default: %(default)s)",
     )
     parser.add_argument(
         "--export-attention",
