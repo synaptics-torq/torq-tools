@@ -83,9 +83,10 @@ def test_model_flags_reads_base_and_w8a8(tmp_path):
 
 
 def test_source_tree_model_flag_files_are_complete():
-    """The LLM exporters ship a validated flag file (guards against drift)."""
+    """The chip-compiled exporters ship a validated flag file (guards against
+    drift)."""
     models_dir = Path(me.__file__).parent.parent / "models"
-    for model in ("gemma3", "smollm2", "liquid"):
+    for model in ("gemma3", "smollm2", "liquid", "moonshine", "moonshine_streaming"):
         path = models_dir / model / COMPILE_FLAGS_FILE
         assert path.is_file(), f"missing validated flags for {model}"
         data = json.loads(path.read_text())
@@ -93,6 +94,12 @@ def test_source_tree_model_flag_files_are_complete():
         assert data.get("w8a8") == ["--torq-disable-host", "--torq-disable-css"], (
             f"{model}: w8a8 workaround (torq-compile 2.2.1 host/CSS bug) missing"
         )
+    # moonshine is validated against the LLM flag set, not its own.
+    llm = json.loads((models_dir / "gemma3" / COMPILE_FLAGS_FILE).read_text())
+    for model in ("moonshine", "moonshine_streaming"):
+        data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
+        assert data.get("flags") == llm["flags"], f"{model}: flags drifted from the LLM set"
+        assert data.get("w8a8") == llm["w8a8"], f"{model}: w8a8 drifted from the LLM set"
     liquid = json.loads((models_dir / "liquid" / COMPILE_FLAGS_FILE).read_text())
     for flag in (
         "--torq-hw=SL2610",

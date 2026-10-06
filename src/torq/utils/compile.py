@@ -259,8 +259,15 @@ def export_torq(
             )
 
 
-def add_torq_args(parser: argparse.ArgumentParser):
+def add_torq_args(parser: argparse.ArgumentParser, *, skip: bool = False):
     group = parser.add_argument_group("Torq args")
+    if skip:
+        group.add_argument(
+            "--skip-torq",
+            action="store_true",
+            default=False,
+            help="Skip Torq compile/export",
+        )
     group.add_argument(
         "--opset",
         type=int,

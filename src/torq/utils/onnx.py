@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     # CLI helpers
     "add_onnx_args",
+    "add_decoder_args",
+    "add_llm_args",
     "validate_onnx_source_dir",
 
     # model inspection
@@ -46,7 +48,18 @@ def add_onnx_args(
     dynamic_quantize: bool = True,
     convert_dtypes: bool = False,
     allow_no_opt: bool = True,
+    extract_embeddings: bool = False,
+    dynamic_models: bool = False,
+    keep_individual_kv_io: bool = False,
+    replace_int_bf16_cast: bool = False,
 ):
+    """Shared export-pipeline args for every model exporter.
+
+    Options that are common across models are defined here, not in each
+    model's ``__init__.py``, so their defaults (e.g. the chip-optimal
+    ``--extract-embeddings``) change in one place for every model. The bool
+    kwargs gate which options a given model supports.
+    """
     group = parser.add_argument_group("ONNX args")
     if model_dtypes:
         group.add_argument(
@@ -62,6 +75,13 @@ def add_onnx_args(
         type=str,
         metavar="DIR",
         help="Directory containing source ONNX models (skips the source download)",
+    )
+    group.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        metavar="DIR",
+        help="Base directory for source and export models (default: %(default)s)",
     )
     group.add_argument(
         "--show-model-info",
@@ -94,6 +114,14 @@ def add_onnx_args(
             "constants stay inline so onnxruntime can still resolve shape-op "
             "inputs (Squeeze/Reshape axes, Slice/Pad parameters) at load time."
         ),
+    )
+    group.add_argument(
+        "--broadcast-ops",
+        type=str,
+        metavar="OP",
+        nargs="*",
+        default=None,
+        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
     if allow_no_opt:
         group.add_argument(
@@ -151,6 +179,117 @@ def add_onnx_args(
             default=False,
             help="Preserve model input/output dtypes by adding runtime casts"
         )
+    if extract_embeddings:
+        group.add_argument(
+            "--extract-embeddings",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Extract large embeddings tables into external .npy data (default: %(default)s)"
+        )
+    if dynamic_models:
+        group.add_argument(
+            "--dynamic-models",
+            action="store_true",
+            default=False,
+            help="Export dynamic models for CPU"
+        )
+    if keep_individual_kv_io:
+        group.add_argument(
+            "--keep-individual-kv-io",
+            action="store_true",
+            default=False,
+            help="Keep KV I/O as separate key, value tensors instead of combining"
+        )
+    if replace_int_bf16_cast:
+        group.add_argument(
+            "--replace-int-bf16-cast",
+            action="store_true",
+            default=False,
+            help="Replace int64 -> bf16 casts with a look-up table"
+        )
+
+
+# Default N for --batch-prefill (the LLM lower-TTFT prefill export).
+DEFAULT_BATCH_PREFILL = 64
+
+
+def add_decoder_args(
+    parser: argparse.ArgumentParser,
+    *,
+    model_name: str,
+    model_sizes: list[str] | None = None,
+    default_model_size: str | None = None,
+    split_lm_head: bool = False,
+    batch_prefill: bool = False,
+):
+    """Args shared by exporters with a decoder component: the
+    ``-s/--model-size`` selector (every model family) and, for LLM decoders,
+    the lower-TTFT ``--split-lm-head`` / ``--batch-prefill`` options.
+
+    Defined here (not in each model's ``__init__.py``) so their defaults
+    change in one place, like the other shared export args.
+    """
+    if model_sizes is not None:
+        parser.add_argument(
+            "-s",
+            "--model-size",
+            type=str,
+            choices=model_sizes,
+            default=default_model_size,
+            help=f"{model_name} model size to export (default: %(default)s)",
+        )
+    if split_lm_head:
+        parser.add_argument(
+            "--split-lm-head",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states (default: %(default)s)"
+        )
+    if batch_prefill:
+        parser.add_argument(
+            "--batch-prefill",
+            type=int,
+            default=DEFAULT_BATCH_PREFILL,
+            metavar="N",
+            help="Also export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
+        )
+
+
+def add_llm_args(
+    parser: argparse.ArgumentParser,
+    *,
+    model_name: str,
+    model_sizes: list[str] | None = None,
+    default_model_size: str | None = None,
+    max_gen_tokens: int,
+    instruct: bool = False,
+    split_lm_head: bool = False,
+    batch_prefill: bool = False,
+):
+    """LLM export args: ``-t/--max-gen-tokens`` and optional
+    ``--instruct-model`` on top of the shared decoder args."""
+    parser.add_argument(
+        "-t",
+        "--max-gen-tokens",
+        type=int,
+        default=max_gen_tokens,
+        help="Maximum number of tokens to generate (default: %(default)s)",
+    )
+    if instruct:
+        parser.add_argument(
+            "--instruct-model",
+            action="store_true",
+            default=False,
+            help="Export instruct model variant"
+        )
+    add_decoder_args(
+        parser,
+        model_name=model_name,
+        model_sizes=model_sizes,
+        default_model_size=default_model_size,
+        split_lm_head=split_lm_head,
+        batch_prefill=batch_prefill,
+    )
 
 
 def validate_onnx_source_dir(
