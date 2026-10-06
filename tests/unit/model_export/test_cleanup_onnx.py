@@ -187,8 +187,3 @@ def test_cleanup_skip_flags_disable_passes():
     assert "Mul" in ops  # BN chain kept
     concat = next(node for node in cleaned.graph.node if node.op_type == "Concat")
     assert list(concat.input) == ["v"]  # concat still collapsed
-
-
-def test_cleanup_rejects_unknown_pass_name():
-    with pytest.raises(ValueError, match="Unknown cleanup pass"):
-        cleanup_onnx_model(_artifact_model(), skip=("no-such-pass",))

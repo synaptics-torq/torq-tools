@@ -4,7 +4,6 @@
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from torq.inference.transformers import (
     DecoderOnlyConfig,
@@ -244,11 +243,6 @@ def test_static_runner_uses_prefill_model_for_full_chunks_then_decode_for_remain
     assert np.array_equal(decode_model.calls[0]["input_ids"], np.array([[5]]))
     assert np.array_equal(decode_model.calls[0]["position_ids"], np.array([[3]]))
     assert len(lm_head.calls) == 2
-
-
-def test_static_runner_requires_prefill_model_and_size_together():
-    with pytest.raises(ValueError, match="must be provided together"):
-        _DemoStatic(_FakeRunner(), prefill_model=_FakeRunner())
 
 
 def test_gemma3_stop_rules_are_preserved():

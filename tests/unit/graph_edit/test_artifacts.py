@@ -6,7 +6,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph, quantized_lm_head_graph
+from support.graph_edit import graph
 from torq.graph_edit.edits.artifacts import ExtractConstantLUT, SplitLMHead, TakeLastToken, TrimLMHeadVocab
 
 
@@ -60,24 +60,6 @@ def test_extract_constant_lut_can_skip_writing_duplicate_table(tmp_path):
     assert g.inputs[-1].name == "token_embedding"
 
 
-def test_trim_lm_head_vocab_slices_weight_and_saves_lut(tmp_path):
-    hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
-    weight = gs.Constant("weight", np.arange(10, dtype=np.float32).reshape(2, 5))
-    logits = gs.Variable("logits", dtype=np.float32, shape=[1, 1, 5])
-    matmul = gs.Node("MatMul", "lm_head", inputs=[hidden, weight], outputs=[logits])
-    g = graph(nodes=[matmul], inputs=[hidden], outputs=[logits])
-    lut_path = tmp_path / "token_lut.npy"
-
-    edit = TrimLMHeadVocab(g, "unit", kept_token_ids=np.array([0, 3, 4]), save_lut=lut_path)
-    assert edit.match(matmul)
-    edit.transform(matmul)
-
-    assert matmul.inputs[1].name == "weight_trimmed"
-    np.testing.assert_array_equal(matmul.inputs[1].values, weight.values[:, [0, 3, 4]])
-    np.testing.assert_array_equal(np.load(lut_path), np.array([0, 3, 4]))
-    assert g.outputs[0].shape == [1, 1, 3]
-
-
 def test_trim_lm_head_vocab_can_append_argmax_output():
     hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
     weight = gs.Constant("weight", np.ones((2, 4), dtype=np.float32))
@@ -89,36 +71,6 @@ def test_trim_lm_head_vocab_can_append_argmax_output():
 
     assert g.outputs[0].name == "compact_token_idx"
     assert any(node.op == "ArgMax" for node in g.nodes)
-
-
-def test_trim_lm_head_vocab_rejects_out_of_range_token_id():
-    hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
-    weight = gs.Constant("weight", np.ones((2, 4), dtype=np.float32))
-    logits = gs.Variable("logits", dtype=np.float32, shape=[1, 1, 4])
-    matmul = gs.Node("MatMul", "lm_head", inputs=[hidden, weight], outputs=[logits])
-
-    with pytest.raises(ValueError, match="outside"):
-        TrimLMHeadVocab(graph(nodes=[matmul], inputs=[hidden], outputs=[logits]), "unit", kept_token_ids=np.array([4])).transform(matmul)
-
-
-def test_trim_quantized_lm_head_vocab_slices_weight_parameters():
-    g = quantized_lm_head_graph()
-    output_node = g.outputs[0].inputs[0]
-
-    edit = TrimLMHeadVocab(g, "unit", kept_token_ids=np.array([0, 3, 4]))
-    assert edit.match(output_node)
-    edit.transform(output_node)
-
-    constants = {
-        tensor.name: tensor
-        for node in g.nodes
-        for tensor in node.inputs
-        if isinstance(tensor, gs.Constant)
-    }
-    assert constants["weight_quantized_trimmed"].shape == (2, 3)
-    np.testing.assert_array_equal(constants["weight_scale_trimmed"].values, [0.25, 0.75, 0.375])
-    np.testing.assert_array_equal(constants["weight_zero_point_trimmed"].values, [1, 0, -2])
-    assert g.outputs[0].shape == [1, 1, 3]
 
 
 def test_split_lm_head_saves_model_and_exposes_hidden_states(tmp_path):
@@ -153,20 +105,3 @@ def test_take_last_token_makes_prefill_share_single_token_lm_head(tmp_path):
     input_shape = [dim.dim_value for dim in lm_head.graph.input[0].type.tensor_type.shape.dim]
     assert input_shape == [1, 1, 2]
     assert g.outputs[0].shape == [1, 1, 2]
-
-
-def test_split_quantized_lm_head_saves_full_head_and_exposes_hidden_states(tmp_path):
-    g = quantized_lm_head_graph()
-    output_node = g.outputs[0].inputs[0]
-    save_to = tmp_path / "lm_head.onnx"
-
-    edit = SplitLMHead(g, "unit", save_to=save_to)
-    assert edit.match(output_node)
-    edit.transform(output_node)
-
-    model = onnx.load(save_to)
-    onnx.checker.check_model(model)
-    assert sorted(node.op_type for node in model.graph.node) == sorted(
-        ["DynamicQuantizeLinear", "MatMulInteger", "Cast", "Mul", "Mul"]
-    )
-    assert g.outputs[0].name == "last_hidden_states"

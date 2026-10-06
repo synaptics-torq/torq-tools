@@ -156,23 +156,10 @@ def assert_model_outputs_close(
             assert_allclose(act, exp, rtol=rtol, atol=atol)
 
 
-def node_ops(g: gs.Graph) -> list[str]:
-    return [node.op for node in g.nodes if node.outputs]
-
-
 def only_node(g: gs.Graph, op: str) -> gs.Node:
     matches = [node for node in g.nodes if node.op == op and node.outputs]
     assert len(matches) == 1
     return matches[0]
-
-
-def const(name: str, values, *, dtype=None, export_dtype=None) -> gs.Constant:
-    arr = np.asarray(values, dtype=dtype)
-    return gs.Constant(name=name, values=arr, export_dtype=export_dtype)
-
-
-def empty_optional() -> gs.Variable:
-    return gs.Variable.empty()
 
 
 def conv_bn_graph(w_values, scale_values, shift_values, bias_values=None, extra_consumer=False):

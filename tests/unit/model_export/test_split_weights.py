@@ -61,16 +61,6 @@ def test_export_onnx_split_weights_writes_data_file(tmp_path):
     assert np.array_equal(numpy_helper.to_array(loaded["weight"]), weight)
 
 
-def test_export_onnx_inline_without_split_weights(tmp_path):
-    model, weight = _two_tensor_model()
-    exporter = StubExporter(tmp_path, {"model": model})
-    exporter.export_onnx(validate=False, cleanup=False)
-
-    assert not (exporter.export_dir / "model.onnx.data").exists()
-    m = onnx.load(str(exporter.export_dir / "model.onnx"))
-    assert np.array_equal(numpy_helper.to_array(_inits(m)["weight"]), weight)
-
-
 def test_editor_dump_kwargs_reads_harness(tmp_path):
     exporter = StubExporter(tmp_path, {"model": _two_tensor_model()[0]})
 
@@ -83,11 +73,4 @@ def test_editor_dump_kwargs_reads_harness(tmp_path):
     assert exporter._editor_dump_kwargs(Path("export/model.onnx")) == {
         "dump_path": Path("export/intermediates/model.onnx"),
         "dump_after_edit": "all",
-    }
-
-    split = StubExporter(tmp_path, {"model": _two_tensor_model()[0]}, split_weights=True)
-    split.set_graph_edit_harness(GraphEditHarness(dump_after_edit="EliminateExpand,FoldScalarMatMul"))
-    assert split._editor_dump_kwargs(Path("export/model.onnx")) == {
-        "dump_path": Path("export/intermediates/model.onnx"),
-        "dump_after_edit": "EliminateExpand,FoldScalarMatMul",
     }

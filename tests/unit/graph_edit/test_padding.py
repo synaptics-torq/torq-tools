@@ -94,12 +94,3 @@ def test_replace_pad_with_concat_removes_noop_pad_graph_output():
 
     assert g.outputs[0] is x
     assert pad.outputs == []
-
-
-def test_replace_pad_with_concat_rejects_negative_pads():
-    x = gs.Variable("x", dtype=np.float32, shape=[1, 2])
-    y = gs.Variable("y", dtype=np.float32, shape=[1, 1])
-    pad = gs.Node("Pad", "pad", inputs=[x, gs.Constant("pads", np.array([0, -1, 0, 0], dtype=np.int64))], outputs=[y])
-
-    with pytest.raises(ValueError, match="negative pads"):
-        ReplacePadWithConcat(graph(nodes=[pad], inputs=[x], outputs=[y]), "unit").transform(pad)

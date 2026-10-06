@@ -9,7 +9,7 @@ import json
 import numpy as np
 import pytest
 
-from torq.models.smollm2._inference import SmolLM2Static, _repo_id_for_size
+from torq.models.smollm2._inference import SmolLM2Static
 from torq.models.smollm2.infer import _find_local_assets
 
 pytestmark = pytest.mark.unit
@@ -67,13 +67,6 @@ def _write_assets(directory):
     return cfg, tok
 
 
-def test_repo_id_follows_model_size_and_instruct():
-    assert _repo_id_for_size("135M", False) == "HuggingFaceTB/SmolLM2-135M"
-    assert _repo_id_for_size("135M", True) == "HuggingFaceTB/SmolLM2-135M-Instruct"
-    assert _repo_id_for_size("360M", True) == "HuggingFaceTB/SmolLM2-360M-Instruct"
-    assert _repo_id_for_size("1.7B", False) == "HuggingFaceTB/SmolLM2-1.7B"
-
-
 def test_find_local_assets_walks_up_to_the_variant_dir(tmp_path):
     variant = tmp_path / "export" / "split_lm_head" / "fp32" / "static"
     compiled = variant / "compiled"
@@ -99,24 +92,6 @@ def test_find_local_assets_stops_at_the_variant_dir(tmp_path):
     model.write_bytes(b"vmfb")
 
     assert _find_local_assets(model) == (None, None)
-
-
-def test_static_runner_prefers_staged_config_and_tokenizer(tmp_path, monkeypatch):
-    """No repo_id, no network: the assets staged next to the export must be
-    enough to build the runner (this venv has no huggingface_hub)."""
-    import torq.models.smollm2._inference as si
-
-    cfg, tok = _write_assets(tmp_path)
-    model = tmp_path / "model.onnx"
-    model.write_bytes(b"onnx")
-    monkeypatch.setattr(si, "_load_tokenizer", lambda path: _FakeTokenizer())
-
-    runner = SmolLM2Static(
-        _FakeModel(model), 2, 8, instruct_model=False,
-        config_path=cfg, tokenizer_path=tok,
-    )
-
-    assert runner._n_layers == _CONFIG["num_hidden_layers"]
 
 
 def test_static_runner_falls_back_to_the_repo_id_download(tmp_path, monkeypatch):

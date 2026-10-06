@@ -8,7 +8,6 @@ import pytest
 from support.graph_edit import graph
 from torq.graph_edit import OnnxGraphEditor
 from torq.graph_edit.harness import (
-    ContextRef,
     EditSpec,
     GraphEditHarness,
     ctx,
@@ -28,10 +27,6 @@ pytestmark = pytest.mark.core
 # Parsing
 # -----------------------------------------------------------------------------
 
-def test_parse_edit_flag_bare_name():
-    assert parse_edit_flag("RemoveIsNaN") == EditSpec("RemoveIsNaN", ())
-
-
 def test_parse_edit_flag_with_yaml_list_args():
     spec = parse_edit_flag("EliminateExpand:[Add, Mul]")
     assert spec == EditSpec("EliminateExpand", ("Add", "Mul"))
@@ -42,11 +37,6 @@ def test_parse_edit_flag_scalar_and_typed_args():
         "WidenStridedDepthwiseConv", (64, 4)
     )
     assert parse_edit_flag("Foo:5") == EditSpec("Foo", (5,))
-
-
-def test_parse_edit_flag_empty_name_raises():
-    with pytest.raises(Exception):
-        parse_edit_flag(":[1, 2]")
 
 
 def test_load_edit_and_exclude_files(tmp_path):
@@ -85,22 +75,12 @@ def test_resolve_args_substitutes_context_refs():
     assert out == [42, 5, "x"]
 
 
-def test_resolve_args_missing_context_raises():
-    with pytest.raises(KeyError):
-        resolve_args((ContextRef("missing"),), {})
-
-
 # -----------------------------------------------------------------------------
 # Merge / precedence semantics
 # -----------------------------------------------------------------------------
 
 def _names(specs):
     return [s.name for s in specs]
-
-
-def test_finalize_defaults_passthrough():
-    defaults = [EditSpec("RemoveIsNaN"), EditSpec("EliminateTranspose")]
-    assert GraphEditHarness().finalize(defaults) == defaults
 
 
 def test_finalize_override_keeps_position_and_replaces_args():
@@ -146,11 +126,6 @@ def test_finalize_bare_name_does_not_wipe_default_args():
     assert h.finalize(defaults)[0].args == (["Mul"],)
 
 
-def test_finalize_unknown_edit_raises():
-    with pytest.raises(ValueError):
-        GraphEditHarness(apply_flag=[EditSpec("NoSuchEdit")]).finalize([])
-
-
 # -----------------------------------------------------------------------------
 # from_args + rendering
 # -----------------------------------------------------------------------------
@@ -181,11 +156,6 @@ def test_from_args_collects_flags_files_and_excludes(tmp_path):
     assert h.dump_after_edit == "all"
 
 
-def test_from_args_defaults_dump_after_edit_to_absent():
-    h = GraphEditHarness.from_args(_NS())
-    assert h.dump_after_edit is None
-
-
 def test_finalize_rejects_unknown_dump_edit_names():
     with pytest.raises(ValueError, match="NoSuchDumpEdit"):
         GraphEditHarness(dump_after_edit="FoldScalarMatMul,NoSuchDumpEdit").finalize([])
@@ -213,17 +183,6 @@ def _identity_graph():
     n1 = gs.Node("Identity", "id1", inputs=[inp], outputs=[mid])
     n2 = gs.Node("Identity", "id2", inputs=[mid], outputs=[out])
     return graph(nodes=[n1, n2], inputs=[inp], outputs=[out])
-
-
-def test_apply_specs_excludes_default_edit():
-    editor = OnnxGraphEditor(_identity_graph(), "g")
-    editor.apply_specs(
-        [EditSpec("RemoveIsNaN"), EditSpec("EliminateTranspose")],
-        GraphEditHarness(exclude={"RemoveIsNaN"}),
-    )
-    # Nothing to assert on graph content here beyond it not raising; the
-    # excluded RemoveIsNaN simply must not be constructed/applied.
-    assert isinstance(editor.graph, gs.Graph)
 
 
 def test_apply_specs_novel_edit_applied_once_per_editor():

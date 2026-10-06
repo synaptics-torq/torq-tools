@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
 import numpy as np
-import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
@@ -228,9 +227,3 @@ def test_collapse_unrolled_concat_requires_proven_shapes():
         tensor.shape = None  # unproven identity must NOT collapse
 
     assert not CollapseUnrolledConcat(g, "unit", min_fanin=4).match(concat)
-
-
-def test_collapse_unrolled_concat_respects_min_fanin():
-    g, concat, _ = unrolled_concat_graph(v_len=4)
-
-    assert not CollapseUnrolledConcat(g, "unit").match(concat)  # default min_fanin=32

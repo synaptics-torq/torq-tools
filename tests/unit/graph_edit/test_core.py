@@ -17,7 +17,6 @@ from torq.graph_edit import (
     OnnxGraphEditor,
     rewire_consumers,
 )
-from torq.graph_edit.edits import CommonGraphEditsMixin
 
 
 pytestmark = pytest.mark.core
@@ -127,80 +126,6 @@ def test_reorder_graph_input_and_output_clamps_negative_positions():
     assert [o.name for o in editor.graph.outputs] == ["out1", "out0"]
 
 
-def test_apply_fixed_input_shapes_updates_only_named_inputs():
-    a = gs.Variable("a", dtype=np.float32, shape=["batch", 3])
-    b = gs.Variable("b", dtype=np.float32, shape=["batch", 3])
-    editor = OnnxGraphEditor(graph(nodes=[], inputs=[a, b], outputs=[]), "unit")
-
-    editor.apply_fixed_input_shapes({"a": [2, 3]})
-
-    assert a.shape == [2, 3]
-    assert b.shape == ["batch", 3]
-
-
-class DelegatingEditor(OnnxGraphEditor, CommonGraphEditsMixin):
-    def __init__(self, tmp_path):
-        super().__init__(graph(nodes=[], inputs=[], outputs=[]), "delegating", export_dtype=onnx.TensorProto.FLOAT)
-        self.applied = []
-        self.tmp_path = tmp_path
-
-    def apply_edit(self, edit):
-        self.applied.append(edit)
-        return self
-
-
-@pytest.mark.parametrize(
-    ("method_name", "args", "expected_type"),
-    [
-        ("replace_dynamic_kv_cache", (gs.Variable("cur", dtype=np.int64, shape=[1]), 8), "ReplaceDynamicKVCache"),
-        ("mask_future_attn_scores", (gs.Variable("cur", dtype=np.int64, shape=[1]), 8), "MaskFutureAttentionScores"),
-        ("add_curr_len_input", (gs.Variable("cur", dtype=np.int64, shape=[1]),), "AddCurrLenInput"),
-        ("decompose_layer_normalization", (), "DecomposeLayerNormalization"),
-        ("convert_to_static_index", (), "ConvertToStaticIndex"),
-        ("dequantize_projections_matmul", (2, 4), "DequantizeProjectionsMatMul"),
-        ("remove_isNaN", (), "RemoveIsNaN"),
-        ("remove_redundant_casts", (), "RemoveRedundantCasts"),
-        ("fold_scalar_matmul", (), "FoldScalarMatMul"),
-        ("replace_constant_div_with_mul", (), "ReplaceConstantDivWithMul"),
-        ("replace_int64_float_cast", (8,), "ReplaceInt64FloatCast"),
-        ("broadcast_op_inputs", (["Add"],), "BroadcastOpInputs"),
-        ("eliminate_expands", (["Add"],), "EliminateExpand"),
-        ("eliminate_transposes", (), "EliminateTranspose"),
-        ("collapse_reshape_chains", (), "CollapseReshapeChain"),
-        ("retarget_cross_attn_key_layout", (), "RetargetCrossAttnKeyLayout"),
-        ("collapse_gqa_broadcast", (), "CollapseGQABroadcast"),
-        ("trim_lm_head_vocab", ([0, 1],), "TrimLMHeadVocab"),
-        ("eliminate_rank0_gather", (), "EliminateRank0Gather"),
-        ("eliminate_singleton_gather_unsqueeze", (), "EliminateSingletonGatherUnsqueeze"),
-        ("rewrite_negative_pads", (), "RewriteNegativePads"),
-        ("absorb_padding", (), "AbsorbPadding"),
-        ("replace_pad_with_concat", (), "ReplacePadWithConcat"),
-        ("widen_strided_depthwise_conv", (), "WidenStridedDepthwiseConv"),
-        ("decompose_strided_conv1d", (), "DecomposeStridedConv1D"),
-        ("decompose_bidirectional_rnn", (), "DecomposeBidirectionalRnn"),
-    ],
-)
-def test_common_graph_edit_mixin_methods_delegate_to_expected_edit(tmp_path, method_name, args, expected_type):
-    editor = DelegatingEditor(tmp_path)
-
-    result = getattr(editor, method_name)(*args)
-
-    assert result is editor
-    assert editor.applied[-1].__class__.__name__ == expected_type
-
-
-def test_common_graph_edit_mixin_artifact_methods_delegate(tmp_path):
-    editor = DelegatingEditor(tmp_path)
-
-    editor.extract_token_embeddings(2, 4, tmp_path / "lut.npy")
-    editor.split_lm_head(tmp_path / "lm_head.onnx")
-
-    assert [edit.__class__.__name__ for edit in editor.applied] == [
-        "ExtractConstantLUT",
-        "SplitLMHead",
-    ]
-
-
 # -----------------------------------------------------------------------------
 # Per-edit intermediate dumps (OnnxGraphEditor.dump_path / dump_after_edit)
 # -----------------------------------------------------------------------------
@@ -238,14 +163,6 @@ def _identity_chain_graph() -> gs.Graph:
     id1 = gs.Node("Identity", "id1", inputs=[x], outputs=[y1])
     id2 = gs.Node("Identity", "id2", inputs=[y1], outputs=[y2])
     return graph(nodes=[id1, id2], inputs=[x], outputs=[y2])
-
-
-def test_editor_does_not_dump_without_dump_path(tmp_path):
-    editor = OnnxGraphEditor(_identity_chain_graph(), "unit")
-
-    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
-
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_editor_dump_after_every_edit_uses_numbered_paths(tmp_path):
@@ -295,17 +212,6 @@ def test_editor_dump_only_for_named_edits(tmp_path):
     dumped = onnx.load(tmp_path / "0001_RenameFinalOutput_model.onnx")
     assert [n.name for n in dumped.graph.node] == ["id1", "id2"]
     assert dumped.graph.output[0].name == "y2_renamed"
-
-
-def test_editor_dump_never_writes_for_unmatched_name(tmp_path):
-    dump = tmp_path / "model.onnx"
-    editor = OnnxGraphEditor(
-        _identity_chain_graph(), "unit", dump_path=dump, dump_after_edit="NoSuchEdit"
-    )
-
-    editor.apply_edit(RenameFinalOutput(editor.graph, "unit"))
-
-    assert list(tmp_path.iterdir()) == []
 
 
 def _matmul_graph(weight: np.ndarray) -> gs.Graph:

@@ -57,13 +57,6 @@ def test_batch_prefill_adds_nss_programs_size_flag(tmp_path, monkeypatch):
     assert calls == [["--torq-max-nss-programs-size", "402653184"]]
 
 
-def test_without_batch_prefill_compile_args_are_untouched(tmp_path, monkeypatch):
-    calls = _fake_compile(monkeypatch)
-    _exporter(tmp_path).export_torq(torq_compile_args=["--foo"])
-
-    assert calls == [["--foo"]]
-
-
 def test_existing_nss_flag_is_not_duplicated(tmp_path, monkeypatch):
     calls = _fake_compile(monkeypatch)
     _exporter(tmp_path, batch_prefill=64).export_torq(

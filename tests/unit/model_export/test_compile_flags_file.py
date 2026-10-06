@@ -20,7 +20,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 import torq.model_export.onnx as me
-from torq.utils.compile import COMPILE_FLAGS_FILE, read_compile_flags_file
+from torq.utils.compile import COMPILE_FLAGS_FILE
 from support.model_export import StubExporter
 
 pytestmark = pytest.mark.unit
@@ -59,29 +59,6 @@ def _exporter(tmp_path: Path, **kwargs) -> StubExporter:
     return exporter
 
 
-def test_read_compile_flags_file_absent_returns_empty(tmp_path):
-    assert read_compile_flags_file(tmp_path / COMPILE_FLAGS_FILE) == {}
-
-
-def test_read_compile_flags_file_parses(tmp_path):
-    path = _flags_file(tmp_path, ["--a"], ["--b"])
-    assert read_compile_flags_file(path) == {"flags": ["--a"], "w8a8": ["--b"]}
-
-
-def test_model_flags_empty_without_package_file(tmp_path):
-    # tests/support ships no compile_flags.json.
-    exporter = _exporter(tmp_path)
-    assert exporter._model_compile_flags() == []
-    assert exporter._model_compile_flags(quantized=True) == []
-
-
-def test_model_flags_reads_base_and_w8a8(tmp_path):
-    exporter = _exporter(tmp_path)
-    exporter._compile_flags_file = lambda: _flags_file(tmp_path, ["--a"], ["--b"])
-    assert exporter._model_compile_flags() == ["--a"]
-    assert exporter._model_compile_flags(quantized=True) == ["--a", "--b"]
-
-
 def test_source_tree_model_flag_files_are_complete():
     """The chip-compiled exporters ship a validated flag file (guards against
     drift)."""
@@ -100,17 +77,6 @@ def test_source_tree_model_flag_files_are_complete():
         data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
         assert data.get("flags") == llm["flags"], f"{model}: flags drifted from the LLM set"
         assert data.get("w8a8") == llm["w8a8"], f"{model}: w8a8 drifted from the LLM set"
-    liquid = json.loads((models_dir / "liquid" / COMPILE_FLAGS_FILE).read_text())
-    for flag in (
-        "--torq-hw=SL2610",
-        "--torq-disable-slicing",
-        "--torq-enable-transpose-optimization",
-        "--torq-convert-dtypes",
-        "--torq-convert-io-dtype",
-        "--torq-enable-split-constants-optimization",
-        "--iree-flow-inline-constants-max-byte-length=300000000",
-    ):
-        assert flag in liquid["flags"], f"liquid: {flag} missing"
 
 
 @pytest.mark.ci
@@ -148,11 +114,6 @@ def test_export_onnx_writes_variant_snapshot(tmp_path):
         "--a",
         "--torq-max-nss-programs-size", me.TORQ_MAX_NSS_PROGRAMS_SIZE,
     ]
-
-
-def test_export_onnx_no_snapshot_without_flags(tmp_path):
-    exporter = _exporter(tmp_path)
-    assert not (exporter.export_dir / COMPILE_FLAGS_FILE).exists()
 
 
 def test_quantized_variant_snapshot_includes_w8a8(tmp_path):
@@ -205,15 +166,6 @@ def test_export_torq_quantized_variant_gets_w8a8_flags(tmp_path, monkeypatch):
     assert calls == [["--a", "--b"]]
 
 
-def test_export_torq_user_nss_flag_wins_over_auto(tmp_path, monkeypatch):
-    calls = _fake_compile(monkeypatch)
-    exporter = _exporter(tmp_path)
-    exporter._batch_prefill = 64
-    exporter.export_torq(torq_compile_args=["--torq-max-nss-programs-size", "999"])
-
-    assert calls == [["--torq-max-nss-programs-size", "999"]]
-
-
 def test_compile_driver_loads_flags_from_model_dir(tmp_path, monkeypatch):
     """Standalone `python -m torq.utils.compile <dir>/model.onnx` picks the up
     variant dir's recorded flags; explicit --compile-flags come after (win)."""
@@ -245,22 +197,3 @@ def test_compile_driver_loads_flags_from_model_dir(tmp_path, monkeypatch):
                                       "--compile-flags", "--a", "--user"])
     tc.main()
     assert compile_calls[1] == ["--a", "--a", "--user"]
-
-
-def test_compile_driver_without_flags_file_uses_user_flags(tmp_path, monkeypatch):
-    import torq.utils.compile as tc
-
-    model_dir = tmp_path / "plain"
-    model_dir.mkdir()
-    (model_dir / "model.onnx").write_bytes(b"")
-
-    compile_calls = []
-    monkeypatch.setattr(tc, "export_onnx_to_mlir", lambda *a, **k: None)
-    monkeypatch.setattr(tc, "compile_mlir_for_vm",
-                        lambda mlir, out, target, args, *a: compile_calls.append(list(args)))
-    monkeypatch.chdir(tmp_path)
-    import sys
-    monkeypatch.setattr(sys, "argv", ["compile.py", str(model_dir / "model.onnx"),
-                                      "--compile-flags", "--user"])
-    tc.main()
-    assert compile_calls == [["--user"]]

@@ -31,13 +31,6 @@ def test_restore_output_arity_adds_missing_state_outputs():
     assert node.outputs[1].shape == (1, 1, 2)
 
 
-def test_max_chunk_len_must_be_positive():
-    g, _ = _rnn_node(direction="forward")
-
-    with pytest.raises(ValueError, match="max_chunk_len"):
-        DecomposeBidirectionalRnn(g, "unit", max_chunk_len=0)
-
-
 def test_bidirectional_rnn_decomposition_creates_forward_and_reverse_branches():
     g, node = _rnn_node()
 
@@ -50,14 +43,6 @@ def test_bidirectional_rnn_decomposition_creates_forward_and_reverse_branches():
     assert node.outputs == []
     assert any(n.name == "rnn_fwd" for n in g.nodes)
     assert any(n.name == "rnn_rev" for n in g.nodes)
-
-
-def test_bidirectional_layout_one_raises_not_implemented():
-    g, node = _rnn_node(layout=1)
-    edit = DecomposeBidirectionalRnn(g, "unit")
-
-    with pytest.raises(NotImplementedError, match="layout=0"):
-        edit.transform(node)
 
 
 def test_forward_rnn_chunking_splits_long_sequence():

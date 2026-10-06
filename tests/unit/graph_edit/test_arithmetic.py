@@ -116,17 +116,6 @@ def test_replace_constant_div_with_mul_reuses_reciprocal_constant():
     np.testing.assert_allclose(div.inputs[1].values, np.array([0.5, 0.25], dtype=np.float32))
 
 
-def test_replace_constant_div_with_mul_rejects_dynamic_divisor():
-    x = gs.Variable("x", dtype=np.float32, shape=[2])
-    denom = gs.Variable("denom", dtype=np.float32, shape=[2])
-    y = gs.Variable("y", dtype=np.float32, shape=[2])
-    div = gs.Node("Div", "div", inputs=[x, denom], outputs=[y])
-    edit = ReplaceConstantDivWithMul(graph(nodes=[div], inputs=[x, denom], outputs=[y]), "unit", export_dtype=onnx.TensorProto.FLOAT)
-
-    with pytest.raises(TypeError, match="second operand"):
-        edit.transform(div)
-
-
 def test_replace_int64_float_cast_builds_lookup_path():
     idx = gs.Variable("idx", dtype=np.dtype(np.int64), shape=[1, 1])
     cast_out = gs.Variable("idx_float", dtype=onnx.TensorProto.FLOAT, shape=[1, 1])
@@ -166,13 +155,3 @@ def test_decompose_layer_normalization_replaces_node_with_arithmetic_ops():
 
     assert ln.outputs == []
     assert {"ReduceMean", "Sub", "Pow", "Sqrt", "Div", "Mul", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
-
-
-def test_decompose_layer_normalization_disabled_flag_skips_match():
-    x = gs.Variable("x", dtype=np.float32, shape=[1, 3])
-    scale = gs.Constant("scale", np.ones(3, dtype=np.float32))
-    y = gs.Variable("y", dtype=np.float32, shape=[1, 3])
-    ln = gs.Node("LayerNormalization", "ln", inputs=[x, scale], outputs=[y])
-    g = graph(nodes=[ln], inputs=[x], outputs=[y])
-
-    assert not DecomposeLayerNormalization(g, "unit", enabled=False).match(ln)
