@@ -105,7 +105,7 @@ VL-specific flags (everything else matches `torq-export-model liquid`):
 | `--split-lm-head` | gemma3-style split at ONNX-export time: the decoder becomes the body `transformer.onnx` (`last_hidden_states` output) + a first-class `lm_head.onnx` (hidden→logits). Lower-TTFT as the head runs only when sampling. Static exports only |
 | `--chunk-lm-head` | revert to the legacy 512-chunk lm_head MatMul split (default: a single `[1024, 65536]` MatMul; tile-and-fuse handles it) |
 | `--batch-prefill N` | also emit the fixed-shape `transformer_prefill.onnx` LLM decoder (N tokens per step, stays fused); requires `--split-lm-head`; static exports only; the vision encoder is unaffected |
-| `--dynamic-quantize` | int8 dynamic-quantize every exported component (decoder, prefill, head, vision); `--dynamic-quantization-skip-model COMPONENT…` exempts components |
+| `--dynamic-quantize` | int8 dynamic-quantize the exported chip components (decoder, prefill, head); `--dynamic-quantization-skip-model COMPONENT…` exempts more. The dynamic `vision_encoder` is skipped by default unless `--compile-vision` / `--vision-res` is set — it is a CPU/ORT component, and ORT's quantizer pre-processing crashes on its dynamic shapes |
 | `--image-decoder-parts [N]` | build + compile the one-shot image-prefill decoder, split into N layer parts (bare = 2) |
 | `--compile-vision` | compile the *dynamic* encoder as-is (experimental; dynamic shapes + exotic ops — prefer `--vision-res`) |
 | `--skip-torq` | stop after ONNX export |

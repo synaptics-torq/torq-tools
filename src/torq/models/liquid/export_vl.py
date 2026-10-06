@@ -757,6 +757,32 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._logger.info("(%s) Verified static shapes; I/O %s", component, json.dumps(io))
 
     # ------------------------------------------------------------------ compile
+    def dynamic_quantize_models(
+        self,
+        quantize_dir: str | os.PathLike | None = None,
+        skip: list[str] | None = None,
+        analyze_nodes: bool = False,
+        **quantize_kwargs,
+    ):
+        """Quantize with the dynamic vision encoder skipped by default.
+
+        The vision encoder is a CPU/ORT component: without ``--compile-vision``
+        / ``--vision-res`` it is never compiled, and ORT's quantizer
+        pre-processing (symbolic shape inference) crashes on its unresolved
+        dynamic SigLIP shapes — so quantizing it can only fail. An explicit
+        ``--dynamic-quantization-skip-model`` still controls the rest.
+        """
+        skip = list(skip or [])
+        if VISION not in skip and not (self._compile_vision or self._vision_res):
+            self._logger.info(
+                "(ONNX-quantize) Skipping '%s' (not compiled in this run)", VISION,
+            )
+            skip.append(VISION)
+        return super().dynamic_quantize_models(
+            quantize_dir=quantize_dir, skip=skip, analyze_nodes=analyze_nodes,
+            **quantize_kwargs,
+        )
+
     def export_torq(self, *args, skip: list[str] | None = None,
                     torq_compile_args: list[str] | None = None, **kwargs):
         """Compile the decoder (and, if requested, the vision encoder / image

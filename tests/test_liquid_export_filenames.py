@@ -588,6 +588,8 @@ class LiquidVLRuntimeAssetTests(unittest.TestCase):
             _conv_L_cache=_CONFIG.get("conv_L_cache", 3),
             _split_lm_head=False,
             _simulate_bf16=False,
+            _compile_vision=False,
+            _vision_res=None,
         )
         defaults.update(attrs)
         for name, value in defaults.items():
