@@ -17,20 +17,20 @@ classifiers = [
 license = { "file" = "LICENSE" }
 readme = "README.md"
 dependencies = [
-    "ai_edge_litert",
-    "datasets",
-    "huggingface_hub",
-    "ml_dtypes",
-    "numpy",
-    "onnx",
-    "onnxruntime",
-    "onnx_graphsurgeon",
-    "optimum[onnxruntime]",
-    "polygraphy",
-    "pyyaml",
-    "tokenizers",
-    "torq-compiler>=2.2.1",
-    "transformers",
+    "ai_edge_litert==2.1.5",
+    "datasets==4.8.5",
+    "huggingface_hub==0.36.2",
+    "ml_dtypes==0.5.4",
+    "numpy==2.5.1",
+    "onnx==1.21.0",
+    "onnxruntime==1.26.0",
+    "onnx_graphsurgeon==0.6.1",
+    "optimum[onnxruntime]==2.1.0",
+    "polygraphy==0.50.3",
+    "pyyaml==6.0.3",
+    "tokenizers==0.22.2",
+    "torq-compiler==2.2.1",
+    "transformers==4.57.6",
 ]
 
 [project.urls]
