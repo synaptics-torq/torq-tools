@@ -872,7 +872,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = LiquidVLModelExporter(
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill,
+        batch_prefill=args.batch_prefill or None,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,

@@ -82,7 +82,7 @@ host-side script; they now live as static methods on
   replace above)
 - **lm_head**: a single `[1024, 65536]` MatMul against a pre-transposed
   weight constant (tile-and-fuse handles it; no export-time chunking)
-- optional `token_embedding` extraction with `--extract-embeddings`
+- **token_embedding** extraction (on by default; opt out with `--no-extract-embeddings`)
 - custom-op replacement for `GroupQueryAttention` /
   `SimplifiedLayerNormalization`
 
@@ -90,15 +90,16 @@ host-side script; they now live as static methods on
 source .venv/bin/activate
 cd torq-tools-dev
 
-torq-export-model liquid \
-  --models-dir models \
-  --convert-dtypes \
-  --extract-embeddings
+torq-export-model liquid --models-dir models
 ```
 
 Like the other models (gemma3, smollm2), this single command **exports and
-compiles**: it produces the bf16 ONNX and then compiles it to a vmfb under
-`export/<unified|split_lm_head>/bf16/static/compiled/`. Pass `--skip-torq` to stop at the ONNX.
+compiles**: by default it produces the static split-lm-head ONNX set
+(embedding extraction and a 64-token batched prefill on) and then compiles it
+to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Pass
+`--convert-dtypes` to compile the converted bf16 variant instead (the VMFB is
+dtype-converted by the compiler either way). Pass `--skip-torq` to stop at the
+ONNX.
 
 Flag breakdown:
 
@@ -110,8 +111,9 @@ Flag breakdown:
 | `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
 | `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
 | `--dynamic-quantize` | dynamically quantize every exported component to int8 weights; `--dynamic-quantization-skip-model COMPONENT…` exempts components (e.g. keep the `lm_head` fp32) |
-| `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. |
-| `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. |
+| `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. **On by default** — opt out with `--no-split-lm-head`. |
+| `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step (default: `64`; pass `0` to disable); requires `--split-lm-head` (on by default). See [Batched prefill](#3-batched-prefill). |
+| `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. **On by default** — opt out with `--no-extract-embeddings`. |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
 | `--compile-flags …` | extra flags forwarded to `torq-compile` (must be last). The liquid export already adds `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`. |
 
@@ -121,7 +123,6 @@ Opt-out flags for the chip-specific rewrites:
 |---|---|
 | `--keep-conv1d` | leave the original depthwise Conv1D in place (useful for CPU/ORT targets) |
 | `--chunk-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
-| `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step; requires `--split-lm-head` (see [Batched prefill](#3-batched-prefill)) |
 
 > [!Note]
 > `--split-lm-head` is the same concept as gemma3's flag of the same name: the lm_head is extracted into a separate file so the body (hidden output) and the head (hidden→logits) can be deployed independently.
@@ -131,12 +132,12 @@ Output on disk after a successful run. As in gemma3, the topology gets its own d
 ```
 models/liquid-2p5-350m/
 ├── source/onnx/fp32/model.onnx        (~1.4 GB — original HF safetensors, converted)
-└── export/<unified|split_lm_head>/    (--split-lm-head picks the latter)
+└── export/<unified|split_lm_head>/    (default: split_lm_head; --no-split-lm-head picks the former)
     ├── fp32/static/
     │   ├── model.onnx                (~1.4 GB; unified export only)
     │   ├── transformer.onnx          (~1.4 GB; split export body with last_hidden_states output)
-    │   ├── lm_head.onnx              (only with --split-lm-head; ~268 MB fp32)
-    │   ├── transformer_prefill.onnx  (only with --batch-prefill N; stays fused)
+    │   ├── lm_head.onnx              (split export, on by default; ~268 MB fp32)
+    │   ├── transformer_prefill.onnx  (default: 64-token prefill; --batch-prefill 0 disables; stays fused)
     │   ├── token_embeddings.npy      (~128 MB, fp32; for host inference)
     │   ├── config.json
     │   ├── tokenizer.json
@@ -199,7 +200,8 @@ lm_head, ~258 MB without FFN).
 
 ## 3. Batched prefill
 
-`--batch-prefill N` requires `--split-lm-head` and additionally emits
+`--batch-prefill N` (default: `64`, `0` disables) requires `--split-lm-head`
+(on by default) and additionally emits
 `transformer_prefill.onnx`: the same static decoder with its token input pinned to
 exactly N positions. It takes `input_ids` / `token_embedding` of shape
 `[1, N]` / `[1, N, hidden]` plus a `position_ids [1, 1]` holding the chunk's

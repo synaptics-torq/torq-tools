@@ -132,7 +132,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
                 )
             if not self._split_lm_head:
-                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+                raise ValueError(
+                    "`--batch-prefill` requires `--split-lm-head` "
+                    "(disable the prefill export with `--batch-prefill 0`)"
+                )
         self._batch_prefill = batch_prefill
 
         opt_config = ORTOptimizerConfig(
@@ -549,7 +552,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         hf_repo=args.hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill,
+        batch_prefill=args.batch_prefill or None,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,

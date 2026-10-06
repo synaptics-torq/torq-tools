@@ -160,7 +160,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
                     f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
                 )
             if not self._split_lm_head:
-                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+                raise ValueError(
+                    "`--batch-prefill` requires `--split-lm-head` "
+                    "(disable the prefill export with `--batch-prefill 0`)"
+                )
             if not static_models:
                 raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
         self._batch_prefill = batch_prefill
@@ -1694,7 +1697,7 @@ def export_liquid_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill,
+        batch_prefill=args.batch_prefill or None,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,

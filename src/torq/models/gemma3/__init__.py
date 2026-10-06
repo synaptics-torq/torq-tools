@@ -10,6 +10,7 @@ from ...graph_edit.harness import add_graph_edit_harness_args
 
 DEFAULT_MODEL_SIZE: Final[str] = "270m"
 DEFAULT_GEN_TOKENS: Final[int] = 256
+DEFAULT_BATCH_PREFILL: Final[int] = 64
 DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
@@ -64,9 +65,9 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--extract-embeddings",
-        action="store_true",
-        default=False,
-        help="Extract large embeddings tables into external .npy data"
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Extract large embeddings tables into external .npy data (default: %(default)s)"
     )
     parser.add_argument(
         "--dynamic-models",
@@ -88,15 +89,16 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--split-lm-head",
-        action="store_true",
-        default=False,
-        help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states"
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states (default: %(default)s)"
     )
     parser.add_argument(
         "--batch-prefill",
         type=int,
+        default=DEFAULT_BATCH_PREFILL,
         metavar="N",
-        help="Export transformer_prefill.onnx with a fixed N-token prefill; requires --split-lm-head",
+        help="Export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
     )
     parser.add_argument(
         "--trim-vocab-groups",
