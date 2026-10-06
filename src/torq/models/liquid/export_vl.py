@@ -43,7 +43,10 @@ from torq.utils.onnx import check_dynamic_shapes
 from .export import LiquidModelExporter, LIQUID_TORQ_FLAGS  # noqa: F401  (import triggers gs bf16 patch)
 from ._graph import LiquidOnnxGraphEditor
 from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase
+from ...model_export.onnx import (
+    OnnxModelExporterBase,
+    TORQ_MAX_NSS_PROGRAMS_SIZE,
+)
 
 
 # Component keys — match the source ONNX filenames so the base exporter writes
@@ -796,7 +799,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
             # The image-decoder parts and the materialized static vision encoder
             # emit many NSS programs (~195-205 MB); the 8 MB default is far too
             # small (image_prefill.md §3e). Harmless for the other components.
-            extra += ["--torq-max-nss-programs-size", "402653184"]
+            extra += ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
         return super().export_torq(*args, skip=skip, torq_compile_args=extra, **kwargs)
 
     # ------------------------------------------------------- deployment assets

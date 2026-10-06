@@ -42,6 +42,12 @@ __all__ = [
     "OnnxModelExporterBase",
 ]
 
+# 384 MiB of NSS program space: a 16-layer batched prefill (64 tokens) emits
+# ~10.2 MB of programs vs the compiler's 8 MB default, and a 26-layer prefill
+# (gemma3-1b) or the VL vision / image-decoder builds (~195-205 MB) need more
+# still. Harmless for components that fit.
+TORQ_MAX_NSS_PROGRAMS_SIZE = "402653184"
+
 FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
     "float": onnx.TensorProto.FLOAT,
     "fp32" : onnx.TensorProto.FLOAT,
@@ -493,6 +499,15 @@ class OnnxModelExporterBase(ABC):
         self._prepare()
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
+        # The --batch-prefill exporters (gemma3, liquid, liquid-vl) set
+        # _batch_prefill in their own __init__ (before super().__init__), so
+        # getattr: the attribute may not exist on other exporters.
+        if getattr(self, "_batch_prefill", None) is not None:
+            torq_compile_args = list(torq_compile_args or [])
+            if "--torq-max-nss-programs-size" not in torq_compile_args:
+                torq_compile_args += [
+                    "--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE,
+                ]
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
