@@ -41,7 +41,6 @@ from torq.utils.logging import configure_logging
 from torq.utils.onnx import check_dynamic_shapes
 
 from .export import (
-    LIQUID_TORQ_FLAGS,  # noqa: F401  (import triggers gs bf16 patch)
     LiquidModelExporter,
 )
 from ._graph import LiquidOnnxGraphEditor
@@ -790,6 +789,15 @@ class LiquidVLModelExporter(LiquidModelExporter):
             **quantize_kwargs,
         )
 
+    def _auto_torq_compile_extras(self) -> list[str]:
+        extras = super()._auto_torq_compile_extras()
+        if (getattr(self, "_image_decoder_parts", None) or getattr(self, "_vision_res", None)) and not extras:
+            # The image-decoder parts and the materialized static vision encoder
+            # emit many NSS programs (~195-205 MB); the 8 MB default is far too
+            # small (image_prefill.md §3e). Harmless for the other components.
+            extras = ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
+        return extras
+
     def export_torq(self, *args, skip: list[str] | None = None,
                     torq_compile_args: list[str] | None = None, **kwargs):
         """Compile the decoder (and, if requested, the vision encoder / image
@@ -797,14 +805,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         skip = list(skip or [])
         if not self._compile_vision and VISION not in skip:
             skip.append(VISION)
-        extra = list(torq_compile_args or [])
-        if (self._image_decoder_parts or self._vision_res) and \
-                "--torq-max-nss-programs-size" not in extra:
-            # The image-decoder parts and the materialized static vision encoder
-            # emit many NSS programs (~195-205 MB); the 8 MB default is far too
-            # small (image_prefill.md §3e). Harmless for the other components.
-            extra += ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
-        return super().export_torq(*args, skip=skip, torq_compile_args=extra, **kwargs)
+        return super().export_torq(*args, skip=skip, torq_compile_args=torq_compile_args, **kwargs)
 
     # ------------------------------------------------------- deployment assets
     def _find_tokenizer(self) -> Path | None:

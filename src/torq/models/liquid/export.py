@@ -73,27 +73,6 @@ HF_REPO_ONNX: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Full torq-compile flag set LFM2.5 needs — the validated set the legacy
-# compile_v1.5.sh hardcoded.  All of these matter for the bf16 model:
-#   --torq-convert-dtypes / --torq-convert-io-dtype run the dtype-conversion
-#     passes; without them a tensor's element type resolves to `none` and
-#     torq-compile asserts out (Kernel.cpp `elementType != DType::none`).
-#   --torq-hw=SL2610 / --torq-disable-slicing / --torq-enable-annotate-tied-operands
-#     target + lowering options the chip needs.
-#   --torq-enable-split-constants-optimization is faster (303 vs 432 ms/step)
-#     and lower-heap (each dispatch reads its constant slice from the mmap'd
-#     vmfb instead of staging the whole blob into anonymous DRAM).
-LIQUID_TORQ_FLAGS: tuple[str, ...] = (
-    "--torq-hw=SL2610",
-    "--torq-disable-slicing",
-    "--torq-enable-transpose-optimization",
-    "--torq-convert-dtypes",
-    "--torq-enable-annotate-tied-operands",
-    "--torq-convert-io-dtype",
-    "--torq-enable-split-constants-optimization",
-)
-
-
 class LiquidModelExporter(OnnxModelExporterBase):
     """Exporter for the LiquidAI LFM2.5 hybrid model.
 
@@ -1468,34 +1447,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
-    def export_torq(
-        self,
-        torq_export_dir: str | os.PathLike | None = None,
-        torq_compile_args: list[str] | None = None,
-        use_binary: bool = False,
-        skip: list[str] | None = None,
-        local_compile: bool = False,
-        compiler_path: str | Path | None = None,
-    ):
-        """Compile the exported (bf16) ONNX to a Torq vmfb.
-
-        Prepends LFM2.5's validated torq-compile flag set (``LIQUID_TORQ_FLAGS``)
-        — in particular ``--torq-enable-split-constants-optimization``, which
-        we measured to be faster and lower-heap than the default — ahead of any
-        user-supplied ``--compile-flags``, then defers to the shared
-        ``torq.utils.compile`` driver via the base exporter.
-        """
-        merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
-        # Runtime assets already live in the variant dir next to compiled/.
-        return super().export_torq(
-            torq_export_dir=torq_export_dir,
-            torq_compile_args=merged_args,
-            use_binary=use_binary,
-            skip=skip,
-            local_compile=local_compile,
-            compiler_path=compiler_path,
-        )
-
     def dynamic_quantize_models(
         self,
         quantize_dir: str | os.PathLike | None = None,
@@ -1552,6 +1503,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if self._convert_dir.exists():
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._convert_dir)
 
         for comp, model_path in list(self._export_paths.items()):
             self._logger.info("(ONNX-convert) Converting '%s' to bf16...", model_path)

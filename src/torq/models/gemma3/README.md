@@ -79,7 +79,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling |
 | `--skip-torq` | Stop after ONNX; skip the VMFB compile |
 | `--skip-validation` | Skip ORT validation of edited ONNX |
-| `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` |
+| `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
 
 `--trim-vocab` and `--split-lm-head` change the output path (see below).
 
@@ -193,30 +193,18 @@ For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
 outputs are directly importable by IREE. (The pipeline's `export_torq` stages
 the `.npy` artefacts in the runtime dtype next to the compiled vmfb when
 `--torq-convert-io-dtype` is passed; a standalone compile doesn't — convert
-them manually if you change the vmfb I/O dtype.) Compile the quantized ONNX to
-a VMFB (from `torq-compiler-dev`):
+them manually if you change the vmfb I/O dtype.)
+
+Every export dir carries its validated `torq-compile` flags; a copy of
+[`compile_flags.json`](compile_flags.json) in this model's package. 
+The compile helper loads the file:
 
 ```sh
-model_dir="/path/to/"
-python -m iree.compiler.tools.import_onnx $model_dir/model_mixed_bf16.onnx -o $model_dir/model_mixed_bf16.mlir --data-prop  
-torq-compile $model_dir/model_mixed_bf16.mlir -o $model_dir/model.vmfb \
-    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
-    --torq-convert-dtypes --torq-convert-io-dtype \
-    --torq-enable-annotate-tied-operands \
-    --torq-enable-split-constants-optimization \
-    --iree-flow-inline-constants-max-byte-length=300000000
+python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb
 ```
 
-Or via the tools' compile helper:
-
-```sh
-python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb \
-    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
-    --torq-convert-dtypes --torq-convert-io-dtype \
-    --torq-enable-annotate-tied-operands \
-    --torq-enable-split-constants-optimization \
-    --iree-flow-inline-constants-max-byte-length=300000000
-```
+In a torq-compiler-only environment (no torq-tools), invoke `torq-compile` with 
+each flag from `compile_flags.json` in the export dir.
 
 ### 5. Benchmark (optional)
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -17,6 +18,21 @@ except ImportError:
     TORQ_C_PYAPI = False
 
 logger = logging.getLogger("Torq-compile")
+
+# The file an export writes into each variant dir, recording the torq-compile
+# flags the exporter applied automatically (see OnnxModelExporterBase
+# ._write_compile_flags_snapshot). A standalone compile of a model from such a
+# dir reads its flags from here, so no flags need to be passed by hand.
+COMPILE_FLAGS_FILE = "compile_flags.json"
+
+
+def read_compile_flags_file(path: str | Path) -> dict:
+    """Parse a ``compile_flags.json`` (``{"flags": [...], "w8a8": [...]}``);
+    ``{}`` when absent."""
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text())
 
 
 def _resolve_compiler(compiler_path: str | Path | None = None) -> str:
@@ -352,7 +368,16 @@ def main():
             logger.debug("Deleted existing debug files at '%s'", str(debug_dir))
         debug_dir.mkdir(exist_ok=True)
 
-    torq_compile_args: list[str] = args.compile_flags or []
+    file_flags: list[str] = []
+    flags_file = model_file.parent / COMPILE_FLAGS_FILE
+    if (data := read_compile_flags_file(flags_file)):
+        file_flags = list(data.get("flags") or [])
+        if file_flags:
+            logger.info(
+                "Loaded %d torq-compile flags from '%s' (append --compile-flags to override)",
+                len(file_flags), flags_file,
+            )
+    torq_compile_args: list[str] = file_flags + list(args.compile_flags or [])
     if debug_dir:
         torq_compile_args += [
             "--mlir-print-ir-after-all",

@@ -115,7 +115,7 @@ Flag breakdown:
 | `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step (default: `64`; pass `0` to disable); requires `--split-lm-head` (on by default). See [Batched prefill](#3-batched-prefill). |
 | `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. **On by default** — opt out with `--no-extract-embeddings`. |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
-| `--compile-flags …` | extra flags forwarded to `torq-compile` (must be last). The liquid export already adds `--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`. |
+| `--compile-flags …` | extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
 
 Opt-out flags for the chip-specific rewrites:
 
@@ -168,19 +168,19 @@ you pass `--skip-torq`), writing `model.vmfb` (or `transformer.vmfb` for a
 split export) to `export/<unified|split_lm_head>/<variant>/static/compiled/`
 (`<variant>` = `bf16` with `--convert-dtypes`, else the base dtype dir). Compilation goes through the shared
 `torq.utils.compile` driver (ONNX → MLIR via `iree-import-onnx`, then
-MLIR → vmfb via `torq-compile`), and the liquid export adds
-`--torq-enable-transpose-optimization --torq-enable-split-constants-optimization`
-on top of `torq-compile`'s SL2610 defaults.
+MLIR → vmfb via `torq-compile`), and every compile applies the model's
+validated flag set ([`compile_flags.json`](compile_flags.json) in this
+model's package).
 
-To compile a standalone ONNX/MLIR later (e.g. a diagnostic variant), use the
-same driver directly (the output directory is created automatically):
+Each export variant dir also records the exact set it was built with in its
+own `compile_flags.json`, so a standalone ONNX/MLIR compile later (e.g. a
+diagnostic variant) needs no flags of its own:
 
 ```sh
 export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
 python -m torq.utils.compile \
   models/export/bf16/static/model.onnx \
-  -o models/export/bf16/static/compiled/model.vmfb \
-  --compile-flags --torq-enable-transpose-optimization --torq-enable-split-constants-optimization
+  -o models/export/bf16/static/compiled/model.vmfb
 ```
 
 Notes:

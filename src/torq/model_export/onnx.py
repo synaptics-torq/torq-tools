@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import inspect
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from torq.lab.quantization.onnx.dynamic import (
     summarize_dynamic_quantization,
 )
 
-from ..utils.compile import export_torq
+from ..utils.compile import export_torq, COMPILE_FLAGS_FILE, read_compile_flags_file
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,
@@ -169,6 +170,40 @@ class OnnxModelExporterBase(ABC):
                 self._logger.info(
                     "(Torq-export) Staged '%s' (%s) -> '%s'", npy.name, data.dtype, dst
                 )
+
+    def _compile_flags_file(self) -> Path:
+        """Location of this model's validated torq-compile flag set: the
+        ``compile_flags.json`` shipped in the exporter's package, next to the
+        exporter class's source file.
+        """
+        return Path(inspect.getfile(self.__class__)).parent / COMPILE_FLAGS_FILE
+
+    def _model_compile_flags(self, *, quantized: bool = False) -> list[str]:
+        """The validated torq-compile flag set for this model, if the exporter's
+        package ships a ``compile_flags.json``"""
+        data = read_compile_flags_file(self._compile_flags_file())
+        flags = list(data.get("flags") or [])
+        if quantized:
+            flags += list(data.get("w8a8") or [])
+        return flags
+
+    def _auto_torq_compile_extras(self) -> list[str]:
+        """torq-compile flags derived from this run's export options."""
+        # The --batch-prefill exporters set _batch_prefill in their own __init__
+        # (before super().__init__), so getattr: the attribute may not exist on
+        # other exporters.
+        if getattr(self, "_batch_prefill", None) is None:
+            return []
+        return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
+
+    def _write_compile_flags_snapshot(self, variant_dir: str | os.PathLike, *, quantized: bool = False) -> None:
+        """Record the auto-applied torq-compile flags in the variant dir. """
+        flags = self._model_compile_flags(quantized=quantized) + self._auto_torq_compile_extras()
+        if not flags:
+            return
+        path = Path(variant_dir) / COMPILE_FLAGS_FILE
+        path.write_text(json.dumps({"flags": flags}, indent=2) + "\n")
+        self._logger.info("(Torq-export) Recorded compile flags in '%s'", path)
 
     @property
     def export_dir(self) -> Path:
@@ -356,6 +391,7 @@ class OnnxModelExporterBase(ABC):
                     else:
                         child.unlink()
         self._export_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._export_dir)
 
         if self._static_models:
             self.make_static()
@@ -435,6 +471,7 @@ class OnnxModelExporterBase(ABC):
         if self._quantize_dir.exists():
             shutil.rmtree(self._quantize_dir, ignore_errors=True)
         self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir, quantized=True)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._quantize_dir))
@@ -485,6 +522,7 @@ class OnnxModelExporterBase(ABC):
         if self._convert_dir.exists():
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._convert_dir)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._convert_dir))
@@ -522,15 +560,15 @@ class OnnxModelExporterBase(ABC):
         self._prepare()
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
-        # The --batch-prefill exporters (gemma3, liquid, liquid-vl) set
-        # _batch_prefill in their own __init__ (before super().__init__), so
-        # getattr: the attribute may not exist on other exporters.
-        if getattr(self, "_batch_prefill", None) is not None:
-            torq_compile_args = list(torq_compile_args or [])
-            if "--torq-max-nss-programs-size" not in torq_compile_args:
-                torq_compile_args += [
-                    "--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE,
-                ]
+        # The model's validated flag set (see _model_compile_flags) comes first,
+        # then the user's --compile-flags, so an explicit user value wins on
+        # duplicates; the run-derived extras (NSS program-space budget for
+        # batched prefill) are appended unless the user already set one.
+        user_args = list(torq_compile_args or [])
+        quantized = self._dynamic_quantize and not self._convert_dtypes
+        torq_compile_args = self._model_compile_flags(quantized=quantized) + user_args
+        if "--torq-max-nss-programs-size" not in torq_compile_args:
+            torq_compile_args += self._auto_torq_compile_extras()
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)

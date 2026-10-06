@@ -1,0 +1,15 @@
+{
+  "version": ["2.2.1"],
+  "flags": [
+    "--torq-enable-annotate-tied-operands",
+    "--torq-enable-split-constants-optimization",
+    "--iree-flow-inline-constants-max-byte-length=300000000",
+    "--torq-convert-dtypes",
+    "--torq-convert-io-dtype",
+    "--torq-disable-slicing"
+  ],
+  "w8a8": [
+    "--torq-disable-host",
+    "--torq-disable-css"
+  ]
+}
