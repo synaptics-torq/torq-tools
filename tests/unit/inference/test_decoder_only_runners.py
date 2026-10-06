@@ -149,11 +149,16 @@ def test_dynamic_runner_can_omit_or_include_position_ids():
     assert np.array_equal(with_pos_model.calls[0]["position_ids"], np.array([[2]], dtype=np.int64))
 
 
-def test_decoder_only_prompt_tokens_are_padded_and_truncated():
-    runner = _DemoDynamic(_FakeRunner(), include_position_ids=True)
+def test_decoder_only_prompt_tokens_are_capped_not_padded():
+    """E-11: max_inp_len is a cap. Right-padding with pad_token_id would be
+    attended over (static exports bake the causal mask in; the dynamic feed
+    uses all-ones masks), degenerating short prompts to an immediate EOT."""
+    dynamic = _DemoDynamic(_FakeRunner(), include_position_ids=True)
+    static = _DemoStatic(_FakeRunner())
 
-    assert runner._format_input_tokens([1, 2]) == [1, 2, 0, 0]
-    assert runner._format_input_tokens([1, 2, 3, 4, 5]) == [1, 2, 3, 4]
+    for runner in (dynamic, static):
+        assert runner._format_input_tokens([1, 2]) == [1, 2]
+        assert runner._format_input_tokens([1, 2, 3, 4, 5]) == [1, 2, 3, 4]
 
 
 def test_static_runner_builds_combined_and_separate_cache_shapes():
