@@ -1,0 +1,12 @@
+# ── Stage 1: GPTQ Quantization (GPU ready is recommended) ──────────────────────────────
+llmcompressor>=0.10.0
+compressed-tensors
+transformers>=4.57
+datasets
+torch>=2.4
+
+# ── Stage 2/3: ONNX export and text ───────────────────────────────
+numpy
+onnx>=1.19
+onnxruntime>=1.20     # block-wise DequantizeLinear support (int4-dql template)
+safetensors
