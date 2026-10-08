@@ -29,7 +29,7 @@ from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
-from ...utils.onnx import validate_onnx_source_dir
+from ...utils.onnx import load_onnx_lazy, validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -205,7 +205,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model_path = self._onnx_dir /  "model.onnx"
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         orig_ir = model.ir_version
         graph = gs.import_onnx(model)
         graph.name = "main"
@@ -422,7 +422,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         return new_model
 
     def _patch_static_model(self, model_path: str | os.PathLike, component: str):
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         editor = Gemma3OnnxGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,
@@ -475,7 +475,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._harness,
                 {"lm_head_path": lm_head_path},
             )
-            lm_head_model = onnx.load(lm_head_path)
+            lm_head_model = load_onnx_lazy(lm_head_path)
             lm_head_model.ir_version = model.ir_version
             self._save_component_model(self.check_model(lm_head_model), lm_head_path)
             self._export_paths["lm_head"] = lm_head_path

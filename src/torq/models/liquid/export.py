@@ -50,6 +50,7 @@ from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...utils.onnx import external_data_cwd
 
 
 # HuggingFace repos containing LFM2.5 model + tokenizer
@@ -436,7 +437,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("Shape inference reported issues; continuing: %s", e)
         try:
-            onnx.checker.check_model(model, full_check=False)
+            with external_data_cwd(model):
+                onnx.checker.check_model(model, full_check=False)
         except Exception as e:
             self._logger.warning("ONNX checker reported issues; continuing: %s", e)
         return model

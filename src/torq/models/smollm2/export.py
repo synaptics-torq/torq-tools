@@ -20,7 +20,7 @@ from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx
-from ...utils.onnx import validate_onnx_source_dir
+from ...utils.onnx import load_onnx_lazy, validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -104,7 +104,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         model_path = self._onnx_dir /  "model.onnx"
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         orig_ir = model.ir_version
         graph = gs.import_onnx(model)
         graph.name = "main"
@@ -203,7 +203,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         return new_model
 
     def _patch_static_model(self, model_path: str | os.PathLike):
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         editor = SmolLM2OnnxGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,

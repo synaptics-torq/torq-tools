@@ -33,7 +33,9 @@ from ..utils.onnx import (
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
-    save_onnx_split_weights,
+    external_data_cwd,
+    load_onnx_lazy,
+    save_onnx,
 )
 from .cleanup import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
@@ -100,8 +102,8 @@ class OnnxModelExporterBase(ABC):
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
         # --split-weights: export component files with tensor data above 1024
-        # bytes in an external <model>.onnx.data file (see
-        # save_onnx_split_weights); also the storage form for --dump-after-edit
+        # bytes in an external <model>.onnx.data file (see save_onnx); also
+        # the storage form for --dump-after-edit
         # files.
         self._split_weights = split_weights
         # Directory setup (which downloads or optimum-exports the source model)
@@ -261,7 +263,8 @@ class OnnxModelExporterBase(ABC):
         model = onnx.shape_inference.infer_shapes(
             model, check_type=True, strict_mode=True, data_prop=not skip_data_prop
         )
-        onnx.checker.check_model(model, full_check=True)
+        with external_data_cwd(model):
+            onnx.checker.check_model(model, full_check=True)
         return model
 
     def optimize_model(self, model_path: str | os.PathLike, opt_config: ORTOptimizerConfig):
@@ -274,10 +277,11 @@ class OnnxModelExporterBase(ABC):
             verbose=opt_config.verbose,
             **opt_config.extra_args
         )
-        optimized.save_model_to_file(str(model_path))
-        optimized_model = onnx.load(model_path)
+        # ORT holds the whole model in memory here; free it before going lazy.
+        optimized.save_model_to_file(str(model_path), use_external_data_format=True)
+        del optimized
         optimized_model = onnx.shape_inference.infer_shapes(
-            optimized_model, check_type=True, strict_mode=True, data_prop=False
+            load_onnx_lazy(model_path), check_type=True, strict_mode=True, data_prop=False
         )
         self._save_component_model(optimized_model, model_path)
 
@@ -304,11 +308,11 @@ class OnnxModelExporterBase(ABC):
         return self._export_dir / f"{component}.onnx"
 
     def _save_component_model(self, model: onnx.ModelProto, path: str | os.PathLike) -> None:
-        """Save an exported component, honoring ``--split-weights``."""
-        if self._split_weights:
-            save_onnx_split_weights(model, path)
-        else:
-            onnx.save(model, str(path))
+        """Save an in-progress component with its weights split out, so the
+        next stage can load it lazily (``load_onnx_lazy``) instead of
+        materializing every weight; ``export_onnx`` settles the final layout.
+        """
+        save_onnx(model, path, split=True)
 
     def _editor_dump_kwargs(self, final_path: Path) -> dict:
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
@@ -424,7 +428,7 @@ class OnnxModelExporterBase(ABC):
             if self._static_models:
                 self._logger.info("(%s) Applying post-static conversion patches...", comp)
                 self.apply_post_static_patches(self._export_paths[comp], comp)
-            self.check_model(onnx.load(self._export_paths[comp]))
+            self.check_model(load_onnx_lazy(self._export_paths[comp]))
             if self._static_models and self._allows_dynamic_shapes(comp):
                 self._logger.info(
                     "(%s) Skipping static-shape verification (component is "
@@ -432,7 +436,7 @@ class OnnxModelExporterBase(ABC):
                 )
             elif self._static_models:
                 self._logger.info("(%s) Verifying static shapes...", comp)
-                dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
+                dynamic_shapes = check_dynamic_shapes(load_onnx_lazy(self._export_paths[comp]))
                 if dynamic_shapes:
                     raise ValueError(
                         f"Model '{comp}' still has dynamic shapes: {json.dumps(dynamic_shapes)}"
@@ -443,11 +447,16 @@ class OnnxModelExporterBase(ABC):
                 print(f"\nModel ops summary:")
                 print(
                     json.dumps(
-                        get_model_ops_count(onnx.load(self._export_paths[comp])), indent=4
+                        get_model_ops_count(load_onnx_lazy(self._export_paths[comp])), indent=4
                     ),
                     end="\n\n",
                 )
             self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
+
+        if not self._split_weights:
+            # Single-file layout for every component that fits the 2 GiB limit.
+            for path in self._export_paths.values():
+                save_onnx(load_onnx_lazy(path), path)
 
         if validate:
             if self._skip_export:
@@ -577,7 +586,7 @@ class OnnxModelExporterBase(ABC):
                 self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
             self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
-            model = onnx.load(onnx_path)
+            model = load_onnx_lazy(onnx_path)
             graph = gs.import_onnx(model)
             graph.name = "main"
             graph.cleanup(
@@ -585,7 +594,7 @@ class OnnxModelExporterBase(ABC):
             ).toposort()
             model = gs.export_onnx(graph)
             self.check_model(model)
-            onnx.save(model, onnx_path)
+            save_onnx(model, onnx_path, split=self._split_weights)
             export_torq(
                 onnx_path,
                 self._torq_dir,

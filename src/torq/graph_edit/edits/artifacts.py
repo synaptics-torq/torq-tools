@@ -11,7 +11,7 @@ import onnx
 import onnx_graphsurgeon as gs
 
 from ..onnx import OnnxGraphEdit, rewire_consumers, replace_node
-from ...utils.onnx import normalize_layer_name
+from ...utils.onnx import normalize_layer_name, save_onnx
 
 
 @dataclass(frozen=True)
@@ -110,10 +110,7 @@ class ExtractConstantLUT(OnnxGraphEdit):
         lut = node.inputs[0]
         if not isinstance(lut, gs.Constant):
             return False
-        lut_shape = lut.values.shape
-        if lut_shape == self.lut_shape:
-            return True
-        return False
+        return tuple(lut.shape) == tuple(self.lut_shape)
 
     def transform(self, node: gs.Node):
         if not (node.op == "Gather" and len(node.inputs) >= 2 and isinstance((lut := node.inputs[0]), gs.Constant)):
@@ -121,20 +118,10 @@ class ExtractConstantLUT(OnnxGraphEdit):
         if (axis := node.attrs.get("axis", 0)) != 0:
             raise ValueError(f"Only support axis = 0 for LUT, found axis = {axis} for Gather node '{node.name}'")
         
-        lut_data = lut.values
-        if not isinstance(lut_data, np.ndarray):
-            self._logger.warning("Constant data is not NumPy array, attempting to load lazy values")
-            try:
-                lut_data = lut_data.load()
-            except AttributeError as e:
-                raise ValueError(f"Constant data for {node.name} is not loadable") from e
-            if not isinstance(lut_data, np.ndarray):
-                raise ValueError(f"Invalid Constant data type: {type(lut_data)}")
-        
         if self.save_to is not None:
             self.save_to = Path(self.save_to)
             self.save_to.parent.mkdir(parents=True, exist_ok=True)
-            np.save(self.save_to, lut_data)
+            np.save(self.save_to, lut.values)
 
         if not self.inp_name:
             self.inp_name = f"extracted_lut_{normalize_layer_name(node.name)}_input"
@@ -501,7 +488,7 @@ class SplitLMHead(OnnxGraphEdit):
         )
         save_to = Path(self.save_to)
         save_to.parent.mkdir(parents=True, exist_ok=True)
-        onnx.save(lm_head_model, save_to)
+        save_onnx(lm_head_model, save_to)
 
         logits = lm_head.logits
         hidden_states.name = self.hidden_states_name
