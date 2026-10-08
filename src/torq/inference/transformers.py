@@ -21,7 +21,7 @@ class DecoderOnlyConfig:
     n_kv_heads: int
     head_dim: int
     bos_token_id: int
-    eos_token_id: int
+    eos_token_id: int | list[int]
     pad_token_id: int | None = None
     instruct_model: bool = False
 
@@ -57,7 +57,10 @@ class DecoderOnlyRunner(ABC):
         self._head_dim: int = config.head_dim
         self._instruct_model: bool = config.instruct_model
         self._bos_token_id: int = config.bos_token_id
-        self._eos_token_id: int = config.eos_token_id
+        # HF configs may list several EOS ids (gemma-3-1b: [1, 106]); the
+        # first is the model's primary EOS.
+        eos_token_id = config.eos_token_id
+        self._eos_token_id: int = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
         self._bos_token: str = self._tokenizer.decode(
             [self._bos_token_id], skip_special_tokens=False
         )
