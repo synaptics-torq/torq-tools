@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
 
+import google.protobuf.message
 import ml_dtypes
 import numpy as np
 import onnx
@@ -488,10 +489,21 @@ class OnnxModelExporterBase(ABC):
                 continue
             self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
             quantized_model_path = self._quantize_dir / model_path.name
-            onnx_dynamic_quantize_file(
-                model_path, quantized_model_path,
-                **quantize_kwargs
-            )
+            try:
+                onnx_dynamic_quantize_file(
+                    model_path, quantized_model_path,
+                    **quantize_kwargs
+                )
+            except google.protobuf.message.EncodeError:
+                # >2 GiB model: ORT's in-memory quant_pre_process can't
+                # serialize it. Run the large-model quantize path instead.
+                self._logger.info(
+                    "(ONNX-quantize) '%s' exceeds the 2 GiB protobuf limit; "
+                    "quantizing with the large-model path", model_path.name,
+                )
+                self._quantize_large_model(
+                    model_path, quantized_model_path, **quantize_kwargs
+                )
             self._logger.info("(ONNX-quantize) Successfully dynamically quantizied model @ '%s'", str(quantized_model_path))
             summary = summarize_dynamic_quantization(model_path, quantized_model_path)
             self._logger.info(
@@ -513,6 +525,46 @@ class OnnxModelExporterBase(ABC):
             self._export_paths[comp] = quantized_model_path
             self._logger.debug("(ONNX-quantize) Update %s model path to '%s'", comp, str(quantized_model_path))
         self._copy_runtime_assets(self._quantize_dir, self._export_dir)
+
+    def _quantize_large_model(
+        self,
+        model_path: str | os.PathLike,
+        quantized_model_path: Path,
+        **quantize_kwargs,
+    ) -> None:
+        """Dynamic-quantize a >2 GiB model that ORT's ``quant_pre_process``
+        can't serialize in memory.
+
+        Preprocess with the large-model flags then quantize with
+        ``use_external_data_format`` so no single-file save exceeds the limit.
+        """
+        from onnxruntime.quantization.preprocess import quant_pre_process
+
+        preprocessed_path = quantized_model_path.with_name(
+            f"{quantized_model_path.stem}_preprocess.onnx"
+        )
+        try:
+            quant_pre_process(
+                model_path,
+                preprocessed_path,
+                skip_symbolic_shape=True,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                external_data_location=f"{preprocessed_path.name}.data",
+            )
+            quantize_kwargs.setdefault("use_external_data_format", True)
+            onnx_dynamic_quantize_file(
+                preprocessed_path,
+                quantized_model_path,
+                skip_preprocess=True,
+                **quantize_kwargs,
+            )
+        finally:
+            preprocessed_path.unlink(missing_ok=True)
+            preprocessed_path.with_name(preprocessed_path.name + ".data").unlink(missing_ok=True)
+        # The quantizer's final single-file re-save of the (int8, sub-2 GiB)
+        # result orphans the intermediate external data.
+        quantized_model_path.with_name(quantized_model_path.name + ".data").unlink(missing_ok=True)
 
     def convert_models(
         self,
