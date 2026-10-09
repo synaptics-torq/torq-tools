@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
-"""Export EmbeddingGemma-2 (text + image + video) to static Torq graphs.
+"""Export EmbeddingGemma-2 (text, image, video, audio) to static Torq graphs.
 
-Source: the fp32 ``onnx-community/embeddinggemma-2-ONNX`` graphs. Produces
+Source: the ``onnx-community/embeddinggemma-2-ONNX`` graphs, downloaded from the copy in
+``Synaptics/Google-EmbeddingGemma-2`` (falls back to onnx-community). Produces
 
     export/onnx/{fp32,bf16}/static/vision_<H>x<W>.onnx   pixel_patches -> image_embeds
     export/onnx/{fp32,bf16}/static/text_body_s<S>.onnx   inputs_embeds + attention_bias -> last_hidden_state
@@ -28,7 +29,10 @@ from ._static import AUDIO_FRAMES, build_static_audio, build_static_text, build_
 
 logger = logging.getLogger("embedding_gemma2.export")
 
-HF_REPO = "onnx-community/embeddinggemma-2-ONNX"
+# Source ONNX repos, tried in order: the Synaptics copy first (so the export keeps working if
+# the upstream repo changes), then the onnx-community export it was copied from.
+HF_REPOS: tuple[str, ...] = ("Synaptics/Google-EmbeddingGemma-2", "onnx-community/embeddinggemma-2-ONNX")
+HF_REPO = HF_REPOS[-1]
 SOURCE_FILES = (
     "onnx/model.onnx", "onnx/model.onnx_data",
     "onnx/vision_encoder.onnx", "onnx/vision_encoder.onnx_data",
@@ -98,10 +102,20 @@ def _download_source(dst: Path, weights: str = "fp32") -> Path:
     files = list(SOURCE_FILES)
     if weights != "fp32":
         files += [f.replace(".onnx", f"_{weights}.onnx") for f in SOURCE_FILES if f.startswith("onnx/")]
+    from huggingface_hub.errors import HfHubHTTPError
+
     for f in files:
-        if not (dst / f).exists():
-            logger.info("downloading %s/%s", HF_REPO, f)
-            hf_hub_download(HF_REPO, f, local_dir=dst)
+        if (dst / f).exists():
+            continue
+        for repo in HF_REPOS:
+            try:
+                logger.info("downloading %s/%s", repo, f)
+                hf_hub_download(repo, f, local_dir=dst)
+                break
+            except HfHubHTTPError as e:
+                if repo == HF_REPOS[-1]:
+                    raise
+                logger.warning("%s/%s unavailable (%s); trying the next source", repo, f, type(e).__name__)
     return dst
 
 
