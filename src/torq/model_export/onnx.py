@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import inspect
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
 
+import google.protobuf.message
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
@@ -25,13 +28,15 @@ from torq.lab.quantization.onnx.dynamic import (
     summarize_dynamic_quantization,
 )
 
-from ..utils.compile import export_torq
+from ..utils.compile import export_torq, COMPILE_FLAGS_FILE, read_compile_flags_file
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
     check_dynamic_shapes,
-    save_onnx_split_weights,
+    external_data_cwd,
+    load_onnx_lazy,
+    save_onnx,
 )
 from .cleanup import cleanup_onnx_model
 from ..graph_edit.harness import EditSpec, GraphEditHarness
@@ -41,6 +46,12 @@ __all__ = [
     "ORTOptimizerConfig",
     "OnnxModelExporterBase",
 ]
+
+# 384 MiB of NSS program space: a 16-layer batched prefill (64 tokens) emits
+# ~10.2 MB of programs vs the compiler's 8 MB default, and a 26-layer prefill
+# (gemma3-1b) or the VL vision / image-decoder builds (~195-205 MB) need more
+# still. Harmless for components that fit.
+TORQ_MAX_NSS_PROGRAMS_SIZE = "402653184"
 
 FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
     "float": onnx.TensorProto.FLOAT,
@@ -92,8 +103,8 @@ class OnnxModelExporterBase(ABC):
             raise ValueError(f"Invalid model dtype '{self._model_dtype}', must be one of {list(FP_EXPORT_DTYPE_MAPPING)}")
         self._skip_export = set(skip_export or [])
         # --split-weights: export component files with tensor data above 1024
-        # bytes in an external <model>.onnx.data file (see
-        # save_onnx_split_weights); also the storage form for --dump-after-edit
+        # bytes in an external <model>.onnx.data file (see save_onnx); also
+        # the storage form for --dump-after-edit
         # files.
         self._split_weights = split_weights
         # Directory setup (which downloads or optimum-exports the source model)
@@ -140,6 +151,62 @@ class OnnxModelExporterBase(ABC):
             if not src_path.exists():
                 continue
             shutil.copy2(src_path, dst_dir / asset_name)
+
+    # Dtypes --torq-convert-io-dtype converts the vmfb I/O to.
+    _RUNTIME_DTYPE_MAP: Final[dict[str, type]] = {
+        "float32": ml_dtypes.bfloat16,
+        "int64": np.int32,
+    }
+
+    def _stage_runtime_dtype_artefacts(self, variant_roots: set[Path]) -> None:
+        """Copy each variant's ``.npy`` artefacts into ``self._torq_dir`` in
+        the runtime dtype the compiled vmfbs expect.
+        """
+        for root in sorted(variant_roots):
+            for npy in sorted(root.glob("*.npy")):
+                data = np.load(npy)
+                data = data.astype(
+                    self._RUNTIME_DTYPE_MAP.get(data.dtype.name, data.dtype), copy=False
+                )
+                dst = self._torq_dir / npy.name
+                np.save(dst, data)
+                self._logger.info(
+                    "(Torq-export) Staged '%s' (%s) -> '%s'", npy.name, data.dtype, dst
+                )
+
+    def _compile_flags_file(self) -> Path:
+        """Location of this model's validated torq-compile flag set: the
+        ``compile_flags.json`` shipped in the exporter's package, next to the
+        exporter class's source file.
+        """
+        return Path(inspect.getfile(self.__class__)).parent / COMPILE_FLAGS_FILE
+
+    def _model_compile_flags(self, *, quantized: bool = False) -> list[str]:
+        """The validated torq-compile flag set for this model, if the exporter's
+        package ships a ``compile_flags.json``"""
+        data = read_compile_flags_file(self._compile_flags_file())
+        flags = list(data.get("flags") or [])
+        if quantized:
+            flags += list(data.get("w8a8") or [])
+        return flags
+
+    def _auto_torq_compile_extras(self) -> list[str]:
+        """torq-compile flags derived from this run's export options."""
+        # The --batch-prefill exporters set _batch_prefill in their own __init__
+        # (before super().__init__), so getattr: the attribute may not exist on
+        # other exporters.
+        if getattr(self, "_batch_prefill", None) is None:
+            return []
+        return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
+
+    def _write_compile_flags_snapshot(self, variant_dir: str | os.PathLike, *, quantized: bool = False) -> None:
+        """Record the auto-applied torq-compile flags in the variant dir. """
+        flags = self._model_compile_flags(quantized=quantized) + self._auto_torq_compile_extras()
+        if not flags:
+            return
+        path = Path(variant_dir) / COMPILE_FLAGS_FILE
+        path.write_text(json.dumps({"flags": flags}, indent=2) + "\n")
+        self._logger.info("(Torq-export) Recorded compile flags in '%s'", path)
 
     @property
     def export_dir(self) -> Path:
@@ -197,7 +264,8 @@ class OnnxModelExporterBase(ABC):
         model = onnx.shape_inference.infer_shapes(
             model, check_type=True, strict_mode=True, data_prop=not skip_data_prop
         )
-        onnx.checker.check_model(model, full_check=True)
+        with external_data_cwd(model):
+            onnx.checker.check_model(model, full_check=True)
         return model
 
     def optimize_model(self, model_path: str | os.PathLike, opt_config: ORTOptimizerConfig):
@@ -210,10 +278,11 @@ class OnnxModelExporterBase(ABC):
             verbose=opt_config.verbose,
             **opt_config.extra_args
         )
-        optimized.save_model_to_file(str(model_path))
-        optimized_model = onnx.load(model_path)
+        # ORT holds the whole model in memory here; free it before going lazy.
+        optimized.save_model_to_file(str(model_path), use_external_data_format=True)
+        del optimized
         optimized_model = onnx.shape_inference.infer_shapes(
-            optimized_model, check_type=True, strict_mode=True, data_prop=False
+            load_onnx_lazy(model_path), check_type=True, strict_mode=True, data_prop=False
         )
         self._save_component_model(optimized_model, model_path)
 
@@ -240,11 +309,11 @@ class OnnxModelExporterBase(ABC):
         return self._export_dir / f"{component}.onnx"
 
     def _save_component_model(self, model: onnx.ModelProto, path: str | os.PathLike) -> None:
-        """Save an exported component, honoring ``--split-weights``."""
-        if self._split_weights:
-            save_onnx_split_weights(model, path)
-        else:
-            onnx.save(model, str(path))
+        """Save an in-progress component with its weights split out, so the
+        next stage can load it lazily (``load_onnx_lazy``) instead of
+        materializing every weight; ``export_onnx`` settles the final layout.
+        """
+        save_onnx(model, path, split=True)
 
     def _editor_dump_kwargs(self, final_path: Path) -> dict:
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
@@ -327,6 +396,7 @@ class OnnxModelExporterBase(ABC):
                     else:
                         child.unlink()
         self._export_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._export_dir)
 
         if self._static_models:
             self.make_static()
@@ -359,7 +429,7 @@ class OnnxModelExporterBase(ABC):
             if self._static_models:
                 self._logger.info("(%s) Applying post-static conversion patches...", comp)
                 self.apply_post_static_patches(self._export_paths[comp], comp)
-            self.check_model(onnx.load(self._export_paths[comp]))
+            self.check_model(load_onnx_lazy(self._export_paths[comp]))
             if self._static_models and self._allows_dynamic_shapes(comp):
                 self._logger.info(
                     "(%s) Skipping static-shape verification (component is "
@@ -367,7 +437,7 @@ class OnnxModelExporterBase(ABC):
                 )
             elif self._static_models:
                 self._logger.info("(%s) Verifying static shapes...", comp)
-                dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
+                dynamic_shapes = check_dynamic_shapes(load_onnx_lazy(self._export_paths[comp]))
                 if dynamic_shapes:
                     raise ValueError(
                         f"Model '{comp}' still has dynamic shapes: {json.dumps(dynamic_shapes)}"
@@ -378,11 +448,16 @@ class OnnxModelExporterBase(ABC):
                 print(f"\nModel ops summary:")
                 print(
                     json.dumps(
-                        get_model_ops_count(onnx.load(self._export_paths[comp])), indent=4
+                        get_model_ops_count(load_onnx_lazy(self._export_paths[comp])), indent=4
                     ),
                     end="\n\n",
                 )
             self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
+
+        if not self._split_weights:
+            # Single-file layout for every component that fits the 2 GiB limit.
+            for path in self._export_paths.values():
+                save_onnx(load_onnx_lazy(path), path)
 
         if validate:
             if self._skip_export:
@@ -406,6 +481,7 @@ class OnnxModelExporterBase(ABC):
         if self._quantize_dir.exists():
             shutil.rmtree(self._quantize_dir, ignore_errors=True)
         self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir, quantized=True)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._quantize_dir))
@@ -413,10 +489,21 @@ class OnnxModelExporterBase(ABC):
                 continue
             self._logger.info("(ONNX-quantize) Dynamically quantizing model '%s' to 8-bit integer...", str(model_path))
             quantized_model_path = self._quantize_dir / model_path.name
-            onnx_dynamic_quantize_file(
-                model_path, quantized_model_path,
-                **quantize_kwargs
-            )
+            try:
+                onnx_dynamic_quantize_file(
+                    model_path, quantized_model_path,
+                    **quantize_kwargs
+                )
+            except google.protobuf.message.EncodeError:
+                # >2 GiB model: ORT's in-memory quant_pre_process can't
+                # serialize it. Run the large-model quantize path instead.
+                self._logger.info(
+                    "(ONNX-quantize) '%s' exceeds the 2 GiB protobuf limit; "
+                    "quantizing with the large-model path", model_path.name,
+                )
+                self._quantize_large_model(
+                    model_path, quantized_model_path, **quantize_kwargs
+                )
             self._logger.info("(ONNX-quantize) Successfully dynamically quantizied model @ '%s'", str(quantized_model_path))
             summary = summarize_dynamic_quantization(model_path, quantized_model_path)
             self._logger.info(
@@ -439,6 +526,46 @@ class OnnxModelExporterBase(ABC):
             self._logger.debug("(ONNX-quantize) Update %s model path to '%s'", comp, str(quantized_model_path))
         self._copy_runtime_assets(self._quantize_dir, self._export_dir)
 
+    def _quantize_large_model(
+        self,
+        model_path: str | os.PathLike,
+        quantized_model_path: Path,
+        **quantize_kwargs,
+    ) -> None:
+        """Dynamic-quantize a >2 GiB model that ORT's ``quant_pre_process``
+        can't serialize in memory.
+
+        Preprocess with the large-model flags then quantize with
+        ``use_external_data_format`` so no single-file save exceeds the limit.
+        """
+        from onnxruntime.quantization.preprocess import quant_pre_process
+
+        preprocessed_path = quantized_model_path.with_name(
+            f"{quantized_model_path.stem}_preprocess.onnx"
+        )
+        try:
+            quant_pre_process(
+                model_path,
+                preprocessed_path,
+                skip_symbolic_shape=True,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                external_data_location=f"{preprocessed_path.name}.data",
+            )
+            quantize_kwargs.setdefault("use_external_data_format", True)
+            onnx_dynamic_quantize_file(
+                preprocessed_path,
+                quantized_model_path,
+                skip_preprocess=True,
+                **quantize_kwargs,
+            )
+        finally:
+            preprocessed_path.unlink(missing_ok=True)
+            preprocessed_path.with_name(preprocessed_path.name + ".data").unlink(missing_ok=True)
+        # The quantizer's final single-file re-save of the (int8, sub-2 GiB)
+        # result orphans the intermediate external data.
+        quantized_model_path.with_name(quantized_model_path.name + ".data").unlink(missing_ok=True)
+
     def convert_models(
         self,
         convert_dir: str | os.PathLike | None = None,
@@ -456,6 +583,7 @@ class OnnxModelExporterBase(ABC):
         if self._convert_dir.exists():
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._convert_dir)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
                 self._export_paths[comp] = Path(shutil.copy2(model_path, self._convert_dir))
@@ -493,6 +621,15 @@ class OnnxModelExporterBase(ABC):
         self._prepare()
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
+        # The model's validated flag set (see _model_compile_flags) comes first,
+        # then the user's --compile-flags, so an explicit user value wins on
+        # duplicates; the run-derived extras (NSS program-space budget for
+        # batched prefill) are appended unless the user already set one.
+        user_args = list(torq_compile_args or [])
+        quantized = self._dynamic_quantize and not self._convert_dtypes
+        torq_compile_args = self._model_compile_flags(quantized=quantized) + user_args
+        if "--torq-max-nss-programs-size" not in torq_compile_args:
+            torq_compile_args += self._auto_torq_compile_extras()
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
@@ -501,7 +638,7 @@ class OnnxModelExporterBase(ABC):
                 self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
             self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
-            model = onnx.load(onnx_path)
+            model = load_onnx_lazy(onnx_path)
             graph = gs.import_onnx(model)
             graph.name = "main"
             graph.cleanup(
@@ -509,7 +646,7 @@ class OnnxModelExporterBase(ABC):
             ).toposort()
             model = gs.export_onnx(graph)
             self.check_model(model)
-            onnx.save(model, onnx_path)
+            save_onnx(model, onnx_path, split=self._split_weights)
             export_torq(
                 onnx_path,
                 self._torq_dir,
@@ -520,3 +657,12 @@ class OnnxModelExporterBase(ABC):
                 compiler_path=compiler_path,
             )
             self._logger.info("(Torq-export) Successfully exported '%s/%s.vmfb'", str(self._torq_dir), onnx_path.stem)
+        if "--torq-convert-io-dtype" in (torq_compile_args or []):
+            # The vmfb I/O is converted by the compiler: stage the matching
+            # runtime-dtype artefacts next to the vmfbs.
+            roots = {
+                Path(onnx_path).parent
+                for comp, onnx_path in self._export_paths.items()
+                if comp not in skip
+            }
+            self._stage_runtime_dtype_artefacts(roots)

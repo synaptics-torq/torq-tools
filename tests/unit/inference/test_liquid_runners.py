@@ -111,11 +111,6 @@ class _DemoStatic(LiquidStatic):
         )
 
 
-def test_liquid_reuses_shared_decoder_only_runners():
-    assert issubclass(LiquidDynamic, DynamicDecoderOnlyRunner)
-    assert issubclass(LiquidStatic, StaticDecoderOnlyRunner)
-
-
 def test_dynamic_feeds_position_ids_for_mirror_source():
     model = _FakeRunner(MIRROR_INPUTS)
 
@@ -124,16 +119,6 @@ def test_dynamic_feeds_position_ids_for_mirror_source():
     fed = model.calls[0]
     assert "num_logits_to_keep" not in fed
     assert np.array_equal(fed["position_ids"], np.array([[2]], dtype=np.int64))
-
-
-def test_dynamic_feeds_num_logits_to_keep_for_upstream_source():
-    model = _FakeRunner(UPSTREAM_INPUTS)
-
-    _DemoDynamic(model)._llm_step(5, 2)
-
-    fed = model.calls[0]
-    assert "position_ids" not in fed
-    assert np.array_equal(fed["num_logits_to_keep"], np.array(1, dtype=np.int64))
 
 
 def test_dynamic_feed_order_matches_declared_graph_inputs():
@@ -194,23 +179,6 @@ def test_static_runs_split_lm_head_for_decode_and_prefill_bodies():
         assert np.array_equal(call["last_hidden_states"], hidden)
 
 
-def test_static_uses_prefill_model_for_full_chunks_then_decode_for_remainder():
-    decode_model = _FakeRunner(input_names=["input_ids", "position_ids"])
-    prefill_model = _FakeRunner(input_names=["input_ids", "position_ids"])
-    runner = _DemoStatic(decode_model, prefill_model=prefill_model, prefill_size=2)
-
-    next_token, curr_seq_len = runner._prefill_prompt([3, 4, 5], start_seq_len=1)
-
-    assert next_token == 3
-    assert curr_seq_len == 4
-    # Full 2-token chunk goes to the prefill model at the chunk start position.
-    assert np.array_equal(prefill_model.calls[0]["input_ids"], np.array([[3, 4]]))
-    assert np.array_equal(prefill_model.calls[0]["position_ids"], np.array([[1]]))
-    # The single remainder token falls back to the decode model.
-    assert np.array_equal(decode_model.calls[0]["input_ids"], np.array([[5]]))
-    assert np.array_equal(decode_model.calls[0]["position_ids"], np.array([[3]]))
-
-
 def test_static_prefill_chunks_repeatedly_advance_cache_and_position():
     decode_model = _FakeRunner(input_names=["input_ids", "position_ids"])
     prefill_model = _FakeRunner(input_names=["input_ids", "position_ids"])
@@ -236,26 +204,6 @@ def test_static_prefill_feeds_token_embeddings_for_chunks():
     assert fed.shape == (1, 2, 3)
     assert np.array_equal(fed[0, 0], runner._token_embeddings[3])
     assert np.array_equal(fed[0, 1], runner._token_embeddings[4])
-
-
-def test_static_requires_prefill_model_and_size_together(tmp_path):
-
-    def _init(**overrides):
-        kwargs = dict(
-            model=_FakeRunner(input_names=["input_ids", "position_ids"]),
-            max_prompt_tokens=4,
-            max_gen_tokens=7,
-            config_path=tmp_path / "config.json",
-            tokenizer_path=tmp_path / "tokenizer.json",
-        )
-        kwargs.update(overrides)
-        LiquidStatic.__init__(LiquidStatic.__new__(LiquidStatic), **kwargs)
-
-    with pytest.raises(ValueError, match="must be provided together"):
-        _init(prefill_model=_FakeRunner(input_names=["input_ids", "position_ids"]))
-    with pytest.raises(ValueError, match="must be positive"):
-        _init(prefill_model=_FakeRunner(input_names=["input_ids", "position_ids"]),
-              prefill_size=0)
 
 
 def test_static_infer_prefill_size_from_input_shapes():

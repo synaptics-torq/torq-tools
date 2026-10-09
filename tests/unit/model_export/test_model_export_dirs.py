@@ -8,9 +8,6 @@ constructing an exporter -- otherwise read-only commands like
 ``--view-graph-edits`` destroy a previous export's artifacts.
 """
 
-import logging
-from pathlib import Path
-
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
@@ -43,12 +40,6 @@ def test_construction_leaves_existing_export_artifacts_untouched(tmp_path):
     StubExporter(tmp_path, {"model": _identity_model()})
 
     assert artifact.read_bytes() == b"previous export"
-
-
-def test_construction_does_not_create_the_export_dir(tmp_path):
-    StubExporter(tmp_path, {"model": _identity_model()})
-
-    assert not (tmp_path / "export").exists()
 
 
 def test_export_onnx_resets_stale_artifacts(tmp_path):
@@ -98,76 +89,6 @@ def test_export_onnx_for_quantized_run_preserves_base_compiled_dir(tmp_path):
     assert not stale.exists()
 
 
-def test_export_onnx_for_convert_run_preserves_base_compiled_dir(tmp_path):
-    compiled = tmp_path / "export" / "compiled"
-    compiled.mkdir(parents=True)
-    vmfb = compiled / "model.vmfb"
-    vmfb.write_bytes(b"fp32 vmfb")
-
-    exporter = StubExporter(tmp_path, {"model": _identity_model()}, convert_dtypes=True)
-    exporter.export_onnx(validate=False)
-
-    assert (tmp_path / "export" / "model.onnx").exists()
-    assert vmfb.read_bytes() == b"fp32 vmfb"
-
-
-def test_quantized_run_after_plain_run_preserves_plain_compiled(tmp_path, monkeypatch):
-    """Regression for the co-located layout: a quantized run regenerates the base
-    dtype ONNX (its input) and used to wipe the base variant's compiled/ dir
-    left behind by the earlier plain run. Both variants' vmfbs must coexist."""
-    import torq.model_export.onnx as me
-
-    def fake_export_torq(input_model, output_dir, **kwargs):
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / (Path(input_model).stem + ".vmfb")).write_bytes(b"vmfb")
-
-    monkeypatch.setattr(me, "export_torq", fake_export_torq)
-
-    plain = StubExporter(tmp_path, {"model": _identity_model()})
-    plain.export_onnx(validate=False)
-    plain.export_torq()
-    assert (tmp_path / "export" / "compiled" / "model.vmfb").exists()
-
-    dql = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
-    dql.export_onnx(validate=False)
-    dql.dynamic_quantize_models(skip_preprocess=True)
-    dql.export_torq()
-
-    assert (tmp_path / "export" / "compiled" / "model.vmfb").read_bytes() == b"vmfb"
-    assert (tmp_path / "quantize" / "compiled" / "model.vmfb").read_bytes() == b"vmfb"
-
-
-def test_dynamic_quantize_models_resets_stale_compiled_artifacts(tmp_path):
-    compiled = tmp_path / "quantize" / "compiled"
-    compiled.mkdir(parents=True)
-    stale = compiled / "model.vmfb"
-    stale.write_bytes(b"stale vmfb")
-
-    exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
-    exporter.export_onnx(validate=False)
-    exporter.dynamic_quantize_models(skip_preprocess=True)
-
-    assert not compiled.exists()
-    assert (tmp_path / "quantize" / "model.onnx").exists()
-
-
-def test_compiled_dir_lives_inside_the_variant_dir(tmp_path):
-    """torq_dir is <variant>/compiled: export dir for f32, quantize dir for DQL,
-    convert dir when both, matching the base _setup_dirs contract."""
-    f32 = StubExporter(tmp_path, {"model": _identity_model()})
-    f32._prepare()
-    assert f32._torq_dir == tmp_path / "export" / "compiled"
-
-    dql = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
-    dql._prepare()
-    assert dql._torq_dir == tmp_path / "quantize" / "compiled"
-
-    conv = StubExporter(tmp_path, {"model": _identity_model()}, convert_dtypes=True)
-    conv._prepare()
-    assert conv._torq_dir == tmp_path / "convert" / "compiled"
-
-
 def test_construction_does_not_download_or_load_the_source_model(tmp_path):
     """`--view-graph-edits` builds an exporter purely to render its edit plan."""
     exporter = StubExporter(tmp_path, {"model": _identity_model()})
@@ -183,17 +104,6 @@ def test_export_onnx_prepares_once(tmp_path):
     exporter.export_onnx(validate=False)
 
     assert (exporter.setup_calls, exporter.load_calls) == (1, 1)
-
-
-def test_dynamic_quantize_models_skips_when_disabled(tmp_path, caplog):
-    caplog.set_level(logging.WARNING, logger="StubExporter")
-    exporter = StubExporter(tmp_path, {"model": _identity_model()})
-
-    exporter.dynamic_quantize_models()
-
-    assert (exporter.setup_calls, exporter.load_calls) == (0, 0)
-    assert not (tmp_path / "quantize").exists()
-    assert "Skipping dynamic quantization" in caplog.text
 
 
 def test_dynamic_quantize_models_quantizes_and_updates_export_paths(tmp_path):

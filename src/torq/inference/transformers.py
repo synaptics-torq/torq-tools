@@ -21,7 +21,7 @@ class DecoderOnlyConfig:
     n_kv_heads: int
     head_dim: int
     bos_token_id: int
-    eos_token_id: int
+    eos_token_id: int | list[int]
     pad_token_id: int | None = None
     instruct_model: bool = False
 
@@ -57,8 +57,10 @@ class DecoderOnlyRunner(ABC):
         self._head_dim: int = config.head_dim
         self._instruct_model: bool = config.instruct_model
         self._bos_token_id: int = config.bos_token_id
-        self._eos_token_id: int = config.eos_token_id
-        self._pad_token_id: int = config.pad_token_id or 0
+        # HF configs may list several EOS ids (gemma-3-1b: [1, 106]); the
+        # first is the model's primary EOS.
+        eos_token_id = config.eos_token_id
+        self._eos_token_id: int = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
         self._bos_token: str = self._tokenizer.decode(
             [self._bos_token_id], skip_special_tokens=False
         )
@@ -118,18 +120,17 @@ class DecoderOnlyRunner(ABC):
         self._kv_cache.update(self._reset_cache_state)
 
     def _format_input_tokens(self, input: list[int]) -> list[int]:
+        """Cap the prompt at ``max_inp_len``.
+
+        This is a cap, not a pad target: decoder-only exports bake the causal
+        mask in (static) or feed it as all-ones (dynamic, one token per step),
+        so right-padding with ``pad_token_id`` would be attended over as real
+        content and degenerate the output (E-11).
+        """
         max_len = self.max_inp_len
-        if isinstance(max_len, int):
-            if len(input) > max_len:
-                self._logger.warning("Truncating input from %d to %d", len(input), max_len)
-                input = input[: max_len]
-            elif len(input) < max_len:
-                self._logger.info("Padding input from %d to %d", len(input), max_len)
-                input = np.pad(
-                    input,
-                    (0, max_len - len(input)),
-                    constant_values=self._pad_token_id,
-                ).tolist()
+        if isinstance(max_len, int) and len(input) > max_len:
+            self._logger.warning("Truncating input from %d to %d", len(input), max_len)
+            input = input[: max_len]
 
         return input
 

@@ -30,6 +30,7 @@ import onnx_graphsurgeon as gs
 
 from ...graph_edit.edits import CommonGraphEditsMixin
 from ...graph_edit.onnx import OnnxGraphEditor
+from ...utils.onnx import external_data_cwd, load_onnx_lazy, save_onnx
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +69,14 @@ def cleanup_onnx_model(
 
     n_nodes, n_inits = len(model.graph.node), len(model.graph.initializer)
     editor = _CleanupEditor(gs.import_onnx(model), GRAPH_NAME)
-    del model  # only the counts are needed below; free the inferred copy
     with editor:
         if "collapse-concat" not in skip:
             editor.collapse_unrolled_concat(min_fanin)
         if "fold-constants" not in skip:
-            editor.graph.fold_constants(size_threshold=fold_size_threshold)
+            # ORT evaluates the folds from a serialized model; the lazy
+            # (load_onnx_lazy) weights gs exports into it must be reachable.
+            with external_data_cwd(model):
+                editor.graph.fold_constants(size_threshold=fold_size_threshold)
         if "fold-conv-bn" not in skip:
             editor.fold_conv_batchnorm()
         # Non-strict: some exporters legitimately carry annotations strict
@@ -135,7 +138,8 @@ def add_onnx_cleanup_args(parser: argparse.ArgumentParser) -> None:
 
 
 def onnx_cleanup_from_args(args: argparse.Namespace) -> None:
-    model = onnx.load(args.input)
+    # --verify runs both models in ORT from memory, which needs the weights.
+    model = onnx.load(args.input) if args.verify else load_onnx_lazy(args.input)
     threshold = args.fold_size_threshold
     if threshold is not None and threshold < 0:
         threshold = None
@@ -150,5 +154,5 @@ def onnx_cleanup_from_args(args: argparse.Namespace) -> None:
 
         verify_equivalence(model, cleaned, _static_fp32_input_shapes(model))
         logger.info("verify: cleaned model matches the original")
-    onnx.save(cleaned, args.output)
+    save_onnx(cleaned, args.output)
     logger.info("saved %s", args.output)

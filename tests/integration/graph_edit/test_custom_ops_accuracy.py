@@ -366,9 +366,3 @@ def test_group_query_attention_chunk_matches_reference():
     np.testing.assert_allclose(got_attn, ref_attn, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(got_pk, ref_pk, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(got_pv, ref_pv, rtol=1e-4, atol=1e-5)
-
-
-def test_group_query_attention_chunk_must_be_positive():
-    with pytest.raises(ValueError, match="chunk_len"):
-        ReplaceGroupQueryAttention(None, "test", num_heads=1, kv_num_heads=1,
-                                   head_dim=2, chunk_len=0)

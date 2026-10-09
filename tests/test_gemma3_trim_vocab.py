@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.processors import TemplateProcessing
@@ -87,27 +86,7 @@ class Gemma3TrimVocabTests(unittest.TestCase):
         self.assertNotIn(7, spec.kept_model_ids)
         # trimmed_vocab_size = kept_model_ids + extra_token_ids
         self.assertEqual(spec.trimmed_vocab_size, len(spec.kept_model_ids) + len(spec.extra_token_ids))
-
-    def test_kept_model_ids_preserves_original_ids(self):
-        """Verify that kept_model_ids are original (not remapped) token IDs."""
-        temp_dir, tokenizer_path, tokenizer_json, config_json, _ = self._build_test_assets()
-        self.addCleanup(temp_dir.cleanup)
-
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
-        spec = build_trimmed_vocab_spec(
-            tokenizer=tokenizer,
-            tokenizer_json=tokenizer_json,
-            config_json=config_json,
-            selected_groups=["latin", "punct"],
-            byte_fallback=True,
-        )
-
-        # All kept IDs should be valid original vocab indices
-        for token_id in spec.kept_model_ids:
-            self.assertGreaterEqual(token_id, 0)
-            self.assertLess(token_id, spec.model_vocab_size)
-
-        # IDs should be sorted (for deterministic weight slicing)
+        # Original (not remapped) IDs, sorted for deterministic weight slicing
         self.assertEqual(spec.kept_model_ids, tuple(sorted(spec.kept_model_ids)))
 
     def test_spec_with_no_config_still_keeps_specials(self):

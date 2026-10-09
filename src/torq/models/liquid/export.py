@@ -50,6 +50,7 @@ from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...utils.onnx import external_data_cwd
 
 
 # HuggingFace repos containing LFM2.5 model + tokenizer
@@ -72,27 +73,6 @@ HF_REPO_ONNX: dict[str, tuple[str, ...]] = {
         "LiquidAI/LFM2.5-230M-ONNX",
     ),
 }
-
-# Full torq-compile flag set LFM2.5 needs — the validated set the legacy
-# compile_v1.5.sh hardcoded.  All of these matter for the bf16 model:
-#   --torq-convert-dtypes / --torq-convert-io-dtype run the dtype-conversion
-#     passes; without them a tensor's element type resolves to `none` and
-#     torq-compile asserts out (Kernel.cpp `elementType != DType::none`).
-#   --torq-hw=SL2610 / --torq-disable-slicing / --torq-enable-annotate-tied-operands
-#     target + lowering options the chip needs.
-#   --torq-enable-split-constants-optimization is faster (303 vs 432 ms/step)
-#     and lower-heap (each dispatch reads its constant slice from the mmap'd
-#     vmfb instead of staging the whole blob into anonymous DRAM).
-LIQUID_TORQ_FLAGS: tuple[str, ...] = (
-    "--torq-hw=SL2610",
-    "--torq-disable-slicing",
-    "--torq-enable-transpose-optimization",
-    "--torq-convert-dtypes",
-    "--torq-enable-annotate-tied-operands",
-    "--torq-convert-io-dtype",
-    "--torq-enable-split-constants-optimization",
-)
-
 
 class LiquidModelExporter(OnnxModelExporterBase):
     """Exporter for the LiquidAI LFM2.5 hybrid model.
@@ -160,7 +140,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
                     f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
                 )
             if not self._split_lm_head:
-                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
+                raise ValueError(
+                    "`--batch-prefill` requires `--split-lm-head` "
+                    "(disable the prefill export with `--batch-prefill 0`)"
+                )
             if not static_models:
                 raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
         self._batch_prefill = batch_prefill
@@ -454,7 +437,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("Shape inference reported issues; continuing: %s", e)
         try:
-            onnx.checker.check_model(model, full_check=False)
+            with external_data_cwd(model):
+                onnx.checker.check_model(model, full_check=False)
         except Exception as e:
             self._logger.warning("ONNX checker reported issues; continuing: %s", e)
         return model
@@ -1465,34 +1449,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
-    def export_torq(
-        self,
-        torq_export_dir: str | os.PathLike | None = None,
-        torq_compile_args: list[str] | None = None,
-        use_binary: bool = False,
-        skip: list[str] | None = None,
-        local_compile: bool = False,
-        compiler_path: str | Path | None = None,
-    ):
-        """Compile the exported (bf16) ONNX to a Torq vmfb.
-
-        Prepends LFM2.5's validated torq-compile flag set (``LIQUID_TORQ_FLAGS``)
-        — in particular ``--torq-enable-split-constants-optimization``, which
-        we measured to be faster and lower-heap than the default — ahead of any
-        user-supplied ``--compile-flags``, then defers to the shared
-        ``torq.utils.compile`` driver via the base exporter.
-        """
-        merged_args = list(LIQUID_TORQ_FLAGS) + list(torq_compile_args or [])
-        # Runtime assets already live in the variant dir next to compiled/.
-        return super().export_torq(
-            torq_export_dir=torq_export_dir,
-            torq_compile_args=merged_args,
-            use_binary=use_binary,
-            skip=skip,
-            local_compile=local_compile,
-            compiler_path=compiler_path,
-        )
-
     def dynamic_quantize_models(
         self,
         quantize_dir: str | os.PathLike | None = None,
@@ -1549,6 +1505,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if self._convert_dir.exists():
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._convert_dir)
 
         for comp, model_path in list(self._export_paths.items()):
             self._logger.info("(ONNX-convert) Converting '%s' to bf16...", model_path)
@@ -1557,14 +1514,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._logger.info("(ONNX-convert) Wrote '%s'", converted_model_path)
             self._export_paths[comp] = converted_model_path
 
-        if self._extract_embeddings:
-            emb_src = self._export_dir / "token_embeddings.npy"
-            if emb_src.exists():
-                emb_data = np.load(emb_src).astype(ml_dtypes.bfloat16)
-                np.save(self._convert_dir / emb_src.name, emb_data)
-        self._copy_runtime_assets(
-            self._convert_dir, self._export_dir, include_npy_data=False
-        )
+        self._copy_runtime_assets(self._convert_dir, self._export_dir)
 
     def make_lm_head_split(
         self, model_path: str | os.PathLike, write_lm_head: bool = True
@@ -1701,7 +1651,7 @@ def export_liquid_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill,
+        batch_prefill=args.batch_prefill or None,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,

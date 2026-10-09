@@ -15,12 +15,12 @@ from transformers import AutoConfig
 
 from . import add_smollm2_export_args
 from ._graph import SmolLM2OnnxGraphEditor
-from ._inference import SmolLM2Dynamic, SmolLM2Static
+from ._inference import SmolLM2Dynamic, SmolLM2Static, _repo_id_for_size
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx
-from ...utils.onnx import validate_onnx_source_dir
+from ...utils.onnx import load_onnx_lazy, validate_onnx_source_dir
 
 from ...utils.logging import (
     configure_logging,
@@ -53,9 +53,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
         )
-        self._hf_repo = f"HuggingFaceTB/SmolLM2-{model_size}"
-        if self._instruct_model:
-            self._hf_repo += "-Instruct"
+        self._hf_repo = _repo_id_for_size(model_size, instruct_model)
         self._config = AutoConfig.from_pretrained(
             self._onnx_source_dir if self._onnx_source_dir is not None else self._hf_repo,
             local_files_only=self._onnx_source_dir is not None,
@@ -106,7 +104,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         model_path = self._onnx_dir /  "model.onnx"
         if not model_path.exists():
             raise FileNotFoundError(f"Expected model.onnx @ '{self._onnx_dir}'")
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         orig_ir = model.ir_version
         graph = gs.import_onnx(model)
         graph.name = "main"
@@ -205,7 +203,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         return new_model
 
     def _patch_static_model(self, model_path: str | os.PathLike):
-        model = onnx.load(model_path)
+        model = load_onnx_lazy(model_path)
         editor = SmolLM2OnnxGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,

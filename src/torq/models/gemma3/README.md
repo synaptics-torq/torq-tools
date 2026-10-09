@@ -45,14 +45,11 @@ HuggingFace (google/gemma-3-*)
 cd torq-tools-dev
 source .venv/bin/activate
 
-torq-export-model gemma3 \
-    --instruct-model \
-    --extract-embeddings \
-    --convert-dtypes
+torq-export-model gemma3 --instruct-model
 ```
 
-This downloads the source, builds the static model, converts to bf16, and
-compiles to a VMFB. Equivalent module form: `python -m torq.models.gemma3.export …`.
+This downloads the source, builds the static model, and compiles it to a
+bf16 VMFB. Equivalent module form: `python -m torq.models.gemma3.export …`.
 
 If the Torq compiler Python API isn't installed in the venv, point the fallback
 at the binary first:
@@ -69,20 +66,20 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--instruct-model` | Use the instruct-tuned (`-it`) variant |
 | `-t, --max-gen-tokens N` | Static sequence length / KV-cache size (default: 256) |
 | `--convert-dtypes` | Convert the export to the dtypes Torq supports: float → bf16 **and** int64 → int32 |
-| `--extract-embeddings` | Extract the token-embedding table to `token_embeddings.npy` (model input becomes an embedding vector) |
+| `--extract-embeddings` | Extract the token-embedding table to `token_embeddings.npy` (model input becomes an embedding vector). **On by default** — opt out with `--no-extract-embeddings` |
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
-| `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits |
-| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens; requires `--split-lm-head` |
+| `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits. **On by default** — opt out with `--no-split-lm-head` |
+| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens (default: `64`; pass `0` to disable). Requires `--split-lm-head` (on by default) |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
 | `--models-dir DIR` | Base directory for source + export models (default: `models`) |
-| `--dynamic-models` | Export dynamic (CPU) models instead of static |
+| `--dynamic-models` | Export dynamic (CPU) models instead of static. The static-only options above are on by default, so a dynamic run also needs `--no-split-lm-head --batch-prefill 0` |
 | `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling |
 | `--skip-torq` | Stop after ONNX; skip the VMFB compile |
 | `--skip-validation` | Skip ORT validation of edited ONNX |
-| `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` |
+| `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
 
 `--trim-vocab` and `--split-lm-head` change the output path (see below).
 
@@ -108,7 +105,8 @@ alongside it, so a compiled model can never outlive the source it was built
 from.
 
 `<full|trim>` follows `--trim-vocab`; `<unified|split_lm_head>` follows
-`--split-lm-head`. The exact paths are printed at the end of the run.
+`--split-lm-head` (default: `split_lm_head`). The exact paths are printed at
+the end of the run.
 
 With `--split-lm-head` the model file is **not** `model.onnx` — each directory
 above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
@@ -143,10 +141,9 @@ Skip the bf16 conversion and the compile so you keep the fp32 static graph
 ```sh
 torq-export-model gemma3 \
     --instruct-model \
-    --extract-embeddings \
     --trim-vocab \
     --skip-torq
-# fp32 ONNX: models/<repo>/export/trim/unified/<dtype>/static/model.onnx
+# fp32 ONNX: models/<repo>/export/trim/split_lm_head/<dtype>/static/ (transformer.onnx, lm_head.onnx, ...)
 ```
 
 ### 2. Quantize
@@ -193,30 +190,21 @@ torq-quantize-model weights quantize -i model.onnx -o model_mixed_bf16.onnx \
 ### 4. Compile the quantized model
 
 For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
-outputs are directly importable by IREE. Compile the quantized ONNX to a VMFB
-(from `torq-compiler-dev`):
+outputs are directly importable by IREE. (The pipeline's `export_torq` stages
+the `.npy` artefacts in the runtime dtype next to the compiled vmfb when
+`--torq-convert-io-dtype` is passed; a standalone compile doesn't — convert
+them manually if you change the vmfb I/O dtype.)
+
+Every export dir carries its validated `torq-compile` flags; a copy of
+[`compile_flags.json`](compile_flags.json) in this model's package. 
+The compile helper loads the file:
 
 ```sh
-model_dir="/path/to/"
-python -m iree.compiler.tools.import_onnx $model_dir/model_mixed_bf16.onnx -o $model_dir/model_mixed_bf16.mlir --data-prop  
-torq-compile $model_dir/model_mixed_bf16.mlir -o $model_dir/model.vmfb \
-    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
-    --torq-convert-dtypes --torq-convert-io-dtype \
-    --torq-enable-annotate-tied-operands \
-    --torq-enable-split-constants-optimization \
-    --iree-flow-inline-constants-max-byte-length=300000000
+python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb
 ```
 
-Or via the tools' compile helper:
-
-```sh
-python -m torq.utils.compile model_mixed_bf16.onnx -o model.vmfb \
-    --compile-flags --torq-hw=SL2610 --torq-disable-slicing \
-    --torq-convert-dtypes --torq-convert-io-dtype \
-    --torq-enable-annotate-tied-operands \
-    --torq-enable-split-constants-optimization \
-    --iree-flow-inline-constants-max-byte-length=300000000
-```
+In a torq-compiler-only environment (no torq-tools), invoke `torq-compile` with 
+each flag from `compile_flags.json` in the export dir.
 
 ### 5. Benchmark (optional)
 

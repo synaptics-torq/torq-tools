@@ -9,7 +9,7 @@ from torq.utils.logging import add_logging_args
 from ...utils.compile import add_torq_args
 
 from ...utils.demo import add_common_args
-from ...utils.onnx import add_onnx_args
+from ...utils.onnx import add_onnx_args, add_llm_args
 from ...graph_edit.harness import add_graph_edit_harness_args
 
 
@@ -22,20 +22,14 @@ MODEL_DTYPES: Final[list[str]] = ["fp32"]
 
 
 def add_liquid_export_args(parser: argparse.ArgumentParser):
-    parser.add_argument(
-        "-t",
-        "--max-gen-tokens",
-        type=int,
-        default=DEFAULT_GEN_TOKENS,
-        help="Maximum number of tokens to generate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-s",
-        "--model-size",
-        type=str,
-        choices=MODEL_SIZES,
-        default=DEFAULT_MODEL_SIZE,
-        help="LFM2.5 (Liquid) model size to export (default: %(default)s)",
+    add_llm_args(
+        parser,
+        model_name="LFM2.5 (Liquid)",
+        model_sizes=MODEL_SIZES,
+        default_model_size=DEFAULT_MODEL_SIZE,
+        max_gen_tokens=DEFAULT_GEN_TOKENS,
+        split_lm_head=True,
+        batch_prefill=True,
     )
     parser.add_argument(
         "--model-dtype",
@@ -48,45 +42,9 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         parser,
         convert_dtypes=["bf16", "fp16"],
         allow_no_opt=False,
-    )
-    parser.add_argument(
-        "--models-dir",
-        type=str,
-        default="models",
-        metavar="DIR",
-        help="Base directory for source and export models (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--extract-embeddings",
-        action="store_true",
-        default=False,
-        help="Extract large embeddings tables into external .npy data"
-    )
-    parser.add_argument(
-        "--dynamic-models",
-        action="store_true",
-        default=False,
-        help="Export dynamic models for CPU"
-    )
-    parser.add_argument(
-        "--skip-torq",
-        action="store_true",
-        default=False,
-        help="Skip compiling the exported ONNX to a Torq vmfb"
-    )
-    parser.add_argument(
-        "--keep-individual-kv-io",
-        action="store_true",
-        default=False,
-        help="Keep KV I/O as separate key, value tensors instead of combining"
-    )
-    parser.add_argument(
-        "--broadcast-ops",
-        type=str,
-        metavar="OP",
-        nargs="*",
-        default=None,
-        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
+        extract_embeddings=True,
+        dynamic_models=True,
+        keep_individual_kv_io=True,
     )
     parser.add_argument(
         "--simulate-bf16",
@@ -113,25 +71,9 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
-    parser.add_argument(
-        "--batch-prefill",
-        type=int,
-        metavar="N",
-        default=None,
-        help=(
-            "Also export transformer_prefill.onnx with N tokens per step "
-            "(requires --split-lm-head; static exports only)"
-        ),
-    )
-    parser.add_argument(
-        "--split-lm-head",
-        action="store_true",
-        default=False,
-        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
-    )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)
-    add_torq_args(parser)
+    add_torq_args(parser, skip=True)
 
 
 def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
@@ -141,24 +83,19 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
     adds ``--compile-vision``.  The model size / dtype are fixed for VL, so
     those selectors are omitted.
     """
-    parser.add_argument(
-        "-t",
-        "--max-gen-tokens",
-        type=int,
-        default=DEFAULT_GEN_TOKENS,
-        help="Maximum number of tokens to generate (default: %(default)s)",
+    add_llm_args(
+        parser,
+        model_name="LFM2-VL",
+        max_gen_tokens=DEFAULT_GEN_TOKENS,
+        split_lm_head=True,
+        batch_prefill=True,
     )
     add_onnx_args(
         parser,
         convert_dtypes=["bf16", "fp16"],
         allow_no_opt=False,
-    )
-    parser.add_argument(
-        "--models-dir",
-        type=str,
-        default="models",
-        metavar="DIR",
-        help="Base directory for source and export models (default: %(default)s)",
+        dynamic_models=True,
+        keep_individual_kv_io=True,
     )
     parser.add_argument(
         "--compile-vision",
@@ -196,32 +133,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--skip-torq",
-        action="store_true",
-        default=False,
-        help="Skip compiling the exported ONNX to a Torq vmfb",
-    )
-    parser.add_argument(
-        "--keep-individual-kv-io",
-        action="store_true",
-        default=False,
-        help="Keep KV I/O as separate key, value tensors instead of combining",
-    )
-    parser.add_argument(
-        "--dynamic-models",
-        action="store_true",
-        default=False,
-        help="Export dynamic models for CPU",
-    )
-    parser.add_argument(
-        "--broadcast-ops",
-        type=str,
-        metavar="OP",
-        nargs="*",
-        default=None,
-        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
-    )
-    parser.add_argument(
         "--simulate-bf16",
         action="store_true",
         default=False,
@@ -246,26 +157,9 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
             "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
-    parser.add_argument(
-        "--batch-prefill",
-        type=int,
-        metavar="N",
-        default=None,
-        help=(
-            "Also export transformer_prefill.onnx with N tokens per step "
-            "(requires --split-lm-head; static exports only; the vision "
-            "encoder is unaffected)"
-        ),
-    )
-    parser.add_argument(
-        "--split-lm-head",
-        action="store_true",
-        default=False,
-        help="Split the final LM head into lm_head.onnx; the body is exported as transformer.onnx and outputs hidden states",
-    )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)
-    add_torq_args(parser)
+    add_torq_args(parser, skip=True)
 
 
 def add_liquid_infer_args(parser: argparse.ArgumentParser):

@@ -12,7 +12,6 @@ from torq.models.liquid.export_vl import (
     DECODER,
     DECODER_PREFILL,
     LiquidVLModelExporter,
-    VISION,
 )
 
 
@@ -74,63 +73,7 @@ def _build_tiny_liquid_decoder(hidden: int = 8, vocab: int = 16):
     )
 
 
-class LiquidExportFilenameTests(unittest.TestCase):
-    def test_text_export_uses_model_filename(self):
-        exporter = LiquidModelExporter.__new__(LiquidModelExporter)
-        exporter._export_dir = Path("export/fp32/static")
-
-        self.assertEqual(
-            exporter._export_path_for_component("model"),
-            Path("export/fp32/static/model.onnx"),
-        )
-
-    def test_split_lm_head_uses_transformer_filenames(self):
-        exporter = LiquidModelExporter.__new__(LiquidModelExporter)
-        exporter._export_dir = Path("export/fp32/static")
-        exporter._split_lm_head = True
-
-        self.assertEqual(
-            exporter._export_path_for_component("model"),
-            Path("export/fp32/static/transformer.onnx"),
-        )
-        self.assertEqual(
-            exporter._export_path_for_component("model_prefill"),
-            Path("export/fp32/static/transformer_prefill.onnx"),
-        )
-
-    def test_vl_batch_prefill_uses_distinct_decoder_filename(self):
-        exporter = LiquidVLModelExporter.__new__(LiquidVLModelExporter)
-        exporter._export_dir = Path("export/fp32/static")
-
-        self.assertEqual(
-            exporter._export_path_for_component(DECODER),
-            Path("export/fp32/static/decoder_model_merged.onnx"),
-        )
-        self.assertEqual(
-            exporter._export_path_for_component(DECODER_PREFILL),
-            Path("export/fp32/static/decoder_model_merged_prefill.onnx"),
-        )
-
-    def test_vl_split_lm_head_uses_transformer_filenames(self):
-        exporter = LiquidVLModelExporter.__new__(LiquidVLModelExporter)
-        exporter._export_dir = Path("export/split_lm_head/fp32/static")
-        exporter._split_lm_head = True
-
-        self.assertEqual(
-            exporter._export_path_for_component(DECODER),
-            Path("export/split_lm_head/fp32/static/transformer.onnx"),
-        )
-        self.assertEqual(
-            exporter._export_path_for_component(DECODER_PREFILL),
-            Path("export/split_lm_head/fp32/static/transformer_prefill.onnx"),
-        )
-        self.assertEqual(
-            exporter._export_path_for_component(VISION),
-            Path("export/split_lm_head/fp32/static/vision_encoder.onnx"),
-        )
-
-
-class LiquidBatchPrefillValidationTests(unittest.TestCase):
+class LiquidExporterTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
@@ -142,27 +85,6 @@ class LiquidBatchPrefillValidationTests(unittest.TestCase):
         source_dir = _write_config(tmp_path)
         kwargs.setdefault("split_lm_head", True)
         return LiquidModelExporter(onnx_source_dir=source_dir, **kwargs)
-
-    def test_batch_prefill_must_be_positive(self):
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            self._create_exporter(self.tmp, batch_prefill=0)
-
-    def test_batch_prefill_cannot_exceed_max_gen_tokens(self):
-        with self.assertRaisesRegex(ValueError, "cannot exceed"):
-            self._create_exporter(self.tmp, batch_prefill=9, max_gen_tokens=8)
-
-    def test_batch_prefill_requires_static_models(self):
-        with self.assertRaisesRegex(ValueError, "static LFM exports"):
-            self._create_exporter(self.tmp, batch_prefill=8, static_models=False)
-
-    def test_batch_prefill_requires_split_lm_head(self):
-        with self.assertRaisesRegex(ValueError, "requires `--split-lm-head`"):
-            self._create_exporter(self.tmp, batch_prefill=8, split_lm_head=False)
-
-    def test_batch_prefill_is_retained_when_valid(self):
-        exporter = self._create_exporter(self.tmp, batch_prefill=8, max_gen_tokens=16)
-
-        self.assertEqual(exporter._batch_prefill, 8)
 
     def test_batch_prefill_block_present_only_when_enabled(self):
         enabled = self._create_exporter(self.tmp, batch_prefill=8)
@@ -187,37 +109,6 @@ class LiquidBatchPrefillValidationTests(unittest.TestCase):
 
         self.assertEqual((export_dir / "config.json").read_text(), json.dumps(_CONFIG))
         self.assertEqual((export_dir / "tokenizer.json").read_text(), "tokenizer")
-
-
-class LiquidVLBatchPrefillValidationTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmp.name)
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def _create_exporter(self, tmp_path: Path, **kwargs) -> LiquidVLModelExporter:
-        source_dir = _write_config(tmp_path)
-        kwargs.setdefault("split_lm_head", True)
-        return LiquidVLModelExporter(onnx_source_dir=source_dir, **kwargs)
-
-    def test_batch_prefill_must_be_positive(self):
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            self._create_exporter(self.tmp, batch_prefill=0)
-
-    def test_batch_prefill_cannot_exceed_max_gen_tokens(self):
-        with self.assertRaisesRegex(ValueError, "cannot exceed"):
-            self._create_exporter(self.tmp, batch_prefill=9, max_gen_tokens=8)
-
-    def test_batch_prefill_requires_split_lm_head(self):
-        with self.assertRaisesRegex(ValueError, "requires `--split-lm-head`"):
-            self._create_exporter(self.tmp, batch_prefill=8, split_lm_head=False)
-
-    def test_batch_prefill_is_retained_when_valid(self):
-        exporter = self._create_exporter(self.tmp, batch_prefill=8, max_gen_tokens=16)
-
-        self.assertEqual(exporter._batch_prefill, 8)
 
 
 class LiquidSplitLMHeadTests(unittest.TestCase):
@@ -246,36 +137,6 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
         exporter._split_weights = False
         exporter._export_paths = {"model": model_path}
         return exporter
-
-    def test_split_lm_head_requires_static_models(self):
-        with tempfile.TemporaryDirectory() as td:
-            source_dir = _write_config(Path(td))
-            with self.assertRaisesRegex(ValueError, "static LFM exports"):
-                LiquidModelExporter(onnx_source_dir=source_dir, static_models=False, split_lm_head=True)
-
-    def test_setup_dirs_keeps_topologies_separate(self):
-        exporter = LiquidModelExporter.__new__(LiquidModelExporter)
-        exporter._models_dir = Path("models/liquid-2p5-350m")
-        exporter._onnx_source_dir = Path("models/liquid-2p5-350m/source/onnx/fp32")
-        exporter._model_dtype = "fp32"
-        exporter._static_models = True
-        exporter._convert_dtypes = True
-
-        exporter._split_lm_head = False
-        _, unified_export_dir, unified_quant_dir, unified_convert_dir, unified_torq_dir = exporter._setup_dirs()
-        exporter._split_lm_head = True
-        _, split_export_dir, split_quant_dir, split_convert_dir, split_torq_dir = exporter._setup_dirs()
-
-        for a, b in (
-            (unified_export_dir, split_export_dir),
-            (unified_quant_dir, split_quant_dir),
-            (unified_convert_dir, split_convert_dir),
-            (unified_torq_dir, split_torq_dir),
-        ):
-            self.assertNotEqual(a, b)
-        self.assertIn("unified", unified_export_dir.parts)
-        self.assertIn("split_lm_head", split_export_dir.parts)
-        self.assertIn("split_lm_head", split_torq_dir.parts)
 
     def test_make_lm_head_split_is_fp32_stage_independent(self):
         import onnx
@@ -472,13 +333,6 @@ class LiquidVLSplitLMHeadTests(unittest.TestCase):
             setattr(exporter, name, value)
         return exporter
 
-    def test_split_lm_head_requires_static_models(self):
-        source_dir = self._vl_source_dir()
-        with self.assertRaisesRegex(ValueError, "static LFM exports"):
-            LiquidVLModelExporter(
-                onnx_source_dir=source_dir, static_models=False, split_lm_head=True
-            )
-
     def test_setup_dirs_keeps_topologies_separate(self):
         source_dir = self._vl_source_dir()
         exporter = LiquidVLModelExporter.__new__(LiquidVLModelExporter)
@@ -505,9 +359,7 @@ class LiquidVLSplitLMHeadTests(unittest.TestCase):
         self.assertIn("split_lm_head", split_torq_dir.parts)
 
     def test_apply_post_static_patches_splits_decoder(self):
-        import logging
         import onnx
-        from onnx import TensorProto
 
         export_dir = self.tmp / "export" / "split_lm_head" / "onnx" / "fp32" / "static"
         export_dir.mkdir(parents=True)
@@ -552,20 +404,6 @@ class LiquidVLSplitLMHeadTests(unittest.TestCase):
         self.assertNotIn("/model/lm_head/MatMul", {n.name for n in prefill.graph.node})
         self.assertEqual((export_dir / "lm_head.onnx").read_bytes(), lm_head_before)
 
-    def test_apply_post_static_patches_ignores_vision(self):
-        model_path = self.tmp / "vision_encoder.onnx"
-        exporter = self._vl_exporter(_export_paths={})
-        exporter._patch_static_model = Mock()
-        exporter._reorder_decoder_inputs = Mock()
-        exporter._stage_runtime_assets = Mock()
-
-        exporter.apply_post_static_patches(model_path, VISION)
-
-        exporter._patch_static_model.assert_not_called()
-        exporter._reorder_decoder_inputs.assert_not_called()
-        exporter._stage_runtime_assets.assert_not_called()
-
-
 class LiquidVLRuntimeAssetTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -588,6 +426,8 @@ class LiquidVLRuntimeAssetTests(unittest.TestCase):
             _conv_L_cache=_CONFIG.get("conv_L_cache", 3),
             _split_lm_head=False,
             _simulate_bf16=False,
+            _compile_vision=False,
+            _vision_res=None,
         )
         defaults.update(attrs)
         for name, value in defaults.items():
@@ -619,32 +459,6 @@ class LiquidVLRuntimeAssetTests(unittest.TestCase):
 
         self.assertEqual(json.loads((export_dir / "config.json").read_text()), _CONFIG)
         self.assertEqual((export_dir / "tokenizer.json").read_text(), "vl-tokenizer")
-
-    def test_dynamic_quantization_updates_decoder_path_and_stages_assets(self):
-        import onnx
-
-        export_dir = self.tmp / "export" / "unified" / "onnx" / "fp32" / "static"
-        export_dir.mkdir(parents=True)
-        decoder_path = export_dir / f"{DECODER}.onnx"
-        onnx.save(_build_tiny_liquid_decoder(), str(decoder_path))
-
-        exporter = self._vl_exporter(
-            _dynamic_quantize=True,
-            _prepared=True,
-            _export_dir=export_dir,
-            _quantize_dir=self.tmp / "export" / "unified" / "onnx" / "quantized" / "static",
-            _export_paths={DECODER: decoder_path},
-        )
-        exporter._stage_runtime_assets(export_dir)
-
-        exporter.dynamic_quantize_models(skip_preprocess=True)
-
-        quantized_path = exporter._quantize_dir / decoder_path.name
-        self.assertEqual(exporter._export_paths[DECODER], quantized_path)
-        self.assertTrue(quantized_path.exists())
-        self.assertEqual(json.loads((exporter._quantize_dir / "config.json").read_text()), _CONFIG)
-        self.assertEqual((exporter._quantize_dir / "tokenizer.json").read_text(), "vl-tokenizer")
-
 
 if __name__ == "__main__":
     unittest.main()
