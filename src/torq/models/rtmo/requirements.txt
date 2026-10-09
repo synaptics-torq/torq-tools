@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
+
+soundfile==0.13.1
+torchcodec==0.14.0
+whisper-openai==1.0.0
+jiwer==4.0.0
+openpyxl==3.1.5
+pandas==3.0.3
+tqdm==4.67.3
