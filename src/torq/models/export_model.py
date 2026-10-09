@@ -9,6 +9,7 @@ from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
 from .qwen import add_qwen_export_args
+from .embedding_gemma2 import add_embedding_gemma2_export_args
 
 
 def main():
@@ -36,6 +37,10 @@ def main():
     qwen = model.add_parser("qwen", help="Export Qwen to Torq")
     add_qwen_export_args(qwen)
 
+    embedding_gemma2 = model.add_parser(
+        "embeddinggemma2", help="Export EmbeddingGemma-2 (text, image, video, audio) to Torq")
+    add_embedding_gemma2_export_args(embedding_gemma2)
+
     args = parser.parse_args()
 
     if args.model_name == "moonshine":
@@ -59,6 +64,9 @@ def main():
     elif args.model_name == "qwen":
         from .qwen.export import export_qwen_from_args
         export_qwen_from_args(args)
+    elif args.model_name == "embeddinggemma2":
+        from .embedding_gemma2.export import export_embedding_gemma2_from_args
+        export_embedding_gemma2_from_args(args)
 
 
 if __name__ == "__main__":
