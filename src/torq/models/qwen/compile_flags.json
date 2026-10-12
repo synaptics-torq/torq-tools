@@ -14,7 +14,11 @@
     "--torq-max-nss-programs-size=12582912"
   ],
   "transformer_if_supported": [
+    "--torq-prefetch-algorithm=stream-schedule",
     "--torq-prefetch-matmul-tile-budget-percent=33"
   ],
-  "lm_head": []
+  "lm_head": [],
+  "lm_head_if_supported": [
+    "--torq-prefetch-algorithm=stream-schedule"
+  ]
 }
