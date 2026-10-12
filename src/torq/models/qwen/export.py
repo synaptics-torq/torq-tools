@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -1392,7 +1393,9 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:
     """Return the GPTQ checkpoint directory to take INT4 weights from, or None.
 
     A local --gptq-checkpoint wins. Otherwise the GPTQ weights of --model-size
-    are downloaded from its Synaptics Hugging Face repository.
+    are downloaded from its Synaptics Hugging Face repository. These weights
+    are only correct for the default source of --model-size: with another
+    --hf-repo or an --onnx-source-dir the export uses round-to-nearest.
     """
     if args.weight_quantization != "int4" or not args.gptq:
         return None
@@ -1400,6 +1403,18 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:
         return Path(args.gptq_checkpoint)
     spec = QWEN_MODELS[args.model_size].get("gptq")
     if not spec:
+        return None
+    default_repo = QWEN_MODELS[args.model_size]["hf_repo"]
+    if (args.hf_repo and args.hf_repo != default_repo) or args.onnx_source_dir:
+        # The hosted GPTQ weights have the same shapes as any model of this
+        # size, so a wrong source would not fail. It would silently replace
+        # the weights of a fine-tuned model with the base model weights.
+        logging.getLogger(__name__).warning(
+            "The hosted GPTQ weights are for '%s', but the source is another "
+            "model. Using round-to-nearest INT4. For GPTQ, run "
+            "int4quant/run_gptq.py --model-id <repo> and pass --gptq-checkpoint.",
+            default_repo,
+        )
         return None
     repo_id, subdir = spec.rsplit("/", 1)
     local = snapshot_download(repo_id, allow_patterns=[f"{subdir}/*"])

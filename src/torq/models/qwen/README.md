@@ -53,6 +53,30 @@ The GPTQ weight loader is in the torq-compiler Python package
 torq-compiler 2.2.1 does not have it yet. With 2.2.1, use `--no-gptq`
 (round-to-nearest INT4).
 
+## Start from another Hugging Face model
+
+The hosted GPTQ weights belong to the default source of each `--model-size`.
+For another model of the same architecture (for example a fine-tune), make
+GPTQ weights for that model first:
+
+```sh
+# 1. GPTQ calibration in its own virtualenv (see int4quant/README.md), about
+#    2 hours on an 8-core CPU
+venv-gptq/bin/python src/torq/models/qwen/int4quant/run_gptq.py \
+    --model-id <hf-repo> --device cpu --num-samples 256 --max-seq-len 1024 \
+    --save-dir gptq-<name>
+
+# 2. Export with these weights
+torq-export-model qwen -s qwen2.5-0.5b-instruct --hf-repo <hf-repo> \
+    --gptq-checkpoint gptq-<name>
+```
+
+Use the `-s` value with the same architecture as `<hf-repo>`. Without
+`--gptq-checkpoint`, an export with another `--hf-repo` or with
+`--onnx-source-dir` uses round-to-nearest INT4 and shows a warning. It does
+not use the hosted weights, because they would replace the weights of your
+model.
+
 ## Compile flags
 
 [`compile_flags.json`](compile_flags.json) has the flags for all components
