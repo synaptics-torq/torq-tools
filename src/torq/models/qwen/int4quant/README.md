@@ -3,7 +3,7 @@
 Builds a static, weight-only INT4 Qwen model for the Torq NPU. Validated on
 `Qwen/Qwen2.5-0.5B-Instruct`. The approach follows the Gemma 3 flow (static
 conversion, host embeddings, trimmed vocab, split LM head) with the GPTQ
-recipe from `wip/gemma-intfour-quant`, which calibrates on
+recipe of the Gemma 3 INT4 work, which calibrates on
 `HuggingFaceH4/ultrachat_200k`.
 
 ```text
@@ -70,24 +70,21 @@ This reports KL, cosine, max absolute error and top-1 agreement of the fake-quan
 [`../compile_flags.json`](../compile_flags.json). See the
 [Qwen README](../README.md#compile-flags) for the reasons.
 
-Decode MatMuls (M = 1) use the full default tile budget (50 % of LRAM), which
-leaves no room to prefetch the next weights. Only 17.6 % of the transformer's
-compute was then hidden under DMA. At 33 % it is 87.5 % (at 25 %: 94.9 %, with
-the same board time). At 20 % the tiles get too small and weights are re-read.
+Decode MatMuls (M = 1) load one weight tile per compute step. Prefetch hides
+the compute only if LRAM has space for the next weight tile next to the
+current one. With the default MatMul tile budget, more than 90 % of the
+transformer compute is hidden under DMA.
 
-On an SL2610 board at 1 GHz, with the chat-demo decode speed:
+On an SL2610 board at 1 GHz:
 
-| build | transformer | LM head | chat demo |
+| model | transformer | LM head | chat demo |
 |---|---|---|---|
-| dev compiler, slicing on | 1085 ms | 224 ms | 0.8 tok/s |
-| torq-compiler 2.2.1 + `--torq-disable-slicing` | 161 ms | 28 ms | 6.2 tok/s |
-| + grouped-query attention rewrite | 143 ms | 28 ms | 6.8 tok/s |
-| prefetch compiler, slicing off, default tile budget | 109 ms | 14 ms | – |
-| **+ MatMul tile budget 33 %** | **74 ms** | 14 ms | **11.2 tok/s** |
+| Qwen2.5-0.5B-Instruct | 74 ms | 14 ms | 11.3 tok/s |
+| Qwen3-0.6B | 155.5 ms | 15.7 ms | 6.0–6.4 tok/s |
 
-Slicing is still not usable on the board. With prefetch, the sliced build is
-estimated at 57 ms but measures 386–451 ms. Without slicing, the compile-time
-estimate is within about 10–30 % of the board.
+Keep LinalgSlicing off (`--torq-disable-slicing`). A sliced build is
+estimated at 57 ms but measures 386–451 ms on the board. Without slicing, the
+compile-time estimate is within about 10–30 % of the board.
 
 ## Notes
 
@@ -114,9 +111,7 @@ fake-quant against fp32 over 288 teacher-forced positions.
 | GPTQ, transformer only | 0.335 | 0.958 | 80.9% |
 | GPTQ, LM head only | 0.011 | 0.998 | 92.0% |
 
-Board performance is in section 4. The dev compiler's compile-time estimate
-(87.5 M + 14.7 M cycles per step) was about 12× more optimistic than what that
-build measured on the board.
+Board performance is in section 4.
 
 ## Measured results (Qwen3-0.6B, 2026-10-09)
 

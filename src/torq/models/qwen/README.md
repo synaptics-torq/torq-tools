@@ -38,20 +38,9 @@ The Torq model repositories are private. Log in with `hf auth login` first.
 
 ### Compiler
 
-torq-compiler 2.2.1 compiles the model. The measured speeds need a Torq
-compiler with input prefetch and `--torq-prefetch-matmul-tile-budget-percent`
-(torq-compiler-dev `wip/prefetch-list-scheduler`, a74ffddd or newer). Point
-the export at it:
-
-```sh
-torq-export-model qwen -s qwen3-0.6b \
-    --use-binary --compiler-path /path/to/iree-build/third_party/iree/tools/torq-compile
-```
-
-The GPTQ weight loader is in the torq-compiler Python package
-(`torq.lab.quantization.onnx.weights`, torq-compiler-dev `wip/weights-quant-gptq`).
-torq-compiler 2.2.1 does not have it yet. With 2.2.1, use `--no-gptq`
-(round-to-nearest INT4).
+The export needs torq-compiler 2.3.0 or newer. It compiles with input
+prefetch, which loads the next weights while the NPU computes. The GPTQ
+weight loader is in its Python package (`torq.lab.quantization.onnx.weights`).
 
 ## Start from another Hugging Face model
 
@@ -81,16 +70,15 @@ model.
 
 [`compile_flags.json`](compile_flags.json) has the flags for all components
 (`flags`) and the extra flags per component (`transformer`, `lm_head`). The
-flags in `transformer_if_supported` are added only when the compiler has them
-(it checks `torq-compile --help-hidden`). Flags after `--compile-flags` come
-last and take precedence.
+flags in `<component>_if_supported` are added when the compiler supports them
+(the exporter checks `torq-compile --help-hidden`). Flags after
+`--compile-flags` come last and take precedence.
 
 - `--torq-disable-slicing`: with LinalgSlicing on, the board is 4–8× slower
   than the compile-time estimate.
-- `--torq-prefetch-matmul-tile-budget-percent=33` (transformer only): at the
-  default budget (50 %) a decode MatMul tile fills LRAM, and the next weight
-  tile cannot load during compute. At 33 % prefetch hides 90 % or more of
-  the compute.
+- `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
+  over the slice compute, so that most of the compute is hidden under the
+  weight loads. Decode is DMA-bound, so this sets the token rate.
 - `--torq-max-nss-programs-size=12582912` (transformer only): the NSS
   programs need about 11 MB.
 
