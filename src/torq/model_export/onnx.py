@@ -28,7 +28,7 @@ from torq.lab.quantization.onnx.dynamic import (
     summarize_dynamic_quantization,
 )
 
-from ..utils.compile import export_torq, COMPILE_FLAGS_FILE, read_compile_flags_file
+from ..utils.compile import export_torq, COMPILE_FLAGS_FILE, read_compile_flags_file, supported_compiler_flags
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,
@@ -627,7 +627,17 @@ class OnnxModelExporterBase(ABC):
         # batched prefill) are appended unless the user already set one.
         user_args = list(torq_compile_args or [])
         quantized = self._dynamic_quantize and not self._convert_dtypes
-        torq_compile_args = self._model_compile_flags(quantized=quantized) + user_args
+        # "flags_if_supported" in compile_flags.json holds flags that only newer compilers
+        # know; a compiler without them compiles without them.
+        optional_flags, unsupported = supported_compiler_flags(
+            list(read_compile_flags_file(self._compile_flags_file()).get("flags_if_supported") or []),
+            compiler_path,
+        )
+        for flag in unsupported:
+            self._logger.warning(
+                "(Torq-export) The compiler does not support '%s'; compiling without it", flag
+            )
+        torq_compile_args = self._model_compile_flags(quantized=quantized) + optional_flags + user_args
         if "--torq-max-nss-programs-size" not in torq_compile_args:
             torq_compile_args += self._auto_torq_compile_extras()
         if self._torq_dir.exists():

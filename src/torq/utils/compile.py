@@ -41,6 +41,28 @@ def _resolve_compiler(compiler_path: str | Path | None = None) -> str:
     return os.environ.get("TORQ_COMPILER_PATH", "torq-compile")
 
 
+def supported_compiler_flags(
+    flags: list[str], compiler_path: str | Path | None = None
+) -> tuple[list[str], list[str]]:
+    """Split ``flags`` into the ones the torq-compile binary knows and the ones it
+    does not. A flag is known when ``--help-hidden`` lists its name. When the binary
+    cannot be run, no flag is known."""
+    import re
+
+    if not flags:
+        return [], []
+    try:
+        result = subprocess.run(
+            [_resolve_compiler(compiler_path), "--help-hidden"],
+            capture_output=True, text=True, timeout=120,
+        )
+        known = set(re.findall(r"^\s+(--[\w-]+)", result.stdout, flags=re.MULTILINE))
+    except (OSError, subprocess.SubprocessError):
+        known = set()
+    supported = [flag for flag in flags if flag.split("=", 1)[0] in known]
+    return supported, [flag for flag in flags if flag not in supported]
+
+
 def get_iree_version(compiler: str | None = None) -> str | None:
     import re
 

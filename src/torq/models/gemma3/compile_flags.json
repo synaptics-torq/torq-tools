@@ -8,6 +8,9 @@
     "--torq-convert-io-dtype",
     "--torq-disable-slicing"
   ],
+  "flags_if_supported": [
+    "--torq-prefetch-algorithm=stream-schedule"
+  ],
   "w8a8": [
     "--torq-disable-host",
     "--torq-disable-css"
