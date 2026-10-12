@@ -6,8 +6,6 @@
     "--iree-flow-inline-constants-max-byte-length=300000000",
     "--torq-convert-dtypes",
     "--torq-convert-io-dtype",
-    "--torq-disable-host",
-    "--torq-disable-css",
     "--torq-disable-slicing"
   ],
   "transformer": [
