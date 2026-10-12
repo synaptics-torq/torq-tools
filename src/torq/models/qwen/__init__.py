@@ -12,6 +12,7 @@ from ...utils.onnx import add_llm_args, add_onnx_args
 QWEN_MODELS: Final[dict[str, dict[str, str]]] = {
     "qwen3-0.6b": {
         "hf_repo": "Qwen/Qwen3-0.6B",
+        "gptq": "Synaptics/Qwen3-0.6B-GPTQ-int4-torq/gptq",
     },
     "qwen2.5-0.5b-instruct": {
         "hf_repo": "Qwen/Qwen2.5-0.5B-Instruct",

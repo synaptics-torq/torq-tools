@@ -145,6 +145,85 @@ class QwenOnnxGraphEditor(
 
         return folded
 
+    def blend_combined_kv_in_place(self) -> int:
+        """
+        Update the combined ``key_value`` cache with one Where per layer.
+
+        ``combine_kv_io_tensors`` splits each ``[1, 2 * kv, S, D]`` cache input into
+        K and V, blends the new token into each with a Where, and concatenates the
+        results back into the cache output. Every step this copies the whole cache
+        three times. This rewrites each layer to::
+
+            present = Where(mask, Concat(new_k, new_v), past)   # one cache write
+            K, V    = Slice(present, heads [0, kv)), Slice(present, heads [kv, 2 kv))
+
+        Only the new ``[1, 2 * kv, 1, D]`` rows are concatenated. K and V are
+        contiguous head ranges of the cache, so the slices need no reshuffle.
+
+        Returns:
+            Number of layers rewritten.
+        """
+
+        tensors = self.graph.tensors()
+        rewritten = 0
+        layer = 0
+        while (combined_out := tensors.get(f"present.{layer}.key_value")) is not None:
+            concat = combined_out.inputs[0] if combined_out.inputs else None
+            past = tensors.get(f"past_key_values.{layer}.key_value")
+            key, value = tensors.get(f"present.{layer}.key"), tensors.get(f"present.{layer}.value")
+            if concat is None or concat.op != "Concat" or past is None or key is None or value is None:
+                raise ValueError(f"Layer {layer} does not have the combined KV pattern")
+
+            key_blend, value_blend = key.inputs[0], value.inputs[0]
+            if key_blend.op != "Where" or value_blend.op != "Where":
+                raise ValueError(f"Layer {layer} KV update is not a Where")
+            mask, new_key = key_blend.inputs[0], key_blend.inputs[1]
+            new_value = value_blend.inputs[1]
+
+            kv_heads = key.shape[1]
+            dtype = past.dtype
+            new_rows = self.graph.layer(
+                name=f"present.{layer}_new_kv_concat",
+                op="Concat",
+                attrs={"axis": 1},
+                inputs=[new_key, new_value],
+                outputs=[gs.Variable(f"present.{layer}.new_key_value", dtype=dtype,
+                                     shape=[1, 2 * kv_heads, 1, key.shape[3]])],
+            )[0]
+
+            # The combined Where writes the cache output directly.
+            concat.outputs.clear()
+            self.graph.layer(
+                name=f"present.{layer}_blend_kv",
+                op="Where",
+                inputs=[mask, new_rows, past],
+                outputs=[combined_out],
+            )
+
+            # Attention reads K and V as head ranges of the updated cache.
+            for tensor, blend, start in ((key, key_blend, 0), (value, value_blend, kv_heads)):
+                blend.outputs.clear()
+                self.graph.layer(
+                    name=f"{tensor.name}_from_present",
+                    op="Slice",
+                    inputs=[
+                        combined_out,
+                        np.array([start], dtype=np.int64),
+                        np.array([start + kv_heads], dtype=np.int64),
+                        np.array([1], dtype=np.int64),
+                    ],
+                    outputs=[tensor],
+                )
+
+            rewritten += 1
+            layer += 1
+
+        self.graph.cleanup().toposort()
+
+        self._logger.info("Blended %d combined KV caches in place", rewritten)
+
+        return rewritten
+
     def grouped_query_attention(
         self,
         num_heads: int,

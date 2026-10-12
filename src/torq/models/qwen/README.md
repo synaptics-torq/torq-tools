@@ -8,12 +8,13 @@ compiles it to Torq VMFBs.
 
 | `-s, --model-size` | Source (Hugging Face) | Torq model (Hugging Face) | SL2610 chat demo |
 |---|---|---|---|
-| `qwen3-0.6b` (default) | `Qwen/Qwen3-0.6B` | – (no GPTQ weights yet; round-to-nearest INT4) | – |
+| `qwen3-0.6b` (default) | `Qwen/Qwen3-0.6B` | `Synaptics/Qwen3-0.6B-GPTQ-int4-torq` | 6.0–6.4 tok/s |
 | `qwen2.5-0.5b-instruct` | `Qwen/Qwen2.5-0.5B-Instruct` | `Synaptics/Qwen2.5-0.5B-Instruct-GPTQ-int4-torq` | 11.3 tok/s |
 
 ## Quick start
 
 ```sh
+torq-export-model qwen -s qwen3-0.6b
 torq-export-model qwen -s qwen2.5-0.5b-instruct
 ```
 
@@ -25,7 +26,8 @@ The command does these steps:
    the output vocabulary to Latin text, punctuation and digits
    (`token_id_lut.npy`) and writes the LM head as a separate model.
 4. It rewrites attention: grouped-query attention reads the KV heads
-   directly, without a `repeat_kv` copy of the cache.
+   directly, and one Where per layer writes the new token into the combined
+   K/V cache.
 5. It quantizes all MatMul weights of the transformer and the LM head to INT4
    `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
    GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
@@ -42,7 +44,7 @@ compiler with input prefetch and `--torq-prefetch-matmul-tile-budget-percent`
 the export at it:
 
 ```sh
-torq-export-model qwen -s qwen2.5-0.5b-instruct \
+torq-export-model qwen -s qwen3-0.6b \
     --use-binary --compiler-path /path/to/iree-build/third_party/iree/tools/torq-compile
 ```
 
@@ -79,7 +81,7 @@ last and take precedence.
 | `--gptq` / `--no-gptq` | Use the GPTQ INT4 weights from Hugging Face (default: on) |
 | `--gptq-checkpoint DIR` | Local GPTQ checkpoint, made with [`int4quant/run_gptq.py`](int4quant/README.md) |
 | `--split-model` | Also split the transformer into Part A and Part B |
-| `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings |
+| `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings, so this fails for Qwen3-0.6B |
 | `--hf-repo`, `--onnx-source-dir` | Override the source model |
 | `--skip-torq` | Stop after the ONNX export |
 | `--compile-flags …` | Extra `torq-compile` flags (must be last) |
@@ -95,8 +97,8 @@ models/<hf-repo>/export/torq/converted/static/
     tokenizer.json, tokenizer_config.json, config.json, generation_config.json
 ```
 
-The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen2_5`
-demo runs this directory.
+The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen3`
+and `qwen2_5` demos run this directory.
 
 ## Split model
 

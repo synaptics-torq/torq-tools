@@ -117,3 +117,17 @@ fake-quant against fp32 over 288 teacher-forced positions.
 Board performance is in section 4. The dev compiler's compile-time estimate
 (87.5 M + 14.7 M cycles per step) was about 12× more optimistic than what that
 build measured on the board.
+
+## Measured results (Qwen3-0.6B, 2026-10-09)
+
+Same method: 256×1024 GPTQ calibration, KV capacity 256, vocab 99520 after
+trimming and padding, 288 teacher-forced positions.
+
+| variant | KL | cosine | top-1 agree |
+|---|---|---|---|
+| RTN INT4 (transformer + LM head) | 0.152 | 0.948 | 83.3% |
+| GPTQ INT4 (transformer + LM head) | 0.107 | 0.968 | 85.4% |
+
+SL2610 board at 1 GHz: transformer 155.5 ms, LM head 15.7 ms, chat demo
+6.0–6.4 tok/s. In the transformer, the NPU program takes 112 ms. The runtime
+copies the 28 tied KV caches (1 MB each) for about 31 ms per call.

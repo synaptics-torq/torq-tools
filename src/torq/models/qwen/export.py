@@ -465,6 +465,8 @@ class QwenModelExporter(OnnxModelExporterBase):
                         head_dim,
                     ]
                 )
+                # One cache write per layer instead of split, blend and concat.
+                editor.blend_combined_kv_in_place()
 
             self._logger.info(
                 "(model) Extracted Qwen token embeddings to '%s'",
