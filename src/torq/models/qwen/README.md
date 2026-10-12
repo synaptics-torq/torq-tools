@@ -74,8 +74,7 @@ flags in `<component>_if_supported` are added when the compiler supports them
 (the exporter checks `torq-compile --help-hidden`). Flags after
 `--compile-flags` come last and take precedence.
 
-- `--torq-disable-slicing`: with LinalgSlicing on, the board is 4–8× slower
-  than the compile-time estimate.
+- `--torq-disable-slicing`: the models are compiled without LinalgSlicing.
 - `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
   over the slice compute, so that most of the compute is hidden under the
   weight loads. Decode is DMA-bound, so this sets the token rate.

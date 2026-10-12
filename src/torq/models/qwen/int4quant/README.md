@@ -82,10 +82,6 @@ On an SL2610 board at 1 GHz:
 | Qwen2.5-0.5B-Instruct | 74 ms | 14 ms | 11.3 tok/s |
 | Qwen3-0.6B | 155.5 ms | 15.7 ms | 6.0–6.4 tok/s |
 
-Keep LinalgSlicing off (`--torq-disable-slicing`). A sliced build is
-estimated at 57 ms but measures 386–451 ms on the board. Without slicing, the
-compile-time estimate is within about 10–30 % of the board.
-
 ## Notes
 
 * Qwen2.5 ONNX exports from transformers older than 4.45 slice a per-layer
@@ -95,9 +91,6 @@ compile-time estimate is within about 10–30 % of the board.
   graph. It is materialized as a constant before trimming
   (`materialize_tied_lm_head`). The host embedding table stays full-precision
   and full-vocab.
-* The trimmed vocab is padded to a multiple of 64 by repeating the last kept
-  token ID. With an odd INT4 width, `torq-compile` fails with
-  `unable to create memcpy from memref<...xi4, strided<[odd, 1]>>`.
 
 ## Measured results (Qwen2.5-0.5B-Instruct, 2026-10-06)
 
