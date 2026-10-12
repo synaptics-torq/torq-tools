@@ -2,31 +2,39 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
+import json
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import onnx
-from onnx.external_data_helper import convert_model_to_external_data
+from onnx import version_converter
+from onnx.external_data_helper import (
+    convert_model_to_external_data,
+    load_external_data_for_model,
+)
 import onnx_graphsurgeon as gs
-from transformers import AutoConfig
-import json
-
+from huggingface_hub import snapshot_download
 from tokenizers import Tokenizer
+from transformers import AutoConfig
 
 from ._trim_vocab import build_qwen_trimmed_vocab_spec
-from . import add_qwen_export_args
+from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
-from ...utils.compile import export_torq as compile_torq_model
-from ...tools.convert_dtype.onnx import (
+from ...utils.compile import export_torq as compile_torq_model, read_compile_flags_file
+from torq.lab.model_tools.dtype_conversion.onnx import (
     FP32Converter,
     Int64Converter,
 )
-from ...tools.quantization.weight_quantization.quantize import WeightQuantizer
-from ...tools.quantization.weight_quantization.config import QuantizationConfig
+from torq.lab.quantization.onnx.weights import (
+    QuantizationConfig,
+    WeightQuantizer,
+)
 from ...model_export.hf import (
     hf_download_source_model,
     optimum_export_onnx,
@@ -38,7 +46,8 @@ from ...model_export.onnx import (
 from ...utils.logging import configure_logging
 
 
-DEFAULT_HF_REPO = "Qwen/Qwen3-0.6B"
+# Trimmed LM-head vocab is padded to a multiple of this (see _patch_static_model).
+VOCAB_PAD_MULTIPLE = 64
 
 class _QwenLargeModelConverterMixin:
     """
@@ -119,24 +128,36 @@ class QwenModelExporter(OnnxModelExporterBase):
         split_lm_head: bool = False,
         split_model: bool = False,
         weight_quantization: str | None = None,
+        gptq_checkpoint: str | os.PathLike | None = None,
     ):
         self._hf_repo = hf_repo
         self._hf_repo_subdir = hf_repo_subdir
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._keep_individual_kv_io = keep_individual_kv_io
-        self._split_lm_head = split_lm_head
+        # Splitting the transformer always splits off the LM head as well.
+        self._split_lm_head = split_lm_head or split_model
         self._split_model = split_model
         self._weight_quantization = weight_quantization
+        self._gptq_checkpoint = (
+            Path(gptq_checkpoint) if gptq_checkpoint else None
+        )
 
-        if self._split_model and not static_models:
+        if self._split_lm_head and not static_models:
             raise ValueError(
-                "`--split-model` is currently supported only for static Qwen exports"
+                "`--split-model` / `--split-lm-head` are currently supported "
+                "only for static Qwen exports"
             )
-        
-        if self._weight_quantization is not None and not self._split_model:
+
+        if self._weight_quantization is not None and not self._split_lm_head:
             raise ValueError(
-                "`--weight-quantization` currently requires `--split-model`"
+                "`--weight-quantization` currently requires `--split-model` "
+                "or `--split-lm-head`"
+            )
+
+        if self._gptq_checkpoint is not None and self._weight_quantization != "int4":
+            raise ValueError(
+                "`--gptq-checkpoint` requires `--weight-quantization int4`"
             )
 
         if self._onnx_source_dir:
@@ -245,7 +266,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             / ("static" if self._static_models else "dynamic")
         )
 
-        return onnx_dir, export_dir, convert_dir, torq_dir
+        return onnx_dir, export_dir, None, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir / "model.onnx"
@@ -291,6 +312,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         self,
         destination_dir: str | os.PathLike,
         source_dir: str | os.PathLike | None = None,
+        include_tables: bool = False,
     ) -> None:
         source_dir = Path(source_dir or self._onnx_dir)
         destination_dir = Path(destination_dir)
@@ -302,6 +324,9 @@ class QwenModelExporter(OnnxModelExporterBase):
             "special_tokens_map.json",
             "tokenizer.json",
             "tokenizer_config.json",
+            # Host-side runtime tables of split exports. Only copied into the
+            # Torq dir: the converted dir holds its own bf16/int32 versions.
+            *(("token_embeddings.npy", "token_id_lut.npy") if include_tables else ()),
         ):
             source_path = source_dir / asset_name
 
@@ -326,6 +351,9 @@ class QwenModelExporter(OnnxModelExporterBase):
 
         editor.fix_io(self._max_gen_tokens)
         editor.remove_redundant_casts()
+        # No-op for Qwen3; required for legacy Qwen2/Qwen2.5 exports.
+        if editor.fold_legacy_rotary_cache(self._max_gen_tokens):
+            editor.rotary_gather_to_onehot_matmul()
 
         position_ids = next(
             (
@@ -401,21 +429,27 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
         )
 
-        if self._split_model:
+        hidden_size = self._config.hidden_size
+        # Qwen2/Qwen2.5 configs do not define head_dim.
+        head_dim = getattr(self._config, "head_dim", None) or (
+            hidden_size // self._config.num_attention_heads
+        )
+
+        if self._split_lm_head:
             embeddings_npy = (
                 Path(model_path).parent / "token_embeddings.npy"
             )
 
             editor.extract_token_embeddings(
-                1024,
-                151936,
+                hidden_size,
+                self._config.vocab_size,
                 embeddings_npy,
                 inp_name="token_embedding",
             )
 
             token_embedding = editor.graph.tensors()["token_embedding"]
             token_embedding.dtype = np.float32
-            token_embedding.shape = [1, 1, 1024]
+            token_embedding.shape = [1, 1, hidden_size]
 
             editor.reorder_graph_input(
                 "token_embedding",
@@ -428,7 +462,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                         1,
                         self._config.num_key_value_heads,
                         self._max_gen_tokens,
-                        self._config.head_dim,
+                        head_dim,
                     ]
                 )
 
@@ -441,7 +475,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         editor.collapse_reshape_chains()
         editor.fold_scalar_matmul()
 
-        if self._split_model:
+        if self._split_lm_head:
             tokenizer_path = (
                 Path(model_path).parent / "tokenizer.json"
             )
@@ -474,10 +508,22 @@ class QwenModelExporter(OnnxModelExporterBase):
                 Path(model_path).parent / "token_id_lut.npy"
             )
 
+            kept_token_ids = (
+                list(spec.kept_model_ids)
+                + list(spec.extra_token_ids)
+            )
+
+            # Pad the compact vocab with repeats of the last kept token: an
+            # odd INT4 LM head width puts tile rows mid-byte, which Torq
+            # cannot DMA. Repeated columns map back to the same token ID.
+            kept_token_ids += [kept_token_ids[-1]] * (
+                -len(kept_token_ids) % VOCAB_PAD_MULTIPLE
+            )
+
+            editor.materialize_tied_lm_head()
             editor.trim_lm_head_vocab(
                 kept_token_ids=np.array(
-                    list(spec.kept_model_ids)
-                    + list(spec.extra_token_ids),
+                    kept_token_ids,
                     dtype=np.int64,
                 ),
                 save_lut=token_id_lut_path,
@@ -496,7 +542,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             )
 
             lm_head_matmul.inputs[0].dtype = np.float32
-            lm_head_matmul.inputs[0].shape = [1, 1, 1024]
+            lm_head_matmul.inputs[0].shape = [1, 1, hidden_size]
 
             editor.split_lm_head(
                 lm_head_path
@@ -506,9 +552,17 @@ class QwenModelExporter(OnnxModelExporterBase):
 
             self._logger.info(
                 "(lm_head) Saved Qwen trimmed LM head to '%s' "
-                "(%d tokens)",
+                "(%d tokens, padded to %d)",
                 str(lm_head_path),
                 spec.trimmed_vocab_size,
+                len(kept_token_ids),
+            )
+
+        if self._static_models:
+            editor.grouped_query_attention(
+                self._config.num_attention_heads,
+                self._config.num_key_value_heads,
+                head_dim,
             )
 
         editor.reorder_graph_input("position_ids", 1)
@@ -520,8 +574,14 @@ class QwenModelExporter(OnnxModelExporterBase):
         if self._split_model:
             split_dir = Path(model_path).parent
 
+            num_layers = self._config.num_hidden_layers
+
             part_a_graph, part_b_graph = (
-                editor.split_transformer_layers()
+                editor.split_transformer_layers(
+                    split_at=num_layers // 2,
+                    num_layers=num_layers,
+                    hidden_size=hidden_size,
+                )
             )
 
             part_a_path = (
@@ -590,6 +650,58 @@ class QwenModelExporter(OnnxModelExporterBase):
             model_path,
         )
 
+    def _load_gptq_weights(self, matmul_info, lut_path: Path) -> dict:
+        """Load the GPTQ INT4 weights for ``matmul_info`` (by MatMul node name).
+
+        The vocabulary-trimmed LM head keeps the columns in ``lut_path``.
+        """
+        try:
+            from torq.lab.quantization.onnx.weights import load_gptq_weights
+        except ImportError as error:
+            raise RuntimeError(
+                "GPTQ weights need a torq-compiler Python package with "
+                "torq.lab.quantization.onnx.weights.load_gptq_weights; this "
+                "one does not have it. Export with --no-gptq for round-to-"
+                "nearest INT4 weights."
+            ) from error
+
+        return load_gptq_weights(
+            self._gptq_checkpoint,
+            matmul_info,
+            lm_head_column_index=(
+                np.load(lut_path) if lut_path.exists() else None
+            ),
+        )
+
+    def _upgrade_opset(
+        self,
+        model: onnx.ModelProto,
+        target_opset: int,
+    ) -> onnx.ModelProto:
+        """Convert the default-domain opset with the ONNX version converter."""
+
+        current = next(
+            (
+                entry.version
+                for entry in model.opset_import
+                if entry.domain in ("", "ai.onnx")
+            ),
+            target_opset,
+        )
+
+        if current >= target_opset:
+            return model
+
+        converted = version_converter.convert_version(model, target_opset)
+
+        self._logger.info(
+            "(ONNX-convert) Upgraded opset %d -> %d",
+            current,
+            target_opset,
+        )
+
+        return converted
+
     def _save_large_external_model(
         self,
         model: onnx.ModelProto,
@@ -603,6 +715,10 @@ class QwenModelExporter(OnnxModelExporterBase):
         """
 
         model_path = Path(model_path)
+
+        # Newer onnx releases default to IR 13, which older importers (e.g.
+        # the IREE ONNX importer's onnx checker) reject. Opset 21 needs IR 10.
+        model.ir_version = min(model.ir_version, 10)
 
         external_data_name = f"{model_path.name}_data"
 
@@ -911,30 +1027,54 @@ class QwenModelExporter(OnnxModelExporterBase):
                     data_prop=True,
                 )
 
-                fp32_model = onnx.load(inferred_fp32_path)
+                if self._weight_quantization is not None:
+                    # Block-wise DequantizeLinear needs opset 21. Upgrade the
+                    # graph structure only; weights stay in external data.
+                    fp32_model = onnx.load(
+                        inferred_fp32_path,
+                        load_external_data=False,
+                    )
+                    fp32_model = self._upgrade_opset(fp32_model, 21)
+                    load_external_data_for_model(
+                        fp32_model,
+                        str(Path(model_path).parent),
+                    )
+                else:
+                    fp32_model = onnx.load(inferred_fp32_path)
             finally:
                 if inferred_fp32_path.exists():
                     inferred_fp32_path.unlink()
 
-            # Quantize supported split-component MatMul weights to INT8 DQL
-            # before the Qwen-specific BF16/int32 conversion pipeline.
+            # Quantize supported split-component MatMul weights to INT8/INT4
+            # DQL before the Qwen-specific BF16/int32 conversion pipeline.
+            # Without the A/B split, model.onnx is the whole transformer.
+            quantized_components = {
+                "transformer_part_A.onnx",
+                "transformer_part_B.onnx",
+                "lm_head.onnx",
+            }
+            if not self._split_model:
+                quantized_components.add("model.onnx")
+
             if (
-                self._split_model
-                and self._weight_quantization == "int8"
-                and model_path.name in {
-                    "transformer_part_A.onnx",
-                    "transformer_part_B.onnx",
-                    "lm_head.onnx",
-                }
+                self._split_lm_head
+                and self._weight_quantization is not None
+                and model_path.name in quantized_components
             ):
+                bits = 4 if self._weight_quantization == "int4" else 8
+
                 self._logger.info(
-                    "(ONNX-quantize) Quantizing %s weights to INT8...",
+                    "(ONNX-quantize) Quantizing %s weights to INT%d%s...",
                     model_path.name,
+                    bits,
+                    " (GPTQ)" if self._gptq_checkpoint else "",
                 )
 
                 quantizer = _QwenDQLOnlyQuantizer(
                     model_path=inferred_fp32_path,
                     output_path=converted_model_path,
+                    # One-hot rotary table lookups are not weight MatMuls.
+                    skip_layers=["rotary_emb_cache_"],
                 )
 
                 # Reuse the already shape-inferred model instead of loading
@@ -942,7 +1082,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 quantizer._model = fp32_model
 
                 quant_config = QuantizationConfig.uniform(
-                    bits=8,
+                    bits=bits,
                     block_size=32,
                 )
 
@@ -950,10 +1090,17 @@ class QwenModelExporter(OnnxModelExporterBase):
                     fp32_model
                 )
 
+                dql_kwargs = {}
+                if self._gptq_checkpoint is not None:
+                    dql_kwargs["precomputed"] = self._load_gptq_weights(
+                        matmul_info, source_dir / "token_id_lut.npy"
+                    )
+
                 quantizer._quantize_to_dql(
                     fp32_model,
                     matmul_info,
                     quant_config,
+                    **dql_kwargs,
                 )
 
                 self._logger.info(
@@ -1004,18 +1151,19 @@ class QwenModelExporter(OnnxModelExporterBase):
                 bf16_model
             )
 
-            if self._split_model:
+            if self._split_lm_head:
                 converted_editor = QwenOnnxGraphEditor.from_onnx(
                     converted_model,
                     self._onnx_export_dtype,
                 )
                 converted_editor.convert_static_shape_params_to_int32()
 
-                if model_path.name in {
-                    "transformer_part_A.onnx",
-                    "transformer_part_B.onnx",
-                }:
-                    converted_editor.split_rope_qk()
+                if model_path.name != "lm_head.onnx":
+                    converted_editor.split_rope_qk(
+                        getattr(self._config, "head_dim", None)
+                        or self._config.hidden_size
+                        // self._config.num_attention_heads
+                    )
 
                 converted_model = converted_editor.to_onnx(
                     override_ir=converted_model.ir_version,
@@ -1039,7 +1187,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 converted_model_path
             )
 
-        if self._split_model:
+        if self._split_lm_head:
             embeddings_src = source_dir / "token_embeddings.npy"
             embeddings_dst = self._convert_dir / "token_embeddings.npy"
 
@@ -1105,6 +1253,13 @@ class QwenModelExporter(OnnxModelExporterBase):
         """
         Compile the Qwen ONNX model directly from its external-data file.
 
+        Each component is compiled with the ``flags`` of this package's
+        ``compile_flags.json``, then the list under its own name
+        (``transformer``, ``lm_head``), then the flags under
+        ``<name>_if_supported`` that the compiler knows, then
+        ``torq_compile_args``. With ``--split-lm-head`` the transformer is
+        written as ``transformer.vmfb``.
+
         The shared exporter reloads the full model into GraphSurgeon and
         re-saves it before compilation. Qwen3-0.6B uses multi-gigabyte
         external tensor data, so that preprocessing path is avoided here.
@@ -1132,6 +1287,10 @@ class QwenModelExporter(OnnxModelExporterBase):
             parents=True,
             exist_ok=True,
         )
+
+        flags_file = read_compile_flags_file(self._compile_flags_file())
+        common_flags = list(flags_file.get("flags") or [])
+        compiler_options = _compiler_options(compiler_path)
 
         for comp, onnx_path in self._export_paths.items():
             if comp in skip:
@@ -1163,50 +1322,125 @@ class QwenModelExporter(OnnxModelExporterBase):
                 None,
             )
 
+            name = "transformer" if comp == "model" and self._split_lm_head else Path(onnx_path).stem
+            optional_flags = []
+            for flag in flags_file.get(f"{name}_if_supported") or []:
+                if flag.split("=", 1)[0] in compiler_options:
+                    optional_flags.append(flag)
+                else:
+                    self._logger.warning(
+                        "(Torq-export) The compiler does not support '%s'; "
+                        "compiling %s without it",
+                        flag,
+                        name,
+                    )
+            compiler_args = (
+                common_flags
+                + list(flags_file.get(name) or [])
+                + optional_flags
+                + list(torq_compile_args or [])
+            )
+
             compile_torq_model(
                 onnx_path,
                 self._torq_dir,
                 opset=opset,
-                compiler_args=torq_compile_args,
+                compiler_args=compiler_args,
                 use_binary=use_binary,
                 local_compile=local_compile,
                 compiler_path=compiler_path,
             )
 
+            if name != Path(onnx_path).stem:
+                for suffix in (".vmfb", ".mlir"):
+                    os.replace(
+                        self._torq_dir / f"{Path(onnx_path).stem}{suffix}",
+                        self._torq_dir / f"{name}{suffix}",
+                    )
+
             self._logger.info(
                 "(Torq-export) Successfully exported '%s/%s.vmfb'",
                 str(self._torq_dir),
-                Path(onnx_path).stem,
+                name,
             )
 
         self._copy_runtime_assets(
             self._torq_dir,
             self._export_paths["model"].parent,
+            include_tables=True,
         )
+
+
+def _compiler_options(compiler_path: str | Path | None) -> set[str]:
+    """Return the option names (``--name``) that the torq-compile binary knows.
+
+    An empty set when the binary cannot be run, so optional flags are left out.
+    """
+    compiler = str(compiler_path or os.environ.get("TORQ_COMPILER_PATH", "torq-compile"))
+    try:
+        result = subprocess.run(
+            [compiler, "--help-hidden"], capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return set(re.findall(r"^\s+(--[\w-]+)", result.stdout, flags=re.MULTILINE))
+
+
+def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:
+    """Return the GPTQ checkpoint directory to take INT4 weights from, or None.
+
+    A local --gptq-checkpoint wins. Otherwise the GPTQ weights of --model-size
+    are downloaded from its Synaptics Hugging Face repository.
+    """
+    if args.weight_quantization != "int4" or not args.gptq:
+        return None
+    if args.gptq_checkpoint:
+        return Path(args.gptq_checkpoint)
+    spec = QWEN_MODELS[args.model_size].get("gptq")
+    if not spec:
+        return None
+    repo_id, subdir = spec.rsplit("/", 1)
+    local = snapshot_download(repo_id, allow_patterns=[f"{subdir}/*"])
+    return Path(local) / subdir
 
 
 def export_qwen_from_args(args: argparse.Namespace) -> None:
     configure_logging(args.logging)
 
+    hf_repo = args.hf_repo or QWEN_MODELS[args.model_size]["hf_repo"]
+    weight_quantization = (
+        None if args.weight_quantization == "none" else args.weight_quantization
+    )
+    if weight_quantization and not args.split_lm_head and not args.split_model:
+        weight_quantization = None
+    # The quantized DequantizeLinear graph is written in bf16, so a quantized
+    # export always converts its dtypes.
+    convert_dtypes = args.convert_dtypes or weight_quantization is not None
+
     exporter = QwenModelExporter(
         static_models=not args.dynamic_models,
-        hf_repo=args.hf_repo,
+        hf_repo=hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
-        convert_dtypes=args.convert_dtypes,
+        convert_dtypes=convert_dtypes,
         keep_individual_kv_io=args.keep_individual_kv_io,
         split_model=args.split_model,
-        weight_quantization=args.weight_quantization,
+        split_lm_head=args.split_lm_head,
+        weight_quantization=weight_quantization,
+        gptq_checkpoint=_resolve_gptq_checkpoint(args),
     )
 
+    # The generic ONNX cleanup serializes the whole model in memory. The Qwen
+    # models have more than 2 GB of fp32 weights, so the cleanup cannot run.
     exporter.export_onnx(
         validate=not args.skip_validation,
+        cleanup=False,
     )
 
-    if args.convert_dtypes:
+    if convert_dtypes:
         exporter.convert_models(
             preserve_io=args.preserve_io_dtypes,
         )
@@ -1222,7 +1456,7 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export Qwen3 to ONNX and Torq"
+        description="Export Qwen to ONNX and Torq"
     )
 
     add_qwen_export_args(parser)

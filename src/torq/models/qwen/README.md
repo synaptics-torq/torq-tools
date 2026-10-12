@@ -1,160 +1,107 @@
-# Qwen3-0.6B export for Torq
+# Qwen export for Torq
 
-Export pipeline for **Qwen3-0.6B**, converting the ONNX model to a static
-Torq-compatible model and compiling it to Torq VMFBs.
+Export pipeline for **Qwen3-0.6B** and **Qwen2.5-0.5B-Instruct**. One command
+converts the Hugging Face model to a static, INT4 weight-quantized model and
+compiles it to Torq VMFBs.
 
-For memory-constrained Torq targets such as the Coralboard, the model can be
-split into two transformer partitions and a separate LM head. Split exports
-also support optional INT8 weight quantization to reduce the compiled model
-and runtime memory footprint.
+## Models
 
-## Source model
+| `-s, --model-size` | Source (Hugging Face) | Torq model (Hugging Face) | SL2610 chat demo |
+|---|---|---|---|
+| `qwen3-0.6b` (default) | `Qwen/Qwen3-0.6B` | – (no GPTQ weights yet; round-to-nearest INT4) | – |
+| `qwen2.5-0.5b-instruct` | `Qwen/Qwen2.5-0.5B-Instruct` | `Synaptics/Qwen2.5-0.5B-Instruct-GPTQ-int4-torq` | 11.3 tok/s |
 
-The default source model is:
-
-| Model | Hugging Face repo |
-|---|---|
-| Qwen3-0.6B | `Qwen/Qwen3-0.6B` |
-
-Use `--hf-repo` / `--hf-repo-subdir` to override the source, or
-`--onnx-source-dir DIR` to use a local ONNX model.
-
-## Pipeline overview
-
-```text
-Qwen3-0.6B ONNX (fp32)
-  -> make static
-  -> extract token embeddings
-  -> split transformer at layer 14
-  -> split LM head
-  -> path-based shape inference
-  -> optional INT8 MatMul weight quantization
-  -> convert fp32 -> bf16
-  -> convert int64 -> int32
-  -> compile with IREE + Torq backend
-  -> Part A / Part B / LM head VMFBs
-```
-
-For large external-data Qwen models, path-based shape inference is used before
-dtype conversion to preserve intermediate tensor dtype information required by
-the BF16 conversion.
-
-For split exports, optional INT8 weight quantization can be enabled with
-`--weight-quantization int8`. The quantized path applies block-size-32 INT8
-weight quantization to supported MatMul layers while retaining BF16
-floating-point computation.
-
-## Quick start — export a split VMFB runtime
-
-From the `torq-tools-dev` repository:
+## Quick start
 
 ```sh
-torq-export-model qwen \
-    --split-model \
-    --convert-dtypes
+torq-export-model qwen -s qwen2.5-0.5b-instruct
 ```
 
-To reduce the memory footprint of the split model, enable INT8 weight
-quantization:
+The command does these steps:
+
+1. It exports the Hugging Face model to ONNX with optimum.
+2. It makes a static single-token decoder with a 256-slot KV cache.
+3. It moves the token embeddings to the host (`token_embeddings.npy`), trims
+   the output vocabulary to Latin text, punctuation and digits
+   (`token_id_lut.npy`) and writes the LM head as a separate model.
+4. It rewrites attention: grouped-query attention reads the KV heads
+   directly, without a `repeat_kv` copy of the cache.
+5. It quantizes all MatMul weights of the transformer and the LM head to INT4
+   `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
+   GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
+6. It converts the model to bf16 and int32 and compiles `transformer.vmfb` and
+   `lm_head.vmfb` with the flags in [`compile_flags.json`](compile_flags.json).
+
+The Torq model repositories are private. Log in with `hf auth login` first.
+
+### Compiler
+
+torq-compiler 2.2.1 compiles the model. The measured speeds need a Torq
+compiler with input prefetch and `--torq-prefetch-matmul-tile-budget-percent`
+(torq-compiler-dev `wip/prefetch-list-scheduler`, a74ffddd or newer). Point
+the export at it:
 
 ```sh
-torq-export-model qwen \
-    --split-model \
-    --weight-quantization int8 \
-    --convert-dtypes
+torq-export-model qwen -s qwen2.5-0.5b-instruct \
+    --use-binary --compiler-path /path/to/iree-build/third_party/iree/tools/torq-compile
 ```
 
-`--weight-quantization int8` applies block-size-32 INT8 weight quantization
-to supported MatMul weights in Part A, Part B, and the LM head. The remaining
-floating-point computation is converted to BF16.
+The GPTQ weight loader is in the torq-compiler Python package
+(`torq.lab.quantization.onnx.weights`, torq-compiler-dev `wip/weights-quant-gptq`).
+torq-compiler 2.2.1 does not have it yet. With 2.2.1, use `--no-gptq`
+(round-to-nearest INT4).
 
-To use a local pre-exported ONNX model:
+## Compile flags
 
-```sh
-torq-export-model qwen \
-    --onnx-source-dir models/Qwen/Qwen3-0.6B/source/fp32 \
-    --split-model \
-    --weight-quantization int8 \
-    --convert-dtypes
-```
+[`compile_flags.json`](compile_flags.json) has the flags for all components
+(`flags`) and the extra flags per component (`transformer`, `lm_head`). The
+flags in `transformer_if_supported` are added only when the compiler has them
+(it checks `torq-compile --help-hidden`). Flags after `--compile-flags` come
+last and take precedence.
 
-This makes the model static, splits the transformer and LM head, applies INT8
-weight quantization, performs the required BF16/INT32 conversion, and compiles
-the resulting models to Torq VMFBs.
-
-Equivalent module form:
-
-```sh
-python -m src.torq.models.qwen.export \
-    --onnx-source-dir models/Qwen/Qwen3-0.6B/source/fp32 \
-    --split-model \
-    --weight-quantization int8 \
-    --convert-dtypes
-```
-
-If the Torq compiler Python bindings are not installed in the active
-environment, configure the Torq compiler according to the repository's
-compiler setup.
+- `--torq-disable-slicing`: with LinalgSlicing on, the board is 4–8× slower
+  than the compile-time estimate.
+- `--torq-prefetch-matmul-tile-budget-percent=33` (transformer only): at the
+  default budget (50 %) a decode MatMul tile fills LRAM, and the next weight
+  tile cannot load during compute. At 33 % prefetch hides 90 % or more of
+  the compute.
+- `--torq-max-nss-programs-size=12582912` (transformer only): the NSS
+  programs need about 11 MB.
 
 ## Key export flags
 
 | Flag | Description |
 |---|---|
+| `-s, --model-size` | Model to export (see [Models](#models)) |
 | `-t, --max-gen-tokens N` | Static sequence length / KV-cache size (default: 256) |
-| `--hf-repo` | Override the Hugging Face source repository |
-| `--hf-repo-subdir DIR` | Subdirectory containing the model files |
-| `--onnx-source-dir DIR` | Use a local source ONNX model |
-| `--models-dir DIR` | Base directory for source and exported models |
-| `--dynamic-models` | Export a dynamic model instead of a static model |
-| `--convert-dtypes` | Convert fp32 -> bf16 and int64 -> int32 |
-| `--split-model` | Split the transformer into Part A, Part B, and a separate LM head |
-| `--weight-quantization int8` | Apply block-size-32 INT8 weight quantization to supported MatMul weights in the split model |
-| `--keep-individual-kv-io` | Keep key/value cache tensors separate |
-| `--skip-torq` | Stop after ONNX conversion |
-| `--skip-validation` | Skip ONNX validation |
-| `--compile-flags …` | Extra flags forwarded to `torq-compile` |
+| `--split-lm-head` / `--no-split-lm-head` | Separate LM head model (default: on) |
+| `--weight-quantization {int4,int8,none}` | DequantizeLinear weight quantization (default: int4) |
+| `--gptq` / `--no-gptq` | Use the GPTQ INT4 weights from Hugging Face (default: on) |
+| `--gptq-checkpoint DIR` | Local GPTQ checkpoint, made with [`int4quant/run_gptq.py`](int4quant/README.md) |
+| `--split-model` | Also split the transformer into Part A and Part B |
+| `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings |
+| `--hf-repo`, `--onnx-source-dir` | Override the source model |
+| `--skip-torq` | Stop after the ONNX export |
+| `--compile-flags …` | Extra `torq-compile` flags (must be last) |
 
 ## Output layout
 
-With `--split-model`, the compiled VMFB artifacts are placed under:
-
 ```text
-models/Qwen/Qwen3-0.6B/export/torq/converted/static/
-    transformer_part_A.vmfb
-    transformer_part_B.vmfb
+models/<hf-repo>/export/torq/converted/static/
+    transformer.vmfb
     lm_head.vmfb
-```
-
-The converted runtime tensor assets are generated under:
-
-```text
-models/Qwen/Qwen3-0.6B/export/onnx/converted/static/
     token_embeddings.npy
     token_id_lut.npy
+    tokenizer.json, tokenizer_config.json, config.json, generation_config.json
 ```
 
-Tokenizer and model configuration files are copied to the Torq output directory:
-
-```text
-models/Qwen/Qwen3-0.6B/export/torq/converted/static/
-    tokenizer.json
-    config.json
-```
-
-A deployable split runtime should package the three VMFBs together with:
-
-```text
-token_embeddings.npy
-token_id_lut.npy
-tokenizer.json
-config.json
-```
-
-The exact output directories are printed during the export.
+The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen2_5`
+demo runs this directory.
 
 ## Split model
 
-With `--split-model`, the Qwen transformer is divided at layer 14:
+With `--split-model`, the Qwen transformer is divided in two halves. For
+Qwen3-0.6B the split is at layer 14:
 
 ```text
 Part A: layers 0–13
@@ -208,17 +155,8 @@ torq-infer-model qwen \
 
 ## Notes
 
-Qwen3-0.6B uses a large external-data ONNX model. The exporter uses
-path-based ONNX shape inference during dtype conversion to avoid the
-in-memory protobuf size limitations of large models.
-
-For split exports, `--weight-quantization int8` applies block-size-32 INT8
-weight quantization to supported MatMul weights in Part A, Part B, and the
-LM head. The remaining floating-point computation is converted to BF16.
-
-The INT8 weight-quantized configuration reduces the VMFB and runtime memory
-footprint, allowing Part A, Part B, and the LM head to remain resident
-simultaneously on memory-constrained Torq targets such as the Coralboard.
-
-The currently validated INT8 weight-quantization workflow requires
-`--split-model`.
+- The source ONNX models are large (external data, more than 2 GB of fp32
+  weights). The exporter uses path-based ONNX shape inference. It skips the
+  generic in-memory ONNX cleanup, which cannot serialize models of this size.
+- `--weight-quantization int8` applies block-size-32 INT8 DequantizeLinear
+  weights. GPTQ weights are only available for int4.

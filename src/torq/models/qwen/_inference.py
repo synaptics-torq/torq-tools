@@ -79,7 +79,11 @@ class ModelConfig(DecoderOnlyConfig):
             return cls(
                 config["num_hidden_layers"],
                 config["num_key_value_heads"],
-                config["head_dim"],
+                # Qwen2/Qwen2.5 configs omit head_dim; derive it like HF does.
+                config.get(
+                    "head_dim",
+                    config["hidden_size"] // config["num_attention_heads"],
+                ),
                 config["bos_token_id"],
                 config["eos_token_id"],
                 config.get("pad_token_id"),
@@ -215,6 +219,9 @@ class QwenStatic(QwenBase, StaticDecoderOnlyRunner):
         self._lm_head = lm_head
         self._split_parts = split_parts
         self._split_runtime = split_parts is not None
+        # Single transformer graph with host embeddings and a separate LM head
+        # (``--split-lm-head`` exports).
+        self._lm_head_split = lm_head is not None and split_parts is None
 
         if self._split_runtime and not combined_kv_io:
             raise ValueError(
@@ -235,7 +242,7 @@ class QwenStatic(QwenBase, StaticDecoderOnlyRunner):
         token_embeddings = None
         token_id_lut = None
 
-        if self._split_runtime:
+        if self._split_runtime or self._lm_head_split:
             model_dir = Path(model.model_path).parent
             embeddings_path = model_dir / "token_embeddings.npy"
             token_lut_path = model_dir / "token_id_lut.npy"
@@ -267,6 +274,7 @@ class QwenStatic(QwenBase, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             token_embeddings=token_embeddings,
             token_id_lut=token_id_lut,
+            lm_head=lm_head,
         )
 
     def _init_cache(self) -> dict[str, np.ndarray]:

@@ -79,17 +79,352 @@ class QwenOnnxGraphEditor(
 
         return onnx_model
 
-    def split_rope_qk(self) -> None:
+    def fold_legacy_rotary_cache(self, max_len: int) -> int:
+        """
+        Replace per-layer ``rotary_emb`` cos/sin cache slices with a static table.
+
+        Older Qwen2/Qwen2.5 exports (transformers <4.45) keep a
+        ``[max_position_embeddings, head_dim]`` cos/sin cache in every layer and
+        slice it to ``Min(max_pos, past_len + seq_len)`` before gathering by
+        ``position_ids``. In the static graph ``position_ids < max_len``, so the
+        slice is equivalent to the constant ``table[:max_len]``. Identical tables
+        are shared across layers.
+
+        Returns:
+            Number of Slice nodes folded.
+        """
+
+        shared: dict[bytes, gs.Constant] = {}
+        folded = 0
+
+        for node in list(self.graph.nodes):
+            if node.op != "Slice" or "/rotary_emb/" not in node.name:
+                continue
+
+            table = node.inputs[0]
+            starts = node.inputs[1] if len(node.inputs) > 1 else None
+
+            if not isinstance(table, gs.Constant) or table.values.ndim != 2:
+                continue
+            if not isinstance(starts, gs.Constant) or np.any(starts.values != 0):
+                continue
+
+            if table.values.shape[0] < max_len:
+                raise ValueError(
+                    f"Rotary cache '{table.name}' has {table.values.shape[0]} "
+                    f"positions, fewer than max_len={max_len}"
+                )
+
+            values = np.ascontiguousarray(table.values[:max_len])
+            key = values.tobytes()
+
+            if key not in shared:
+                shared[key] = gs.Constant(
+                    f"rotary_emb_cache_{len(shared)}",
+                    values,
+                )
+
+            # Consumers (Gather by position_ids) now read the static table.
+            for consumer in list(node.outputs[0].outputs):
+                for idx, inp in enumerate(consumer.inputs):
+                    if inp is node.outputs[0]:
+                        consumer.inputs[idx] = shared[key]
+
+            node.outputs.clear()
+            folded += 1
+
+        self.graph.cleanup()
+
+        self._logger.info(
+            "Folded %d legacy rotary_emb cache slices into %d static tables "
+            "of %d positions",
+            folded,
+            len(shared),
+            max_len,
+        )
+
+        return folded
+
+    def grouped_query_attention(
+        self,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> int:
+        """
+        Attend against the un-expanded KV caches instead of ``repeat_kv`` copies.
+
+        Exported GQA attention expands each ``[1, kv, S, D]`` cache to
+        ``[1, heads, S, D]`` (Unsqueeze -> Expand -> Reshape) and applies half of
+        the softmax scale to the expanded K. For single-token decode this rewrites
+        each layer to::
+
+            Qg = Reshape(Q * (q_scale * k_scale), [1, kv, heads / kv, D])
+            O  = Softmax(Qg @ Transpose(K) + mask) @ V      # [1, kv, heads/kv, D]
+            O  = Reshape(O, [1, heads, 1, D])
+
+        Query head ``h`` maps to KV group ``h // (heads / kv)``, matching HF's
+        ``repeat_kv``. This removes the per-step copy and scale of the full cache.
+
+        Returns:
+            Number of layers rewritten.
+        """
+
+        group = num_heads // num_kv_heads
+        nodes = {node.name: node for node in self.graph.nodes}
+
+        def producer(tensor: gs.Tensor, op: str) -> gs.Node:
+            node = tensor.inputs[0] if tensor.inputs else None
+            if node is None or node.op != op:
+                raise ValueError(f"Expected {op} producing '{tensor.name}'")
+            return node
+
+        def scale_of(mul: gs.Node) -> tuple[gs.Tensor, float]:
+            data, const = mul.inputs
+            values = None
+            if isinstance(const, gs.Constant):
+                values = const.values
+            elif const.inputs and const.inputs[0].op == "Constant":
+                # Newer exports (e.g. Qwen3) emit the scale as a Constant node.
+                values = const.inputs[0].attrs["value"].values
+            if values is None or values.size != 1:
+                raise ValueError(f"'{mul.name}' is not a scalar scale")
+            return data, float(values.ravel()[0])
+
+        rewritten = 0
+        layer = 0
+        while (scores := nodes.get(f"/model/layers.{layer}/self_attn/MatMul")) is not None:
+            base = f"/model/layers.{layer}/self_attn/"
+            context = nodes[base + "MatMul_1"]
+
+            # Q side: Mul(q, q_scale). K side: Mul(Transpose(Reshape(Expand(Unsqueeze(K)))), k_scale).
+            q, q_scale = scale_of(producer(scores.inputs[0], "Mul"))
+            k_t, k_scale = scale_of(producer(scores.inputs[1], "Mul"))
+            k_cache = producer(
+                producer(producer(producer(k_t, "Transpose").inputs[0], "Reshape").inputs[0], "Expand").inputs[0],
+                "Unsqueeze",
+            ).inputs[0]
+            v_cache = producer(
+                producer(producer(context.inputs[1], "Reshape").inputs[0], "Expand").inputs[0],
+                "Unsqueeze",
+            ).inputs[0]
+            dtype = q.dtype or np.float32
+
+            q_grouped = self.graph.layer(
+                name=base + "GQA/QReshape",
+                op="Reshape",
+                inputs=[
+                    self.graph.layer(
+                        name=base + "GQA/QScale",
+                        op="Mul",
+                        inputs=[q, np.array(q_scale * k_scale, dtype=np.float32)],
+                        outputs=[gs.Variable(base + "GQA/q_scaled", dtype=dtype, shape=[1, num_heads, 1, head_dim])],
+                    )[0],
+                    np.array([1, num_kv_heads, group, head_dim], dtype=np.int64),
+                ],
+                outputs=[gs.Variable(base + "GQA/q", dtype=dtype, shape=[1, num_kv_heads, group, head_dim])],
+            )[0]
+            k_transposed = self.graph.layer(
+                name=base + "GQA/KTranspose",
+                op="Transpose",
+                attrs={"perm": [0, 1, 3, 2]},
+                inputs=[k_cache],
+                outputs=[gs.Variable(base + "GQA/k_t", dtype=dtype)],
+            )[0]
+
+            # Scores [1, kv, group, S]; the [1, 1, 1, S] mask Add still broadcasts.
+            scores.inputs = [q_grouped, k_transposed]
+            scores.outputs[0].shape = None
+            score_users = list(scores.outputs[0].outputs)
+            for user in score_users:
+                user.outputs[0].shape = None
+            softmax_out = next(u for u in score_users if u.op == "Add").outputs[0].outputs[0].outputs[0]
+            softmax_out.shape = None
+
+            # Context [1, kv, group, D] -> [1, heads, 1, D] for the unchanged head merge.
+            context_out = context.outputs[0]
+            grouped_out = gs.Variable(base + "GQA/context", dtype=dtype, shape=[1, num_kv_heads, group, head_dim])
+            context.inputs = [context.inputs[0], v_cache]
+            context.outputs = [grouped_out]
+            self.graph.layer(
+                name=base + "GQA/ContextReshape",
+                op="Reshape",
+                inputs=[grouped_out, np.array([1, num_heads, 1, head_dim], dtype=np.int64)],
+                outputs=[context_out],
+            )
+
+            rewritten += 1
+            layer += 1
+
+        self.graph.cleanup().toposort()
+
+        self._logger.info(
+            "Rewrote %d layers to grouped-query attention (%d heads over %d KV heads)",
+            rewritten,
+            num_heads,
+            num_kv_heads,
+        )
+
+        return rewritten
+
+    def rotary_gather_to_onehot_matmul(self) -> int:
+        """
+        Replace ``Gather(rotary_table, position_ids)`` with a one-hot MatMul.
+
+        Torq has no NPU lowering for a data-dependent row Gather, so with
+        ``--torq-disable-host --torq-disable-css`` the static rotary-table
+        lookup from :meth:`fold_legacy_rotary_cache` cannot be compiled.
+        ``onehot(position_ids) @ table`` selects the same row on the NPU and is
+        exact (a single non-zero product). Gathers of the same table share one
+        MatMul, and all tables share one one-hot vector.
+
+        Returns:
+            Number of Gather nodes replaced.
+        """
+
+        gathers = [
+            node
+            for node in self.graph.nodes
+            if node.op == "Gather"
+            and isinstance(node.inputs[0], gs.Constant)
+            and node.inputs[0].name.startswith("rotary_emb_cache_")
+            and node.attrs.get("axis", 0) == 0
+        ]
+        if not gathers:
+            return 0
+
+        indices = gathers[0].inputs[1]
+        if any(g.inputs[1] is not indices for g in gathers):
+            raise ValueError("Rotary Gathers use different index tensors")
+
+        num_positions = gathers[0].inputs[0].values.shape[0]
+
+        # [1, 1] positions -> [1, 1, 1] == arange(P) -> [1, 1, P] one-hot.
+        positions = self.graph.layer(
+            name="rotary_onehot/Unsqueeze",
+            op="Unsqueeze",
+            inputs=[indices, np.array([-1], dtype=np.int64)],
+            outputs=[gs.Variable("rotary_onehot/positions", dtype=indices.dtype)],
+        )[0]
+        is_position = self.graph.layer(
+            name="rotary_onehot/Equal",
+            op="Equal",
+            inputs=[
+                positions,
+                gs.Constant(
+                    "rotary_onehot/arange",
+                    np.arange(num_positions, dtype=indices.dtype or np.int64),
+                ),
+            ],
+            outputs=[gs.Variable("rotary_onehot/mask", dtype=np.bool_)],
+        )[0]
+        onehot = self.graph.layer(
+            name="rotary_onehot/Cast",
+            op="Cast",
+            attrs={"to": onnx.TensorProto.FLOAT},
+            inputs=[is_position],
+            outputs=[
+                gs.Variable(
+                    "rotary_onehot",
+                    dtype=np.float32,
+                    shape=[1, 1, num_positions],
+                )
+            ],
+        )[0]
+
+        selected: dict[str, gs.Variable] = {}
+        for gather in gathers:
+            table = gather.inputs[0]
+            if table.name not in selected:
+                selected[table.name] = self.graph.layer(
+                    name=f"{table.name}/OneHotMatMul",
+                    op="MatMul",
+                    inputs=[onehot, table],
+                    outputs=[
+                        gs.Variable(
+                            f"{table.name}/selected",
+                            dtype=np.float32,
+                            shape=[1, 1, table.values.shape[1]],
+                        )
+                    ],
+                )[0]
+
+            out = gather.outputs[0]
+            for consumer in list(out.outputs):
+                for idx, inp in enumerate(consumer.inputs):
+                    if inp is out:
+                        consumer.inputs[idx] = selected[table.name]
+            gather.outputs.clear()
+
+        self.graph.cleanup().toposort()
+
+        self._logger.info(
+            "Replaced %d rotary table Gathers with %d one-hot MatMuls",
+            len(gathers),
+            len(selected),
+        )
+
+        return len(gathers)
+
+    def materialize_tied_lm_head(self) -> bool:
+        """
+        Replace a ``Transpose(embed_tokens.weight)`` LM-head operand with a constant.
+
+        Exports of tied-embedding models (e.g. Qwen2.5-0.5B) feed the LM head
+        from a runtime Transpose of the embedding table. Vocabulary trimming
+        and weight quantization expect a constant ``[hidden, vocab]`` weight.
+
+        Returns:
+            True if the LM head weight was materialized.
+        """
+
+        lm_head = next(
+            (node for node in self.graph.nodes if node.name == "/lm_head/MatMul"),
+            None,
+        )
+        if lm_head is None or isinstance(lm_head.inputs[1], gs.Constant):
+            return False
+
+        weight = lm_head.inputs[1]
+        transpose = weight.inputs[0] if weight.inputs else None
+
+        if (
+            transpose is None
+            or transpose.op != "Transpose"
+            or not isinstance(transpose.inputs[0], gs.Constant)
+            or list(transpose.attrs.get("perm", [1, 0])) != [1, 0]
+        ):
+            raise ValueError(
+                "LM head weight is neither a constant nor Transpose(constant)"
+            )
+
+        source = transpose.inputs[0]
+        lm_head.inputs[1] = gs.Constant(
+            "lm_head.weight",
+            np.ascontiguousarray(source.values.T),
+        )
+        self.graph.cleanup()
+
+        self._logger.info(
+            "Materialized tied LM head weight from '%s' %s",
+            source.name,
+            list(lm_head.inputs[1].shape),
+        )
+
+        return True
+
+    def split_rope_qk(self, head_dim: int = 128) -> None:
         """Replace Qwen RoPE Q/K Slice pairs with Split operations."""
 
-        split_name = "qwen_rope_split_sizes_64_64"
+        half = head_dim // 2
+        split_name = f"qwen_rope_split_sizes_{half}_{half}"
 
         split_sizes = self._graph.tensors().get(split_name)
 
         if split_sizes is None:
             split_sizes = gs.Constant(
                 name=split_name,
-                values=np.array([64, 64], dtype=np.int64),
+                values=np.array([half, half], dtype=np.int64),
             )
 
         layers = sorted({
@@ -167,15 +502,17 @@ class QwenOnnxGraphEditor(
     def split_transformer_layers(
         self,
         split_at: int = 14,
+        num_layers: int = 28,
+        hidden_size: int = 1024,
     ) -> tuple[gs.Graph, gs.Graph]:
         """Split the static Qwen transformer into two runnable graphs.
 
         The split is made between layers ``split_at - 1`` and ``split_at``.
         For Qwen3-0.6B, the default split is layers 0-13 and 14-27.
         """
-        if not 0 < split_at < 28:
+        if not 0 < split_at < num_layers:
             raise ValueError(
-                f"split_at must be between 1 and 27, got {split_at}"
+                f"split_at must be between 1 and {num_layers - 1}, got {split_at}"
             )
 
         source_graph = self._graph.copy()
@@ -209,9 +546,9 @@ class QwenOnnxGraphEditor(
             position_ids.shape = [1, 1]
 
             if part == "A":
-                # Keep the layer-13 producer connected. The boundary tensor is
+                # Keep the boundary-layer producer connected. The boundary tensor is
                 # an output of Part A.
-                boundary.shape = [1, 1, 1024]
+                boundary.shape = [1, 1, hidden_size]
                 boundary.dtype = np.float32
 
                 inputs = [
@@ -230,7 +567,7 @@ class QwenOnnxGraphEditor(
 
             else:
                 boundary.inputs.clear()
-                boundary.shape = [1, 1, 1024]
+                boundary.shape = [1, 1, hidden_size]
                 boundary.dtype = np.float32
 
                 inputs = [
@@ -238,13 +575,13 @@ class QwenOnnxGraphEditor(
                     position_ids,
                     *[
                         tensors[f"past_key_values.{i}.key_value"]
-                        for i in range(split_at, 28)
+                        for i in range(split_at, num_layers)
                     ],
                 ]
 
                 outputs = [
                     tensors[f"present.{i}.key_value"]
-                    for i in range(split_at, 28)
+                    for i in range(split_at, num_layers)
                 ] + [final_hidden]
 
             graph.inputs = inputs
@@ -267,10 +604,11 @@ class QwenOnnxGraphEditor(
 
         self._logger.info(
             "Split Qwen transformer at layer %d: "
-            "Part A layers 0-%d, Part B layers %d-27",
+            "Part A layers 0-%d, Part B layers %d-%d",
             split_at,
             split_at - 1,
             split_at,
+            num_layers - 1,
         )
 
         return part_a, part_b

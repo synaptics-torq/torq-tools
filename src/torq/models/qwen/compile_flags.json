@@ -1,0 +1,20 @@
+{
+  "version": ["2.2.1"],
+  "flags": [
+    "--torq-enable-annotate-tied-operands",
+    "--torq-enable-split-constants-optimization",
+    "--iree-flow-inline-constants-max-byte-length=300000000",
+    "--torq-convert-dtypes",
+    "--torq-convert-io-dtype",
+    "--torq-disable-host",
+    "--torq-disable-css",
+    "--torq-disable-slicing"
+  ],
+  "transformer": [
+    "--torq-max-nss-programs-size=12582912"
+  ],
+  "transformer_if_supported": [
+    "--torq-prefetch-matmul-tile-budget-percent=33"
+  ],
+  "lm_head": []
+}

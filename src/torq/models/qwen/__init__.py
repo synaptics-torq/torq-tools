@@ -4,26 +4,39 @@ from typing import Final
 from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
-from ...utils.onnx import add_onnx_args
+from ...utils.onnx import add_llm_args, add_onnx_args
 
 
-DEFAULT_HF_REPO: Final[str] = "Qwen/Qwen3-0.6B"
+# -s/--model-size choices. Each one sets the source repository and the GPTQ
+# INT4 weights that the default one-command export uses.
+QWEN_MODELS: Final[dict[str, dict[str, str]]] = {
+    "qwen3-0.6b": {
+        "hf_repo": "Qwen/Qwen3-0.6B",
+    },
+    "qwen2.5-0.5b-instruct": {
+        "hf_repo": "Qwen/Qwen2.5-0.5B-Instruct",
+        "gptq": "Synaptics/Qwen2.5-0.5B-Instruct-GPTQ-int4-torq/gptq",
+    },
+}
+DEFAULT_MODEL: Final[str] = "qwen3-0.6b"
+DEFAULT_HF_REPO: Final[str] = QWEN_MODELS[DEFAULT_MODEL]["hf_repo"]
 DEFAULT_GEN_TOKENS: Final[int] = 256
 
 
 def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "-t",
-        "--max-gen-tokens",
-        type=int,
-        default=DEFAULT_GEN_TOKENS,
-        help="Token generation limit (default: %(default)s)",
+    add_llm_args(
+        parser,
+        model_name="Qwen",
+        model_sizes=list(QWEN_MODELS),
+        default_model_size=DEFAULT_MODEL,
+        max_gen_tokens=DEFAULT_GEN_TOKENS,
+        split_lm_head=True,
     )
     parser.add_argument(
         "--hf-repo",
         type=str,
-        default=DEFAULT_HF_REPO,
-        help="Qwen Hugging Face repository (default: %(default)s)",
+        default=None,
+        help="Override the Hugging Face source repository of --model-size",
     )
     parser.add_argument(
         "--hf-repo-subdir",
@@ -34,34 +47,11 @@ def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
 
     add_onnx_args(
         parser,
-        convert_dtypes=["bf16", "fp16"],
+        dynamic_quantize=False,
+        convert_dtypes=True,
         allow_no_opt=False,
-    )
-
-    parser.add_argument(
-        "--models-dir",
-        type=str,
-        default="models",
-        metavar="DIR",
-        help="Base directory for source and exported models (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--dynamic-models",
-        action="store_true",
-        default=False,
-        help="Export a dynamic model instead of producing a static model",
-    )
-    parser.add_argument(
-        "--skip-torq",
-        action="store_true",
-        default=False,
-        help="Skip Torq compilation",
-    )
-    parser.add_argument(
-        "--keep-individual-kv-io",
-        action="store_true",
-        default=False,
-        help="Keep key/value cache tensors separate instead of combining them",
+        dynamic_models=True,
+        keep_individual_kv_io=True,
     )
 
     parser.add_argument(
@@ -69,23 +59,41 @@ def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help=(
-            "Split the static Qwen transformer into two parts and "
-            "export a separate LM head for memory-constrained Torq targets"
+            "Also split the transformer into two parts (Part A and Part B) "
+            "for memory-constrained Torq targets"
         ),
     )
-
     parser.add_argument(
         "--weight-quantization",
-        choices=["int8"],
-        default=None,
+        choices=["int4", "int8", "none"],
+        default="int4",
         help=(
-            "Apply weight quantization to split Qwen components. "
-            "Currently supported: int8."
+            "Block-size-32 DequantizeLinear weight quantization of the transformer and "
+            "LM head MatMuls; requires --split-lm-head (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--gptq",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the GPTQ INT4 weights of --model-size from Hugging Face instead of "
+            "round-to-nearest (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--gptq-checkpoint",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Local compressed-tensors GPTQ INT4 checkpoint (int4quant/run_gptq.py); "
+            "overrides the Hugging Face default"
         ),
     )
 
     add_logging_args(parser)
-    add_torq_args(parser)
+    add_torq_args(parser, skip=True)
 
 
 def add_qwen_infer_args(parser: argparse.ArgumentParser) -> None:
