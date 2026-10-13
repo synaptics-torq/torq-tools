@@ -3,7 +3,6 @@
 
 import argparse
 import os
-import shutil
 from pathlib import Path
 from typing import Final, Literal
 from collections.abc import Sequence
@@ -41,6 +40,11 @@ _GEMMA3_MODEL_FILENAMES: Final[tuple[tuple[str, ...], tuple[str, ...]]] = (
     ("model.onnx",),
 )
 
+_GEMMA3_PTD_MODEL_FILENAMES: Final[tuple[tuple[str, ...], tuple[str, ...]]] = (
+    ("ptd_transformer.onnx", "ptd_lm_head.onnx"),
+    ("ptd_model.onnx",),
+)
+
 # Sizes whose base (non-instruct) checkpoint is published with a `-pt` suffix.
 _GEMMA3_PRETRAINED_SUFFIX_SIZES: Final[frozenset[str]] = frozenset({"1b"})
 
@@ -69,6 +73,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         trim_vocab_groups: list[str] | None = None,
         trim_byte_fallback: bool = True,
         split_weights: bool = False,
+        ptd_rows: int | None = None,
         **edit_args
     ):
         self._instruct_model = instruct_model
@@ -99,6 +104,18 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             if self._onnx_source_dir is not None
             else [Path(models_dir) / self._hf_repo / "source" / "fp32"]
         )
+        if ptd_rows is not None and ptd_rows > 0:
+            if not static_models:
+                raise ValueError("`--ptd-rows` is currently supported only for static Gemma exports")
+            if ptd_rows < 2:
+                raise ValueError(f"`--ptd-rows` must be at least 2 (anchor + 1 tree row), got {ptd_rows}")
+            if ptd_rows > max_gen_tokens:
+                raise ValueError(
+                    f"`--ptd-rows` ({ptd_rows}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            self._ptd_rows = int(ptd_rows)
+        else:
+            self._ptd_rows = None
         if self._onnx_source_dir is not None:
             self._config = AutoConfig.from_pretrained(self._onnx_source_dir, local_files_only=True)
         else:
@@ -142,6 +159,19 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             num_heads=self._config.num_attention_heads,
             hidden_size=self._config.hidden_size,
         )
+        opt_configs = {"model": opt_config, "model_prefill": opt_config}
+        if self._ptd_rows is not None:
+            # The static PTD body bakes the causal mask as "all committed keys
+            # visible"; that equals Gemma's local (sliding-window) semantics only
+            # while the cache never outgrows the window.
+            sliding_window = getattr(self._config, "sliding_window", None)
+            if sliding_window is not None and max_gen_tokens > sliding_window:
+                raise ValueError(
+                    f"`--ptd-rows` requires `--max-gen-tokens` ({max_gen_tokens}) <= "
+                    f"sliding_window ({sliding_window}) so the local-attention window "
+                    "stays inactive (same dependence as the static decode baseline)"
+                )
+            opt_configs["model_ptd"] = opt_config
 
         super().__init__(
             "fp32",
@@ -151,9 +181,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             show_model_info=show_model_info,
             dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
-            opt_configs={"model": opt_config, "model_prefill": opt_config},
+            opt_configs=opt_configs,
             split_weights=split_weights,
         )
+
+        # PTD component file layout mirrors the regular model's.
+        self._ptd_export_model_filenames = _GEMMA3_PTD_MODEL_FILENAMES[0 if split_lm_head else 1]
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir = [None] * 5
@@ -221,6 +254,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             return self._export_dir / self._export_model_filenames[0]
         if component == "model_prefill":
             return self._export_dir / "transformer_prefill.onnx"
+        if component == "model_ptd":
+            return self._export_dir / self._ptd_export_model_filenames[0]
+        if component == "ptd_lm_head":
+            return self._export_dir / self._ptd_export_model_filenames[1]
         return super()._export_path_for_component(component)
 
     def _resolve_source_asset_path(self, asset_name: str) -> Path:
@@ -324,6 +361,24 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
             EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
         ]
+        if self._ptd_rows is not None:
+            # PTD body (Gao et al. 2026, arXiv:2607.10661; attribution in
+            # torq.inference.ptd): packed anchor + tree rows; per-row
+            # positions and a host-supplied visibility matrix replace the
+            # consecutive-chunk causal machinery, and tree rows stay scratch
+            # (see PTDKVCache).
+            # The mask edit runs first: it is the consumer of the fresh
+            # tree_vis graph input (per-edit cleanup drops inputs without
+            # consumers).
+            blocks["model_ptd (KV cache)"] = [
+                EditSpec(
+                    "PTDTreeAttentionMask",
+                    (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), ctx("tree_vis"), ctx("rows")),
+                ),
+                EditSpec("PTDKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("rows"))),
+                EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
+                EditSpec("ConvertToStaticIndex", (ctx("rows"), ctx("positions_input"))),
+            ]
 
         patch = [
             EditSpec("EliminateTranspose"),
@@ -367,6 +422,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
         Args:
             model (onnx.ModelProto): ONNX decoder model to modify
+            component (str): Component name (selects the staticization scheme)
+            chunk_len (int): Fixed query-row count for this component
 
         Returns:
             onnx.ModelProto: The modified decoder model with static dimensions and transformations applied
@@ -374,8 +431,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         Raises:
             ValueError: If an unexpected dynamic dimension is found in the model inputs, outputs, or nodes
         """
-
         graph: gs.Graph = gs.import_onnx(model)
+        ptd = component == "model_ptd"
+        rows = self._ptd_rows if ptd else chunk_len
         self._logger.debug(
             "Set export data type to %s for model data type %s",
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
@@ -386,36 +444,70 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
         )
-        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
+        editor.fix_io(self._max_gen_tokens, chunk_len=rows)
 
         blocks = self.graph_edit_blocks()
         # Remove redundant Cast + isNaN ops
         editor.apply_specs(blocks["model.static"], self._harness)
 
-        cur_len_2d = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
-        graph.inputs.append(cur_len_2d)
-        cur_len = graph.layer(
-            name="current_len_to_1d",
-            op="Squeeze",
-            inputs=[cur_len_2d, [0]],
-            outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
-        )[0]
-        cur_len_scalar = graph.layer(
-            name="current_len_to_scalar",
-            op="Squeeze",
-            inputs=[cur_len, [0]],
-            outputs=[gs.Variable(cur_len.name + "_squeezed", dtype=np.int64, shape=[])],
-        )[0]
+        if ptd:
+            # PTD: per-row logical positions as a [1, rows] input; the anchor
+            # position (first row) drives the KV/mask edits.
+            cur_len_2d = gs.Variable("position_ids", dtype=np.int64, shape=[1, rows])
+            graph.inputs.append(cur_len_2d)
+            positions_1d = graph.layer(
+                name="current_len_positions_1d",
+                op="Squeeze",
+                inputs=[cur_len_2d, [0]],
+                outputs=[gs.Variable("position_ids_1d", dtype=np.int64, shape=[rows])],
+            )[0]
+            cur_len = graph.layer(
+                name="current_len_ptd",
+                op="Gather",
+                inputs=[positions_1d, [0]],
+                outputs=[gs.Variable("cur_len_ptd_1d", dtype=np.int64, shape=[1])],
+            )[0]
+            cur_len_scalar = None
+        else:
+            cur_len_2d = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+            graph.inputs.append(cur_len_2d)
+            cur_len = graph.layer(
+                name="current_len_to_1d",
+                op="Squeeze",
+                inputs=[cur_len_2d, [0]],
+                outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
+            )[0]
+            cur_len_scalar = graph.layer(
+                name="current_len_to_scalar",
+                op="Squeeze",
+                inputs=[cur_len, [0]],
+                outputs=[gs.Variable(cur_len.name + "_squeezed", dtype=np.int64, shape=[])],
+            )[0]
+            positions_1d = None
+
+        ctx_values = {
+            "cur_len": cur_len,
+            "max_tokens": self._max_gen_tokens,
+            "export_dtype": self._onnx_export_dtype,
+            "chunk_len": rows,
+        }
+        kv_cache_block = "model.static (KV cache)"
+        if ptd:
+            tree_vis = gs.Variable(
+                "tree_vis", dtype=np.int32, shape=[1, 1, rows, rows - 1]
+            )
+            graph.inputs.append(tree_vis)
+            ctx_values.update({
+                "rows": rows,
+                "tree_vis": tree_vis,
+                "positions_input": positions_1d,
+            })
+            kv_cache_block = "model_ptd (KV cache)"
 
         editor.apply_specs(
-            blocks["model.static (KV cache)"],
+            blocks[kv_cache_block],
             self._harness,
-            {
-                "cur_len": cur_len,
-                "max_tokens": self._max_gen_tokens,
-                "export_dtype": self._onnx_export_dtype,
-                "chunk_len": chunk_len,
-            },
+            ctx_values,
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
@@ -469,7 +561,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             editor.apply_specs(blocks["model.patch (batch prefill)"], self._harness)
 
         if self._split_lm_head:
-            lm_head_path = Path(model_path).parent / self._export_model_filenames[1]
+            # PTD keeps all rows (no TakeLastToken): its block head projects
+            # the full [1, rows, hidden] stack in one call.
+            lm_head_component = "ptd_lm_head" if component == "model_ptd" else "lm_head"
+            lm_head_path = self._export_path_for_component(lm_head_component)
             editor.apply_specs(
                 blocks["model.patch (split LM head)"],
                 self._harness,
@@ -478,8 +573,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_model = load_onnx_lazy(lm_head_path)
             lm_head_model.ir_version = model.ir_version
             self._save_component_model(self.check_model(lm_head_model), lm_head_path)
-            self._export_paths["lm_head"] = lm_head_path
-            self._logger.info("(lm_head) Saved split LM head to '%s'", str(lm_head_path))
+            self._export_paths[lm_head_component] = lm_head_path
+            self._logger.info("(%s) Saved split LM head to '%s'", lm_head_component, str(lm_head_path))
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         self._save_component_model(new_model, model_path)
@@ -496,6 +591,15 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 source_model,
                 component="model_prefill",
                 chunk_len=self._batch_prefill,
+            )
+        if self._ptd_rows is not None:
+            self._logger.info(
+                "(model_ptd) Making graph static with %d PTD rows...", self._ptd_rows
+            )
+            self._components["model_ptd"] = self._make_model_static(
+                source_model,
+                component="model_ptd",
+                chunk_len=self._ptd_rows,
             )
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
@@ -521,6 +625,26 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_path=self._export_paths.get("lm_head"),
             prefill_model_path=self._export_paths.get("model_prefill"),
             prefill_size=self._batch_prefill,
+        )
+        if self._ptd_rows is not None:
+            self._validate_ptd_onnx()
+
+    def _validate_ptd_onnx(self):
+        from ...model_export.validation_ptd import validate_ptd_onnx
+
+        emb_path = self._export_paths["model"].parent / "token_embeddings.npy"
+        token_embeddings = np.load(emb_path) if emb_path.exists() else None
+        lut_path = self._export_paths["model"].parent / "token_id_lut.npy"
+        validate_ptd_onnx(
+            self._logger,
+            self._export_paths["model_ptd"],
+            self._export_paths["model"],
+            ptd_lm_head_path=self._export_paths.get("ptd_lm_head"),
+            decode_lm_head_path=self._export_paths.get("lm_head"),
+            token_embeddings=token_embeddings,
+            token_id_lut=np.load(lut_path) if self._trim_vocab else None,
+            vocab_size=self._vocab_size,
+            rows=self._ptd_rows,
         )
 
     def convert_models(
@@ -563,6 +687,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         trim_vocab_groups=args.trim_vocab_groups,
         trim_byte_fallback=args.trim_byte_fallback,
         split_weights=args.split_weights,
+        ptd_rows=args.ptd_rows or None,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops
     )
@@ -581,11 +706,18 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:
+        # The PTD components are an ONNX-only experimental variant: the
+        # compiler path for the fixed-row body is unvalidated, so keep it out
+        # of the standard compile loop.
+        ptd_skip = ["model_ptd", "ptd_lm_head"] if args.ptd_rows else []
+        if ptd_skip:
+            exporter._logger.info("(gemma3) --ptd-rows: skipping PTD components in the torq compile (ONNX-only experimental)")
         exporter.export_torq(
             torq_compile_args=args.compile_flags or [],
             use_binary=args.use_binary,
             local_compile=args.local_compile,
             compiler_path=args.compiler_path,
+            skip=ptd_skip,
         )
 
 

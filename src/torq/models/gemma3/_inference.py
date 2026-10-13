@@ -26,6 +26,7 @@ from ...inference.transformers import (
     DecoderOnlyConfig,
     DynamicDecoderOnlyRunner,
     StaticDecoderOnlyRunner,
+    StaticPTDRunner,
     find_single_data_file,
 )
 
@@ -367,6 +368,109 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         if path is None:
             return None
         return np.load(path)
+
+
+class Gemma3PTD(Gemma3Base, StaticPTDRunner):
+    """Gemma 3 static runner with Progressive Tree Drafting (experimental).
+
+    Prefills with the ordinary 1-token decode model and decodes with packed
+    PTD rounds; greedy output is token-identical to ``Gemma3Static``.
+
+    Progressive Tree Drafting (PTD): Gao et al. 2026,
+    https://arxiv.org/abs/2607.10661 (see torq.inference.ptd for attribution
+    and the domain-specific adaptations).
+    """
+
+    def __init__(
+        self,
+        model: InferenceRunner,
+        max_prompt_tokens: int,
+        max_gen_tokens: int,
+        instruct_model: bool = False,
+        repo_id: str | None = None,
+        ptd_model: InferenceRunner | None = None,
+        ptd_rows: int | None = None,
+        ptd_lm_head: InferenceRunner | None = None,
+        combined_kv_io: bool = True,
+        lm_head: InferenceRunner | None = None,
+        ptd_width: int = 4,
+        ptd_depth: int = 6,
+        pool_max_nodes: int = 16,
+        pool_max_entries: int = 64,
+    ):
+        if ptd_model is None or ptd_rows is None:
+            raise ValueError("Gemma3PTD requires the PTD body model and ptd_rows")
+        token_embeddings = Gemma3Static._find_token_embeddings(model.model_path)
+        token_id_lut = Gemma3Static._find_token_id_lut(model.model_path)
+        config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
+        tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
+        StaticPTDRunner.__init__(
+            self,
+            model,
+            ModelConfig.from_json_config(config_path, instruct_model),
+            max_prompt_tokens,
+            max_gen_tokens,
+            _load_tokenizer(tokenizer_path),
+            DEFAULT_SYS_PROMPT if instruct_model else None,
+            ptd_model=ptd_model,
+            ptd_rows=ptd_rows,
+            ptd_lm_head=ptd_lm_head,
+            combined_kv_io=combined_kv_io,
+            token_embeddings=token_embeddings,
+            token_id_lut=token_id_lut,
+            lm_head=lm_head,
+            ptd_width=ptd_width,
+            ptd_depth=ptd_depth,
+            pool_max_nodes=pool_max_nodes,
+            pool_max_entries=pool_max_entries,
+        )
+
+    @classmethod
+    def from_onnx(
+        cls,
+        model_path: str | os.PathLike,
+        ptd_model_path: str | os.PathLike,
+        max_gen_tokens: int,
+        max_inp_len: int | None = None,
+        n_threads: int | None = None,
+        instruct_model: bool = False,
+        repo_id: str | None = None,
+        combined_kv_io: bool = True,
+        lm_head_path: str | os.PathLike | None = None,
+        ptd_lm_head_path: str | os.PathLike | None = None,
+        ptd_rows: int | None = None,
+        **ptd_kwargs,
+    ) -> "Gemma3PTD":
+        lm_head_path = lm_head_path or Gemma3Static._find_lm_head(model_path, "lm_head.onnx")
+        ptd_lm_head_path = ptd_lm_head_path or Gemma3Static._find_lm_head(ptd_model_path, "ptd_lm_head.onnx")
+        ptd_runner = ORTInferenceRunner(ptd_model_path, n_threads=n_threads)
+        if ptd_rows is None:
+            for input_name in ("token_embedding", "input_ids"):
+                shape = ptd_runner.input_shapes.get(input_name)
+                if shape is not None and len(shape) >= 2 and isinstance(shape[1], int):
+                    ptd_rows = shape[1]
+                    break
+            if ptd_rows is None:
+                raise ValueError(f"Could not determine PTD row count from '{ptd_model_path}'")
+        return cls(
+            ORTInferenceRunner(model_path, n_threads=n_threads),
+            max_prompt_tokens=max_inp_len,
+            max_gen_tokens=max_gen_tokens,
+            instruct_model=instruct_model,
+            repo_id=repo_id,
+            ptd_model=ptd_runner,
+            ptd_rows=ptd_rows,
+            ptd_lm_head=(
+                ORTInferenceRunner(ptd_lm_head_path, n_threads=n_threads)
+                if ptd_lm_head_path else None
+            ),
+            combined_kv_io=combined_kv_io,
+            lm_head=(
+                ORTInferenceRunner(lm_head_path, n_threads=n_threads)
+                if lm_head_path else None
+            ),
+            **ptd_kwargs,
+        )
 
 
 if __name__ == "__main__":

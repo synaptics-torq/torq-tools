@@ -69,6 +69,18 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=True,
         help="Retain byte fallback tokens when --trim-vocab is enabled (default: %(default)s)",
     )
+    parser.add_argument(
+        "--ptd-rows",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Also export a fixed-row Progressive Tree Drafting body "
+            "(PTD, Gao et al. 2026, arXiv:2607.10661) as ptd_transformer.onnx "
+            "[+ ptd_lm_head.onnx], packing N rows (anchor + draft/verification "
+            "tree rows); experimental (default: %(default)s; pass 0 to disable)"
+        ),
+    )
     add_graph_edit_harness_args(parser)
     add_logging_args(parser)
     add_torq_args(parser, skip=True)
