@@ -9,10 +9,12 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter_ns as _perf_counter_ns
 
 import numpy as np
 
 from .runners import InferenceRunner
+from . import ptd as ptd_core
 
 
 @dataclass(frozen=True)
@@ -176,14 +178,17 @@ class DecoderOnlyRunner(ABC):
         return self._tokenize_input(self._sys_prompt, "system")
 
     def run(self, input: str, max_gen_tokens: int | None = None) -> str:
+        return self._tokenizer.decode(self.run_tokens(input, max_gen_tokens))
+
+    def run_tokens(self, input: str, max_gen_tokens: int | None = None) -> list[int]:
+        """Generate token IDs without decoding away special tokens or token boundaries."""
         self._reset_cache()
         inp_tokens = self._prepare_run_input_tokens(input)
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
-        output = self._tokenizer.decode(out_tokens)
         et = time.perf_counter_ns()
         self._infer_times.append(et - st)
-        return output
+        return out_tokens
 
     def warmup(self) -> int:
         if not self._instruct_model:
@@ -430,6 +435,280 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
             curr_seq_len += 1
         self._n_tokens_gen = len(gen_tokens)
         return gen_tokens
+
+
+class StaticPTDRunner(StaticDecoderOnlyRunner):
+    """Static decode runner with Progressive Tree Drafting (PTD).
+
+    Prefills with the ordinary 1-token decode model, then decodes with PTD
+    rounds: a fixed-row body (anchor + packed draft/verification tree nodes)
+    and greedy verification against a request-local candidate pool. The
+    committed KV cache is shared with the decode model; accepted-path scratch
+    KVs are promoted into it by the host each round. While the cache is too
+    full for a full row budget (L > M - rows), decoding falls back to the
+    ordinary 1-token step.
+
+    PTD greedy output is token-identical to ordinary greedy decoding of the
+    same model (anchor row = ordinary step; each accepted continuation is the
+    ordinary greedy prediction for its prefix; the stop condition is scanned
+    per emitted token).
+
+    Progressive Tree Drafting (PTD): Gao et al. 2026,
+    https://arxiv.org/abs/2607.10661 (see torq.inference.ptd for attribution
+    and the domain-specific adaptations).
+    """
+
+    def __init__(
+        self,
+        model: InferenceRunner,
+        config: DecoderOnlyConfig,
+        max_prompt_tokens: int,
+        max_gen_tokens: int,
+        tokenizer,
+        sys_prompt: str | None,
+        *,
+        ptd_model: InferenceRunner,
+        ptd_rows: int,
+        ptd_lm_head: InferenceRunner | None = None,
+        combined_kv_io: bool = True,
+        token_embeddings: np.ndarray | None = None,
+        token_id_lut: np.ndarray | None = None,
+        lm_head: InferenceRunner | None = None,
+        ptd_width: int = 4,
+        ptd_depth: int = 6,
+        pool_max_nodes: int = 16,
+        pool_max_entries: int = 64,
+        min_draft_rows: int = 1,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ):
+        if ptd_rows < 2:
+            raise ValueError(f"ptd_rows must be >= 2, got {ptd_rows}")
+        if temperature != 0.0 or top_p != 1.0:
+            raise ValueError("PTD supports greedy decoding only (temperature=0, top_p=1)")
+        super().__init__(
+            model,
+            config,
+            max_prompt_tokens,
+            max_gen_tokens,
+            tokenizer,
+            sys_prompt,
+            combined_kv_io=combined_kv_io,
+            token_embeddings=token_embeddings,
+            token_id_lut=token_id_lut,
+            lm_head=lm_head,
+        )
+        self._ptd_model = ptd_model
+        self._ptd_lm_head = ptd_lm_head
+        self._ptd_rows = ptd_rows
+        self._ptd_width = ptd_width
+        self._ptd_depth = ptd_depth
+        self._ptd_pool_max_nodes = pool_max_nodes
+        self._ptd_pool_max_entries = pool_max_entries
+        self._ptd_min_draft_rows = max(0, min_draft_rows)
+        self._ptd_pool = None
+        self._ptd_tree = None
+        self._ptd_pad_token = config.pad_token_id if config.pad_token_id is not None else 0
+        self._ptd_out_names: list[str] = list(ptd_model.output_names)
+        self._ptd_first_out = next(
+            (n for n in self._ptd_out_names if n in ("logits", "last_hidden_states")), None
+        )
+        if self._ptd_first_out is None:
+            raise ValueError(f"PTD model has no logits/last_hidden_states output: {self._ptd_out_names[:4]}...")
+        self._ptd_log: list[dict] = []
+        self._ptd_rounds: int = 0
+        self._logger.info(
+            "Loaded PTD body '%s' (rows=%d, width=%d, depth=%d)",
+            str(ptd_model.model_path), ptd_rows, ptd_width, ptd_depth,
+        )
+
+    # -- PTD round machinery -------------------------------------------------
+
+    def _ptd_token_feed(self, tokens: np.ndarray) -> dict[str, np.ndarray]:
+        if isinstance(self._token_embeddings, np.ndarray):
+            return {"token_embedding": self._token_embeddings[tokens][None, ...]}
+        return {"input_ids": tokens.astype(np.int64)[None, ...]}
+
+    def _ptd_row_tokens(self, logits: np.ndarray) -> np.ndarray:
+        """argmax per row, remapped through the token ID LUT when trimmed."""
+        row_tokens = np.argmax(logits, axis=-1).astype(np.int64)
+        if self._token_id_lut is not None:
+            if np.any(row_tokens >= len(self._token_id_lut)):
+                raise RuntimeError("PTD row token outside token ID LUT")
+            row_tokens = self._token_id_lut[row_tokens]
+        return row_tokens
+
+    def _ptd_round(self, anchor_token: int, L: int, gen_tokens: list[int]) -> tuple[list[int], bool]:
+        """One PTD round. Returns (emitted tokens, stopped). Updates the
+        committed cache, draft tree, pool, and metrics."""
+        round_start = _perf_counter_ns()
+        rows = self._ptd_rows
+        free = rows - 1
+
+        # 1. Retrieve candidates (key = this round's anchor = last emitted
+        # token) and allocate the row budget: candidates first, keeping at
+        # least one draft row while the draft tree is non-empty.
+        candidate_tree = self._ptd_pool.retrieve(anchor_token) if self._ptd_pool else None
+        cand_nodes = candidate_tree.bfs_nodes() if candidate_tree is not None else []
+        draft_nodes = self._ptd_tree.bfs_nodes()
+        if draft_nodes and self._ptd_min_draft_rows > 0:
+            n_cand = min(len(cand_nodes), free - self._ptd_min_draft_rows)
+        else:
+            n_cand = min(len(cand_nodes), free)
+        n_draft = min(len(draft_nodes), free - max(n_cand, 0))
+        cand_nodes = cand_nodes[: max(n_cand, 0)]
+        draft_nodes = draft_nodes[:n_draft]
+
+        # 2. Pack the round.
+        packing = ptd_core.pack_round(
+            L, anchor_token, cand_nodes, draft_nodes, rows, self._ptd_pad_token
+        )
+
+        # 3. Body (+ block head).
+        feeds = self._ptd_token_feed(packing.tokens)
+        feeds.update({
+            "position_ids": packing.positions[None, ...],
+            "tree_vis": packing.vis.reshape(1, 1, rows, rows - 1),
+            **self._kv_cache,
+        })
+        t0 = _perf_counter_ns()
+        out = self._ptd_model.infer(feeds)
+        out_map = dict(zip(self._ptd_out_names, out))
+        first = out_map[self._ptd_first_out]
+        if self._ptd_lm_head is not None:
+            first = self._ptd_lm_head.infer({self._hidden_states_name: first})[0]
+        body_ms = (_perf_counter_ns() - t0) / 1e6
+
+        # 4. Greedy verification. The stop adapter matches ordinary greedy:
+        # the base _stop_decoding expects the candidate included as the last
+        # element of the generated-token list, while the PTD scan hands over
+        # the tokens committed *before* the candidate.
+        row_tokens = self._ptd_row_tokens(first.reshape(rows, -1))
+        max_accepted = self._max_gen_tokens - L - 1
+        result = ptd_core.greedy_verify(
+            row_tokens, cand_nodes, packing.candidate_slots,
+            gen_tokens,
+            lambda token, committed: self._stop_decoding(token, list(committed) + [token]),
+            max_accepted,
+        )
+
+        # 5. Commit: present cache (anchor at L) + promote accepted path KVs.
+        new_cache = self._ptd_promote(out_map, packing, result.accepted, L)
+        self._update_cache(new_cache)
+
+        # 6. Evolve the draft tree and pool (bounded, request-local):
+        # packed draft nodes grow their argmax children, the tree steps and
+        # re-anchors on the round's first emitted token, and the pool absorbs
+        # the packed nodes' subtrees keyed by token value.
+        for node in packing.draft_slots:
+            self._ptd_tree.add_child(node, int(row_tokens[packing.draft_slots[node]]))
+        self._ptd_tree.step_and_prune()
+        self._ptd_tree.reroot(result.emitted[0])
+        for node in packing.draft_slots:
+            self._ptd_pool.merge_node(node)
+
+        self._ptd_rounds += 1
+        self._ptd_log.append({
+            "round": self._ptd_rounds,
+            "L": L,
+            "rows": rows,
+            "n_candidates": packing.n_candidates,
+            "n_drafts": packing.n_drafts,
+            "emitted": len(result.emitted),
+            "accepted": len(result.accepted),
+            "hit": result.hit,
+            "pool_entries": len(self._ptd_pool) if self._ptd_pool else 0,
+            "body_ms": body_ms,
+            "round_ms": (_perf_counter_ns() - round_start) / 1e6,
+        })
+        return result.emitted, result.stopped
+
+    def _ptd_promote(self, out_map: dict, packing, accepted: list, L: int) -> list[np.ndarray]:
+        """Present caches (anchor committed at L by the model) + accepted-path
+        scratch KVs promoted to rows L+1.., in place on the present outputs.
+
+        Returns the updated cache values in ``self._kv_cache`` key order (the
+        base ``_update_cache`` zips them by position).
+        """
+        cache = self._kv_cache
+        if self._combined_kv_io:
+            H = self._n_kv_heads  # per-role head count (cache stores 2H combined)
+            for l in range(self._n_layers):
+                committed = out_map[f"present.{l}.key_value"]
+                k_scr = out_map[f"present.{l}.key_scratch"]
+                v_scr = out_map[f"present.{l}.value_scratch"]
+                for j, node in enumerate(accepted):
+                    s = packing.candidate_slots[node] - 1  # scratch row index
+                    committed[0, :H, L + 1 + j, :] = k_scr[0, :, s, :]
+                    committed[0, H:, L + 1 + j, :] = v_scr[0, :, s, :]
+            return [out_map[name.replace("past_key_values", "present")] for name in cache]
+        for l in range(self._n_layers):
+            for role in ("key", "value"):
+                scratch = out_map[f"present.{l}.{role}_scratch"]
+                committed = out_map[f"present.{l}.{role}"]
+                for j, node in enumerate(accepted):
+                    s = packing.candidate_slots[node] - 1
+                    committed[0, :, L + 1 + j, :] = scratch[0, :, s, :]
+        return [out_map[name.replace("past_key_values", "present")] for name in cache]
+
+    def _run(
+        self,
+        inp_tokens: list[int],
+        max_gen_tokens: int | None = None,
+    ) -> list[int]:
+        if isinstance(max_gen_tokens, int) and 0 <= max_gen_tokens < self._max_gen_tokens:
+            self._max_gen_tokens = max_gen_tokens
+        inp_tokens = self._format_input_tokens(inp_tokens)
+        next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
+        gen_tokens = [next_token]
+
+        # Request-local PTD state (fresh draft tree; the pool warms up).
+        self._ptd_tree = ptd_core.PTDTree(width=self._ptd_width, max_depth=self._ptd_depth)
+        self._ptd_pool = ptd_core.PTDPool(
+            max_entry_nodes=self._ptd_pool_max_nodes,
+            max_entries=self._ptd_pool_max_entries,
+            width=self._ptd_width,
+        )
+        self._ptd_log = []
+        self._ptd_rounds = 0
+
+        M = self._max_gen_tokens
+        if self._stop_decoding(next_token, gen_tokens):
+            self._n_tokens_gen = len(gen_tokens)
+            return gen_tokens
+        while True:
+            # Same loop gate as the base runner: the cache (size M) is full
+            # once curr_seq_len reaches M.
+            if curr_seq_len >= M:
+                self._logger.warning("Max generation tokens reached, stopping early")
+                break
+            # A full row budget needs the anchor at L plus scratch rows
+            # L+1..L+N-1 to fit in the cache; otherwise fall back to the
+            # ordinary 1-token step (the cache only grows, so once this
+            # triggers it stays triggered).
+            if curr_seq_len + self._ptd_rows > M:
+                next_token, cache = self._llm_step(next_token, curr_seq_len)
+                self._update_cache(cache)
+                gen_tokens.append(next_token)
+                curr_seq_len += 1
+                # The base runner stop-checks every generated token; the
+                # fallback path must too (a stop inside the last rows-1
+                # tokens would otherwise keep generating to cache full).
+                if self._stop_decoding(next_token, gen_tokens):
+                    break
+                continue
+            emitted, stopped = self._ptd_round(next_token, curr_seq_len, gen_tokens)
+            gen_tokens.extend(emitted)
+            curr_seq_len += len(emitted)  # anchor row + accepted input nodes
+            if stopped:
+                break
+            next_token = emitted[-1]
+        self._n_tokens_gen = len(gen_tokens)
+        return gen_tokens
+
+    @property
+    def ptd_round_log(self) -> list[dict]:
+        return self._ptd_log
 
 
 @dataclass(frozen=True)

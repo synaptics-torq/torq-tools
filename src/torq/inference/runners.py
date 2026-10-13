@@ -50,6 +50,10 @@ class InferenceRunner(ABC):
     def input_shapes(self) -> Mapping[str, Sequence[int | str | None]]:
         return {}
 
+    @property
+    def output_names(self) -> Sequence[str]:
+        return []
+
     @abstractmethod
     def _infer(self, inputs: Sequence[npt.NDArray] | Mapping[str, npt.NDArray]) -> Sequence[npt.NDArray]:
         ...
@@ -80,6 +84,10 @@ class ORTInferenceRunner(InferenceRunner):
     @property
     def input_shapes(self) -> Mapping[str, Sequence[int | str | None]]:
         return {value.name: value.shape for value in self._sess.get_inputs()}
+
+    @property
+    def output_names(self) -> Sequence[str]:
+        return [value.name for value in self._sess.get_outputs()]
 
     def _infer(self, inputs: list[npt.NDArray] | dict[str, npt.NDArray]) -> list[npt.NDArray]:
         return [np.asarray(o) for o in self._sess.run(None, inputs)]
