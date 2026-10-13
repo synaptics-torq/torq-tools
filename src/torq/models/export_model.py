@@ -9,6 +9,7 @@ from .smollm2 import add_smollm2_export_args
 from .gemma3 import add_gemma3_export_args
 from .liquid import add_liquid_export_args, add_liquid_vl_export_args
 from .qwen import add_qwen_export_args
+from .qwen3_5 import add_qwen35_export_args
 
 
 def main():
@@ -35,6 +36,8 @@ def main():
 
     qwen = model.add_parser("qwen", help="Export Qwen to Torq")
     add_qwen_export_args(qwen)
+    qwen3_5 = model.add_parser("qwen3_5", help="Export Qwen3.5 to Torq (needs transformers 5.x)")
+    add_qwen35_export_args(qwen3_5)
 
     args = parser.parse_args()
 
@@ -59,6 +62,9 @@ def main():
     elif args.model_name == "qwen":
         from .qwen.export import export_qwen_from_args
         export_qwen_from_args(args)
+    elif args.model_name == "qwen3_5":
+        from .qwen3_5.export import export_qwen35_from_args
+        export_qwen35_from_args(args)
 
 
 if __name__ == "__main__":

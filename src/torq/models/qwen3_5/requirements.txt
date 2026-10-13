@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
+
+# Qwen3.5 needs the `qwen3_5` model class, added to Hugging Face Transformers in
+# the 5.x series. It conflicts with the optimum pin of the base package: install
+# it in a separate virtualenv, then `pip install -e . --no-deps`.
+transformers==5.17.0
+# The exporter builds the decode step in PyTorch and exports it with torch.onnx.
+# For a CPU-only install:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0
+safetensors
+onnx==1.21.0
+onnx_graphsurgeon==0.6.1
+polygraphy==0.50.3
+ml_dtypes
+tokenizers
+huggingface_hub
+pyyaml
+torq-compiler==2.2.1
