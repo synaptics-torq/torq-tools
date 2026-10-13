@@ -181,6 +181,198 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
         self._logger.debug("Added static KV cache for output '%s'", cache_output)
 
 @dataclass
+class PTDKVCache(OnnxGraphEdit):
+    """
+    Static KV handling for a fixed-row PTD body. 
+    (Progressive Tree Drafting, Gao et al. 2026, arXiv:2607.10661)
+
+    Row 0 of the N-row batch is the anchor: its K/V is blended into the
+    committed cache at position `cur_len` and the cache  is the `present` output. 
+    Rows 1..N-1 are scratch: their K/V is placed into the attention key space at
+    fixed offsets `cur_len+1..cur_len+N-1` for this forward pass only, is
+    exposed as `present.{layer}.key_scratch` / `present.{layer}.value_scratch`
+    graph outputs for host-side promotion of the accepted path, and is never
+    written into the committed cache.
+
+    The host must keep committed cache rows >= N free (zero) beyond the
+    committed length; stale scratch data there is masked out of attention.
+
+    Args:
+        cur_len (gs.Variable): Graph input with the anchor position (L), shape [1]
+        max_tokens (int): Maximum sequence length (cache rows)
+        rows (int): Total fixed row budget N (anchor + scratch rows)
+    """
+
+    cur_len: gs.Variable
+    max_tokens: int
+    rows: int = 2
+
+    def __post_init__(self):
+        if not 2 <= self.rows <= self.max_tokens:
+            raise ValueError("rows must be between 2 and max_tokens")
+        self.output_names = {o.name for o in self.graph.outputs}
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        return (
+            node.op == "Concat"
+            and node.attrs.get("axis") == -2
+            and node.outputs[0].name in self.output_names
+            and re.search(r"present\.\d+\.(key|value)$", node.outputs[0].name) is not None
+        )
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Concat")
+        out = node.outputs[0]
+        if node.attrs["axis"] != -2:
+            raise ValueError(
+                f"PTD KV: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
+            )
+        if len(node.inputs) != 2:
+            raise ValueError(f"PTD KV: '{node.name}' expected 2 inputs, got {len(node.inputs)}")
+        m = re.search(r"present\.(\d+)\.(key|value)$", out.name)
+        layer, role = m.group(1), m.group(2)
+        past, new = node.inputs
+        if not (isinstance(past.shape, list) and all(isinstance(d, int) for d in past.shape)):
+            raise ValueError(f"PTD KV: '{out.name}' past cache has non-static shape {past.shape}")
+        if past.shape[2] != self.max_tokens:
+            raise ValueError(
+                f"PTD KV: '{out.name}' past cache rows {past.shape[2]} != max_tokens {self.max_tokens}"
+            )
+        n_rows = new.shape[2] if isinstance(new.shape, list) else None
+        if isinstance(n_rows, int) and n_rows != self.rows:
+            raise ValueError(
+                f"PTD KV: '{out.name}' batch rows {n_rows} != edit rows {self.rows}"
+            )
+
+        if not (time_ids := self.graph.tensors().get("time_ids")):
+            time_ids = gs.Constant(
+                "time_ids", np.arange(self.max_tokens, dtype=np.int64).reshape(1, 1, self.max_tokens, 1)
+            )
+        seq_axis = gs.Constant(out.name + "_ptd_seq_axis", np.asarray([2], dtype=np.int64))
+
+        # Anchor row -> committed cache at cur_len (present keeps only this update).
+        anchor = self.graph.layer(
+            name=out.name + "_ptd_anchor",
+            op="Slice",
+            inputs=[new,
+                    gs.Constant(out.name + "_ptd_zero", np.asarray([0], dtype=np.int64)),
+                    gs.Constant(out.name + "_ptd_one", np.asarray([1], dtype=np.int64)),
+                    seq_axis],
+            outputs=[gs.Variable(out.name + "_ptd_anchor_kv", dtype=past.dtype, shape=[*past.shape[:-2], 1, past.shape[-1]])],
+        )[0]
+        eq_mask = self.graph.layer(
+            name=out.name + "_ptd_at_anchor",
+            op="Equal",
+            inputs=[time_ids, self.cur_len],
+            outputs=[gs.Variable(out.name + "_ptd_eq", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, 1])],
+        )[0]
+        self.graph.layer(
+            name=out.name + "_ptd_blend_anchor",
+            op="Where",
+            inputs=[eq_mask, anchor, past],
+            outputs=[out],
+        )
+
+        # Original attention-path consumers.
+        attention_consumers = list(out.outputs)
+
+        # Tree rows -> scratch output (raw, for host promotion).
+        scratch_out = gs.Variable(
+            f"present.{layer}.{role}_scratch", dtype=past.dtype, shape=[*past.shape[:-2], self.rows - 1, past.shape[-1]]
+        )
+        self.graph.layer(
+            name=out.name + "_ptd_tree_kv",
+            op="Slice",
+            inputs=[new,
+                    gs.Constant(out.name + "_ptd_one_c", np.asarray([1], dtype=np.int64)),
+                    gs.Constant(out.name + "_ptd_rows", np.asarray([self.rows], dtype=np.int64)),
+                    seq_axis],
+            outputs=[scratch_out],
+        )
+
+        # Place tree rows into key space cur_len+1 .. cur_len+N-1 for attention.
+        onehot = self.graph.layer(
+            name=out.name + "_ptd_scratch_onehot",
+            op="Equal",
+            inputs=[time_ids,
+                    self.graph.layer(
+                        name=out.name + "_ptd_scratch_pos",
+                        op="Add",
+                        inputs=[self.cur_len,
+                                gs.Constant(out.name + "_ptd_offsets",
+                                            np.arange(1, self.rows, dtype=np.int64).reshape(1, 1, 1, self.rows - 1))],
+                        outputs=[gs.Variable(out.name + "_ptd_pos_vals", dtype=np.int64, shape=[1, 1, 1, self.rows - 1])],
+                    )[0]],
+            outputs=[gs.Variable(out.name + "_ptd_onehot_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, self.rows - 1])],
+        )[0]
+        weights = self.graph.layer(
+            name=out.name + "_ptd_scratch_weights",
+            op="Cast",
+            attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(np.dtype(past.dtype))},
+            inputs=[onehot],
+            outputs=[gs.Variable(out.name + "_ptd_weights", dtype=past.dtype, shape=[1, 1, self.max_tokens, self.rows - 1])],
+        )[0]
+        placed = self.graph.layer(
+            name=out.name + "_ptd_placed_tree",
+            op="MatMul",
+            inputs=[weights, scratch_out],
+            outputs=[gs.Variable(out.name + "_ptd_placed", dtype=past.dtype, shape=list(past.shape))],
+        )[0]
+
+        # Key range cur_len+1 .. cur_len+N-1 selects scratch, everything else 
+        # keeps the committed cache.
+        range_mask = self.graph.layer(
+            name=out.name + "_ptd_range",
+            op="And",
+            inputs=[
+                self.graph.layer(
+                    name=out.name + "_ptd_ge_start",
+                    op="GreaterOrEqual",
+                    inputs=[time_ids,
+                            self.graph.layer(
+                                name=out.name + "_ptd_start",
+                                op="Add",
+                                inputs=[self.cur_len, gs.Constant(out.name + "_ptd_c1", np.asarray([1], dtype=np.int64))],
+                                outputs=[gs.Variable(out.name + "_ptd_start_v", dtype=np.int64, shape=[1])],
+                            )[0]],
+                    outputs=[gs.Variable(out.name + "_ptd_ge", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, 1])],
+                )[0],
+                self.graph.layer(
+                    name=out.name + "_ptd_lt_end",
+                    op="Less",
+                    inputs=[time_ids,
+                            self.graph.layer(
+                                name=out.name + "_ptd_end",
+                                op="Add",
+                                inputs=[self.cur_len, gs.Constant(out.name + "_ptd_cn", np.asarray([self.rows], dtype=np.int64))],
+                                outputs=[gs.Variable(out.name + "_ptd_end_v", dtype=np.int64, shape=[1])],
+                            )[0]],
+                    outputs=[gs.Variable(out.name + "_ptd_lt", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, 1])],
+                )[0],
+            ],
+            outputs=[gs.Variable(out.name + "_ptd_range_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, 1])],
+        )[0]
+        attn_kv = self.graph.layer(
+            name=out.name + "_ptd_attn_kv",
+            op="Where",
+            inputs=[range_mask, placed, out],
+            outputs=[gs.Variable(out.name + "_ptd_attn_kv_t", dtype=past.dtype, shape=list(past.shape))],
+        )[0]
+
+        # Attention reads committed + scratch; the present output (and the
+        # later KV-combine step) keep reading the committed cache only.
+        rewire_consumers(attention_consumers, out, attn_kv)
+        self.graph.outputs.append(scratch_out)
+
+        # disconnect Concat node
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Added PTD KV cache (anchor commit + scratch rows) for output '%s'", out.name)
+
+
+@dataclass
 class MaskFutureAttentionScores(OnnxGraphEdit):
     """
     Add causal masking to attention scores to prevent attending to future tokens.
@@ -320,6 +512,164 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         self._logger.debug("Added causal attention mask to scores at node '%s'", producer_node.name)
 
 @dataclass
+class PTDTreeAttentionMask(OnnxGraphEdit):
+    """
+    Tree attention mask for a fixed-row PTD body. 
+    (Progressive Tree Drafting, Gao et al. 2026, arXiv:2607.10661)
+
+    Every query row sees the full committed key range (positions <= cur_len,
+    including the anchor's own slot), plus, among the batch's scratch rows
+    (slots 1..N-1 at key positions cur_len+1..cur_len+N-1), exactly the rows
+    the host's `tree_vis` input marks visible. 
+    Sibling rows share logical positions but are isolated through
+    `tree_vis`; rows of the other tree (draft vs verification) are never
+    visible to each other. Invalid slots are zero in `tree_vis` and are never
+    seen; every row always sees at least the committed keys, so no softmax
+    degenerates to NaN.
+
+    Args:
+        cur_len (gs.Variable): Graph input with the anchor position (L), shape [1]
+        max_tokens (int): Maximum sequence length (cache rows)
+        export_dtype (onnx.TensorProto.DataType): ONNX export data type
+        tree_vis (gs.Variable): Graph input [1, 1, N, N-1] int32 visibility matrix
+        rows (int): Total fixed row budget N
+    """
+
+    cur_len: gs.Variable
+    max_tokens: int
+    export_dtype: onnx.TensorProto.DataType
+    tree_vis: gs.Variable
+    rows: int = 2
+    match_shape_fallback: bool = False
+
+    def __post_init__(self):
+        if self.export_dtype not in onnx.TensorProto.DataType.values():
+            raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
+        if not 2 <= self.rows <= self.max_tokens:
+            raise ValueError("rows must be between 2 and max_tokens")
+        return super().__post_init__()
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op == "Softmax":
+            is_self_attn = node.name.endswith("self_attn/Softmax")
+            if not is_self_attn and self.match_shape_fallback and node.inputs:
+                inp_shape = getattr(node.inputs[0], "shape", None)
+                if inp_shape and len(inp_shape) >= 1:
+                    is_self_attn = inp_shape[-1] in (self.max_tokens, self.max_tokens + 1)
+            if is_self_attn:
+                return isinstance(node.i(), gs.Node)
+        return False
+
+    def transform(self, node: gs.Node):
+        if not self.export_dtype:
+            raise RuntimeError("ONNX export dtype is required for this graph edit, provide via `export_dtype`")
+
+        self._check_node_op(node, "Softmax")
+        n_rows = self.rows
+
+        if not (time_axis := self.graph.tensors().get("time_axis")):
+            time_axis = gs.Constant(
+                "time_axis", np.arange(self.max_tokens, dtype=np.int64).reshape(1, 1, 1, self.max_tokens)
+            )
+        if not (attn_mask_keep := self.graph.tensors().get("attn_mask_keep")):
+            attn_mask_keep = gs.Constant(
+                "attn_mask_keep", np.asarray(0.0, dtype=np.float32),
+                export_dtype=self.export_dtype
+            )
+        if not (attn_mask_block := self.graph.tensors().get("attn_mask_block")):
+            max_float = -65504 if self.export_dtype == onnx.TensorProto.FLOAT16 else -1e9
+            attn_mask_block = gs.Constant(
+                "attn_mask_block", np.asarray(max_float, dtype=np.float32),
+                export_dtype=self.export_dtype
+            )
+        if not (time_ids := self.graph.tensors().get("time_ids")):
+            time_ids = gs.Constant(
+                "time_ids", np.arange(self.max_tokens, dtype=np.int64).reshape(1, 1, self.max_tokens, 1)
+            )
+
+        # Scratch one-hot: [1, 1, max_tokens, N-1] int32, 1 at row cur_len+1+j
+        # for scratch slot j.
+        onehot_b = self.graph.layer(
+            name=node.name + "_ptd_scratch_onehot",
+            op="Equal",
+            inputs=[time_ids,
+                    self.graph.layer(
+                        name=node.name + "_ptd_scratch_pos",
+                        op="Add",
+                        inputs=[self.cur_len,
+                                gs.Constant(node.name + "_ptd_offsets",
+                                            np.arange(1, n_rows, dtype=np.int64).reshape(1, 1, 1, n_rows - 1))],
+                        outputs=[gs.Variable(node.name + "_ptd_pos_vals", dtype=np.int64, shape=[1, 1, 1, n_rows - 1])],
+                    )[0]],
+            outputs=[gs.Variable(node.name + "_ptd_onehot_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, self.max_tokens, n_rows - 1])],
+        )[0]
+        onehot = self.graph.layer(
+            name=node.name + "_ptd_onehot",
+            op="Cast",
+            attrs={"to": onnx.TensorProto.INT32},
+            inputs=[onehot_b],
+            outputs=[gs.Variable(node.name + "_ptd_onehot_i", dtype=np.int32, shape=[1, 1, self.max_tokens, n_rows - 1])],
+        )[0]
+        onehot_t = self.graph.layer(
+            name=node.name + "_ptd_onehot_t",
+            op="Transpose",
+            attrs={"perm": [0, 1, 3, 2]},
+            inputs=[onehot],
+            outputs=[gs.Variable(node.name + "_ptd_onehot_it", dtype=np.int32, shape=[1, 1, n_rows - 1, self.max_tokens])],
+        )[0]
+        # Per-row scratch visibility: tree_vis [1, 1, N, N-1] x one-hot [1, 1, N-1, M]
+        vis_matrix = self.graph.layer(
+            name=node.name + "_ptd_vis_matrix",
+            op="MatMul",
+            inputs=[self.tree_vis, onehot_t],
+            outputs=[gs.Variable(node.name + "_ptd_vis_m", dtype=np.int32, shape=[1, 1, n_rows, self.max_tokens])],
+        )[0]
+        scratch_vis = self.graph.layer(
+            name=node.name + "_ptd_scratch_vis",
+            op="Greater",
+            inputs=[vis_matrix,
+                    gs.Constant(node.name + "_ptd_zero_i32", np.asarray(0, dtype=np.int32))],
+            outputs=[gs.Variable(node.name + "_ptd_scratch_vis_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, n_rows, self.max_tokens])],
+        )[0]
+        # Committed visibility: every row sees keys 0..cur_len.
+        committed = self.graph.layer(
+            name=node.name + "_ptd_committed",
+            op="LessOrEqual",
+            inputs=[time_axis, self.cur_len],
+            outputs=[gs.Variable(node.name + "_ptd_committed_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, 1, self.max_tokens])],
+        )[0]
+        valid = self.graph.layer(
+            name=node.name + "_ptd_valid",
+            op="Or",
+            inputs=[committed, scratch_vis],
+            outputs=[gs.Variable(node.name + "_ptd_valid_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, n_rows, self.max_tokens])],
+        )[0]
+        mask = self.graph.layer(
+            name=node.name + "_ptd_mask",
+            op="Where",
+            inputs=[valid, attn_mask_keep, attn_mask_block],
+            outputs=[gs.Variable(node.name + "_ptd_where", dtype=node.inputs[0].dtype or self.export_dtype, shape=[1, 1, n_rows, self.max_tokens])],
+        )[0]
+
+        # rewire producer node to use mask (same pattern as the causal edit)
+        producer_node: gs.Node = node.i()
+        if producer_node.op != "Add":
+            producer_output: gs.Variable = node.inputs[0]
+            consumers: list[gs.Node] = producer_output.outputs.copy()
+            add_output: gs.Variable = self.graph.layer(
+                name=node.name + "_ptd_bias_add",
+                op="Add",
+                inputs=[node.inputs[0], mask],
+                outputs=[gs.Variable(node.name + "_ptd_biased", dtype=producer_output.dtype, shape=producer_output.shape)],
+            )[0]
+            rewire_consumers(consumers, producer_output, add_output)
+        else:
+            producer_node.inputs[1] = mask
+
+        self._logger.debug("Added PTD tree attention mask to scores at node '%s'", producer_node.name)
+
+
+@dataclass
 class AddCurrLenInput(OnnxGraphEdit):
     """
     Replace dynamic sequence length computation with runtime model input.
@@ -369,6 +719,9 @@ class ConvertToStaticIndex(OnnxGraphEdit):
 
     Args:
         chunk_len (int): Number of consecutive positions in the fixed vector
+        positions_input (gs.Variable | None): Optional 1-D per-row position input
+            ([rows] int64) used verbatim instead of `start + arange(chunk_len)`
+            (PTD bodies: arbitrary, non-consecutive, shared positions)
 
     Raises:
         ValueError: If Range limit is not produced by an `Add` op
@@ -381,6 +734,7 @@ class ConvertToStaticIndex(OnnxGraphEdit):
     """
 
     chunk_len: int = 1
+    positions_input: gs.Variable | None = None
 
     def __post_init__(self):
         if self.chunk_len < 1:
@@ -404,27 +758,30 @@ class ConvertToStaticIndex(OnnxGraphEdit):
             )
         if not any(inp is start for inp in limit_prod.inputs):
             raise ValueError(
-                f"Range node and limit node must have common producer for dynamic range replacement"
+                "Range node and limit node must have common producer for dynamic range replacement"
             )
         range_out: gs.Variable = node.outputs[0]
-        replacement = start
-        if self.chunk_len > 1:
-            replacement = self.graph.layer(
-                name=node.name + "_static_positions",
-                op="Add",
-                inputs=[
-                    start,
-                    gs.Constant(
-                        node.name + "_offsets",
-                        np.arange(self.chunk_len, dtype=np.int64),
-                    ),
-                ],
-                outputs=[gs.Variable(
-                    range_out.name + "_static",
-                    dtype=np.int64,
-                    shape=[self.chunk_len],
-                )],
-            )[0]
+        if self.positions_input is not None:
+            replacement = self.positions_input
+        else:
+            replacement = start
+            if self.chunk_len > 1:
+                replacement = self.graph.layer(
+                    name=node.name + "_static_positions",
+                    op="Add",
+                    inputs=[
+                        start,
+                        gs.Constant(
+                            node.name + "_offsets",
+                            np.arange(self.chunk_len, dtype=np.int64),
+                        ),
+                    ],
+                    outputs=[gs.Variable(
+                        range_out.name + "_static",
+                        dtype=np.int64,
+                        shape=[self.chunk_len],
+                    )],
+                )[0]
         consumers: list[gs.Node] = list(range_out.outputs)
         for consumer in consumers:
             for i, inp in enumerate(consumer.inputs):

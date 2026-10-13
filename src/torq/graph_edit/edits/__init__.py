@@ -31,6 +31,8 @@ from .transformer import (
     CombineKVCacheMixin,
     ConvertToStaticIndex,
     MaskFutureAttentionScores,
+    PTDKVCache,
+    PTDTreeAttentionMask,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
@@ -43,6 +45,8 @@ from .custom_ops import (
 __all__ = [
     "ReplaceDynamicKVCache",
     "MaskFutureAttentionScores",
+    "PTDKVCache",
+    "PTDTreeAttentionMask",
     "AddCurrLenInput",
     "ConvertToStaticIndex",
     "DequantizeProjectionsMatMul",
