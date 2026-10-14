@@ -140,8 +140,21 @@ the input features) instead of round-to-nearest weights.
    hf download Synaptics/gemma-3-270-GPTQ-int4-it-torq --include "gptq/*" --local-dir gemma3-gptq
    ```
 
-   Or make one with the int4quant scripts (`run_gptq.py`, `select_best_gptq.py`).
-   The checkpoint is a compressed-tensors `pack-quantized` safetensors folder.
+   Or make one with [`int4quant/run_gptq.py`](int4quant/run_gptq.py) (see the
+   [int4quant README](int4quant/README.md) for the environment and the GPU/CPU options):
+
+   ```sh
+   cd src/torq/models/gemma3/int4quant
+   pip install -r requirements.txt
+   python run_gptq.py --grouping in --device cpu   # or --device cuda
+   ```
+
+   - Output: the checkpoint folder `gemma-3-270m-it-W4A16-G32-infeat-gptq-512/`
+     (compressed-tensors `pack-quantized` safetensors). Give this folder to `--gptq-checkpoint`.
+   - Calibration: 512 samples of 2048 tokens of `HuggingFaceH4/ultrachat_200k`.
+     On a CPU with 8 cores, one run takes approximately 67 minutes.
+   - GPTQ results change a little from run to run. `select_best_gptq.py` does
+     several runs and prints the best run N. Its checkpoint is `<--work-dir>/st_run<N>/`.
 
 2. Export, quantize and compile:
 
