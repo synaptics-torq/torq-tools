@@ -102,8 +102,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             else [Path(models_dir) / self._hf_repo / "source" / "fp32"]
         )
         if ptd_rows is not None and ptd_rows > 0:
-            if batch_prefill is not None:
-                raise ValueError("`--ptd-rows` and `--batch-prefill` cannot be enabled together; use `--batch-prefill 0`")
             if not static_models:
                 raise ValueError("`--ptd-rows` is currently supported only for static Gemma exports")
             if ptd_rows < 2:
@@ -113,6 +111,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     f"`--ptd-rows` ({ptd_rows}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
                 )
             self._ptd_rows = int(ptd_rows)
+            if batch_prefill is not None and batch_prefill > 0:
+                batch_prefill = None
         else:
             self._ptd_rows = None
         if self._onnx_source_dir is not None:
@@ -458,7 +458,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 inputs=[positions_1d, [0]],
                 outputs=[gs.Variable("cur_len_ptd_1d", dtype=np.int64, shape=[1])],
             )[0]
-            cur_len_scalar = None
         else:
             cur_len_2d = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
             graph.inputs.append(cur_len_2d)
@@ -467,12 +466,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 op="Squeeze",
                 inputs=[cur_len_2d, [0]],
                 outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
-            )[0]
-            cur_len_scalar = graph.layer(
-                name="current_len_to_scalar",
-                op="Squeeze",
-                inputs=[cur_len, [0]],
-                outputs=[gs.Variable(cur_len.name + "_squeezed", dtype=np.int64, shape=[])],
             )[0]
             positions_1d = None
 

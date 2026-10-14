@@ -41,9 +41,9 @@ HuggingFace (google/gemma-3-*)
 
 ## Experimental PTD export
 
-`--ptd-rows N --batch-prefill 0` selects standalone Progressive Tree Drafting. The export contains `transformer.onnx` and `lm_head.onnx`; the split head is enabled automatically. The transformer handles both causal prompt batches and tree rounds, with masked padding for unused rows. The runner projects vocabulary scores only for the final prefill batch, then for every decode round.
+`--ptd-rows N` selects standalone Progressive Tree Drafting. The export contains `transformer.onnx` and `lm_head.onnx`; the split head is enabled automatically. The transformer handles both causal prompt batches and tree rounds, with masked padding for unused rows. The runner projects vocabulary scores only for the final prefill batch, then for every decode round.
 
-Load it with `Gemma3PTD.from_onnx(path_to_transformer, max_gen_tokens)`. Ordinary and PTD exports have different tensor contracts despite sharing filenames; use separate `--models-dir` destinations if retaining both. Batched-prefill export and PTD cannot be enabled together. PTD hardware compilation remains unvalidated and is skipped by the export CLI.
+Load it with `Gemma3PTD.from_onnx(path_to_transformer, max_gen_tokens)`. Ordinary and PTD exports have different tensor contracts despite sharing filenames; use separate `--models-dir` destinations if retaining both. PTD takes precedence over `--batch-prefill`, automatically disabling separate prefill export with an info log. The current PTD runner uses its own transformer and fixed-row head for prefill; it does not load a separate causal prefill model. PTD components compile through the standard Torq flow; hardware execution and performance remain unvalidated.
 
 ## Quick start — export a bf16 VMFB
 
@@ -76,7 +76,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
 | `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits. **On by default** — opt out with `--no-split-lm-head` |
-| `--ptd-rows N` | Export a standalone Progressive Tree Drafting transformer and separate LM head. Uses the standard filenames and requires `--batch-prefill 0` |
+| `--ptd-rows N` | Export a standalone Progressive Tree Drafting transformer and separate LM head. Uses the standard filenames and automatically disables separate batch-prefill export |
 | `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens (default: `64`; pass `0` to disable). Requires `--split-lm-head` (on by default) |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |

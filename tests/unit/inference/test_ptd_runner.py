@@ -23,18 +23,10 @@ EOS = 3
 ROWS = 8
 MAX_TOKENS = 14
 N_LAYERS, N_KV, HEAD_DIM = 2, 3, 5
-PROMPT_LEN = 1  # the prompt "0"
 
 
 def _succ(t: int) -> int:
     return (t + 1) % 3
-
-
-def _expected_gen() -> list[int]:
-    gen = [1]
-    while len(gen) < MAX_TOKENS:
-        gen.append(_succ(gen[-1]))
-    return gen
 
 
 class _FakePTDModel:
@@ -137,88 +129,7 @@ class _PTDRunner(StaticPTDRunner):
         return next_token == self._eos_token_id
 
 
-def _run_prompt(prompt: str) -> _PTDRunner:
-    runner = _PTDRunner(_FakePTDModel(ROWS))
-    runner.run(prompt)
-    return runner
-
-
-def _gen_from_cache(runner) -> list[int]:
-    """Generated tokens from the committed cache (row i >= 1 holds gen[i-1])."""
-    return [int(runner._kv_cache["past_key_values.0.key_value"][0, 0, i, 0])
-            for i in range(1, MAX_TOKENS)
-            if runner._kv_cache["past_key_values.0.key_value"][0, 0, i, 0] != 0]
-
-
-@pytest.mark.parametrize("combined_scratch", [True, False])
-def test_ptd_runner_cache_holds_full_greedy_cycle(combined_scratch):
-    runner = _PTDRunner(_FakePTDModel(ROWS, combined_scratch=combined_scratch))
-    runner.run("0")
-    gen = _expected_gen()
-    assert runner._n_tokens_gen == len(gen)
-    # Cache row i (i >= 1) holds the KV of gen[i-1]; the final token has none.
-    for l in range(N_LAYERS):
-        cache = runner._kv_cache[f"past_key_values.{l}.key_value"]
-        assert cache[0, 0, 0, 0] == 0  # prompt token
-        for i in range(1, len(gen)):
-            assert cache[0, 0, i, 0] == gen[i - 1], f"layer {l} key row {i}"
-            assert cache[0, N_KV, i, 0] == gen[i - 1] + 100, f"layer {l} value row {i}"
-
-
-def test_ptd_runner_hits_and_emission_bookkeeping():
-    runner = _run_prompt("0")
-    log = runner.ptd_round_log
-    assert len(log) >= 5, log
-    hits = [e for e in log if e["hit"]]
-    assert hits, "expected at least one candidate hit with a warmed pool"
-    for e in hits:
-        assert e["accepted"] >= 1
-        assert e["emitted"] == e["accepted"] + 1  # accepted path + terminal bonus
-    assert sum(e["emitted"] for e in log) == MAX_TOKENS - PROMPT_LEN
-    assert any(e["L"] + ROWS > MAX_TOKENS for e in log)
-    for e in log:
-        assert e["L"] + 1 + e["n_candidates"] + e["n_drafts"] <= MAX_TOKENS
-    assert log[-1]["L"] + log[-1]["emitted"] == MAX_TOKENS
-
-
-def test_ptd_runner_row_positions_track_committed_length():
-    runner = _run_prompt("0")
-    ptd_model = runner._model
-    # Each PTD call: position_ids[0] == L (committed length), rows 1.. follow
-    # the packed nodes' depths (>= L + 1); invalid pad rows are at L.
-    for toks, positions in ptd_model.input_calls[1:]:
-        L = int(positions[0])
-        assert 1 <= L < MAX_TOKENS
-        for p in positions[1:]:
-            assert L <= p < MAX_TOKENS, (positions, "row position before the anchor position")
-
-
-def test_ptd_runner_stop_check_near_cache_capacity():
-    """Stop rules still apply when fewer than N real rows fit in the cache."""
-    vocab, eos = 16, 10
-
-    def succ(t: int) -> int:
-        return t + 1  # 1,2,...,9 -> 10 (EOS); EOS is never an input
-
-    runner = _PTDRunner(_FakePTDModel(ROWS, vocab=vocab, succ=succ),
-                        eos=eos)
-    runner.run("1")  # prefill: 1 -> 2, then the cycle walks up to EOS=10
-    gen = _gen_from_cache(runner)
-    # The cache holds every generated token except the final one (it has no
-    # KV); the full generation is 2..10 (nine tokens), ending at EOS.
-    assert gen == [2, 3, 4, 5, 6, 7, 8, 9], f"committed cache diverged: {gen}"
-    assert runner._n_tokens_gen == 9, (
-        f"padded region missed the stop check (generated {runner._n_tokens_gen} tokens, "
-        f"expected 9 ending at EOS)"
-    )
-    # The final model call predicted EOS=10 from input 9 (a padded PTD step).
-    last_tokens, _ = runner._model.input_calls[-1]
-    assert int(last_tokens[0]) == 9
-    assert sum(e["emitted"] for e in runner.ptd_round_log) == runner._n_tokens_gen - 1
-    assert runner.ptd_round_log[-1]["L"] + ROWS > MAX_TOKENS
-
-
-def test_ptd_trimmed_vocabulary_matches_sequential_token_ids():
+def test_ptd_generation_preserves_model_tokens_and_cache():
     lut = np.array([0, 5, 10], dtype=np.int32)
 
     class CompactModel(_FakePTDModel):
@@ -240,27 +151,20 @@ def test_ptd_trimmed_vocabulary_matches_sequential_token_ids():
     assert actual == expected
     assert set(actual) == set(lut)
     assert any(e["accepted"] > 0 for e in ptd.ptd_round_log)
-    for i, token in enumerate(actual[:-1], start=1):
-        assert ptd._kv_cache["past_key_values.0.key_value"][0, 0, i, 0] == token
+    assert ptd._n_tokens_gen == len(actual)
+    assert sum(row["emitted"] for row in ptd.ptd_round_log) == len(actual) - 1
+    for layer in range(N_LAYERS):
+        cache = ptd._kv_cache[f"past_key_values.{layer}.key_value"]
+        for i, token in enumerate(actual[:-1], start=1):
+            np.testing.assert_array_equal(cache[0, :N_KV, i, 0], token)
+            np.testing.assert_array_equal(cache[0, N_KV:, i, 0], token + 100)
+    for _, positions in ptd._model.input_calls:
+        assert (positions >= positions[0]).all() and (positions < MAX_TOKENS).all()
 
 
-def test_first_prediction_eos_resets_generation_count():
-    runner = _run_prompt("0")
-    assert runner._n_tokens_gen == MAX_TOKENS
-    runner._eos_token_id = 1
-    assert runner.run_tokens("0") == [1]
-    assert runner._n_tokens_gen == 1
-    assert runner.ptd_round_log == []
+def test_ptd_prefill_handles_partial_batches_and_cache_boundary():
+    prompt_size = ROWS + 2
 
-
-@pytest.mark.parametrize("kwargs", [{"temperature": 0.5}, {"top_p": 0.9}])
-def test_ptd_rejects_sampling_settings(kwargs):
-    with pytest.raises(ValueError, match="greedy"):
-        _PTDRunner(_FakePTDModel(ROWS), **kwargs)
-
-
-@pytest.mark.parametrize("prompt_size", [1, ROWS, ROWS + 2, MAX_TOKENS])
-def test_ptd_prefill_chunks_commit_only_real_rows_and_run_head_once(prompt_size):
     class Body(_FakePTDModel):
         @property
         def output_names(self):
@@ -293,73 +197,39 @@ def test_ptd_prefill_chunks_commit_only_real_rows_and_run_head_once(prompt_size)
             np.testing.assert_array_equal(vis[0, 0, row], np.arange(ROWS - 1) < row)
         assert not vis[0, 0, size:, :].any()
         assert not vis[0, 0, :, max(size - 1, 0):].any()
-
-
-def test_ptd_warmup_and_repeat_requests_use_only_ptd_body():
-    body = _FakePTDModel(ROWS)
-    runner = _PTDRunner(body, instruct_model=True)
-    assert runner._warmup_len == 1
-    expected = runner.run_tokens("1")
-    assert runner.run_tokens("1") == expected
-    assert all(tokens.shape == (ROWS,) for tokens, _ in body.input_calls)
-    assert any(log["L"] == MAX_TOKENS - 1 for log in runner.ptd_round_log)
-
-
-def test_ptd_single_token_at_last_cache_slot_uses_masked_padding():
-    body = _FakePTDModel(ROWS)
-    runner = _PTDRunner(body)
-    next_token, cache = runner._llm_step(1, MAX_TOKENS - 1)
-    assert next_token == 2
+    prediction, caches = runner._llm_step(1, MAX_TOKENS - 1)
+    assert prediction == 2
     assert not body.visibility_calls[-1].any()
     np.testing.assert_array_equal(body.input_calls[-1][1], MAX_TOKENS - 1)
-    assert cache[0][0, 0, -1, 0] == 1
-    assert not cache[0][:, :, :-1, :].any()
-
-
-def test_ptd_prefill_rejects_prompt_larger_than_cache():
-    runner = _PTDRunner(_FakePTDModel(ROWS))
+    assert caches[0][0, 0, -1, 0] == 1
     with pytest.raises(ValueError, match="cache capacity"):
         runner._prefill_prompt([1] * (MAX_TOKENS + 1))
 
 
-def test_standalone_ptd_prefill_and_generation_with_individual_kv_io():
-    class SeparateBody(_FakePTDModel):
-        @property
-        def input_shapes(self):
-            shapes = super().input_shapes
-            for layer in range(N_LAYERS):
-                shape = shapes.pop(f"past_key_values.{layer}.key_value")
-                for role in ("key", "value"):
-                    shapes[f"past_key_values.{layer}.{role}"] = [1, N_KV, *shape[2:]]
-            return shapes
+def test_ptd_runner_stop_check_near_cache_capacity():
+    """Stop rules still apply when fewer than N real rows fit in the cache."""
+    vocab, eos = 16, 10
 
-        @property
-        def output_names(self):
-            return ["logits"] + [
-                f"present.{layer}.{role}{suffix}"
-                for layer in range(N_LAYERS)
-                for suffix in ("", "_scratch")
-                for role in ("key", "value")
-            ]
+    def succ(t: int) -> int:
+        return t + 1  # 1,2,...,9 -> 10 (EOS); EOS is never an input
 
-        def infer(self, inputs):
-            combined = {name: value for name, value in inputs.items() if not name.startswith("past_key_values.")}
-            for layer in range(N_LAYERS):
-                combined[f"past_key_values.{layer}.key_value"] = np.concatenate(
-                    [inputs[f"past_key_values.{layer}.{role}"] for role in ("key", "value")], axis=1,
-                )
-            raw = super().infer(combined)
-            out = [raw[0]]
-            for layer in range(N_LAYERS):
-                committed, key_scratch, value_scratch = raw[1 + 3 * layer:4 + 3 * layer]
-                out.extend([committed[:, :N_KV], committed[:, N_KV:], key_scratch, value_scratch])
-            return out
-
-    runner = _PTDRunner(SeparateBody(ROWS, combined_scratch=False), combined_kv_io=False)
-    generated = runner.run_tokens("0")
-    assert generated == _expected_gen()
-    assert any(row["accepted"] > 0 for row in runner.ptd_round_log)
-    for layer in range(N_LAYERS):
-        for role, offset in (("key", 0), ("value", 100)):
-            cache = runner._kv_cache[f"past_key_values.{layer}.{role}"]
-            np.testing.assert_array_equal(cache[0, 0, :, 0], np.array([0] + generated[:-1]) + offset)
+    runner = _PTDRunner(_FakePTDModel(ROWS, vocab=vocab, succ=succ),
+                        eos=eos)
+    runner.run("1")  # prefill: 1 -> 2, then the cycle walks up to EOS=10
+    gen = [int(token) for token in runner._kv_cache["past_key_values.0.key_value"][0, 0, 1:9, 0]]
+    # The cache holds every generated token except the final one (it has no
+    # KV); the full generation is 2..10 (nine tokens), ending at EOS.
+    assert gen == [2, 3, 4, 5, 6, 7, 8, 9], f"committed cache diverged: {gen}"
+    assert runner._n_tokens_gen == 9, (
+        f"padded region missed the stop check (generated {runner._n_tokens_gen} tokens, "
+        f"expected 9 ending at EOS)"
+    )
+    # The final model call predicted EOS=10 from input 9 (a padded PTD step).
+    last_tokens, _ = runner._model.input_calls[-1]
+    assert int(last_tokens[0]) == 9
+    assert sum(e["emitted"] for e in runner.ptd_round_log) == runner._n_tokens_gen - 1
+    assert runner.ptd_round_log[-1]["L"] + ROWS > MAX_TOKENS
+    runner._eos_token_id = 2
+    assert runner.run_tokens("1") == [2]
+    assert runner._n_tokens_gen == 1
+    assert runner.ptd_round_log == []

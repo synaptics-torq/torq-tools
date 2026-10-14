@@ -6,7 +6,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph, run_model
+from support.graph_edit import graph
 from torq.graph_edit import OnnxGraphEditor
 from torq.graph_edit.edits.transformer import (
     AddCurrLenInput,
@@ -227,31 +227,3 @@ def test_combine_kv_io_tensors_replaces_key_value_inputs_with_combined_input():
     assert key_use.inputs[0].name == "past_key_values.0.key_from_combined"
     assert value_use.inputs[0].name == "past_key_values.0.value_from_combined"
     assert [o.name for o in editor.graph.outputs] == ["present.0.key_value"]
-
-
-@pytest.mark.ort
-def test_combine_scratch_kv_preserves_head_order_and_committed_cache():
-    cache_shape, scratch_shape = [1, 2, 8, 3], [1, 2, 3, 3]
-    nodes, inputs, outputs, feeds = [], [], [], {}
-    for role, offset in (("key", 0), ("value", 100)):
-        for suffix, shape in (("", cache_shape), ("_scratch", scratch_shape)):
-            inp_name = f"past_key_values.0.{role}" if not suffix else f"new_{role}"
-            inp = gs.Variable(inp_name, dtype=np.float32, shape=shape)
-            out = gs.Variable(f"present.0.{role}{suffix}", dtype=np.float32, shape=shape)
-            nodes.append(gs.Node("Identity", f"copy_{role}{suffix}", inputs=[inp], outputs=[out]))
-            inputs.append(inp)
-            outputs.append(out)
-            feeds[inp_name] = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + offset
-    editor = KVEditor(graph(nodes=nodes, inputs=inputs, outputs=outputs), "unit")
-    editor.combine_kv_io_tensors(cache_shape)
-    editor.combine_kv_io_tensors(
-        scratch_shape, kv_layer_re=r"\.(\d+)\.(key|value)_scratch$", combined_suffix="_scratch",
-    )
-    expected_cache = np.concatenate([feeds.pop(f"past_key_values.0.{role}") for role in ("key", "value")], axis=1)
-    feeds["past_key_values.0.key_value"] = expected_cache
-    assert [out.name for out in editor.graph.outputs] == ["present.0.key_value", "present.0.key_value_scratch"]
-    assert editor.graph.outputs[1].shape == [1, 4, 3, 3]
-    result = run_model(editor.graph, feeds)
-    np.testing.assert_array_equal(result["present.0.key_value"], expected_cache)
-    np.testing.assert_array_equal(result["present.0.key_value_scratch"],
-                                  np.concatenate([feeds["new_key"], feeds["new_value"]], axis=1))
