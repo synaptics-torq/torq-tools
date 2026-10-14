@@ -77,6 +77,8 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 | `--models-dir DIR` | Base directory for source + export models (default: `models`) |
 | `--dynamic-models` | Export dynamic (CPU) models instead of static. The static-only options above are on by default, so a dynamic run also needs `--no-split-lm-head --batch-prefill 0` |
 | `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling |
+| `--weight-quantization {int4,int8}` | Quantize the MatMul weights (block size 32) in-pipeline to a DQL model, before compiling. See [Weight quantization](#weight-quantization-int4--int8) |
+| `--gptq-checkpoint DIR` | Use the GPTQ INT4 weights in DIR (compressed-tensors safetensors). Requires `--weight-quantization int4` |
 | `--skip-torq` | Stop after ONNX; skip the VMFB compile |
 | `--skip-validation` | Skip ORT validation of edited ONNX |
 | `--compile-flags …` | Extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
@@ -88,7 +90,7 @@ export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compil
 ```
 models/<repo>/export/<full|trim>/<unified|split_lm_head>/
     <dtype>/static/model.onnx           ← fp32 static ONNX (quantization input)
-    quantized/static/model.onnx         ← int8 DQL model (--dynamic-quantize)
+    quantized/static/model.onnx         ← DQL model (--dynamic-quantize or --weight-quantization)
     converted/static/model.onnx         ← bf16 model (--convert-dtypes)
     …/static/token_embeddings.npy       ← with --extract-embeddings
     …/static/token_id_lut.npy           ← with --trim-vocab
@@ -126,7 +128,44 @@ they sit next to the transformer. Full `N`-token prompt chunks run through
 
 ## Weight quantization (int4 / int8)
 
-Quantization is a **separate step** applied to the fp32 static ONNX, using the
+### INT4 with GPTQ (one command)
+
+The exporter can quantize the MatMul weights in the same run. With
+`--gptq-checkpoint`, it uses GPTQ INT4 weights (asymmetric, group size 32 along
+the input features) instead of round-to-nearest weights.
+
+1. Get a GPTQ checkpoint. Download the Synaptics checkpoint:
+
+   ```sh
+   hf download Synaptics/gemma-3-270-GPTQ-int4-it-torq --include "gptq/*" --local-dir gemma3-gptq
+   ```
+
+   Or make one with the int4quant scripts (`run_gptq.py`, `select_best_gptq.py`).
+   The checkpoint is a compressed-tensors `pack-quantized` safetensors folder.
+
+2. Export, quantize and compile:
+
+   ```sh
+   torq-export-model gemma3 -s 270m --instruct-model --trim-vocab --batch-prefill 0 \
+       --weight-quantization int4 --gptq-checkpoint gemma3-gptq/gptq
+   ```
+
+   - The LM head is split (default). The vocabulary is trimmed and the exporter
+     also quantizes the trimmed LM head rows with the GPTQ weights.
+   - For each model, the log shows a "Quantization summary" line: KL divergence,
+     cosine similarity and max absolute error of the logits against the fp32 model.
+   - Output: `models/<repo>/export/trim/split_lm_head/quantized/static/`
+     (`transformer.onnx`, `lm_head.onnx`, `token_embeddings.npy`,
+     `token_id_lut.npy`, `tokenizer.json`, `config.json`) and `compiled/`
+     (`transformer.vmfb`, `lm_head.vmfb`).
+
+`--weight-quantization int4` without `--gptq-checkpoint` uses round-to-nearest
+INT4 weights. `--weight-quantization` cannot be used with `--dynamic-quantize`
+or `--convert-dtypes`.
+
+### INT4 / INT8 with torq-quantize-model
+
+Quantization can also be a **separate step** applied to the fp32 static ONNX, using the
 `torq-quantize-model` tool from the `torq-compiler` dependency
 (`torq.lab.quantization.onnx`; see the torq-compiler user manual for the full
 flag reference). It quantizes MatMul weights to int8 / int4 / bf16 and can

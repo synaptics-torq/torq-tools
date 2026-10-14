@@ -69,8 +69,19 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         trim_vocab_groups: list[str] | None = None,
         trim_byte_fallback: bool = True,
         split_weights: bool = False,
+        weight_quantization: Literal["int4", "int8"] | None = None,
+        gptq_checkpoint: str | os.PathLike | None = None,
         **edit_args
     ):
+        if gptq_checkpoint is not None and weight_quantization != "int4":
+            raise ValueError("--gptq-checkpoint needs --weight-quantization int4")
+        if weight_quantization is not None and (dynamic_quantize or convert_dtypes):
+            raise ValueError(
+                "--weight-quantization converts the model itself; do not combine it with "
+                "--dynamic-quantize or --convert-dtypes"
+            )
+        self._weight_quantization = weight_quantization
+        self._gptq_checkpoint = Path(gptq_checkpoint) if gptq_checkpoint is not None else None
         self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
@@ -197,7 +208,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         # Compiled artifacts live in the variant that is actually compiled
         # (see the base class contract for _setup_dirs).
         variant_dir = convert_dir if self._convert_dtypes else (
-            quantize_dir if self._dynamic_quantize else export_dir)
+            quantize_dir if self._dynamic_quantize or self._weight_quantization else export_dir)
         torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
@@ -541,6 +552,84 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
         return result
 
+    def weight_quantize_models(self):
+        """Quantize the MatMul weights of every component to blocks of 32 (W4A16 or W8A16).
+
+        Each weight becomes a block-wise DequantizeLinear of INT4/INT8 values with bf16 scales;
+        the activations stay bf16. With a GPTQ checkpoint (``--gptq-checkpoint``) its weights
+        replace round-to-nearest; the vocabulary-trimmed LM head keeps the columns of
+        token_id_lut.npy. The rest of the model is converted to bf16 and int32.
+        """
+        from torq.lab.quantization.onnx.weights import (
+            QuantizationConfig,
+            WeightQuantizer,
+            load_gptq_weights,
+        )
+
+        self._prepare()
+        bits = 4 if self._weight_quantization == "int4" else 8
+        if self._quantize_dir.exists():
+            shutil.rmtree(self._quantize_dir, ignore_errors=True)
+        self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir)
+        lut_path = self._export_paths["model"].parent / "token_id_lut.npy"
+        lut = np.load(lut_path) if lut_path.exists() else None
+        for comp, model_path in self._export_paths.items():
+            self._logger.info(
+                "(ONNX-quantize) Quantizing the weights of '%s' to INT%d, block size 32%s...",
+                str(model_path), bits, " (GPTQ)" if self._gptq_checkpoint else "",
+            )
+            model = onnx.load(str(model_path), load_external_data=True)
+            quantizer = WeightQuantizer()
+            matmul_info = quantizer._find_matmul_weights(model)
+            precomputed = None
+            if self._gptq_checkpoint is not None:
+                precomputed = load_gptq_weights(
+                    self._gptq_checkpoint, matmul_info, lm_head_column_index=lut
+                )
+            summary = self._summarize_weight_quantization(
+                model_path, model, matmul_info, precomputed or {}, bits
+            )
+            self._logger.info(
+                "(ONNX-quantize) Quantization summary for '%s': kl=%.6g cosine=%.6f max_abs_error=%.6g [%s]",
+                comp, summary["kl"], summary["cosine"], summary["max_abs_error"], summary["classification"],
+            )
+            quantizer._quantize_to_dql(
+                model, matmul_info, QuantizationConfig.uniform(bits, 32), precomputed=precomputed
+            )
+            quantized_model_path = self._quantize_dir / model_path.name
+            self._save_component_model(model, quantized_model_path)
+            self._export_paths[comp] = quantized_model_path
+        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
+
+
+    @staticmethod
+    def _summarize_weight_quantization(model_path, model, matmul_info, precomputed, bits) -> dict:
+        """The validation of --dynamic-quantize for weight quantization: compare the fp32
+        component with a copy whose MatMul weights hold the dequantized INT4/INT8 values,
+        so that both run on the CPU."""
+        import tempfile
+
+        from torq.lab.quantization.onnx.dynamic import summarize_dynamic_quantization
+        from torq.lab.quantization.onnx.weights import dequantize_weight, quantize_weight
+
+        fake = onnx.ModelProto()
+        fake.CopyFrom(model)
+        initializers = {i.name: i for i in fake.graph.initializer}
+        for node, weight_name, init in matmul_info:
+            if node.name in precomputed:
+                qw = precomputed[node.name]
+            else:
+                qw = quantize_weight(numpy_helper.to_array(init).astype(np.float32), bits, 32)
+            initializers[weight_name].CopyFrom(
+                numpy_helper.from_array(dequantize_weight(qw), weight_name)
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_path = Path(tmp) / Path(model_path).name
+            onnx.save(fake, str(fake_path), save_as_external_data=True, location=f"{fake_path.name}.data")
+            return summarize_dynamic_quantization(model_path, fake_path)
+
+
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = Gemma3ModelExporter(
@@ -564,7 +653,9 @@ def export_gemma3_from_args(args: argparse.Namespace):
         trim_byte_fallback=args.trim_byte_fallback,
         split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
-        broadcast_ops=args.broadcast_ops
+        broadcast_ops=args.broadcast_ops,
+        weight_quantization=args.weight_quantization,
+        gptq_checkpoint=args.gptq_checkpoint,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:
@@ -578,6 +669,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
             uint8_weights=args.dynamic_quantize_uint8_weights,
             per_tensor=args.dynamic_quantize_per_tensor,
         )
+    if args.weight_quantization:
+        exporter.weight_quantize_models()
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:
