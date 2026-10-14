@@ -71,11 +71,13 @@ def test_source_tree_model_flag_files_are_complete():
         assert data.get("w8a8") == ["--torq-disable-host", "--torq-disable-css"], (
             f"{model}: w8a8 workaround (torq-compile 2.2.1 host/CSS bug) missing"
         )
-    # moonshine is validated against the LLM flag set, not its own.
+    # moonshine is validated against the LLM flag set, not its own. The stream
+    # schedule prefetch is validated only on gemma3, so it is not compared.
     llm = json.loads((models_dir / "gemma3" / COMPILE_FLAGS_FILE).read_text())
+    llm_flags = [f for f in llm["flags"] if not f.startswith("--torq-prefetch-algorithm")]
     for model in ("moonshine", "moonshine_streaming"):
         data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
-        assert data.get("flags") == llm["flags"], f"{model}: flags drifted from the LLM set"
+        assert data.get("flags") == llm_flags, f"{model}: flags drifted from the LLM set"
         assert data.get("w8a8") == llm["w8a8"], f"{model}: w8a8 drifted from the LLM set"
 
 

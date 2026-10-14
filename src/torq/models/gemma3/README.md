@@ -128,7 +128,7 @@ they sit next to the transformer. Full `N`-token prompt chunks run through
 
 ## Weight quantization (int4 / int8)
 
-### INT4 with GPTQ (one command)
+### INT4 with GPTQ
 
 The exporter can quantize the MatMul weights in the same run. With
 `--gptq-checkpoint`, it uses GPTQ INT4 weights (asymmetric, group size 32 along
