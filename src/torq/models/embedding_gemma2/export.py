@@ -199,22 +199,24 @@ def _to_bf16(src: Path, dst: Path, weights: str = "fp32", split_cols: bool = Fal
     ort_model, _ = to_matmulnbits(onnx.load(str(src)))
     _save(ort_model, src.parent.parent.parent / f"{weights}_ort" / "static" / src.name)
     model = onnx.load(str(src))
+    changed = 0
     if weights == "q8":
         exact, approx = avoid_int8_min_zero_point(model)
+        changed += exact + approx
         if exact or approx:
             logger.info("%s: int8 zero point -128 rewritten to -127 in %d blocks exactly, %d requantized",
                         src.stem, exact, approx)
     # long row counts are split for both int4 and int8 (tile search, text S=512); at S<=128 the
     # wide int8 weights are split by columns (local memory). Vision and audio stay whole.
-    split = split_int4_matmul_rows(model)
+    changed += split_int4_matmul_rows(model)
     if split_cols:
-        split += split_int8_matmul_cols(model)
-    if split:
-        split_src = dst.with_name(dst.stem + "_rowsplit.onnx")
-        _save(model, split_src)
-        convert_model(str(split_src), str(dst), "bf16", convert_io=True)
-        split_src.unlink()
-        split_src.with_suffix(".onnx_data").unlink()
+        changed += split_int8_matmul_cols(model)
+    if changed:
+        edited = dst.with_name(dst.stem + "_edited.onnx")
+        _save(model, edited)
+        convert_model(str(edited), str(dst), "bf16", convert_io=True)
+        edited.unlink()
+        edited.with_suffix(".onnx_data").unlink()
     else:
         convert_model(str(src), str(dst), "bf16", convert_io=True)
 
