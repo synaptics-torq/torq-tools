@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
-"""Support for the onnx-community ``*_q4`` EmbeddingGemma-2 graphs.
+"""Support for the onnx-community ``*_q4`` (4-bit) and ``*_quantized`` (8-bit, "q8")
+EmbeddingGemma-2 graphs.
 
-Those graphs carry 4-bit block-quantized weights in onnxruntime contrib ops:
+Those graphs carry block-quantized weights in onnxruntime contrib ops:
 
-* ``com.microsoft::MatMulNBits`` (bits=4, block_size=32): B uint8 [N, K/32, 16] with two
-  nibbles per byte (low nibble first), scales fp32 [N, K/32], zero points uint8
-  [N, ceil(K/64)] packed the same way; W[k, n] = (q - zp) * scale.
-* ``com.microsoft::GatherBlockQuantized`` (bits=4, block_size=32, quantize_axis=1): the
+* ``com.microsoft::MatMulNBits`` (bits=4 or 8, block_size=32): B uint8 [N, K/32, 32*bits/8];
+  for 4 bits two nibbles per byte (low nibble first), for 8 bits one value per byte. Scales
+  fp32 [N, K/32], zero points uint8 [N, K/32] (8 bits) or packed like B (4 bits);
+  W[k, n] = (q - zp) * scale.
+* ``com.microsoft::GatherBlockQuantized`` (same bits and block_size, quantize_axis=1): the
   text token-embedding table and the vision position tables, same packing per row.
 
-Torq compiles 4-bit weights in the standard ONNX form
-``DequantizeLinear(INT4 [K, N], axis=0, block_size=32, scale [K/32, N], zero_point INT4
+Torq compiles these weights in the standard ONNX form
+``DequantizeLinear(INT4|INT8 [K, N], axis=0, block_size=32, scale [K/32, N], zero_point
 [K/32, N]) -> MatMul``. The static builders constant-fold with onnxsim, which would fold
 a constant DequantizeLinear back to float, so the conversion runs in two steps:
 
@@ -22,7 +24,8 @@ a constant DequantizeLinear back to float, so the conversion runs in two steps:
 2. After the static builder ran, :func:`requantize_matmuls` finds those weights again by
    content and turns each MatMul back into ``DequantizeLinear(INT4) -> MatMul``.
 
-Moving uint4 [0, 15] to int4 [-8, 7] (q - 8, zp - 8) leaves q - zp unchanged.
+Moving uint4 [0, 15] to int4 [-8, 7] (q - 8, zp - 8), or uint8 to int8 (q - 128, zp - 128),
+leaves q - zp unchanged.
 """
 
 from __future__ import annotations
@@ -42,6 +45,16 @@ logger = logging.getLogger(__name__)
 BLOCK = 32
 
 
+def _unpack(packed: np.ndarray, bits: int) -> np.ndarray:
+    """uint8 [..., n] -> uint8 values [..., n * 8 / bits]."""
+    return _unpack_nibbles(packed) if bits == 4 else packed
+
+
+def _check_bits(name: str, bits: int):
+    if bits not in (4, 8):
+        raise NotImplementedError(f"{name}: only bits=4 or 8 is supported, got {bits}")
+
+
 def _unpack_nibbles(packed: np.ndarray) -> np.ndarray:
     """uint8 [..., n] -> uint8 [..., 2n], low nibble first."""
     lo = packed & 0x0F
@@ -51,11 +64,13 @@ def _unpack_nibbles(packed: np.ndarray) -> np.ndarray:
 
 @dataclass
 class Int4Weight:
-    """A [K, N] weight as signed int4 values with per-(block, column) scale and zero point."""
+    """A [K, N] weight as signed int4 (or int8) values with per-(block, column) scale and
+    zero point."""
 
-    q: np.ndarray      # int8 [K, N], values in [-8, 7]
+    q: np.ndarray      # int8 [K, N], values in [-8, 7] (4 bits) or [-128, 127] (8 bits)
     scale: np.ndarray  # fp32 [K/32, N]
-    zp: np.ndarray     # int8 [K/32, N], values in [-8, 7]
+    zp: np.ndarray     # int8 [K/32, N], same range as q
+    bits: int = 4
 
     def dequantize(self) -> np.ndarray:
         k, n = self.q.shape
@@ -67,40 +82,42 @@ class Int4Weight:
 
 
 def _matmulnbits_weight(node: gs.Node) -> Int4Weight:
-    k, n = node.attrs["K"], node.attrs["N"]
-    if node.attrs.get("bits", 4) != 4 or node.attrs.get("block_size", BLOCK) != BLOCK:
-        raise NotImplementedError(f"{node.name}: only bits=4, block_size=32 is supported")
+    k, n, bits = node.attrs["K"], node.attrs["N"], node.attrs.get("bits", 4)
+    _check_bits(node.name, bits)
+    if node.attrs.get("block_size", BLOCK) != BLOCK:
+        raise NotImplementedError(f"{node.name}: only block_size={BLOCK} is supported")
     if k % BLOCK:
         raise NotImplementedError(f"{node.name}: K={k} is not a multiple of {BLOCK}")
-    nb = k // BLOCK
-    b = node.inputs[1].values                        # uint8 [N, nb, 16]
-    q = _unpack_nibbles(b.reshape(n, nb, BLOCK // 2)).reshape(n, k).astype(np.int8) - 8
+    nb, offset = k // BLOCK, 1 << (bits - 1)
+    b = node.inputs[1].values                        # uint8 [N, nb, 32 * bits / 8]
+    q = (_unpack(b.reshape(n, nb, BLOCK * bits // 8), bits).reshape(n, k).astype(np.int16) - offset).astype(np.int8)
     scale = node.inputs[2].values.reshape(n, nb).astype(np.float32)
     if len(node.inputs) > 3 and node.inputs[3] is not None and not _is_empty(node.inputs[3]):
         zp_t = node.inputs[3].values
         if zp_t.dtype != np.uint8:
             raise NotImplementedError(f"{node.name}: float zero points are not supported")
-        zp = _unpack_nibbles(zp_t.reshape(n, -1))[:, :nb].astype(np.int8) - 8
+        zp = (_unpack(zp_t.reshape(n, -1), bits)[:, :nb].astype(np.int16) - offset).astype(np.int8)
     else:
-        zp = np.zeros((n, nb), np.int8)              # default uint4 zero point 8 -> int4 0
+        zp = np.zeros((n, nb), np.int8)              # default zero point 8 / 128 -> 0
     return Int4Weight(q=np.ascontiguousarray(q.T), scale=np.ascontiguousarray(scale.T),
-                      zp=np.ascontiguousarray(zp.T))
+                      zp=np.ascontiguousarray(zp.T), bits=bits)
 
 
 def _gbq_table(node: gs.Node) -> np.ndarray:
     a = node.attrs
-    if a.get("bits", 4) != 4 or a.get("block_size", BLOCK) != BLOCK or a.get("quantize_axis") != 1 \
-            or a.get("gather_axis", 0) != 0:
+    bits = a.get("bits", 4)
+    _check_bits(node.name, bits)
+    if a.get("block_size", BLOCK) != BLOCK or a.get("quantize_axis") != 1 or a.get("gather_axis", 0) != 0:
         raise NotImplementedError(f"{node.name}: unsupported GatherBlockQuantized attrs {a}")
-    data = node.inputs[0].values                     # uint8 [V, D/2]
+    data = node.inputs[0].values                     # uint8 [V, D * bits / 8]
     v = data.shape[0]
-    q = _unpack_nibbles(data).astype(np.float32)     # [V, D]
+    q = _unpack(data, bits).astype(np.float32)       # [V, D]
     d = q.shape[1]
     scale = node.inputs[2].values.reshape(v, d // BLOCK).astype(np.float32)
     if len(node.inputs) > 3 and node.inputs[3] is not None and not _is_empty(node.inputs[3]):
-        zp = _unpack_nibbles(node.inputs[3].values.reshape(v, -1))[:, : d // BLOCK].astype(np.float32)
+        zp = _unpack(node.inputs[3].values.reshape(v, -1), bits)[:, : d // BLOCK].astype(np.float32)
     else:
-        zp = np.full((v, d // BLOCK), 8, np.float32)
+        zp = np.full((v, d // BLOCK), 1 << (bits - 1), np.float32)
     q = q.reshape(v, d // BLOCK, BLOCK)
     return ((q - zp[:, :, None]) * scale[:, :, None]).reshape(v, d)
 
@@ -170,12 +187,13 @@ def _match_concat(w: np.ndarray, by_k: dict[int, dict[int, dict[str, Int4Weight]
     if len(parts) < 2:
         return None
     return Int4Weight(q=np.concatenate([p.q for p in parts], 1), scale=np.concatenate([p.scale for p in parts], 1),
-                      zp=np.concatenate([p.zp for p in parts], 1))
+                      zp=np.concatenate([p.zp for p in parts], 1), bits=parts[0].bits)
 
 
 def requantize_matmuls(model: onnx.ModelProto, registry: dict[str, Int4Weight]) -> tuple[onnx.ModelProto, int, int]:
-    """Turn every MatMul whose constant weight is a registered q4 weight (or a concatenation
-    of them along N) into ``DequantizeLinear(INT4, axis=0, block_size=32) -> MatMul``.
+    """Turn every MatMul whose constant weight is a registered quantized weight (or a
+    concatenation of them along N) into ``DequantizeLinear(INT4|INT8, axis=0, block_size=32)
+    -> MatMul``.
     Returns (model, requantized, float matmuls left with a constant weight)."""
     g = model.graph
     inits = {t.name: t for t in g.initializer}
@@ -197,12 +215,13 @@ def requantize_matmuls(model: onnx.ModelProto, registry: dict[str, Int4Weight]) 
                     raise NotImplementedError(f"{node.name}: transposed q4 weight (blocks would run along N)")
             if w4 is not None:
                 base = node.input[1]
-                qn, sn, zn = f"{base}/int4", f"{base}/scale", f"{base}/zero_point"
+                qn, sn, zn = f"{base}/int{w4.bits}", f"{base}/scale", f"{base}/zero_point"
+                qtype = ml_dtypes.int4 if w4.bits == 4 else np.int8
                 if base not in used:
                     new_inits += [
-                        numpy_helper.from_array(w4.q.astype(ml_dtypes.int4), qn),  # packed raw data
+                        numpy_helper.from_array(w4.q.astype(qtype), qn),  # int4: packed raw data
                         numpy_helper.from_array(w4.scale.astype(np.float32), sn),
-                        numpy_helper.from_array(w4.zp.astype(ml_dtypes.int4), zn),
+                        numpy_helper.from_array(w4.zp.astype(qtype), zn),
                     ]
                     new_nodes.append(helper.make_node(
                         "DequantizeLinear", [qn, sn, zn], [f"{base}/dequantized"],
@@ -220,12 +239,12 @@ def requantize_matmuls(model: onnx.ModelProto, registry: dict[str, Int4Weight]) 
     g.initializer.extend(keep + new_inits)
     del g.node[:]
     g.node.extend(new_nodes)
-    # DequantizeLinear with INT4 + block_size needs opset 21
+    # DequantizeLinear with INT4 or block_size needs opset 21
     for o in model.opset_import:
         if o.domain in ("", "ai.onnx") and o.version < 21:
             o.version = 21
     lifted = _lift_rank2_int4_matmuls(model)
-    logger.info("q4: MatMul -> DequantizeLinear(INT4) + MatMul: %d (float MatMuls with constant weight left: %d,"
+    logger.info("MatMul -> DequantizeLinear(INT4/INT8) + MatMul: %d (float MatMuls with constant weight left: %d,"
                 " rank-2 lifted to rank 3: %d)", hit, miss, lifted)
     return model, hit, miss
 
@@ -277,6 +296,91 @@ def split_int4_matmul_rows(model: onnx.ModelProto, rows: int = SPLIT_ROWS) -> in
     return split
 
 
+def avoid_int8_min_zero_point(model: onnx.ModelProto) -> tuple[int, int]:
+    """For torq-compile: rewrite int8 block zero points of -128 to -127.
+
+    torq-compile negates the block zero points into an int8 bias, and -(-128) wraps back to
+    -128, corrupting every weight of such a block (the scalar zero-point path rejects -128;
+    the per-block path does not). A block whose largest value is below 127 becomes
+    ``q + 1`` with zero point -127, which is exact. A block that also uses 127 spans all 256
+    levels; it is requantized onto 255 levels with the scale widened by 255/254 (error at most
+    half a step). Returns (exact blocks, requantized blocks)."""
+    g = model.graph
+    inits = {t.name: t for t in g.initializer}
+    exact = approx = 0
+    for d in (n for n in g.node if n.op_type == "DequantizeLinear"):
+        qt = inits.get(d.input[0])
+        if qt is None or qt.data_type != onnx.TensorProto.INT8 or len(d.input) < 3 or d.input[2] not in inits:
+            continue
+        zp = numpy_helper.to_array(inits[d.input[2]]).astype(np.int16)        # [K/32, N]
+        bad = zp == -128
+        if not bad.any():
+            continue
+        q = numpy_helper.to_array(qt).astype(np.int16)
+        k, n = q.shape
+        qb = q.reshape(k // BLOCK, BLOCK, n)
+        scale = numpy_helper.to_array(inits[d.input[1]]).astype(np.float32)
+        shift = bad & (qb.max(1) < 127)
+        requant = bad & ~shift
+        qb += shift[:, None, :]                                               # q + 1 with zp -127: exact
+        u = np.rint((qb + 128) * (254.0 / 255.0)) - 127                       # 256 levels onto 255
+        qb[:] = np.where(requant[:, None, :], u, qb)
+        scale = np.where(requant, scale * np.float32(255.0 / 254.0), scale).astype(np.float32)
+        zp[bad] = -127
+        for name, arr, dt in ((d.input[0], qb.reshape(k, n), np.int8), (d.input[1], scale, np.float32), (d.input[2], zp, np.int8)):
+            inits[name].CopyFrom(numpy_helper.from_array(arr.astype(dt), name))
+        exact += int(shift.sum())
+        approx += int(requant.sum())
+    return exact, approx
+
+
+SPLIT_COLS = 512
+
+
+def split_int8_matmul_cols(model: onnx.ModelProto, cols: int = SPLIT_COLS) -> int:
+    """For torq-compile: run every ``x @ DequantizeLinear(INT8 [K, N])`` with N > cols as
+    N/cols column chunks (one DequantizeLinear + MatMul per chunk) and a Concat.
+
+    With 8-bit weights a dequantized [K, N] tile is twice the size of the 4-bit one; the MLP
+    weights (512 x 2048) then no longer fit the NPU's local memory (``failed to allocate LRAM
+    addresses``). Splitting the rows instead (as for int4) re-dequantizes the whole weight for
+    every row chunk and runs past the NPU's 5 s job limit."""
+    g = model.graph
+    inits = {t.name: t for t in g.initializer}
+    dq = {n.output[0]: n for n in g.node if n.op_type == "DequantizeLinear"
+          and inits.get(n.input[0]) is not None and inits[n.input[0]].data_type == onnx.TensorProto.INT8}
+    new_nodes, new_inits, split = [], [], 0
+    for node in g.node:
+        d = dq.get(node.input[1]) if node.op_type == "MatMul" else None
+        q = numpy_helper.to_array(inits[d.input[0]]) if d is not None else None
+        if q is None or q.ndim != 2 or q.shape[1] <= cols or q.shape[1] % cols:
+            new_nodes.append(node)
+            continue
+        scale, zp = (numpy_helper.to_array(inits[d.input[i]]) for i in (1, 2))
+        attrs = {a.name: helper.get_attribute_value(a) for a in d.attribute}
+        base = node.name or node.output[0]
+        outs = []
+        for i in range(q.shape[1] // cols):
+            sl, c = slice(i * cols, (i + 1) * cols), f"{d.output[0]}/cols{i}"
+            new_inits += [numpy_helper.from_array(np.ascontiguousarray(a[:, sl]), f"{c}/{k}")
+                          for a, k in ((q, "int8"), (scale, "scale"), (zp, "zero_point"))]
+            new_nodes.append(helper.make_node("DequantizeLinear", [f"{c}/int8", f"{c}/scale", f"{c}/zero_point"],
+                                              [f"{c}/w"], name=f"{c}/DequantizeLinear", **attrs))
+            outs.append(f"{base}/cols{i}")
+            new_nodes.append(helper.make_node("MatMul", [node.input[0], f"{c}/w"], [outs[-1]], name=f"{base}/mm_cols{i}"))
+        new_nodes.append(helper.make_node("Concat", outs, list(node.output), axis=-1, name=f"{base}/concat_cols"))
+        split += 1
+    if split:
+        used = {i for n in new_nodes for i in n.input}
+        new_nodes = [n for n in new_nodes if n.op_type != "DequantizeLinear" or n.output[0] in used]
+        keep = [t for t in list(g.initializer) + new_inits if t.name in used]
+        del g.node[:]
+        g.node.extend(new_nodes)
+        del g.initializer[:]
+        g.initializer.extend(keep)
+    return split
+
+
 def _lift_rank2_int4_matmuls(model: onnx.ModelProto) -> int:
     """Run every rank-2 ``[M,K] x DequantizeLinear(INT4)`` MatMul as ``[1,M,K]``.
 
@@ -317,15 +421,16 @@ def _pack_nibbles(u: np.ndarray) -> np.ndarray:
 
 
 def to_matmulnbits(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
-    """For ONNX Runtime: turn each ``DequantizeLinear(INT4, axis=0, block_size=32) -> MatMul``
-    back into ``com.microsoft::MatMulNBits`` (bits=4, block_size=32, no accuracy_level), the
-    form of the onnx-community q4 graphs. ORT's own DequantizeLinear+MatMul fusion would run
+    """For ONNX Runtime: turn each ``DequantizeLinear(INT4|INT8, axis=0, block_size=32) ->
+    MatMul`` back into ``com.microsoft::MatMulNBits`` (bits=4|8, block_size=32, no
+    accuracy_level), the form of the onnx-community q4 / quantized graphs. ORT's own DequantizeLinear+MatMul fusion would run
     int8 activations instead; MatMulNBits without accuracy_level computes in fp32 and matches
     the q4 source graphs. Returns (model, MatMuls converted)."""
     g = model.graph
     inits = {t.name: t for t in g.initializer}
     dq = {n.output[0]: n for n in g.node if n.op_type == "DequantizeLinear"
-          and inits.get(n.input[0]) is not None and inits[n.input[0]].data_type == onnx.TensorProto.INT4}
+          and inits.get(n.input[0]) is not None
+          and inits[n.input[0]].data_type in (onnx.TensorProto.INT4, onnx.TensorProto.INT8)}
     packed: dict[str, list[str]] = {}
     new_inits, new_nodes, converted = [], [], 0
     for node in g.node:
@@ -336,15 +441,19 @@ def to_matmulnbits(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
             attrs = {a.name: helper.get_attribute_value(a) for a in d.attribute}
             if attrs.get("axis") != 0 or attrs.get("block_size") != BLOCK:
                 raise NotImplementedError(f"{d.name}: unsupported DequantizeLinear attrs {attrs}")
-            q = numpy_helper.to_array(inits[d.input[0]]).astype(np.int8)        # [K, N]
+            bits = 4 if inits[d.input[0]].data_type == onnx.TensorProto.INT4 else 8
+            offset = 1 << (bits - 1)
+            q = numpy_helper.to_array(inits[d.input[0]]).astype(np.int16)       # [K, N]
             k, n = q.shape
             nb = k // BLOCK
             if d.output[0] not in packed:
                 base = d.output[0].removesuffix("/dequantized")
                 scale = numpy_helper.to_array(inits[d.input[1]]).astype(np.float32)  # [nb, N]
-                zp = numpy_helper.to_array(inits[d.input[2]]).astype(np.int8)        # [nb, N]
-                b = _pack_nibbles((q.T + 8).astype(np.uint8).reshape(n, nb, BLOCK))   # [N, nb, 16]
-                z = _pack_nibbles((zp.T + 8).astype(np.uint8))                        # [N, ceil(nb/2)]
+                zp = numpy_helper.to_array(inits[d.input[2]]).astype(np.int16)       # [nb, N]
+                b = (q.T + offset).astype(np.uint8).reshape(n, nb, BLOCK)             # [N, nb, 32]
+                z = (zp.T + offset).astype(np.uint8)                                  # [N, nb]
+                if bits == 4:
+                    b, z = _pack_nibbles(b), _pack_nibbles(z)                         # [N, nb, 16], [N, ceil(nb/2)]
                 names = [f"{base}/nbits_B", f"{base}/nbits_scales", f"{base}/nbits_zp"]
                 new_inits += [numpy_helper.from_array(b, names[0]),
                               numpy_helper.from_array(np.ascontiguousarray(scale.T).reshape(-1), names[1]),
@@ -352,7 +461,7 @@ def to_matmulnbits(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
                 packed[d.output[0]] = names
             new_nodes.append(helper.make_node(
                 "MatMulNBits", [node.input[0], *packed[d.output[0]]], list(node.output), name=node.name,
-                domain="com.microsoft", K=k, N=n, bits=4, block_size=BLOCK))
+                domain="com.microsoft", K=k, N=n, bits=bits, block_size=BLOCK))
             converted += 1
         else:
             new_nodes.append(node)

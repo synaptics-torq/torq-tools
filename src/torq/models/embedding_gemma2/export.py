@@ -50,18 +50,33 @@ TORQ_FLAGS: tuple[str, ...] = (
     "--torq-enable-annotate-tied-operands",
     "--torq-convert-io-dtype",
     "--torq-enable-split-constants-optimization",
+    # NSS only: no host or CSS offload
+    "--torq-disable-host",
+    "--torq-disable-css",
+    # the constant-prefetch pass makes the large encoders compile for hours, at no latency gain
+    "--torq-constant-prefetch=false",
 )
-# NSS program budget per graph. The budget is reserved in every loaded network's XRAM
-# map, so oversized budgets make the vision + text networks fail to load together
-# ("failed to acquire hardware"). Measured needs: vision 384x384 31.1 MB, audio 1120
-# frames 10.4 MB, text S=128 3.5 MB, text S=512 12.4 MB.
-def nss_programs_size(name: str) -> int:
+# NSS program budget per graph and weight format, in MB. The budget is reserved in every
+# loaded network's XRAM map, so oversized budgets make the vision + text networks fail to
+# load together ("failed to acquire hardware"). Sized from the measured needs (8-bit:
+# vision 98.8 MB, audio 1120 frames 28.6 MB, text S=128 15.8 MB).
+NSS_PROGRAMS_MB = {
+    #        vision audio audio_1120 text<=128 text_512
+    "fp32": (32, 16, 16, 8, 16),
+    "q4": (32, 16, 24, 8, 60),
+    "q8": (100, 32, 32, 16, 60),
+}
+
+
+def nss_programs_size(name: str, weights: str = "fp32") -> int:
+    vision, audio, audio_1120, text_short, text_long = NSS_PROGRAMS_MB[weights]
     if name.startswith("vision_"):
-        return 32 << 20
-    if name.startswith("audio_"):
-        return 16 << 20
-    seq_len = int(name.rsplit("_s", 1)[1])
-    return (8 << 20) if seq_len <= 128 else (16 << 20)
+        mb = vision
+    elif name.startswith("audio_"):
+        mb = audio_1120 if name == "audio_1120" else audio
+    else:
+        mb = text_short if int(name.rsplit("_s", 1)[1]) <= 128 else text_long
+    return mb << 20
 
 
 def _parse_grid(s: str) -> tuple[int, int]:
@@ -87,13 +102,19 @@ def add_embedding_gemma2_export_args(parser: argparse.ArgumentParser):
     parser.add_argument("--audio-frames", default=f"{AUDIO_FRAMES},{AUDIO_FRAMES // 2},{AUDIO_FRAMES // 4},{AUDIO_FRAMES // 8}",
                         help="Static audio windows in 10 ms mel frames, comma separated; each is a separate "
                              "audio encoder (default: %(default)s = 11.2/5.6/2.8/1.4 s)")
-    parser.add_argument("--weights", choices=["fp32", "q4"], default="fp32",
-                        help="Source weights: fp32 graphs (bf16 on Torq) or the onnx-community *_q4 graphs "
-                             "(int4 weights, bf16 activations; exported under export-q4) (default: %(default)s)")
+    parser.add_argument("--weights", choices=list(WEIGHTS), default="fp32",
+                        help="Source weights: fp32 graphs (bf16 on Torq), or the onnx-community *_q4 (int4) or "
+                             "*_quantized (q8: int8) graphs, with bf16 activations, exported under export-q4 / "
+                             "export-q8 (default: %(default)s)")
     parser.add_argument("--no-compile", action="store_true", help="Stop after the bf16 ONNX graphs")
     parser.add_argument("--skip-validate", action="store_true", help="Skip ORT validation against the source")
     add_torq_args(parser)
     add_logging_args(parser)
+
+
+# onnx-community file suffix of each weight choice, and its weight format
+WEIGHTS = {"fp32": "", "q4": "q4", "q8": "quantized"}
+WEIGHT_FORMAT = {"q4": "int4 block-32 weights, bf16 activations", "q8": "int8 block-32 weights, bf16 activations"}
 
 
 def _download_source(dst: Path, weights: str = "fp32") -> Path:
@@ -101,7 +122,7 @@ def _download_source(dst: Path, weights: str = "fp32") -> Path:
 
     files = list(SOURCE_FILES)
     if weights != "fp32":
-        files += [f.replace(".onnx", f"_{weights}.onnx") for f in SOURCE_FILES if f.startswith("onnx/")]
+        files += [f.replace(".onnx", f"_{WEIGHTS[weights]}.onnx") for f in SOURCE_FILES if f.startswith("onnx/")]
     from huggingface_hub.errors import HfHubHTTPError
 
     for f in files:
@@ -120,9 +141,9 @@ def _download_source(dst: Path, weights: str = "fp32") -> Path:
 
 
 class _SourceGraphs:
-    """Source graph per component for the static builders. For q4 weights, the builders
-    run on an exact float rewrite of the q4 graph (cached under onnx/q4_dequantized/) and
-    :meth:`requantize` restores the int4 weights in the built graph."""
+    """Source graph per component for the static builders. For q4/q8 weights, the builders
+    run on an exact float rewrite of the quantized graph (cached under onnx/<weights>_dequantized/)
+    and :meth:`requantize` restores the int4/int8 weights in the built graph."""
 
     def __init__(self, source: Path, weights: str):
         self.source, self.weights = source, weights
@@ -148,7 +169,7 @@ class _SourceGraphs:
 
         model, hit, _ = requantize_matmuls(model, self.registry[name])
         if hit == 0:
-            raise RuntimeError(f"{name}: no q4 weight found in the static graph")
+            raise RuntimeError(f"{name}: no {self.weights} weight found in the static graph")
         return model
 
 
@@ -162,22 +183,34 @@ def _save(model: onnx.ModelProto, path: Path):
     onnx.save(model, str(path), save_as_external_data=True, location=data.name)
 
 
-def _to_bf16(src: Path, dst: Path, weights: str = "fp32"):
-    """The bf16 graph torq-compile builds. For q4, also writes the MatMulNBits graph that
-    the ONNX Runtime backend runs, next to the q4 static graph (``q4_ort``)."""
+def _to_bf16(src: Path, dst: Path, weights: str = "fp32", split_cols: bool = False):
+    """The bf16 graph torq-compile builds. For q4/q8, also writes the MatMulNBits graph that
+    the ONNX Runtime backend runs, next to the static graph (``q4_ort`` / ``q8_ort``).
+
+    ``split_cols``: split wide int8 weights into 512-column chunks (text S<=128, q8 only)."""
     from torq.lab.model_tools.dtype_conversion.onnx import convert_model
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if weights != "q4":
+    if weights == "fp32":
         convert_model(str(src), str(dst), "bf16", convert_io=True)
         return
-    from .q4 import split_int4_matmul_rows, to_matmulnbits
+    from .q4 import avoid_int8_min_zero_point, split_int4_matmul_rows, split_int8_matmul_cols, to_matmulnbits
 
     ort_model, _ = to_matmulnbits(onnx.load(str(src)))
-    _save(ort_model, src.parent.parent.parent / "q4_ort" / "static" / src.name)
+    _save(ort_model, src.parent.parent.parent / f"{weights}_ort" / "static" / src.name)
     model = onnx.load(str(src))
-    if split_int4_matmul_rows(model):
-        split_src = dst.with_name(dst.stem + "_q4split.onnx")
+    if weights == "q8":
+        exact, approx = avoid_int8_min_zero_point(model)
+        if exact or approx:
+            logger.info("%s: int8 zero point -128 rewritten to -127 in %d blocks exactly, %d requantized",
+                        src.stem, exact, approx)
+    # long row counts are split for both int4 and int8 (tile search, text S=512); at S<=128 the
+    # wide int8 weights are split by columns (local memory). Vision and audio stay whole.
+    split = split_int4_matmul_rows(model)
+    if split_cols:
+        split += split_int8_matmul_cols(model)
+    if split:
+        split_src = dst.with_name(dst.stem + "_rowsplit.onnx")
         _save(model, split_src)
         convert_model(str(split_src), str(dst), "bf16", convert_io=True)
         split_src.unlink()
@@ -198,7 +231,7 @@ def _static_session(path: Path):
 
 
 def _source_graph(source: Path, name: str, weights: str) -> Path:
-    return source / "onnx" / (f"{name}_{weights}.onnx" if weights != "fp32" else f"{name}.onnx")
+    return source / "onnx" / (f"{name}_{WEIGHTS[weights]}.onnx" if weights != "fp32" else f"{name}.onnx")
 
 
 def _cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -266,7 +299,7 @@ def validate_audio(source: Path, static: Path, num_frames: int, weights: str = "
 def validate_text(source: Path, static: Path, seq_len: int, lut: np.ndarray, weights: str = "fp32") -> float:
     from .reference import OrtEmbeddingGemma2
 
-    ref = OrtEmbeddingGemma2(source, vision=False, variant="" if weights == "fp32" else weights)
+    ref = OrtEmbeddingGemma2(source, vision=False, variant=WEIGHTS[weights])
     st = _static_session(static)
     worst = 1.0
     for text, prompt in (("cats sleeping on a couch", "query"),
@@ -308,10 +341,11 @@ def export_embedding_gemma2(models_dir: str | Path = "models", onnx_source_dir: 
                             audio: bool = True, audio_frames=(AUDIO_FRAMES,),
                             use_binary: bool = False, compiler_path: str | Path | None = None,
                             weights: str = "fp32") -> Path:
-    """``weights``: "fp32" builds bf16 graphs from the fp32 source; "q4" builds from the
-    onnx-community ``*_q4`` graphs and keeps their 4-bit block-quantized weights as
-    DequantizeLinear(INT4) -> MatMul (bf16 activations), exported under ``export-q4``."""
-    if weights not in ("fp32", "q4"):
+    """``weights``: "fp32" builds bf16 graphs from the fp32 source; "q4" / "q8" build from the
+    onnx-community ``*_q4`` / ``*_quantized`` graphs and keep their 4-/8-bit block-quantized
+    weights as DequantizeLinear(INT4|INT8) -> MatMul (bf16 activations), exported under
+    ``export-q4`` / ``export-q8``."""
+    if weights not in WEIGHTS:
         raise ValueError(f"unknown weights {weights!r}")
     root = Path(models_dir) / "embeddinggemma-2"
     source = Path(onnx_source_dir) if onnx_source_dir else _download_source(root / "source", weights)
@@ -368,7 +402,7 @@ def export_embedding_gemma2(models_dir: str | Path = "models", onnx_source_dir: 
             logger.info("%s: min sentence cos vs source %.7f", name, c)
             if c < 0.9999:
                 raise RuntimeError(f"{name} does not match the source graph (cos {c})")
-        _to_bf16(fp32_dir / f"{name}.onnx", bf16_dir / f"{name}.onnx", weights)
+        _to_bf16(fp32_dir / f"{name}.onnx", bf16_dir / f"{name}.onnx", weights, split_cols=s <= 128)
         graphs.append(("text", bf16_dir / f"{name}.onnx"))
 
     if lut is not None:
@@ -380,7 +414,7 @@ def export_embedding_gemma2(models_dir: str | Path = "models", onnx_source_dir: 
     manifest = {
         "model": "google/embeddinggemma-2",
         "source": HF_REPO,
-        "weights": weights if weights == "fp32" else f"{weights} (int4 block-32 weights, bf16 activations)",
+        "weights": weights if weights == "fp32" else f"{weights} ({WEIGHT_FORMAT[weights]})",
         "seq_lens": list(seq_lens),
         "image_sizes": [list(x) for x in image_sizes],
         "patch_size": pp.PATCH_SIZE,
@@ -406,7 +440,7 @@ def export_embedding_gemma2(models_dir: str | Path = "models", onnx_source_dir: 
         from ...utils.compile import export_torq
 
         for _, path in graphs:
-            args = list(TORQ_FLAGS) + [f"--torq-max-nss-programs-size={nss_programs_size(path.stem)}"]
+            args = list(TORQ_FLAGS) + [f"--torq-max-nss-programs-size={nss_programs_size(path.stem, weights)}"]
             args += list(compiler_args or [])
             logger.info("compiling %s", path.name)
             export_torq(path, iree_dir, compiler_args=args, use_binary=use_binary, compiler_path=compiler_path)
