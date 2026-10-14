@@ -33,6 +33,20 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         help="Custom Gemma3 HuggingFace repository"
     )
     parser.add_argument(
+        "--weight-quantization",
+        choices=["int4", "int8"],
+        default=None,
+        help="Quantize the MatMul weights to INT4 or INT8 in blocks of 32; the activations "
+             "stay bf16 (W4A16 / W8A16). Round-to-nearest unless --gptq-checkpoint is given"
+    )
+    parser.add_argument(
+        "--gptq-checkpoint",
+        type=str,
+        metavar="DIR",
+        help="GPTQ INT4 checkpoint (compressed-tensors, from int4quant/run_gptq.py) to take the "
+             "INT4 weights from, with --weight-quantization int4"
+    )
+    parser.add_argument(
         "--hf-repo-subdir",
         type=str,
         metavar="DIR",
