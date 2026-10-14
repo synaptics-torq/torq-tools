@@ -531,7 +531,7 @@ class PTDTreeAttentionMask(OnnxGraphEdit):
         cur_len (gs.Variable): Graph input with the anchor position (L), shape [1]
         max_tokens (int): Maximum sequence length (cache rows)
         export_dtype (onnx.TensorProto.DataType): ONNX export data type
-        tree_vis (gs.Variable): Graph input [1, 1, N, N-1] int32 visibility matrix
+        tree_vis (gs.Variable): Graph input [1, 1, N, N-1] float32 visibility matrix
         rows (int): Total fixed row budget N
     """
 
@@ -587,7 +587,7 @@ class PTDTreeAttentionMask(OnnxGraphEdit):
                 "time_ids", np.arange(self.max_tokens, dtype=np.int64).reshape(1, 1, self.max_tokens, 1)
             )
 
-        # Scratch one-hot: [1, 1, max_tokens, N-1] int32, 1 at row cur_len+1+j
+        # Scratch one-hot: [1, 1, max_tokens, N-1] float32, 1 at row cur_len+1+j
         # for scratch slot j.
         onehot_b = self.graph.layer(
             name=node.name + "_ptd_scratch_onehot",
@@ -606,29 +606,30 @@ class PTDTreeAttentionMask(OnnxGraphEdit):
         onehot = self.graph.layer(
             name=node.name + "_ptd_onehot",
             op="Cast",
-            attrs={"to": onnx.TensorProto.INT32},
+            attrs={"to": onnx.TensorProto.FLOAT},
             inputs=[onehot_b],
-            outputs=[gs.Variable(node.name + "_ptd_onehot_i", dtype=np.int32, shape=[1, 1, self.max_tokens, n_rows - 1])],
+            outputs=[gs.Variable(node.name + "_ptd_onehot_f", dtype=np.float32, shape=[1, 1, self.max_tokens, n_rows - 1])],
         )[0]
         onehot_t = self.graph.layer(
             name=node.name + "_ptd_onehot_t",
             op="Transpose",
             attrs={"perm": [0, 1, 3, 2]},
             inputs=[onehot],
-            outputs=[gs.Variable(node.name + "_ptd_onehot_it", dtype=np.int32, shape=[1, 1, n_rows - 1, self.max_tokens])],
+            outputs=[gs.Variable(node.name + "_ptd_onehot_ft", dtype=np.float32, shape=[1, 1, n_rows - 1, self.max_tokens])],
         )[0]
+        # Each key matches at most one scratch slot, so the float result is exactly 0/1.
         # Per-row scratch visibility: tree_vis [1, 1, N, N-1] x one-hot [1, 1, N-1, M]
         vis_matrix = self.graph.layer(
             name=node.name + "_ptd_vis_matrix",
             op="MatMul",
             inputs=[self.tree_vis, onehot_t],
-            outputs=[gs.Variable(node.name + "_ptd_vis_m", dtype=np.int32, shape=[1, 1, n_rows, self.max_tokens])],
+            outputs=[gs.Variable(node.name + "_ptd_vis_m", dtype=np.float32, shape=[1, 1, n_rows, self.max_tokens])],
         )[0]
         scratch_vis = self.graph.layer(
             name=node.name + "_ptd_scratch_vis",
             op="Greater",
             inputs=[vis_matrix,
-                    gs.Constant(node.name + "_ptd_zero_i32", np.asarray(0, dtype=np.int32))],
+                    gs.Constant(node.name + "_ptd_threshold", np.asarray(0.5, dtype=np.float32))],
             outputs=[gs.Variable(node.name + "_ptd_scratch_vis_b", dtype=onnx.TensorProto.BOOL, shape=[1, 1, n_rows, self.max_tokens])],
         )[0]
         # Committed visibility: every row sees keys 0..cur_len.

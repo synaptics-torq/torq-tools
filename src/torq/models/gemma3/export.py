@@ -485,7 +485,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         kv_cache_block = "model.static (KV cache)"
         if ptd:
             tree_vis = gs.Variable(
-                "tree_vis", dtype=np.int32, shape=[1, 1, rows, rows - 1]
+                "tree_vis", dtype=np.float32, shape=[1, 1, rows, rows - 1]
             )
             graph.inputs.append(tree_vis)
             ctx_values.update({

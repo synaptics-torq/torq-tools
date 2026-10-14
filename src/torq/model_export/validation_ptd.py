@@ -115,7 +115,7 @@ def validate_ptd_onnx(
             feeds = _token_feed(dec_body, tokens, token_embeddings)
             feeds.update({
                 "position_ids": np.full((1, rows), position, dtype=np.int64),
-                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.int32),
+                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.float32),
                 **cache,
             })
         else:
@@ -173,7 +173,7 @@ def validate_ptd_onnx(
 
 def _chain_vis(rows: int) -> np.ndarray:
     """Linear-chain visibility: row i (scratch slot i) sees slots 1..i."""
-    vis = np.zeros((1, 1, rows, rows - 1), dtype=np.int32)
+    vis = np.zeros((1, 1, rows, rows - 1), dtype=np.float32)
     for i in range(1, rows):
         vis[0, 0, i, :i] = 1
     return vis

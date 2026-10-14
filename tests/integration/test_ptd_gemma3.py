@@ -129,7 +129,7 @@ def test_packed_verification_tree_matches_separate_executions():
     tokens = np.array([anchor, r0, r0c, r1, r1c] + [0] * (rows - 5), dtype=np.int64)
     positions = np.array([seq_len, seq_len + 1, seq_len + 2, seq_len + 1, seq_len + 2]
                          + [seq_len] * (rows - 5), dtype=np.int64)
-    vis = np.zeros((1, 1, rows, rows - 1), dtype=np.int32)
+    vis = np.zeros((1, 1, rows, rows - 1), dtype=np.float32)
     # slot 1 (r0): self; slot 2 (r0c): slot1 + self; slot 3 (r1): self;
     # slot 4 (r1c): slot3 + self; roots do NOT see each other
     vis[0, 0, 1, 0] = 1
@@ -227,7 +227,7 @@ def test_ptd_near_full_cache_round():
             padded = _token_feed(body, np.full(rows, token, dtype=np.int64), embeddings)
             padded.update({
                 "position_ids": np.full((1, rows), M - 1, dtype=np.int64),
-                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.int32),
+                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.float32),
                 **{name: value[:, :, :ptd_inputs[name][2], :] for name, value in c.items()},
             })
             padded_logits, padded_out = _run_logits(body, head, padded)

@@ -125,7 +125,7 @@ def test_ptd_kv_cache_rejects_wrong_row_count():
 def _mask_graph(max_tokens: int, rows: int):
     scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, rows, max_tokens])
     cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1])
-    tree_vis = gs.Variable("tree_vis", dtype=np.int32, shape=[1, 1, rows, rows - 1])
+    tree_vis = gs.Variable("tree_vis", dtype=np.float32, shape=[1, 1, rows, rows - 1])
     biased = gs.Variable("biased", dtype=np.float32, shape=[1, 1, rows, max_tokens])
     probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, rows, max_tokens])
     identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[biased])
@@ -148,6 +148,10 @@ def test_ptd_mask_committed_plus_ancestor_visibility():
         export_dtype=onnx.TensorProto.FLOAT, tree_vis=g.inputs[2], rows=N,
     ).transform(softmax)
 
+    matmul = next(node for node in g.nodes if node.op == "MatMul")
+    assert all(tensor.dtype == np.float32 for tensor in [*matmul.inputs, *matmul.outputs])
+    assert matmul.inputs[0] is g.inputs[2]
+
     # scratch slots 1..3 live at keys 3,4,5; visibility per row:
     # row 0 (anchor): none | row 1: self | row 2: slot1 + self | row 3: self
     vis = np.array([
@@ -155,7 +159,7 @@ def test_ptd_mask_committed_plus_ancestor_visibility():
         [1, 0, 0],
         [1, 1, 0],
         [0, 0, 1],
-    ], dtype=np.int32).reshape(1, 1, N, N - 1)
+    ], dtype=np.float32).reshape(1, 1, N, N - 1)
 
     keep = np.zeros((N, M))
     for i in range(N):
@@ -191,7 +195,7 @@ def test_ptd_mask_sibling_isolation_and_cross_tree():
         [1, 1, 0, 0],
         [0, 0, 1, 0],
         [0, 0, 1, 1],
-    ], dtype=np.int32).reshape(1, 1, N, N - 1)
+    ], dtype=np.float32).reshape(1, 1, N, N - 1)
 
     keep = np.zeros((N, M))
     for i in range(N):
@@ -231,7 +235,7 @@ def test_ptd_mask_invalid_row_still_has_committed_visibility():
         g, "integration", cur_len=g.inputs[1], max_tokens=M,
         export_dtype=onnx.TensorProto.FLOAT, tree_vis=g.inputs[2], rows=N,
     ).transform(softmax)
-    vis = np.zeros((1, 1, N, N - 1), dtype=np.int32)
+    vis = np.zeros((1, 1, N, N - 1), dtype=np.float32)
     vis[0, 0, 0, :] = 0
     vis[0, 0, 1, 0] = 1  # only row 1 valid, sees itself
     scores = np.arange(N * M, dtype=np.float32).reshape(1, 1, N, M)
@@ -306,6 +310,6 @@ def test_ptd_padded_anchor_at_last_cache_slot_ignores_out_of_range_scratch():
     probs = run_model(mask_graph, {
         "scores": np.zeros((1, 1, N, M), dtype=np.float32),
         "cur_len": np.array([L], dtype=np.int64),
-        "tree_vis": np.zeros((1, 1, N, N - 1), dtype=np.int32),
+        "tree_vis": np.zeros((1, 1, N, N - 1), dtype=np.float32),
     })["probs"]
     np.testing.assert_allclose(probs, 1 / M)

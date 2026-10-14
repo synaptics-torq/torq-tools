@@ -224,6 +224,7 @@ def test_pack_round_layout_positions_and_vis():
     assert list(p.tokens[6:]) == [0, 0]
     assert list(p.positions[6:]) == [L, L]
 
+    assert p.vis.dtype == np.float32
     # vis (row, scratch-slot-1): row 2 (11) sees slot 1 (10) + itself
     assert p.vis[2, 0] == 1 and p.vis[2, 1] == 1
     # row 2 does not see draft rows (cross-tree isolation) or the pad rows

@@ -274,7 +274,7 @@ class PtdPacking:
 
     tokens: np.ndarray      # [N] int64; slot 0 = anchor
     positions: np.ndarray   # [N] int64; per-row logical positions
-    vis: np.ndarray         # [N, N-1] int32; row i sees scratch slot j+1 iff set
+    vis: np.ndarray         # [N, N-1] float32; row i sees scratch slot j+1 iff set
     candidate_slots: dict   # PTDNode -> slot
     draft_slots: dict       # PTDNode -> slot
     n_candidates: int
@@ -297,7 +297,7 @@ def pack_round(
     """
     tokens = np.full(rows, pad_token, dtype=np.int64)
     positions = np.full(rows, L, dtype=np.int64)
-    vis = np.zeros((rows, rows - 1), dtype=np.int32)
+    vis = np.zeros((rows, rows - 1), dtype=np.float32)
     tokens[0] = anchor_token
 
     candidate_slots: dict[PTDNode, int] = {}
