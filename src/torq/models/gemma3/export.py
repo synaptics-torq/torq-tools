@@ -691,18 +691,11 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:
-        # The PTD components are an ONNX-only experimental variant: the
-        # compiler path for the fixed-row body is unvalidated, so keep it out
-        # of the standard compile loop.
-        ptd_skip = ["model", "lm_head"] if args.ptd_rows else []
-        if ptd_skip:
-            exporter._logger.info("(gemma3) --ptd-rows: skipping PTD components in the torq compile (ONNX-only experimental)")
         exporter.export_torq(
             torq_compile_args=args.compile_flags or [],
             use_binary=args.use_binary,
             local_compile=args.local_compile,
             compiler_path=args.compiler_path,
-            skip=ptd_skip,
         )
 
 
