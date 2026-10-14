@@ -75,10 +75,10 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         default=0,
         metavar="N",
         help=(
-            "Also export a fixed-row Progressive Tree Drafting body "
-            "(PTD, Gao et al. 2026, arXiv:2607.10661) as ptd_transformer.onnx "
-            "[+ ptd_lm_head.onnx], packing N rows (anchor + draft/verification "
-            "tree rows); experimental (default: %(default)s; pass 0 to disable)"
+            "Export a standalone fixed-row Progressive Tree Drafting body "
+            "(PTD, Gao et al. 2026, arXiv:2607.10661) as transformer.onnx "
+            "and lm_head.onnx, packing N rows (anchor + draft/verification "
+            "tree rows); incompatible with --batch-prefill; experimental (default: %(default)s; pass 0 to disable)"
         ),
     )
     add_graph_edit_harness_args(parser)

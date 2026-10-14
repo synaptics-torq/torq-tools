@@ -5,8 +5,8 @@
 
 Single-path check (plan step 1): pack a *linear chain* (row i at position
 L+i, each row seeing all preceding chain rows) through the PTD body and
-verify every row's logits against separate sequential 1-token executions of
-the ordinary decode model. This exercises the per-row positions, the
+verify every row's logits against sequential padded single-token PTD passes
+(or an optional ordinary decode reference). This exercises the per-row positions, the
 scratch/committed KV split, the visibility mask, and the block head without
 any tree semantics.
 
@@ -56,7 +56,7 @@ def _run_logits(body: ORTInferenceRunner, head: ORTInferenceRunner | None,
 def validate_ptd_onnx(
     logger: logging.Logger,
     ptd_model_path: str | Path,
-    decode_model_path: str | Path,
+    decode_model_path: str | Path | None = None,
     *,
     ptd_lm_head_path: str | Path | None = None,
     decode_lm_head_path: str | Path | None = None,
@@ -69,11 +69,11 @@ def validate_ptd_onnx(
     atol: float = 1e-3,
     n_threads: int | None = None,
 ) -> None:
-    """Compare packed single-chain PTD rows against sequential decode steps."""
+    """Compare a packed chain with sequential steps, using padded PTD by default."""
     ptd_body = _load_session(ptd_model_path, n_threads)
-    dec_body = _load_session(decode_model_path, n_threads)
+    dec_body = _load_session(decode_model_path, n_threads) if decode_model_path else ptd_body
     ptd_head = _load_session(ptd_lm_head_path, n_threads) if ptd_lm_head_path else None
-    dec_head = _load_session(decode_lm_head_path, n_threads) if decode_lm_head_path else None
+    dec_head = (_load_session(decode_lm_head_path, n_threads) if decode_lm_head_path else None) if decode_model_path else ptd_head
 
     dec_inputs = _input_map(dec_body)
     ptd_inputs = _input_map(ptd_body)
@@ -109,13 +109,26 @@ def validate_ptd_onnx(
         for name in dec_cache_names:
             cache[name] = out[out_idx[name.replace("past_key_values", "present")]]
 
+    def decode_step(token: int, position: int) -> tuple[np.ndarray, list]:
+        if "tree_vis" in dec_inputs:
+            tokens = np.full(rows, token, dtype=np.int64)
+            feeds = _token_feed(dec_body, tokens, token_embeddings)
+            feeds.update({
+                "position_ids": np.full((1, rows), position, dtype=np.int64),
+                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.int32),
+                **cache,
+            })
+        else:
+            feeds = _token_feed(dec_body, np.array([token]), token_embeddings)
+            feeds.update({"position_ids": np.array([[position]], dtype=np.int64), **cache})
+        logits, out = _run_logits(dec_body, dec_head, feeds)
+        return logits.reshape(-1, logits.shape[-1])[0], out
+
     # Prefill both models identically (1-token decode steps).
     seq_len = 0
     last_logits = None
     for token in prompt_tokens:
-        feeds = _token_feed(dec_body, np.array([token]), token_embeddings)
-        feeds.update({"position_ids": np.array([[seq_len]], dtype=np.int64), **cache})
-        last_logits, out = _run_logits(dec_body, dec_head, feeds)
+        last_logits, out = decode_step(token, seq_len)
         update_cache(out)
         seq_len += 1
 
@@ -138,9 +151,7 @@ def validate_ptd_onnx(
 
     # Sequential decode over the chain; PTD row i must match step i.
     for i, token in enumerate(chain):
-        feeds = _token_feed(dec_body, np.array([token]), token_embeddings)
-        feeds.update({"position_ids": np.array([[seq_len + i]], dtype=np.int64), **cache})
-        expected, out = _run_logits(dec_body, dec_head, feeds)
+        expected, out = decode_step(token, seq_len + i)
         expected = expected.reshape(-1)
         actual = ptd_row_logits[i]
         np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol,

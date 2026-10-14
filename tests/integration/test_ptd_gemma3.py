@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
-"""Artifact-dependent PTD tests for Gemma 3 (skipped when the export is absent).
+"""PTD artifact checks against an ordinary decode export in a separate directory.
 
-Requires an export dir containing both transformer.onnx (ordinary static
-decode body, + lm_head.onnx) and ptd_transformer.onnx (+ ptd_lm_head.onnx):
-set TORQ_PTD_TEST_DIR or export with --ptd-rows next to the regular model.
+Set TORQ_PTD_TEST_DIR to a standalone PTD export and TORQ_PTD_REFERENCE_DIR to
+an ordinary export. Both use transformer.onnx and lm_head.onnx.
 """
 
 import os
@@ -23,41 +22,31 @@ from torq.model_export.validation_ptd import (
     _token_feed,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CANDIDATE_DIRS = [
-    Path(os.environ.get("TORQ_PTD_TEST_DIR", "")),
-    REPO_ROOT / "models-ptd/google/gemma-3-270m-it/export/full/split_lm_head/fp32/static",
-    REPO_ROOT / "models/google/gemma-3-270m-it/export/full/split_lm_head/fp32/static",
-]
-
-
-def _export_dir() -> Path | None:
-    for d in CANDIDATE_DIRS:
-        if d and (d / "transformer.onnx").exists() and (d / "ptd_transformer.onnx").exists():
-            return d
-    return None
-
-
-EXPORT_DIR = _export_dir()
+EXPORT_DIR = Path(os.environ["TORQ_PTD_TEST_DIR"]) if os.environ.get("TORQ_PTD_TEST_DIR") else None
+REFERENCE_DIR = Path(os.environ["TORQ_PTD_REFERENCE_DIR"]) if os.environ.get("TORQ_PTD_REFERENCE_DIR") else None
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.ort,
-    pytest.mark.skipif(EXPORT_DIR is None, reason="Gemma 3 PTD export artifacts not present"),
+    pytest.mark.skipif(
+        EXPORT_DIR is None or REFERENCE_DIR is None,
+        reason="Set TORQ_PTD_TEST_DIR and TORQ_PTD_REFERENCE_DIR to separate export directories",
+    ),
 ]
 
 
 def _load_runners():
     from torq.models.gemma3._inference import Gemma3PTD, Gemma3Static
 
-    shapes = _input_map(_load_session(EXPORT_DIR / "transformer.onnx"))
+    shapes = _input_map(_load_session(EXPORT_DIR / "transformer.onnx", 2))
     capacity = next(shape[2] for name, shape in shapes.items() if name.startswith("past_key_values."))
+    reference_shapes = _input_map(_load_session(REFERENCE_DIR / "transformer.onnx", 2))
+    reference_capacity = next(shape[2] for name, shape in reference_shapes.items() if name.startswith("past_key_values."))
     static = Gemma3Static.from_onnx(
-        EXPORT_DIR / "transformer.onnx", capacity, instruct_model=True, n_threads=os.cpu_count(),
+        REFERENCE_DIR / "transformer.onnx", reference_capacity, instruct_model=True, n_threads=2,
     )
     ptd = Gemma3PTD.from_onnx(
         EXPORT_DIR / "transformer.onnx",
-        EXPORT_DIR / "ptd_transformer.onnx",
-        capacity, instruct_model=True, n_threads=os.cpu_count(),
+        capacity, instruct_model=True, n_threads=2,
     )
     return static, ptd
 
@@ -68,7 +57,7 @@ def test_ptd_greedy_output_matches_static_decode():
         expected = static.run_tokens(prompt, max_gen_tokens=128)
         actual = ptd.run_tokens(prompt, max_gen_tokens=128)
         assert actual == expected, f"PTD output diverges for {prompt!r}:\n{actual!r}\nvs\n{expected!r}"
-        # PTD actually used rounds (not just the fallback path); the instruct
+        # PTD actually used tree rounds; the instruct
         # warmup + chat framing consume ~40 of the 128-token budget.
         assert len(ptd.ptd_round_log) > 0
 
@@ -83,14 +72,14 @@ def test_ptd_accepts_multiple_tokens_with_gemma():
 
 
 def test_ptd_round_bookkeeping_consistent():
-    static, ptd = _load_runners()
+    _, ptd = _load_runners()
     ptd.run("Repeat the word hello five times.", max_gen_tokens=48)
     log = ptd.ptd_round_log
     committed = sum(e["emitted"] for e in log)
-    # every committed token came from a round; the anchor row is processed each
-    # round, so rows_processed >= committed + rounds
+    # Every round processes the anchor plus enough candidate input rows to
+    # cover its emission (accepted nodes plus the final prediction).
     rows = sum(e["n_candidates"] + e["n_drafts"] + 1 for e in log)
-    assert rows >= committed + len(log)
+    assert rows >= committed
     assert all(e["emitted"] >= 1 for e in log)
     # hit rounds accept at least the matching root
     for e in log:
@@ -101,10 +90,10 @@ def test_ptd_round_bookkeeping_consistent():
 def test_packed_verification_tree_matches_separate_executions():
     """Plan step 2: each packed candidate row must match a separate causal
     execution of its own path (sibling isolation, repeated positions)."""
-    body = _load_session(EXPORT_DIR / "ptd_transformer.onnx")
-    head = _load_session(EXPORT_DIR / "ptd_lm_head.onnx")
-    dec_body = _load_session(EXPORT_DIR / "transformer.onnx")
-    dec_head = _load_session(EXPORT_DIR / "lm_head.onnx")
+    body = _load_session(EXPORT_DIR / "transformer.onnx", 2)
+    head = _load_session(EXPORT_DIR / "lm_head.onnx", 2)
+    dec_body = _load_session(REFERENCE_DIR / "transformer.onnx", 2)
+    dec_head = _load_session(REFERENCE_DIR / "lm_head.onnx", 2)
     emb_path = EXPORT_DIR / "token_embeddings.npy"
     embeddings = np.load(emb_path) if emb_path.exists() else None
 
@@ -154,7 +143,7 @@ def test_packed_verification_tree_matches_separate_executions():
     feeds.update({
         "position_ids": positions[None, ...],
         "tree_vis": vis,
-        **cache,
+        **{name: value[:, :, :ptd_inputs[name][2], :] for name, value in cache.items()},
     })
     ptd_first, _ = _run_logits(body, head, feeds)
     ptd_rows_logit = ptd_first.reshape(rows, -1)
@@ -191,17 +180,17 @@ def test_packed_verification_tree_matches_separate_executions():
 def test_ptd_near_full_cache_round():
     """A PTD round with the cache nearly full (scratch region at the cache
     edge) must still match sequential decode."""
-    body = _load_session(EXPORT_DIR / "ptd_transformer.onnx")
-    head = _load_session(EXPORT_DIR / "ptd_lm_head.onnx")
-    dec_body = _load_session(EXPORT_DIR / "transformer.onnx")
-    dec_head = _load_session(EXPORT_DIR / "lm_head.onnx")
+    body = _load_session(EXPORT_DIR / "transformer.onnx", 2)
+    head = _load_session(EXPORT_DIR / "lm_head.onnx", 2)
+    dec_body = _load_session(REFERENCE_DIR / "transformer.onnx", 2)
+    dec_head = _load_session(REFERENCE_DIR / "lm_head.onnx", 2)
     embeddings = np.load(EXPORT_DIR / "token_embeddings.npy")
     ptd_inputs = _input_map(body)
     rows = (ptd_inputs.get("token_embedding") or ptd_inputs.get("input_ids"))[1]
     dec_inputs = _input_map(dec_body)
     cache_names = sorted(n for n in dec_inputs if n.startswith("past_key_values."))
     cache = {n: np.zeros(dec_inputs[n], dtype=np.float32) for n in cache_names}
-    M = dec_inputs[cache_names[0]][2]
+    M = ptd_inputs[cache_names[0]][2]
 
     # Prefill until L = M - rows (the last legal PTD round start).
     L = M - rows
@@ -224,7 +213,7 @@ def test_ptd_near_full_cache_round():
     ptd_feeds.update({
         "position_ids": np.array([list(range(L, L + rows))], dtype=np.int64),
         "tree_vis": _chain_vis(rows),
-        **cache,
+        **{name: value[:, :, :ptd_inputs[name][2], :] for name, value in cache.items()},
     })
     ptd_first, _ = _run_logits(body, head, ptd_feeds)
     ptd_rows_logit = ptd_first.reshape(rows, -1)
@@ -232,8 +221,24 @@ def test_ptd_near_full_cache_round():
     # Sequential reference over the chain from the same cache.
     c = {n: v.copy() for n, v in cache.items()}
     for i, token in enumerate(chain):
+        if i == rows - 1:
+            # The same PTD body can run an anchor at M-1, with all scratch
+            # slots beyond capacity masked padding.
+            padded = _token_feed(body, np.full(rows, token, dtype=np.int64), embeddings)
+            padded.update({
+                "position_ids": np.full((1, rows), M - 1, dtype=np.int64),
+                "tree_vis": np.zeros((1, 1, rows, rows - 1), dtype=np.int32),
+                **{name: value[:, :, :ptd_inputs[name][2], :] for name, value in c.items()},
+            })
+            padded_logits, padded_out = _run_logits(body, head, padded)
         f = _token_feed(dec_body, np.array([token]), embeddings)
         f.update({"position_ids": np.array([[L + i]], dtype=np.int64), **c})
         lg, out = _run_logits(dec_body, dec_head, f)
         update_cache(c, out)
         np.testing.assert_allclose(ptd_rows_logit[i], lg.reshape(-1), rtol=1e-3, atol=1e-3)
+        if i == rows - 1:
+            np.testing.assert_allclose(padded_logits.reshape(rows, -1)[0], lg.reshape(-1), rtol=1e-3, atol=1e-3)
+            ptd_out_idx = _output_index(body)
+            for name, value in c.items():
+                actual = padded_out[ptd_out_idx[name.replace("past_key_values", "present")]]
+                np.testing.assert_allclose(actual, value[:, :, :M, :], rtol=1e-3, atol=1e-3)

@@ -29,7 +29,7 @@ def test_trimmed_ptd_block_head_preserves_all_rows(tmp_path):
     lut = np.array([0, 3, 5])
     TrimLMHeadVocab(body, "integration", kept_token_ids=lut).transform(matmul)
     assert body.outputs[0].shape == [1, 4, 3]
-    head_path = tmp_path / "ptd_lm_head.onnx"
+    head_path = tmp_path / "lm_head.onnx"
     SplitLMHead(body, "integration", save_to=head_path).transform(matmul)
     inputs = np.arange(8, dtype=np.float32).reshape(1, 4, 2)
     actual = run_model(onnx.load(head_path), {"last_hidden_states": inputs})["logits"]
@@ -281,3 +281,31 @@ def test_static_index_default_behavior_unchanged():
     ConvertToStaticIndex(g, "integration", chunk_len=5).transform(range_node)
     actual = run_model(g, {"start": np.array([2], dtype=np.int64)})["pos_out"]
     np.testing.assert_array_equal(actual, [2, 3, 4, 5, 6])
+
+
+def test_ptd_padded_anchor_at_last_cache_slot_ignores_out_of_range_scratch():
+    M, N, L = 8, 4, 7
+    g, concat = _kv_graph(M, N)
+    PTDKVCache(g, "integration", cur_len=g.inputs[2], max_tokens=M, rows=N).transform(concat)
+    past = np.arange(M * 2, dtype=np.float32).reshape(1, 1, M, 2)
+    new = np.full((1, 1, N, 2), 999, dtype=np.float32)
+    new[:, :, 0, :] = 42
+    out = run_model(g, {
+        "past_key_values.0.key": past, "new_kv": new,
+        "cur_len": np.array([L], dtype=np.int64),
+    })
+    expected = past.copy()
+    expected[:, :, L, :] = 42
+    np.testing.assert_array_equal(out["present.0.key"], expected)
+    np.testing.assert_array_equal(out["attn_key"], expected)
+    mask_graph, softmax = _mask_graph(M, N)
+    PTDTreeAttentionMask(
+        mask_graph, "integration", cur_len=mask_graph.inputs[1], max_tokens=M,
+        export_dtype=onnx.TensorProto.FLOAT, tree_vis=mask_graph.inputs[2], rows=N,
+    ).transform(softmax)
+    probs = run_model(mask_graph, {
+        "scores": np.zeros((1, 1, N, M), dtype=np.float32),
+        "cur_len": np.array([L], dtype=np.int64),
+        "tree_vis": np.zeros((1, 1, N, N - 1), dtype=np.int32),
+    })["probs"]
+    np.testing.assert_allclose(probs, 1 / M)

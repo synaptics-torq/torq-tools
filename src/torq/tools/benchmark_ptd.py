@@ -14,7 +14,7 @@ torq.inference.ptd).
 
 Usage:
     python -m torq.tools.benchmark_ptd --model transformer.onnx \
-        --ptd-model ptd_transformer.onnx [--instruct-model] [prompts...]
+        --ptd-model /path/to/ptd/transformer.onnx [--instruct-model] [prompts...]
 """
 
 import argparse
@@ -122,10 +122,9 @@ def run_benchmark(args) -> dict:
         repo_id=args.repo_id, lm_head_path=args.lm_head,
     )
     ptd_runner = Gemma3PTD.from_onnx(
-        args.model, args.ptd_model, model_max_tokens, max_inp_len=args.max_inp_len,
+        args.ptd_model, model_max_tokens, max_inp_len=args.max_inp_len,
         n_threads=args.n_threads, instruct_model=args.instruct_model,
-        repo_id=args.repo_id, lm_head_path=args.lm_head,
-        ptd_lm_head_path=args.ptd_lm_head, ptd_rows=args.ptd_rows,
+        repo_id=args.repo_id, lm_head_path=args.ptd_lm_head, ptd_rows=args.ptd_rows,
         ptd_width=args.ptd_width, ptd_depth=args.ptd_depth,
     )
 
@@ -138,11 +137,8 @@ def run_benchmark(args) -> dict:
     for prompt in prompts:
         prefill_s, decode_s, n_tok = _decode_step_time(static_runner, prompt, max_gen_tokens)
         step_time = decode_s / max(n_tok - 1, 1)
-        ptd_prefill, ptd_total, ptd_n_tok, ptd_out = _ptd_timings(ptd_runner, prompt, max_gen_tokens)
+        ptd_prefill, ptd_total, _, ptd_out = _ptd_timings(ptd_runner, prompt, max_gen_tokens)
         ptd_summary = _ptd_summary(ptd_runner)
-        # Fallback 1-token steps (cache too full for the row budget) are not
-        # included in the measured PTD round times.
-        ptd_summary["fallback_steps"] = ptd_n_tok - 1 - ptd_summary["committed_tokens"]
         ptd_summary["prefill_s"] = ptd_prefill
         static_out = static_runner.run_tokens(prompt, max_gen_tokens=max_gen_tokens)
         match = ptd_out == static_out
@@ -159,7 +155,7 @@ def run_benchmark(args) -> dict:
         }
         print(f"\n=== {prompt!r}")
         print(f"  static: {n_tok} tokens, step {step_time*1e3:.1f} ms")
-        print(f"  ptd:    {ptd_summary['rounds']} rounds + {ptd_summary['fallback_steps']} fallback, "
+        print(f"  ptd:    {ptd_summary['rounds']} rounds, "
               f"{ptd_summary['committed_tokens']} committed, hit {ptd_summary['hit_rate']:.0%}, "
               f"accept {ptd_summary['mean_accept_length']:.2f}, body {ptd_summary['mean_body_ms']:.1f} ms, "
               f"warmup round {ptd_summary['pool_warmup_round']}")
@@ -174,7 +170,7 @@ def run_benchmark(args) -> dict:
         "peak_rss_mb": _peak_rss_mb(),
     }
     # Round-cost speedup (plan formula): mean committed per round * step /
-    # round time, with prefill and fallback steps excluded from the round
+    # round time, with prefill excluded from the round
     # time.
     speedups = []
     for entry in report["prompts"].values():
@@ -191,9 +187,9 @@ def run_benchmark(args) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="ordinary static decode model (transformer.onnx)")
-    parser.add_argument("--ptd-model", required=True, help="PTD body (ptd_transformer.onnx)")
+    parser.add_argument("--ptd-model", required=True, help="PTD body (transformer.onnx in the PTD export directory)")
     parser.add_argument("--lm-head", default=None, help="decode lm_head.onnx (default: auto next to --model)")
-    parser.add_argument("--ptd-lm-head", default=None, help="PTD ptd_lm_head.onnx (default: auto next to --ptd-model)")
+    parser.add_argument("--ptd-lm-head", default=None, help="PTD lm_head.onnx (default: auto next to --ptd-model)")
     parser.add_argument("--ptd-rows", type=int, default=None, help="PTD row count (default: read from model)")
     parser.add_argument("--model-max-tokens", type=int, default=None,
                         help="static cache rows (default: read from --model)")

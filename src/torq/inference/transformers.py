@@ -440,13 +440,10 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
 class StaticPTDRunner(StaticDecoderOnlyRunner):
     """Static decode runner with Progressive Tree Drafting (PTD).
 
-    Prefills with the ordinary 1-token decode model, then decodes with PTD
-    rounds: a fixed-row body (anchor + packed draft/verification tree nodes)
-    and greedy verification against a request-local candidate pool. The
-    committed KV cache is shared with the decode model; accepted-path scratch
-    KVs are promoted into it by the host each round. While the cache is too
-    full for a full row budget (L > M - rows), decoding falls back to the
-    ordinary 1-token step.
+    Uses one fixed-row body and optional block head for every phase. Prefill
+    packs causal prompt chains; decoding packs draft/verification trees.
+    The host promotes valid scratch KVs into the committed cache. Near cache
+    capacity, fewer real rows are packed and remaining rows are masked padding.
 
     PTD greedy output is token-identical to ordinary greedy decoding of the
     same model (anchor row = ordinary step; each accepted continuation is the
@@ -467,9 +464,7 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
         tokenizer,
         sys_prompt: str | None,
         *,
-        ptd_model: InferenceRunner,
         ptd_rows: int,
-        ptd_lm_head: InferenceRunner | None = None,
         combined_kv_io: bool = True,
         token_embeddings: np.ndarray | None = None,
         token_id_lut: np.ndarray | None = None,
@@ -484,8 +479,29 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
     ):
         if ptd_rows < 2:
             raise ValueError(f"ptd_rows must be >= 2, got {ptd_rows}")
+        if list(model.input_shapes.get("tree_vis", ())) != [1, 1, ptd_rows, ptd_rows - 1]:
+            raise ValueError("PTD requires a body with matching fixed-row tree_vis input")
         if temperature != 0.0 or top_p != 1.0:
             raise ValueError("PTD supports greedy decoding only (temperature=0, top_p=1)")
+        self._ptd_rows = ptd_rows
+        self._ptd_width = ptd_width
+        self._ptd_depth = ptd_depth
+        self._ptd_pool_max_nodes = pool_max_nodes
+        self._ptd_pool_max_entries = pool_max_entries
+        self._ptd_min_draft_rows = max(0, min_draft_rows)
+        self._ptd_pool = None
+        self._ptd_tree = None
+        self._ptd_pad_token = config.pad_token_id if config.pad_token_id is not None else 0
+        self._ptd_out_names: list[str] = list(model.output_names)
+        self._ptd_first_out = next(
+            (n for n in self._ptd_out_names if n in ("logits", "last_hidden_states")), None
+        )
+        if self._ptd_first_out is None:
+            raise ValueError(f"PTD model has no logits/last_hidden_states output: {self._ptd_out_names[:4]}...")
+        if self._ptd_first_out == "last_hidden_states" and lm_head is None:
+            raise ValueError("PTD hidden-state output requires a split LM head")
+        self._ptd_log: list[dict] = []
+        self._ptd_rounds: int = 0
         super().__init__(
             model,
             config,
@@ -498,28 +514,9 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
             token_id_lut=token_id_lut,
             lm_head=lm_head,
         )
-        self._ptd_model = ptd_model
-        self._ptd_lm_head = ptd_lm_head
-        self._ptd_rows = ptd_rows
-        self._ptd_width = ptd_width
-        self._ptd_depth = ptd_depth
-        self._ptd_pool_max_nodes = pool_max_nodes
-        self._ptd_pool_max_entries = pool_max_entries
-        self._ptd_min_draft_rows = max(0, min_draft_rows)
-        self._ptd_pool = None
-        self._ptd_tree = None
-        self._ptd_pad_token = config.pad_token_id if config.pad_token_id is not None else 0
-        self._ptd_out_names: list[str] = list(ptd_model.output_names)
-        self._ptd_first_out = next(
-            (n for n in self._ptd_out_names if n in ("logits", "last_hidden_states")), None
-        )
-        if self._ptd_first_out is None:
-            raise ValueError(f"PTD model has no logits/last_hidden_states output: {self._ptd_out_names[:4]}...")
-        self._ptd_log: list[dict] = []
-        self._ptd_rounds: int = 0
         self._logger.info(
             "Loaded PTD body '%s' (rows=%d, width=%d, depth=%d)",
-            str(ptd_model.model_path), ptd_rows, ptd_width, ptd_depth,
+            str(model.model_path), ptd_rows, ptd_width, ptd_depth,
         )
 
     # -- PTD round machinery -------------------------------------------------
@@ -528,6 +525,50 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
         if isinstance(self._token_embeddings, np.ndarray):
             return {"token_embedding": self._token_embeddings[tokens][None, ...]}
         return {"input_ids": tokens.astype(np.int64)[None, ...]}
+
+    def _ptd_forward(self, packing) -> dict[str, np.ndarray]:
+        feeds = self._ptd_token_feed(packing.tokens)
+        feeds.update({
+            "position_ids": packing.positions[None, ...],
+            "tree_vis": packing.vis[None, None, ...],
+            **self._kv_cache,
+        })
+        return dict(zip(self._ptd_out_names, self._model.infer(feeds)))
+
+    def _ptd_logits(self, out_map: dict) -> np.ndarray:
+        first = out_map[self._ptd_first_out]
+        if self._lm_head is not None:
+            first = self._lm_head.infer({self._hidden_states_name: first})[0]
+        return first.reshape(self._ptd_rows, -1)
+
+    def _llm_step(self, token: int, curr_seq_len: int) -> tuple[int, list[np.ndarray]]:
+        packing = ptd_core.pack_round(
+            curr_seq_len, token, [], [], self._ptd_rows, self._ptd_pad_token,
+        )
+        out_map = self._ptd_forward(packing)
+        next_token = int(self._ptd_row_tokens(self._ptd_logits(out_map))[0])
+        return next_token, self._ptd_promote(out_map, packing, [], curr_seq_len)
+
+    def _prefill_prompt(self, prompt_tokens: list[int], start_seq_len: int = 0) -> tuple[int, int]:
+        if start_seq_len + len(prompt_tokens) > self._max_gen_tokens:
+            raise ValueError("PTD prompt exceeds the remaining cache capacity")
+        curr_seq_len = start_seq_len
+        next_token = None
+        for offset in range(0, len(prompt_tokens), self._ptd_rows):
+            chunk = prompt_tokens[offset:offset + self._ptd_rows]
+            nodes = []
+            for depth, token in enumerate(chunk[1:], start=1):
+                nodes.append(ptd_core.PTDNode(token, depth, parent=nodes[-1] if nodes else None))
+            packing = ptd_core.pack_round(
+                curr_seq_len, chunk[0], nodes, [], self._ptd_rows, self._ptd_pad_token,
+            )
+            out_map = self._ptd_forward(packing)
+            self._update_cache(self._ptd_promote(out_map, packing, nodes, curr_seq_len))
+            curr_seq_len += len(chunk)
+            # Keep the split head off the prefill path until the final batch.
+            if offset + len(chunk) == len(prompt_tokens):
+                next_token = int(self._ptd_row_tokens(self._ptd_logits(out_map))[len(chunk) - 1])
+        return next_token, curr_seq_len
 
     def _ptd_row_tokens(self, logits: np.ndarray) -> np.ndarray:
         """argmax per row, remapped through the token ID LUT when trimmed."""
@@ -543,7 +584,7 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
         committed cache, draft tree, pool, and metrics."""
         round_start = _perf_counter_ns()
         rows = self._ptd_rows
-        free = rows - 1
+        free = min(rows, self._max_gen_tokens - L) - 1
 
         # 1. Retrieve candidates (key = this round's anchor = last emitted
         # token) and allocate the row budget: candidates first, keeping at
@@ -565,18 +606,9 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
         )
 
         # 3. Body (+ block head).
-        feeds = self._ptd_token_feed(packing.tokens)
-        feeds.update({
-            "position_ids": packing.positions[None, ...],
-            "tree_vis": packing.vis.reshape(1, 1, rows, rows - 1),
-            **self._kv_cache,
-        })
         t0 = _perf_counter_ns()
-        out = self._ptd_model.infer(feeds)
-        out_map = dict(zip(self._ptd_out_names, out))
-        first = out_map[self._ptd_first_out]
-        if self._ptd_lm_head is not None:
-            first = self._ptd_lm_head.infer({self._hidden_states_name: first})[0]
+        out_map = self._ptd_forward(packing)
+        first = self._ptd_logits(out_map)
         body_ms = (_perf_counter_ns() - t0) / 1e6
 
         # 4. Greedy verification. The stop adapter matches ordinary greedy:
@@ -684,21 +716,6 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
             if curr_seq_len >= M:
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
-            # A full row budget needs the anchor at L plus scratch rows
-            # L+1..L+N-1 to fit in the cache; otherwise fall back to the
-            # ordinary 1-token step (the cache only grows, so once this
-            # triggers it stays triggered).
-            if curr_seq_len + self._ptd_rows > M:
-                next_token, cache = self._llm_step(next_token, curr_seq_len)
-                self._update_cache(cache)
-                gen_tokens.append(next_token)
-                curr_seq_len += 1
-                # The base runner stop-checks every generated token; the
-                # fallback path must too (a stop inside the last rows-1
-                # tokens would otherwise keep generating to cache full).
-                if self._stop_decoding(next_token, gen_tokens):
-                    break
-                continue
             emitted, stopped = self._ptd_round(next_token, curr_seq_len, gen_tokens)
             gen_tokens.extend(emitted)
             curr_seq_len += len(emitted)  # anchor row + accepted input nodes
