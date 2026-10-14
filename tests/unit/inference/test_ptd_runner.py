@@ -40,11 +40,12 @@ def _expected_gen() -> list[int]:
 class _FakePTDModel:
     """1-row (decode body) or N-row (PTD body) fake with the static contract."""
 
-    def __init__(self, rows: int, vocab: int = VOCAB, succ=None):
+    def __init__(self, rows: int, vocab: int = VOCAB, succ=None, combined_scratch=True):
         self.model_path = Path(f"fake_{rows}.onnx")
         self.rows = rows
         self.vocab = vocab
         self.succ = succ or _succ
+        self.combined_scratch = combined_scratch
         self.input_calls = []
 
     @property
@@ -65,7 +66,8 @@ class _FakePTDModel:
         for i in range(N_LAYERS):
             names.append(f"present.{i}.key_value")
             if self.rows > 1:
-                names += [f"present.{i}.key_scratch", f"present.{i}.value_scratch"]
+                names += ([f"present.{i}.key_value_scratch"] if self.combined_scratch else
+                          [f"present.{i}.key_scratch", f"present.{i}.value_scratch"])
         return names
 
     def infer(self, inputs):
@@ -80,13 +82,15 @@ class _FakePTDModel:
             L = int(np.asarray(inputs["position_ids"]).reshape(-1)[0])
             anchor = int(toks[0])
             cache[0, :N_KV, L, 0] = anchor
-            cache[0, N_KV:, L, 0] = anchor
+            cache[0, N_KV:, L, 0] = anchor + 100
             out.append(cache)
             if self.rows > 1:
+                scratch_outputs = []
                 for role in ("key", "value"):
                     scratch = np.zeros((1, N_KV, self.rows - 1, HEAD_DIM), dtype=np.float32)
-                    scratch[0, :, np.arange(self.rows - 1), 0] = toks[1:][:, None]
-                    out.append(scratch)
+                    scratch[0, :, np.arange(self.rows - 1), 0] = toks[1:][:, None] + (100 if role == "value" else 0)
+                    scratch_outputs.append(scratch)
+                out.extend([np.concatenate(scratch_outputs, axis=1)] if self.combined_scratch else scratch_outputs)
         return out
 
 
@@ -141,8 +145,10 @@ def _gen_from_cache(runner) -> list[int]:
             if runner._kv_cache["past_key_values.0.key_value"][0, 0, i, 0] != 0]
 
 
-def test_ptd_runner_cache_holds_full_greedy_cycle():
-    runner = _run_prompt("0")
+@pytest.mark.parametrize("combined_scratch", [True, False])
+def test_ptd_runner_cache_holds_full_greedy_cycle(combined_scratch):
+    runner = _PTDRunner(_FakePTDModel(1), _FakePTDModel(ROWS, combined_scratch=combined_scratch))
+    runner.run("0")
     gen = _expected_gen()
     assert runner._n_tokens_gen == len(gen)
     # Cache row i (i >= 1) holds the KV of gen[i-1]; the final token has none.
@@ -151,7 +157,7 @@ def test_ptd_runner_cache_holds_full_greedy_cycle():
         assert cache[0, 0, 0, 0] == 0  # prompt token
         for i in range(1, len(gen)):
             assert cache[0, 0, i, 0] == gen[i - 1], f"layer {l} key row {i}"
-            assert cache[0, N_KV, i, 0] == gen[i - 1], f"layer {l} value row {i}"
+            assert cache[0, N_KV, i, 0] == gen[i - 1] + 100, f"layer {l} value row {i}"
 
 
 def test_ptd_runner_hits_and_emission_bookkeeping():

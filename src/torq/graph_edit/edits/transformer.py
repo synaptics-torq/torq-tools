@@ -1038,7 +1038,8 @@ class CombineKVCacheMixin:
         input_prefix: str = "past_key_values",
         output_prefix: str = "present",
         kv_layer_re: str | re.Pattern = r"\.(\d+)\.(key|value)$",
-        combined_name_fmt: str = "{prefix}.{layer}"
+        combined_name_fmt: str = "{prefix}.{layer}",
+        combined_suffix: str = "",
     ):
         if isinstance(kv_layer_re, str):
             kv_layer_re = re.compile(kv_layer_re)
@@ -1101,7 +1102,7 @@ class CombineKVCacheMixin:
             combined_shape = kv_tensor_shape.copy()
             combined_shape[_H_DIM_AXIS] *= 2
             combined_input = gs.Variable(
-                name=f"{base}.key_value",
+                name=f"{base}.key_value{combined_suffix}",
                 dtype=key_input.dtype,
                 shape=combined_shape
             )
@@ -1205,12 +1206,12 @@ class CombineKVCacheMixin:
             combined_shape = kv_tensor_shape.copy()
             combined_shape[_H_DIM_AXIS] *= 2
             combined_tensor: gs.Variable = self._graph.layer(
-                name=f"{base}_kv_concat",
+                name=f"{base}_kv_concat{combined_suffix}",
                 op="Concat",
                 inputs=[key_output, value_output],
                 outputs=[
                     gs.Variable(
-                        name=f"{base}.key_value",
+                        name=f"{base}.key_value{combined_suffix}",
                         dtype=key_output.dtype,
                         shape=combined_shape,
                     )

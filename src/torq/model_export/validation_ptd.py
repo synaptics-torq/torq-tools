@@ -150,9 +150,9 @@ def validate_ptd_onnx(
         )
         update_cache(out)
 
-    # Scratch output sanity: per-layer K and V scratch tensors exist.
+    # Scratch output sanity: K/V may be combined into one tensor per layer.
     n_scratch = len([name for name in _output_index(ptd_body) if name.endswith("_scratch")])
-    assert n_scratch >= 2, "PTD body exposes no scratch KV outputs"
+    assert n_scratch >= 1, "PTD body exposes no scratch KV outputs"
 
     logger.info(
         "(PTD-validation) single-path check passed: %d packed rows match sequential "

@@ -632,15 +632,17 @@ class StaticPTDRunner(StaticDecoderOnlyRunner):
         """
         cache = self._kv_cache
         if self._combined_kv_io:
-            H = self._n_kv_heads  # per-role head count (cache stores 2H combined)
             for l in range(self._n_layers):
                 committed = out_map[f"present.{l}.key_value"]
-                k_scr = out_map[f"present.{l}.key_scratch"]
-                v_scr = out_map[f"present.{l}.value_scratch"]
+                scratch = out_map.get(f"present.{l}.key_value_scratch")
+                if scratch is None:  # Older exports kept scratch K/V separate.
+                    scratch = np.concatenate(
+                        [out_map[f"present.{l}.key_scratch"], out_map[f"present.{l}.value_scratch"]],
+                        axis=1,
+                    )
                 for j, node in enumerate(accepted):
                     s = packing.candidate_slots[node] - 1  # scratch row index
-                    committed[0, :H, L + 1 + j, :] = k_scr[0, :, s, :]
-                    committed[0, H:, L + 1 + j, :] = v_scr[0, :, s, :]
+                    committed[0, :, L + 1 + j, :] = scratch[0, :, s, :]
             return [out_map[name.replace("past_key_values", "present")] for name in cache]
         for l in range(self._n_layers):
             for role in ("key", "value"):

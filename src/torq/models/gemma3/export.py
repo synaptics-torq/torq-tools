@@ -542,6 +542,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._max_gen_tokens,                                           # L
                 self._config.head_dim                                           # D
             ])
+            if component == "model_ptd":
+                editor.combine_kv_io_tensors(
+                    [1, self._config.num_key_value_heads, self._ptd_rows - 1, self._config.head_dim],
+                    kv_layer_re=r"\.(\d+)\.(key|value)_scratch$",
+                    combined_suffix="_scratch",
+                )
 
         if self._trim_vocab:
             spec = self._get_trimmed_vocab_spec()
