@@ -1,0 +1,15 @@
+# GPTQ calibration environment for run_gptq.py.
+#
+# Keep this in its own virtualenv: current llmcompressor releases need
+# transformers 5.x, which conflicts with optimum-onnx in the main torq-tools
+# environment (transformers <4.58). The exporter only reads the resulting
+# safetensors, so it does not need any of these packages.
+#
+# CPU-only install: pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Validated on 2026-10-05 with llmcompressor 0.14.0, compressed-tensors 0.19.0,
+# transformers 5.17.0, torch 2.11.0+cpu.
+llmcompressor>=0.14.0
+compressed-tensors
+datasets
+torch>=2.4
+safetensors
