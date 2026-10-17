@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from shutil import copy2
 
@@ -27,12 +28,32 @@ COMPILE_FLAGS_FILE = "compile_flags.json"
 
 
 def read_compile_flags_file(path: str | Path) -> dict:
-    """Parse a ``compile_flags.json`` (``{"flags": [...], "w8a8": [...]}``);
-    ``{}`` when absent."""
+    """Parse a ``compile_flags.json``; ``{}`` when absent.
+    """
     path = Path(path)
     if not path.is_file():
         return {}
     return json.loads(path.read_text())
+
+
+def select_compile_flags_entry(data: dict, compiler_version: str | None) -> dict:
+    """The flag set validated for exactly ``compiler_version`` from a parsed
+    model ``compile_flags.json``.
+
+    Version matches are exact: a compiler version with no entry  gets ``{}`` 
+    and a warning, and the model compiles without its validated flag set. 
+    ``{}`` also when the file is empty.
+    """
+    if not data:
+        return {}
+    if compiler_version in data:
+        return data[compiler_version]
+    logger.warning(
+        "No validated compile flags for torq-compile version %s (validated: %s); "
+        "compiling without the model's flag set",
+        compiler_version, ", ".join(sorted(data)),
+    )
+    return {}
 
 
 def _resolve_compiler(compiler_path: str | Path | None = None) -> str:
@@ -45,18 +66,26 @@ def get_iree_version(compiler: str | None = None) -> str | None:
     import re
 
     compiler = compiler or _resolve_compiler()
+    out = None
     try:
         out = subprocess.check_output([compiler, "--version"], text=True)
     except FileNotFoundError:
-        logger.warning("Failed to check torq-compile version; Ensure '%s' is installed and accessible from PATH", compiler)
+        pass
+    if out is not None:
+        m = re.search(r"IREE compiler version ([\w.\-+]+)", out)
+        if m and m.group(1).lower() != "unknown":
+            return m.group(1)
+    # The binary can't report a version: fall back to the installed package, 
+    # which carries the same version the wheel bakes into its binaries.
+    try:
+        return version("torq-compiler")
+    except PackageNotFoundError:
+        logger.warning(
+            "Failed to check torq-compile version; ensure '%s' is installed "
+            "and accessible from PATH, or install the torq-compiler package",
+            compiler,
+        )
         return None
-    m = re.search(r"IREE compiler version ([\w.\-+]+)", out)
-    if not m:
-        return None
-    ver_str = m.group(1)
-    if ver_str.lower() == "unknown":
-        return None
-    return ver_str
 
 
 def export_onnx_to_mlir(

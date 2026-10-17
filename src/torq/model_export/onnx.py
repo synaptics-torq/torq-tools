@@ -28,7 +28,13 @@ from torq.lab.quantization.onnx.dynamic import (
     summarize_dynamic_quantization,
 )
 
-from ..utils.compile import export_torq, COMPILE_FLAGS_FILE, read_compile_flags_file
+from ..utils.compile import (
+    export_torq,
+    COMPILE_FLAGS_FILE,
+    get_iree_version,
+    read_compile_flags_file,
+    select_compile_flags_entry,
+)
 from ..utils.onnx import (
     get_model_opset,
     get_model_ops_count,
@@ -181,14 +187,20 @@ class OnnxModelExporterBase(ABC):
         """
         return Path(inspect.getfile(self.__class__)).parent / COMPILE_FLAGS_FILE
 
-    def _model_compile_flags(self, *, quantized: bool = False) -> list[str]:
+    def _model_compile_flags(
+        self,
+        *,
+        quantized: bool = False,
+        compiler_path: str | os.PathLike | None = None,
+    ) -> list[str]:
         """The validated torq-compile flag set for this model, if the exporter's
         package ships a ``compile_flags.json``"""
-        data = read_compile_flags_file(self._compile_flags_file())
-        flags = list(data.get("flags") or [])
-        if quantized:
-            flags += list(data.get("w8a8") or [])
-        return flags
+        entry = select_compile_flags_entry(
+            read_compile_flags_file(self._compile_flags_file()),
+            get_iree_version(compiler_path),
+        )
+        groups = ["common", "dynamic_quantize"] if quantized else ["common"]
+        return [flag for group in groups for flag in entry.get(group) or []]
 
     def _auto_torq_compile_extras(self) -> list[str]:
         """torq-compile flags derived from this run's export options."""
@@ -627,7 +639,7 @@ class OnnxModelExporterBase(ABC):
         # batched prefill) are appended unless the user already set one.
         user_args = list(torq_compile_args or [])
         quantized = self._dynamic_quantize and not self._convert_dtypes
-        torq_compile_args = self._model_compile_flags(quantized=quantized) + user_args
+        torq_compile_args = self._model_compile_flags(quantized=quantized, compiler_path=compiler_path) + user_args
         if "--torq-max-nss-programs-size" not in torq_compile_args:
             torq_compile_args += self._auto_torq_compile_extras()
         if self._torq_dir.exists():
