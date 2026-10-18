@@ -58,6 +58,7 @@ __all__ = [
 # (gemma3-1b) or the VL vision / image-decoder builds (~195-205 MB) need more
 # still. Harmless for components that fit.
 TORQ_MAX_NSS_PROGRAMS_SIZE = "402653184"
+NSS_PROGRAMS_SIZE_FLAG = "--torq-max-nss-programs-size"
 
 FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
     "float": onnx.TensorProto.FLOAT,
@@ -209,7 +210,7 @@ class OnnxModelExporterBase(ABC):
         # other exporters.
         if getattr(self, "_batch_prefill", None) is None:
             return []
-        return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
+        return [NSS_PROGRAMS_SIZE_FLAG, TORQ_MAX_NSS_PROGRAMS_SIZE]
 
     def _write_compile_flags_snapshot(self, variant_dir: str | os.PathLike, *, quantized: bool = False) -> None:
         """Record the auto-applied torq-compile flags in the variant dir. """
@@ -306,6 +307,32 @@ class OnnxModelExporterBase(ABC):
 
     @abstractmethod
     def validate_onnx(self, n_iters: int = 5): ...
+
+    def _torq_compile_args_for(self, component: str) -> list[str]:
+        """Run-derived torq-compile args for one component, appended after the
+        shared ``torq_compile_args`` unless those already set an NSS program
+        budget (an explicit user value always wins). Default: the run-wide
+        :meth:`_auto_torq_compile_extras`.
+
+        Exists because compile knobs can be per-component in effect even when
+        they look global: ``--torq-max-nss-programs-size`` reserves its full
+        value inside every network's XRAM address map, so a cap sized for the
+        biggest component, passed to all of them, inflates each network's
+        IOMMU footprint and the whole bundle can stop fitting on the device
+        (observed as ``failed to acquire hardware`` /
+        ``Failed to map SG table ... -12`` with five networks x 384 MB).
+        Override to right-size per component instead.
+        """
+        return self._auto_torq_compile_extras()
+
+    def _torq_entry_point(self, component: str) -> str:
+        """Name of the compiled vmfb's entry function (i.e. the ONNX graph name).
+
+        The runtime looks functions up by name, so a component whose runner
+        expects something other than ``main`` must override this — compiling it
+        as ``main`` produces a vmfb that loads but cannot be invoked.
+        """
+        return "main"
 
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """Whether ``component`` is *intentionally* exported with dynamic shapes.
@@ -635,13 +662,16 @@ class OnnxModelExporterBase(ABC):
         skip = skip or []
         # The model's validated flag set (see _model_compile_flags) comes first,
         # then the user's --compile-flags, so an explicit user value wins on
-        # duplicates; the run-derived extras (NSS program-space budget for
-        # batched prefill) are appended unless the user already set one.
+        # duplicates; the run-derived per-component extras (NSS program-space
+        # budget, see _torq_compile_args_for) are appended unless one is
+        # already set.
         user_args = list(torq_compile_args or [])
         quantized = self._dynamic_quantize and not self._convert_dtypes
         torq_compile_args = self._model_compile_flags(quantized=quantized, compiler_path=compiler_path) + user_args
-        if "--torq-max-nss-programs-size" not in torq_compile_args:
-            torq_compile_args += self._auto_torq_compile_extras()
+        nss_budget_set = any(
+            a == NSS_PROGRAMS_SIZE_FLAG or a.startswith(NSS_PROGRAMS_SIZE_FLAG + "=")
+            for a in torq_compile_args
+        )
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
@@ -649,10 +679,13 @@ class OnnxModelExporterBase(ABC):
             if comp in skip:
                 self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
+            comp_args = list(torq_compile_args)
+            if not nss_budget_set:
+                comp_args += self._torq_compile_args_for(comp)
             self._logger.info("(Torq-export) Exporting %s model @ '%s' to Torq...", comp, str(onnx_path))
             model = load_onnx_lazy(onnx_path)
             graph = gs.import_onnx(model)
-            graph.name = "main"
+            graph.name = self._torq_entry_point(comp)
             graph.cleanup(
                 remove_unused_graph_inputs=True, remove_unused_node_outputs=True
             ).toposort()
@@ -663,7 +696,7 @@ class OnnxModelExporterBase(ABC):
                 onnx_path,
                 self._torq_dir,
                 opset=get_model_opset(model),
-                compiler_args=torq_compile_args,
+                compiler_args=comp_args,
                 use_binary=use_binary,
                 local_compile=local_compile,
                 compiler_path=compiler_path,
