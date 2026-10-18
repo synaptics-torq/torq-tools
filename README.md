@@ -79,6 +79,17 @@ Or manually via their requirements file:
 pip install -r "$torq_tools_dir/src/torq/models/moonshine/requirements.txt"
 ```
 
+#### Moonshine Streaming (separate environment)
+`moonshine_streaming` requires `transformers` 5.x, which is incompatible with the `optimum`-based exporters in the base environment (they cap `transformers` below 4.58). **Do not** install it into the base environment: pip will report dependency conflicts, and the `optimum`-based exporters (gemma3, smollm2, liquid, siglip2, non-streaming moonshine) break under `transformers` 5.x.
+Set up the dedicated environment with the helper script:
+
+```bash
+bash src/torq/models/moonshine_streaming/install_requirements.sh
+source .venv-moonshine-streaming/bin/activate
+```
+
+The script creates `.venv-moonshine-streaming` at the repository root (pass a different directory as its first argument to relocate it) with torq-tools and the pinned requirements in `requirements.txt`. `huggingface_hub` is left unpinned there so `transformers` 5.x can resolve the version it needs. For the development variant (editable install, pytest), see [CONTRIBUTING.md](CONTRIBUTING.md#development-environment).
+
 ## Usage
 `torq-tools` can be used directly from the command line or imported into application code via the `torq` namespace.
 
@@ -122,14 +133,12 @@ To export a static Moonshine Streaming model (fixed audio chunk, with dtype conv
 python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280 --convert-dtypes
 ```
 > [!NOTE]
-> Moonshine Streaming requires the `moonshine-streaming` extra (`transformers>=5.5.1`). The
-> exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
+> Moonshine Streaming requires a separate virtual environment since `transformers` 5.x
+> conflicts with the base `optimum`-based exporters; see [Install extras](#moonshine-streaming-separate-environment).
+The exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
 > e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side
 > `*.npy` LUTs and a `streaming_config.json`.
 
-> [!WARNING]
-> This tool assumes the model's default `shape` values are valid and mutually consistent. If any tensor has an invalid
-> default shape (e.g., `0` or `-1`), the exported model will have incorrect static shapes.
 
 #### Run inference
 You can run inference directly using helper scripts that support multiple runtimes.

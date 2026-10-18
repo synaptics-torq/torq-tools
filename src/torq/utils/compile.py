@@ -211,7 +211,6 @@ def compile_mlir_for_vm(
     elif target == "torq":
         if local_compile:
             compiler_args += [
-                "--torq-css-qemu",
                 "--torq-target-host-triple=native"
             ]
 

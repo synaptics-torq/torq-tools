@@ -697,6 +697,9 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
             feat_len=self._feature_stride,
         )
         editor.apply_specs(self.graph_edit_blocks()["encoder.static"], self._harness)
+        # HF bakes -finfo.min mask sentinels into the static graph; clamp them
+        # before conversion (see _graph.clamp_attention_mask_constants).
+        editor.clamp_attention_mask_constants()
         # Ensure kernel_shape is present on all 1-D Conv nodes (dynamo may omit it).
         for node in list(editor._graph.nodes):
             if node.op == "Conv":

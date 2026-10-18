@@ -12,6 +12,13 @@ from ...graph_edit.edits import CommonGraphEditsMixin, CombineKVCacheMixin
 from ...graph_edit.edits.transformer import MaskFutureAttentionScores
 from ...graph_edit.edits.arithmetic import DecomposeLayerNormalization
 
+# Finite sentinel for blocked attention entries, matching MaskFutureAttentionScores.
+# transformers' eager mask interface materializes blocked entries as -finfo(min),
+# which the static encoder export bakes into fp32 constants; the sentinels then
+# exceed the bf16 converter's max_float guard (|value| <= 1e9) and --convert-dtypes
+# fails. -1e9 zeroes the same softmax outputs and converts cleanly to bf16/int32.
+_ATTN_BLOCK_BIAS = -1e9
+
 
 @dataclass
 class DecomposeGelu(OnnxGraphEdit):
@@ -241,6 +248,21 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
                             node.outputs.clear()
                             node.inputs.clear()
         self._graph.cleanup().toposort()
+        return self
+
+    def clamp_attention_mask_constants(self):
+        """Clamp large-negative float constants down to ``_ATTN_BLOCK_BIAS``.
+        """
+        for tensor in self._graph.tensors().values():
+            values = getattr(tensor, "values", None)
+            if values is None or not np.issubdtype(values.dtype, np.floating) or values.size == 0:
+                continue
+            if (min_value := values.min()) < _ATTN_BLOCK_BIAS:
+                tensor.values = np.clip(values, _ATTN_BLOCK_BIAS, None)
+                self._logger.info(
+                    "Clamped attention mask constant '%s' (min %g) to %g",
+                    tensor.name, min_value, _ATTN_BLOCK_BIAS,
+                )
         return self
 
     def decompose_asinh(self):

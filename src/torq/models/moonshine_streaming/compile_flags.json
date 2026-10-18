@@ -6,9 +6,7 @@
       "--iree-flow-inline-constants-max-byte-length=300000000",
       "--torq-convert-dtypes",
       "--torq-convert-io-dtype",
-      "--torq-disable-slicing"
-    ],
-    "dynamic_quantize": [
+      "--torq-disable-slicing",
       "--torq-disable-host",
       "--torq-disable-css"
     ]
