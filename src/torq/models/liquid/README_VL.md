@@ -88,6 +88,9 @@ torq-export-model liquid-vl \
   --use-binary --compiler-path $C
 ```
 
+`--batch-prefill 0` skips `transformer_prefill.vmfb`, which the board demo
+does not use (the image-prefill parts cover the 64 image tokens).
+
 The default export is the lower-TTFT body/head split: the decoder becomes
 `transformer.onnx` (`last_hidden_states` output) + a standalone `lm_head.onnx`,
 exported under `export/split_lm_head/…` (like the text-only liquid export).
@@ -220,9 +223,14 @@ Every board artifact from one topology is reproducible from a single
 `torq-export-model liquid-vl` invocation — the flags compose, so the
 full-bundle command in §1 emits the vision and image-part vmfbs alongside the
 fused decoder in one run. Compile is heavy for the vision encoder and the
-image-decoder parts (`--torq-max-nss-programs-size` is right-sized per
-component automatically: 32 MB for the vision encoder, 192 MB for each image
-part, the compiler default for the decoder / lm_head).
+image-decoder parts. None of the board components needs more than the
+compiler's default 8 MB of NSS program space (measured with torq-compile
+2.2.1 and 2.3: vision ~5 MB, each image part <5 MB, decoder / lm_head <1 MB),
+so only `transformer_prefill` (`--batch-prefill N`) gets a raised
+`--torq-max-nss-programs-size`. Keep it that way: the budget is reserved in
+every network's XRAM address map, and a blanket 384 MB cap on all five
+networks left the demo unable to acquire the NPU (`failed to acquire
+hardware`, kernel `Failed to map SG table ... -12`).
 
 > The vision encoder and the image-decoder parts are built during
 > `convert_models`, i.e. *after* `export_onnx`'s static-shape verification loop

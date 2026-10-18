@@ -46,7 +46,6 @@ from .export import (
 from ._graph import LiquidOnnxGraphEditor
 from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import (
-    NSS_PROGRAMS_SIZE_FLAG,
     OnnxModelExporterBase,
 )
 
@@ -811,23 +810,21 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return super().export_torq(*args, skip=skip, torq_compile_args=torq_compile_args, **kwargs)
 
     def _torq_compile_args_for(self, component: str) -> list[str]:
-        """Per-component NSS-programs caps (see the base hook's docstring for
-        why this must NOT be one global value).
+        """Only the batched-prefill decoder gets the run-wide NSS program
+        budget; every other VL component compiles with the compiler default.
 
-        Measured requirements: the 256-res vision encoder needs ~12.1 MB (the
-        8 MB default fails with 'Not enough space available for NSS programs');
-        the 8-layer image-prefill parts need >101 MB (image_prefill.md §3e; the
-        192 MB value is that doc's proven headroom). The decoder / lm_head fit
-        the default and get only the base's run-derived budget (batched
-        prefill). A former global 384 MB cap made every network's XRAM
-        footprint ~384 MB and the 5-network VL demo could not acquire the
-        hardware; it also slowed the vision compile ~16x.
+        The budget is reserved inside each network's XRAM address map (see the
+        base hook), and the board demo runs five networks, so it must not be
+        handed to components that do not need it. Measured with torq-compile
+        2.2.1 and 2.3, the 256-res vision encoder needs ~5 MB, each image-
+        prefill part <5 MB, and the decoder / lm_head <1 MB — all under the
+        8 MB default (pre-2.2.1 builds needed 12 MB / >100 MB, hence the
+        old caps). A former blanket 384 MB cap made the 5-network demo fail
+        with ``failed to acquire hardware``.
         """
-        if self._vision_res and component == f"vision_encoder_{self._vision_res}":
-            return [NSS_PROGRAMS_SIZE_FLAG, "33554432"]
-        if component.startswith("decoder_image_"):
-            return [NSS_PROGRAMS_SIZE_FLAG, "201326592"]
-        return super()._torq_compile_args_for(component)
+        if component == DECODER_PREFILL:
+            return super()._torq_compile_args_for(component)
+        return []
 
     # ------------------------------------------------------- deployment assets
     def _find_tokenizer(self) -> Path | None:
