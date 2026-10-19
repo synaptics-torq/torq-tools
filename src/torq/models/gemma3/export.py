@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 import argparse
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -17,7 +18,7 @@ from onnx import numpy_helper
 from tokenizers import Tokenizer
 from transformers import AutoConfig
 
-from . import add_gemma3_export_args
+from . import GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
 from ._trim_vocab import (
@@ -630,8 +631,41 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             return summarize_dynamic_quantization(model_path, fake_path)
 
 
+logger = logging.getLogger("Gemma3.export")
+
+
+def _resolve_gptq_checkpoint(args: argparse.Namespace, weight_quantization: str | None) -> Path | None:
+    """The GPTQ checkpoint for --weight-quantization int4: --gptq-checkpoint, else the hosted
+    one when the source is the one it was made for (270m instruct), else None (round-to-nearest).
+    """
+    if weight_quantization != "int4":
+        return None
+    if args.gptq_checkpoint:
+        return Path(args.gptq_checkpoint)
+    if not args.gptq:
+        return None
+    source = args.hf_repo or f"google/gemma-3-{args.model_size}{'-it' if args.instruct_model else ''}"
+    if source != GPTQ_SOURCE_REPO or args.onnx_source_dir:
+        logger.warning(
+            "No hosted GPTQ weights for %s: the INT4 weights use round-to-nearest. "
+            "Pass --gptq-checkpoint to use GPTQ weights", source,
+        )
+        return None
+    from huggingface_hub import snapshot_download
+
+    local = snapshot_download(GPTQ_HF_REPO, allow_patterns=["gptq/*"])
+    return Path(local) / "gptq"
+
+
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
+    weight_quantization = None if args.weight_quantization == "none" else args.weight_quantization
+    if weight_quantization and args.dynamic_quantize:
+        logger.info("--dynamic-quantize: the weights are not quantized to %s", weight_quantization)
+        weight_quantization = None
+    # The weight quantization writes a bf16 model, so it replaces --convert-dtypes.
+    convert_dtypes = args.convert_dtypes and weight_quantization is None
+    gptq_checkpoint = _resolve_gptq_checkpoint(args, weight_quantization)
     exporter = Gemma3ModelExporter(
         args.model_size,
         args.instruct_model,
@@ -646,7 +680,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         dynamic_quantize=args.dynamic_quantize,
-        convert_dtypes=args.convert_dtypes,
+        convert_dtypes=convert_dtypes,
         trim_vocab=args.trim_vocab,
         split_lm_head=args.split_lm_head,
         trim_vocab_groups=args.trim_vocab_groups,
@@ -654,8 +688,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
         split_weights=args.split_weights,
         replace_int_bf16_cast=args.replace_int_bf16_cast,
         broadcast_ops=args.broadcast_ops,
-        weight_quantization=args.weight_quantization,
-        gptq_checkpoint=args.gptq_checkpoint,
+        weight_quantization=weight_quantization,
+        gptq_checkpoint=gptq_checkpoint,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:
@@ -669,9 +703,9 @@ def export_gemma3_from_args(args: argparse.Namespace):
             uint8_weights=args.dynamic_quantize_uint8_weights,
             per_tensor=args.dynamic_quantize_per_tensor,
         )
-    if args.weight_quantization:
+    if weight_quantization:
         exporter.weight_quantize_models()
-    if args.convert_dtypes:
+    if convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:
         exporter.export_torq(

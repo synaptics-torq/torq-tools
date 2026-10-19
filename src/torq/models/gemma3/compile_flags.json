@@ -20,7 +20,8 @@
       "--iree-flow-inline-constants-max-byte-length=300000000",
       "--torq-convert-dtypes",
       "--torq-convert-io-dtype",
-      "--torq-disable-slicing"
+      "--torq-disable-slicing",
+      "--torq-prefetch-algorithm=stream-schedule"
     ]
   }
 }

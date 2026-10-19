@@ -27,6 +27,8 @@ pytestmark = pytest.mark.unit
 
 # torq-compile 2.2.1 host/CSS pipeline bug workaround (dynamic-quantize models).
 HOST_CSS_WORKAROUND = ["--torq-disable-host", "--torq-disable-css"]
+# Validated for the LLM exporters only (gemma3, qwen).
+STREAM_SCHEDULE_FLAG = "--torq-prefetch-algorithm=stream-schedule"
 
 
 @pytest.fixture(autouse=True)
@@ -106,11 +108,16 @@ def test_source_tree_model_flag_files_are_complete():
         )
     # moonshine is validated against the LLM flag set, not its own;
     # moonshine_streaming matches it, except versions that inline the
-    # dynamic_quantize workaround into common (see above).
+    # dynamic_quantize workaround into common (see above). The stream-schedule
+    # prefetch is validated for the LLM only, so it is not part of the shared set.
     llm = json.loads((models_dir / "gemma3" / COMPILE_FLAGS_FILE).read_text())
     for model in ("moonshine", "moonshine_streaming"):
         data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
         for version, entry in llm.items():
+            entry = {
+                group: [f for f in flags if f != STREAM_SCHEDULE_FLAG]
+                for group, flags in entry.items()
+            }
             inlined = {"common": entry["common"] + entry.get("dynamic_quantize", [])}
             assert data.get(version) in (entry, inlined), (
                 f"{model}: {version} flags drifted from the LLM set"
