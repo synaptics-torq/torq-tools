@@ -262,7 +262,10 @@ each flag from `compile_flags.json` in the export dir.
 
 The flags include `--torq-convert-io-dtype`, so the compiled model takes bf16
 embeddings and int32 token IDs. The one-command export writes the host files in
-these dtypes; after a standalone compile, convert them yourself:
+these dtypes. A standalone compile keeps them in fp32 and int64; the demo still
+runs with them (the runner casts the embedding row), but you can convert them
+(optional). This halves the size of `token_embeddings.npy` and makes the files
+match the hosted ones:
 
 ```sh
 python -c "import numpy as np, ml_dtypes; np.save('token_embeddings.npy', np.load('token_embeddings.npy').astype(ml_dtypes.bfloat16)); np.save('token_id_lut.npy', np.load('token_id_lut.npy').astype(np.int32))"
