@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+# Complete pin list for the dedicated moonshine_streaming environment
+# (see install_requirements.sh): transformers 5.x conflicts with the base
+# environment's optimum-based exporters (which cap transformers <4.58), so
+# this venv holds the shared runtime stack plus the moonshine pins.
+
+# Shared runtime stack (torq.lab converter/compiler, graph editing,
+# validation). Keep in sync with the base pins in pyproject.toml.
+# huggingface_hub is deliberately unpinned: transformers 5.x resolves the
+# version it needs (newer than the base pin).
+torq-compiler==2.3.0
+onnx==1.21.0
+onnxruntime==1.26.0
+onnx_graphsurgeon==0.6.1
+numpy==2.5.1
+ml_dtypes==0.5.4
+datasets==4.8.5
+tokenizers==0.22.2
+pyyaml==6.0.3
+
 # Moonshine Streaming requires the `moonshine_streaming` model class, which was added to
 # Hugging Face Transformers in the 5.5.x series.
 transformers==5.12.1
@@ -13,3 +32,5 @@ onnxscript==0.7.1
 # Validation: audio loading + resampling to 16 kHz.
 soundfile==0.14.0
 scipy==1.18.0
+# Audio decoding for the validation dataset (datasets Audio column).
+torchcodec==0.17.0

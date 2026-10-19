@@ -22,17 +22,15 @@ Install optional extras only for workflows that need them:
 python -m pip install -e '.[moonshine]' --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-Moonshine Streaming is the exception: it requires `transformers` 5.x, which is
-incompatible with the `optimum`-based exporters (they cap `transformers` below
-4.58). Install it in a **separate** virtual environment from its own pinned
-requirements file:
+Moonshine Streaming is the exception: it requires `transformers` 5.x, which is incompatible with the `optimum`-based exporters (they cap `transformers` below 4.58). Do **not** layer it onto the base environment: installing it there
+produces pip resolver conflicts and breaks the `optimum`-based exporters. Set it up in a dedicated virtual environment (see [README.md](README.md#moonshine-streaming-separate-environment)):
 
 ```bash
-python3 -m venv .venv-moonshine-streaming
+bash src/torq/models/moonshine_streaming/install_requirements.sh
 source .venv-moonshine-streaming/bin/activate
-python -m pip install -r src/torq/models/moonshine_streaming/requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cpu
 ```
+
+The script installs torq-tools in editable mode with `--no-deps` (skipping the base `optimum`/`transformers` 4.x pins) plus the complete pinned requirements.
 
 Generated model artifacts should stay in ignored locations such as `models/`, `.torq/`, or pytest `tmp_path`. Large generated files like `.onnx`, `.tflite`, `.vmfb`, and `.mlir` are usually better to reproduce from commands than to commit.
 
