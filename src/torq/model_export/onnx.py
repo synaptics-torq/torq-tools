@@ -166,9 +166,11 @@ class OnnxModelExporterBase(ABC):
 
     def _stage_runtime_dtype_artefacts(self, variant_roots: set[Path]) -> None:
         """Copy each variant's ``.npy`` artefacts into ``self._torq_dir`` in
-        the runtime dtype the compiled vmfbs expect.
+        the runtime dtype the compiled vmfbs expect, and its ``config.json`` and
+        ``tokenizer.json``, so that the compiled dir is complete for the runners.
         """
         for root in sorted(variant_roots):
+            self._copy_runtime_assets(self._torq_dir, root, include_npy_data=False)
             for npy in sorted(root.glob("*.npy")):
                 data = np.load(npy)
                 data = data.astype(
