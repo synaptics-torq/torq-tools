@@ -32,7 +32,7 @@ The command does these steps:
    `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
    GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
 6. It converts the model to bf16 and int32 and compiles `transformer.vmfb` and
-   `lm_head.vmfb` with the flags in [`compile_flags.json`](compile_flags.json).
+   `lm_head.vmfb.trim` with the flags in [`compile_flags.json`](compile_flags.json).
 
 The Torq model repositories are private. Log in with `hf auth login` first.
 
@@ -103,7 +103,7 @@ warning. Flags after `--compile-flags` come last and take precedence.
 ```text
 models/<hf-repo>/export/torq/converted/static/
     transformer.vmfb
-    lm_head.vmfb
+    lm_head.vmfb.trim
     token_embeddings.npy
     token_id_lut.npy
     tokenizer.json, tokenizer_config.json, config.json, generation_config.json

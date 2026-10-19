@@ -345,7 +345,11 @@ class QwenStatic(QwenBase, StaticDecoderOnlyRunner):
     @classmethod
     def from_vmfb(cls, model_path: str | os.PathLike, max_gen_tokens: int, max_inp_len: int | None = None, n_threads: int | None = None, repo_id: str | None = None, combined_kv_io: bool = True) -> "QwenStatic":
         model_path = Path(model_path)
-        lm_head_path = model_path.parent / "lm_head.vmfb"
+        # A trimmed-vocabulary LM head is named lm_head.vmfb.trim.
+        lm_head_path = next(
+            (p for p in (model_path.parent / "lm_head.vmfb.trim", model_path.parent / "lm_head.vmfb") if p.exists()),
+            model_path.parent / "lm_head.vmfb",
+        )
         lm_head = VMFBInferenceRunner(lm_head_path, n_threads=n_threads, device_uri="torq") if lm_head_path.exists() else None
         return cls(VMFBInferenceRunner(model_path, n_threads=n_threads, device_uri="torq"), max_prompt_tokens=max_inp_len, max_gen_tokens=max_gen_tokens, repo_id=repo_id, combined_kv_io=combined_kv_io, lm_head=lm_head)
 

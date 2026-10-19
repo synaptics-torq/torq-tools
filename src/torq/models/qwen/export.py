@@ -1364,6 +1364,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._export_paths["model"].parent,
             include_tables=True,
         )
+        self._name_trimmed_lm_head()
 
 
 def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:

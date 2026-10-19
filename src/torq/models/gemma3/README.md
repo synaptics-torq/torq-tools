@@ -51,7 +51,7 @@ This is the model of the torq-examples `gemma3` demo
 and the GPTQ INT4 weights (the `gptq/` folder of that repository), builds the
 static model with a trimmed vocabulary and a separate LM head, quantizes the
 weights to INT4, and compiles `transformer.vmfb`, `transformer_prefill.vmfb`
-and `lm_head.vmfb`. Equivalent module form: `python -m torq.models.gemma3.export …`.
+and `lm_head.vmfb.trim` (the trimmed-vocabulary LM head). Equivalent module form: `python -m torq.models.gemma3.export …`.
 
 The `.vmfb` files and the host files (`token_embeddings.npy` in bf16,
 `token_id_lut.npy` in int32, `tokenizer.json`, `config.json`) are in

@@ -182,6 +182,20 @@ class OnnxModelExporterBase(ABC):
                     "(Torq-export) Staged '%s' (%s) -> '%s'", npy.name, data.dtype, dst
                 )
 
+    def _name_trimmed_lm_head(self, *src_dirs: str | os.PathLike) -> None:
+        """Rename ``lm_head.vmfb`` in ``self._torq_dir`` to ``lm_head.vmfb.trim``
+        when the vocabulary is trimmed (a ``token_id_lut.npy`` in the torq dir or
+        in one of ``src_dirs``), the name the Synaptics model repos use for a
+        trimmed-vocabulary LM head.
+        """
+        lm_head = Path(self._torq_dir) / "lm_head.vmfb"
+        dirs = [Path(self._torq_dir), *(Path(d) for d in src_dirs)]
+        if not lm_head.exists() or not any((d / "token_id_lut.npy").exists() for d in dirs):
+            return
+        trimmed = lm_head.with_name("lm_head.vmfb.trim")
+        os.replace(lm_head, trimmed)
+        self._logger.info("(Torq-export) Trimmed-vocabulary LM head: '%s'", trimmed)
+
     def _compile_flags_file(self) -> Path:
         """Location of this model's validated torq-compile flag set: the
         ``compile_flags.json`` shipped in the exporter's package, next to the
@@ -680,3 +694,6 @@ class OnnxModelExporterBase(ABC):
                 if comp not in skip
             }
             self._stage_runtime_dtype_artefacts(roots)
+        self._name_trimmed_lm_head(
+            *{Path(p).parent for c, p in self._export_paths.items() if c not in skip}
+        )
