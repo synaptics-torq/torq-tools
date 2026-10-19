@@ -58,6 +58,11 @@ moonshine = [
 ]
 all = ["torq-tools[moonshine]"]
 
+# The exporters read their validated torq-compile flags from compile_flags.json next
+# to their module; without this, a non-editable install has no flags.
+[tool.setuptools.package-data]
+"*" = ["compile_flags.json"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = ["src", "tests"]
