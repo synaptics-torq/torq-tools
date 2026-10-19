@@ -5,9 +5,7 @@ import argparse
 import json
 import logging
 import os
-import re
 import shutil
-import subprocess
 from pathlib import Path
 
 import ml_dtypes
@@ -27,7 +25,12 @@ from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
-from ...utils.compile import export_torq as compile_torq_model, read_compile_flags_file
+from ...utils.compile import (
+    export_torq as compile_torq_model,
+    get_iree_version,
+    read_compile_flags_file,
+    select_compile_flags_entry,
+)
 from torq.lab.model_tools.dtype_conversion.onnx import (
     FP32Converter,
     Int64Converter,
@@ -1256,12 +1259,11 @@ class QwenModelExporter(OnnxModelExporterBase):
         """
         Compile the Qwen ONNX model directly from its external-data file.
 
-        Each component is compiled with the ``flags`` of this package's
-        ``compile_flags.json``, then the list under its own name
-        (``transformer``, ``lm_head``), then the flags under
-        ``<name>_if_supported`` that the compiler knows, then
-        ``torq_compile_args``. With ``--split-lm-head`` the transformer is
-        written as ``transformer.vmfb``.
+        Each component is compiled with the flags that this package's
+        ``compile_flags.json`` validates for the installed compiler version:
+        ``common``, then the list under the component's own name
+        (``transformer``, ``lm_head``), then ``torq_compile_args``. With
+        ``--split-lm-head`` the transformer is written as ``transformer.vmfb``.
 
         The shared exporter reloads the full model into GraphSurgeon and
         re-saves it before compilation. Qwen3-0.6B uses multi-gigabyte
@@ -1291,9 +1293,11 @@ class QwenModelExporter(OnnxModelExporterBase):
             exist_ok=True,
         )
 
-        flags_file = read_compile_flags_file(self._compile_flags_file())
-        common_flags = list(flags_file.get("flags") or [])
-        compiler_options = _compiler_options(compiler_path)
+        flags_entry = select_compile_flags_entry(
+            read_compile_flags_file(self._compile_flags_file()),
+            get_iree_version(compiler_path),
+        )
+        common_flags = list(flags_entry.get("common") or [])
 
         for comp, onnx_path in self._export_paths.items():
             if comp in skip:
@@ -1326,21 +1330,9 @@ class QwenModelExporter(OnnxModelExporterBase):
             )
 
             name = "transformer" if comp == "model" and self._split_lm_head else Path(onnx_path).stem
-            optional_flags = []
-            for flag in flags_file.get(f"{name}_if_supported") or []:
-                if flag.split("=", 1)[0] in compiler_options:
-                    optional_flags.append(flag)
-                else:
-                    self._logger.warning(
-                        "(Torq-export) The compiler does not support '%s'; "
-                        "compiling %s without it",
-                        flag,
-                        name,
-                    )
             compiler_args = (
                 common_flags
-                + list(flags_file.get(name) or [])
-                + optional_flags
+                + list(flags_entry.get(name) or [])
                 + list(torq_compile_args or [])
             )
 
@@ -1372,21 +1364,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._export_paths["model"].parent,
             include_tables=True,
         )
-
-
-def _compiler_options(compiler_path: str | Path | None) -> set[str]:
-    """Return the option names (``--name``) that the torq-compile binary knows.
-
-    An empty set when the binary cannot be run, so optional flags are left out.
-    """
-    compiler = str(compiler_path or os.environ.get("TORQ_COMPILER_PATH", "torq-compile"))
-    try:
-        result = subprocess.run(
-            [compiler, "--help-hidden"], capture_output=True, text=True, timeout=120
-        )
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    return set(re.findall(r"^\s+(--[\w-]+)", result.stdout, flags=re.MULTILINE))
 
 
 def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:

@@ -68,11 +68,12 @@ model.
 
 ## Compile flags
 
-[`compile_flags.json`](compile_flags.json) has the flags for all components
-(`flags`) and the extra flags per component (`transformer`, `lm_head`). The
-flags in `<component>_if_supported` are added when the compiler supports them
-(the exporter checks `torq-compile --help-hidden`). Flags after
-`--compile-flags` come last and take precedence.
+[`compile_flags.json`](compile_flags.json) has one entry per validated
+torq-compiler version, as for the other models. Each entry has the flags for
+all components (`common`) and the extra flags per component (`transformer`,
+`lm_head`). The exporter uses the entry of the installed compiler version; a
+version without an entry compiles without the model's flags and shows a
+warning. Flags after `--compile-flags` come last and take precedence.
 
 - `--torq-disable-slicing`: the models are compiled without LinalgSlicing.
 - `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
