@@ -25,6 +25,9 @@ from support.model_export import StubExporter
 
 pytestmark = pytest.mark.unit
 
+# torq-compile 2.2.1 host/CSS pipeline bug workaround (dynamic-quantize models).
+HOST_CSS_WORKAROUND = ["--torq-disable-host", "--torq-disable-css"]
+
 
 @pytest.fixture(autouse=True)
 def _pin_compiler_version(monkeypatch):
@@ -32,6 +35,13 @@ def _pin_compiler_version(monkeypatch):
     (matching ``_flags_file``'s default) rather than the environment's.
     """
     monkeypatch.setattr(me, "get_iree_version", lambda compiler_path=None: "2.2.1")
+
+
+def _validated_versions(data: dict) -> list[str]:
+    """The compiler versions a parsed flag file validates: the top-level
+    version keys (per-version schema) or the ``version`` list (flat schema).
+    """
+    return data.get("version") or list(data)
 
 
 def _flags_file(
@@ -82,15 +92,29 @@ def test_source_tree_model_flag_files_are_complete():
         data = json.loads(path.read_text())
         for version, entry in data.items():
             assert entry.get("common"), f"{model} {version}: empty common flags"
-        assert data["2.2.1"].get("dynamic_quantize") == [
-            "--torq-disable-host",
-            "--torq-disable-css",
-        ], f"{model}: 2.2.1 dynamic_quantize workaround (torq-compile 2.2.1 host/CSS bug) missing"
-    # moonshine is validated against the LLM flag set, not its own.
+        # The float-only moonshine_streaming exporter inlines the workaround
+        # into common (it never compiles a dynamic_quantize variant); the
+        # other models carry it as a dynamic_quantize group.
+        entry = data["2.2.1"]
+        has_workaround = (
+            entry.get("dynamic_quantize") == HOST_CSS_WORKAROUND
+            or set(HOST_CSS_WORKAROUND) <= set(entry["common"])
+        )
+        assert has_workaround, (
+            f"{model}: 2.2.1 host/CSS workaround (torq-compile 2.2.1 host/CSS "
+            "bug) missing"
+        )
+    # moonshine is validated against the LLM flag set, not its own;
+    # moonshine_streaming matches it, except versions that inline the
+    # dynamic_quantize workaround into common (see above).
     llm = json.loads((models_dir / "gemma3" / COMPILE_FLAGS_FILE).read_text())
     for model in ("moonshine", "moonshine_streaming"):
         data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
-        assert data == llm, f"{model}: flags drifted from the LLM set"
+        for version, entry in llm.items():
+            inlined = {"common": entry["common"] + entry.get("dynamic_quantize", [])}
+            assert data.get(version) in (entry, inlined), (
+                f"{model}: {version} flags drifted from the LLM set"
+            )
 
 
 @pytest.mark.ci
@@ -110,10 +134,11 @@ def test_installed_compiler_matches_shipped_flag_versions():
     for path in sorted(models_dir.rglob(COMPILE_FLAGS_FILE)):
         rel = path.relative_to(models_dir)
         data = json.loads(path.read_text())
-        assert installed in data, (
+        validated = _validated_versions(data)
+        assert installed in validated, (
             f"{rel}: installed torq-compiler {installed} not in validated "
-            f"versions {sorted(data)!r}; re-validate the flags for {installed} "
-            "and add an entry alongside the compiler requirement"
+            f"versions {sorted(validated)!r}; re-validate the flags for "
+            f"{installed} and add an entry alongside the compiler requirement"
         )
 
 
@@ -134,9 +159,10 @@ def test_pinned_compiler_has_entries_in_all_flag_files():
     for path in sorted(models_dir.rglob(COMPILE_FLAGS_FILE)):
         rel = path.relative_to(models_dir)
         data = json.loads(path.read_text())
-        assert pinned in data, (
+        validated = _validated_versions(data)
+        assert pinned in validated, (
             f"{rel}: pinned torq-compiler {pinned} not in validated "
-            f"versions {sorted(data)!r}; add a flag set validated for "
+            f"versions {sorted(validated)!r}; add a flag set validated for "
             f"{pinned} so package installs can export this model"
         )
 
