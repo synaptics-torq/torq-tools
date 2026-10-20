@@ -1,21 +1,19 @@
 {
-  "version": ["2.3.0"],
-  "flags": [
-    "--torq-enable-annotate-tied-operands",
-    "--torq-enable-split-constants-optimization",
-    "--iree-flow-inline-constants-max-byte-length=300000000",
-    "--torq-convert-dtypes",
-    "--torq-convert-io-dtype",
-    "--torq-disable-slicing"
-  ],
-  "transformer": [
-    "--torq-max-nss-programs-size=12582912"
-  ],
-  "transformer_if_supported": [
-    "--torq-prefetch-algorithm=stream-schedule"
-  ],
-  "lm_head": [],
-  "lm_head_if_supported": [
-    "--torq-prefetch-algorithm=stream-schedule"
-  ]
+  "2.3.0": {
+    "common": [
+      "--torq-enable-annotate-tied-operands",
+      "--torq-enable-split-constants-optimization",
+      "--iree-flow-inline-constants-max-byte-length=300000000",
+      "--torq-convert-dtypes",
+      "--torq-convert-io-dtype",
+      "--torq-disable-slicing"
+    ],
+    "transformer": [
+      "--torq-max-nss-programs-size=12582912",
+      "--torq-prefetch-algorithm=stream-schedule"
+    ],
+    "lm_head": [
+      "--torq-prefetch-algorithm=stream-schedule"
+    ]
+  }
 }

@@ -292,7 +292,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         prefill_model_path: str | os.PathLike | None = None,
         prefill_size: int | None = None,
     ) -> "Gemma3Static":
-        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb")
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb*")
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
             model_path, "transformer_prefill.vmfb"
         )

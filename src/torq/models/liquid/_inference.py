@@ -423,7 +423,7 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
             model_path, f"{Path(model_path).stem}_prefill.vmfb"
         )
-        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb")
+        lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb*")
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
             max_prompt_tokens=max_inp_len,

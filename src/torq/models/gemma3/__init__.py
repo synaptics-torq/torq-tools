@@ -14,6 +14,9 @@ DEFAULT_IS_INSTRUCT: Final[bool] = False
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 MODEL_SIZES: Final[list[str]] = ["270m", "1b"]
 TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "digits", "digits-non-latin", "other"]
+# The hosted GPTQ INT4 weights belong to this source only (270m, instruct).
+GPTQ_SOURCE_REPO: Final[str] = "google/gemma-3-270m-it"
+GPTQ_HF_REPO: Final[str] = "Synaptics/gemma-3-270-GPTQ-int4-it-torq"
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -31,6 +34,31 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         "--hf-repo",
         type=str,
         help="Custom Gemma3 HuggingFace repository"
+    )
+    parser.add_argument(
+        "--weight-quantization",
+        choices=["int4", "int8", "none"],
+        default="int4",
+        help="Quantize the MatMul weights to INT4 or INT8 in blocks of 32; the activations "
+             "stay bf16 (W4A16 / W8A16). 'none' keeps the float weights. --dynamic-quantize "
+             "turns it off (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--gptq",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "With --weight-quantization int4 and the default 270m instruct source, take the "
+            "INT4 weights from the GPTQ checkpoint in the gptq/ folder of "
+            f"{GPTQ_HF_REPO}; other sources use round-to-nearest (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--gptq-checkpoint",
+        type=str,
+        metavar="DIR",
+        help="Local GPTQ INT4 checkpoint (compressed-tensors) to take the INT4 weights from, "
+             "with --weight-quantization int4; overrides the hosted one"
     )
     parser.add_argument(
         "--hf-repo-subdir",

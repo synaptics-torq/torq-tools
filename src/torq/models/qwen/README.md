@@ -32,7 +32,7 @@ The command does these steps:
    `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
    GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
 6. It converts the model to bf16 and int32 and compiles `transformer.vmfb` and
-   `lm_head.vmfb` with the flags in [`compile_flags.json`](compile_flags.json).
+   `lm_head.vmfb.trim` with the flags in [`compile_flags.json`](compile_flags.json).
 
 The Torq model repositories are private. Log in with `hf auth login` first.
 
@@ -68,11 +68,12 @@ model.
 
 ## Compile flags
 
-[`compile_flags.json`](compile_flags.json) has the flags for all components
-(`flags`) and the extra flags per component (`transformer`, `lm_head`). The
-flags in `<component>_if_supported` are added when the compiler supports them
-(the exporter checks `torq-compile --help-hidden`). Flags after
-`--compile-flags` come last and take precedence.
+[`compile_flags.json`](compile_flags.json) has one entry per validated
+torq-compiler version, as for the other models. Each entry has the flags for
+all components (`common`) and the extra flags per component (`transformer`,
+`lm_head`). The exporter uses the entry of the installed compiler version; a
+version without an entry compiles without the model's flags and shows a
+warning. Flags after `--compile-flags` come last and take precedence.
 
 - `--torq-disable-slicing`: the models are compiled without LinalgSlicing.
 - `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
@@ -102,7 +103,7 @@ flags in `<component>_if_supported` are added when the compiler supports them
 ```text
 models/<hf-repo>/export/torq/converted/static/
     transformer.vmfb
-    lm_head.vmfb
+    lm_head.vmfb.trim
     token_embeddings.npy
     token_id_lut.npy
     tokenizer.json, tokenizer_config.json, config.json, generation_config.json
