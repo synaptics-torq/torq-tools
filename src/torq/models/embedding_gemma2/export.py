@@ -3,16 +3,31 @@
 
 """Export EmbeddingGemma-2 (text, image, video, audio) to static Torq graphs.
 
+Usage (see README.md in this directory)::
+
+    torq-export-model embeddinggemma2 --weights fp32   # bf16 weights, under export/
+    torq-export-model embeddinggemma2 --weights q4     # int4 block-32 weights, under export-q4/
+    torq-export-model embeddinggemma2 --weights q8     # int8 block-32 weights, under export-q8/
+
 Source: the ``onnx-community/embeddinggemma-2-ONNX`` graphs, downloaded from the copy in
-``Synaptics/Google-EmbeddingGemma-2`` (falls back to onnx-community). Produces
+``Synaptics/Google-EmbeddingGemma-2`` (falls back to onnx-community). Produces, under
+``<models-dir>/embeddinggemma-2/export[-q4|-q8]/``
 
-    export/onnx/{fp32,bf16}/static/vision_<H>x<W>.onnx   pixel_patches -> image_embeds
-    export/onnx/{fp32,bf16}/static/text_body_s<S>.onnx   inputs_embeds + attention_bias -> last_hidden_state
-    export/iree/bf16/static/*.vmfb                       (unless --no-compile)
-    export/assets/                                       token_embeddings.npy (bf16), tokenizer, manifest
+    onnx/{fp32,q4,q8}/static/*.onnx    static graphs, validated against the source in ORT
+    onnx/bf16/static/*.onnx            the graphs torq-compile builds
+    onnx/{q4,q8}_ort/static/*.onnx     MatMulNBits graphs for ONNX Runtime (q4 / q8 only)
+    iree/bf16/static/*.vmfb            (unless --no-compile)
+    assets/                            token_embeddings.npy (bf16), mel_filters.npy, mel_window.npy,
+                                       tokenizer, config, embeddinggemma2_manifest.json
 
-Token-embedding gather, media scatter, mean pooling and L2 normalisation run on the host
-(see :mod:`.preprocess`).
+for the networks
+
+    vision_<H>x<W>     pixel_patches -> image_embeds (images and video frames)
+    audio_<frames>     input_features (log-mel) -> audio soft tokens
+    text_body_s<S>     inputs_embeds + attention_bias -> last_hidden_state
+
+Token-embedding gather, media scatter, the audio front end, mean pooling and L2
+normalisation run on the host (see :mod:`.preprocess`).
 """
 
 import argparse
@@ -93,7 +108,8 @@ def add_embedding_gemma2_export_args(parser: argparse.ArgumentParser):
     parser.add_argument("--models-dir", default="models", metavar="DIR",
                         help="Base directory for source and export models (default: %(default)s)")
     parser.add_argument("--onnx-source-dir", default=None, metavar="DIR",
-                        help=f"Directory holding the {HF_REPO} files (skips the download)")
+                        help=f"Directory holding the {HF_REPO} files (Synaptics/Google-EmbeddingGemma-2 "
+                             "holds the same files; skips the download)")
     parser.add_argument("--seq-lens", default="128,512",
                         help="Static text sequence lengths, comma separated, each <= 513 (default: %(default)s)")
     parser.add_argument("--image-sizes", default="384x384", type=lambda s: [_parse_grid(x) for x in s.split(",")],
