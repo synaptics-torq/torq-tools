@@ -14,11 +14,19 @@ Token layout (``tokenizer.json`` post-processor adds BOS/EOS):
     audio  : <bos> <|audio> <|audio|>*n <audio|> <eos>
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import Image
+
+if TYPE_CHECKING:
+    from PIL import Image
+
+# Pillow is imported where an image is resized or decoded, so `torq-export-model --help`
+# and the other exporters load without it.
 
 PATCH_SIZE = 16
 POOL_KERNEL = 3
@@ -97,6 +105,8 @@ def patchify(image: Image.Image, size: tuple[int, int]) -> VisionInput:
     Patch layout follows ``convert_image_to_patches``: each row is (py, px, c) flattened,
     patches are row-major over the grid, positions are (x, y).
     """
+    from PIL import Image
+
     h, w = size
     img = image.convert("RGB")
     if img.size != (w, h):
@@ -126,6 +136,7 @@ def sample_video_frames(path: str, fps: float = 1.0, max_frames: int = 7) -> lis
     """Sample frames at ``fps`` (uniform over the clip); if more than ``max_frames``,
     keep ``max_frames`` uniformly spaced ones. Mirrors the HF ``fps`` + ``uniform`` overflow."""
     import cv2
+    from PIL import Image
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():

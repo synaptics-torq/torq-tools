@@ -68,6 +68,7 @@ The project ships with optional extras for specific export and validation workfl
 | extra | purpose |
 | :---: | ------------ |
 | "moonshine" | Install dependencies for Moonshine export and validation |
+| "embeddinggemma2" | Install dependencies for EmbeddingGemma-2 export and validation |
 | "all" | Install dependencies for all extras |
 
 You can install these extras alongside the base package:
@@ -174,6 +175,7 @@ torq-quantize-model weights quantize -i model_fp32.onnx -o model_mixed.onnx --co
 # export models
 torq-export-model moonshine --convert-dtype bf16
 torq-export-model moonshine_streaming --chunk-len 1280 --convert-dtypes
+torq-export-model embeddinggemma2 --weights q8
 
 # run inference
 torq-infer-model moonshine apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
