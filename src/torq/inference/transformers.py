@@ -57,9 +57,9 @@ class DecoderOnlyRunner(ABC):
         self._head_dim: int = config.head_dim
         self._instruct_model: bool = config.instruct_model
         self._bos_token_id: int = config.bos_token_id
-        # HF configs may list several EOS ids (gemma-3-1b: [1, 106]); the
-        # first is the model's primary EOS.
+        # Keep the primary EOS for display and honor every configured stop ID.
         eos_token_id = config.eos_token_id
+        self._eos_token_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
         self._eos_token_id: int = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
         self._bos_token: str = self._tokenizer.decode(
             [self._bos_token_id], skip_special_tokens=False
@@ -183,12 +183,12 @@ class DecoderOnlyRunner(ABC):
     def _warmup_tokens(self) -> list[int]:
         return self._tokenize_input(self._sys_prompt, "system")
 
-    def run(self, input: str, max_gen_tokens: int | None = None) -> str:
+    def run(self, input: str, max_gen_tokens: int | None = None, *, skip_special_tokens: bool = True) -> str:
         self._reset_cache()
         inp_tokens = self._prepare_run_input_tokens(input)
         st = time.perf_counter_ns()
         out_tokens = self._run(inp_tokens, max_gen_tokens)
-        output = self._tokenizer.decode(out_tokens)
+        output = self._tokenizer.decode(out_tokens, skip_special_tokens=skip_special_tokens)
         et = time.perf_counter_ns()
         self._infer_times.append(et - st)
         return output
@@ -283,7 +283,7 @@ class DynamicDecoderOnlyRunner(DecoderOnlyRunner):
         inp_tokens = self._format_input_tokens(inp_tokens)
         next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
         gen_tokens = [next_token]
-        while not self._stop_decoding(next_token, gen_tokens):
+        while next_token not in self._eos_token_ids and not self._stop_decoding(next_token, gen_tokens):
             if isinstance(self._max_gen_tokens, int) and len(gen_tokens) >= self._max_gen_tokens:
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
@@ -432,7 +432,7 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
         inp_tokens = self._format_input_tokens(inp_tokens)
         next_token, curr_seq_len = self._prefill_prompt(inp_tokens, start_seq_len=self._warmup_len)
         gen_tokens = [next_token]
-        while not self._stop_decoding(next_token, gen_tokens):
+        while next_token not in self._eos_token_ids and not self._stop_decoding(next_token, gen_tokens):
             if curr_seq_len >= self._max_gen_tokens:
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break

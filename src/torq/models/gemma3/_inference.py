@@ -91,6 +91,18 @@ class ModelConfig(DecoderOnlyConfig):
 
 
 class Gemma3Base:
+    def _load_tool_template(self, tokenizer_path: str, tools: list[dict] | None):
+        self._tools = tools
+        self._chat_tokenizer = None
+        if tools is not None:
+            from transformers import AutoTokenizer
+
+            self._chat_tokenizer = AutoTokenizer.from_pretrained(
+                Path(tokenizer_path).parent, local_files_only=True,
+            )
+            if not self._chat_tokenizer.chat_template:
+                raise ValueError("FunctionGemma requires the source checkpoint's chat template")
+
     def _init_model_metadata(self):
         self._nl_token_id: int = self._tokenizer.encode("\n").ids[-1]
         self._double_nl_token_id: int = self._tokenizer.encode("\n\n").ids[-1]
@@ -112,12 +124,29 @@ class Gemma3Base:
         return ids
 
     def _prepare_run_input_tokens(self, input: str) -> list[int]:
+        if self._tools is not None:
+            tokens = self._chat_tokenizer.apply_chat_template(
+                [
+                    {"role": "developer", "content": "You are a model that can do function calling with the following functions"},
+                    {"role": "user", "content": input},
+                ],
+                tools=self._tools,
+                add_generation_prompt=True,
+            )
+            # BOS is already in the warmed-up cache.
+            if tokens and tokens[0] == self._bos_token_id:
+                tokens = tokens[1:]
+            if self.max_inp_len is not None and len(tokens) > self.max_inp_len:
+                raise ValueError("FunctionGemma tool prompt exceeds the input limit; increase --max-gen-tokens")
+            return tokens
         inp_tokens = self._tokenize_input(input, "user")
         if self._instruct_model:
             inp_tokens += self._tokenize_input("", "model")
         return inp_tokens
 
     def _warmup_tokens(self) -> list[int]:
+        if self._tools is not None:
+            return [self._bos_token_id]
         return [self._bos_token_id] + self._tokenize_input(self._sys_prompt, "system")
 
     def _stop_decoding(self, next_token: int, gen_tokens: list[int]) -> bool:
@@ -140,9 +169,12 @@ class Gemma3Dynamic(Gemma3Base, DynamicDecoderOnlyRunner):
         max_gen_tokens: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        tools: list[dict] | None = None,
     ):
+        instruct_model = instruct_model or tools is not None
         config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
         tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
+        self._load_tool_template(tokenizer_path, tools)
         DynamicDecoderOnlyRunner.__init__(
             self,
             model,
@@ -163,6 +195,7 @@ class Gemma3Dynamic(Gemma3Base, DynamicDecoderOnlyRunner):
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        tools: list[dict] | None = None,
     ) -> "Gemma3Dynamic":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
@@ -170,6 +203,7 @@ class Gemma3Dynamic(Gemma3Base, DynamicDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            tools=tools,
         )
 
     @classmethod
@@ -181,6 +215,7 @@ class Gemma3Dynamic(Gemma3Base, DynamicDecoderOnlyRunner):
         n_threads: int | None = None,
         instruct_model: bool = False,
         repo_id: str | None = None,
+        tools: list[dict] | None = None,
     ) -> "Gemma3Dynamic":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
@@ -188,6 +223,7 @@ class Gemma3Dynamic(Gemma3Base, DynamicDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            tools=tools,
         )
 
 
@@ -203,11 +239,14 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         lm_head: InferenceRunner | None = None,
         prefill_model: InferenceRunner | None = None,
         prefill_size: int | None = None,
+        tools: list[dict] | None = None,
     ):
         token_embeddings = self._find_token_embeddings(model.model_path)
         token_id_lut = self._find_token_id_lut(model.model_path)
+        instruct_model = instruct_model or tools is not None
         config_path = _resolve_asset_path(model.model_path, "config.json", repo_id, instruct_model)
         tokenizer_path = _resolve_asset_path(model.model_path, "tokenizer.json", repo_id, instruct_model)
+        self._load_tool_template(tokenizer_path, tools)
         StaticDecoderOnlyRunner.__init__(
             self,
             model,
@@ -252,6 +291,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         lm_head_path: str | os.PathLike | None = None,
         prefill_model_path: str | os.PathLike | None = None,
         prefill_size: int | None = None,
+        tools: list[dict] | None = None,
     ) -> "Gemma3Static":
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.onnx")
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
@@ -269,6 +309,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            tools=tools,
             combined_kv_io=combined_kv_io,
             lm_head=(
                 ORTInferenceRunner(lm_head_path, n_threads=n_threads)
@@ -291,6 +332,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
         lm_head_path: str | os.PathLike | None = None,
         prefill_model_path: str | os.PathLike | None = None,
         prefill_size: int | None = None,
+        tools: list[dict] | None = None,
     ) -> "Gemma3Static":
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb*")
         prefill_model_path = prefill_model_path or cls._find_prefill_model(
@@ -302,6 +344,7 @@ class Gemma3Static(Gemma3Base, StaticDecoderOnlyRunner):
             max_gen_tokens=max_gen_tokens,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            tools=tools,
             combined_kv_io=combined_kv_io,
             lm_head=(
                 VMFBInferenceRunner(lm_head_path, n_threads=n_threads)

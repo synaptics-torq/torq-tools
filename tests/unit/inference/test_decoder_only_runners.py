@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Synaptics Incorporated.
 
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 
@@ -281,6 +282,30 @@ def test_gemma3_stop_rules_are_preserved():
     assert runner._stop_decoding(11, [1, 2, 11])
     assert runner._stop_decoding(7, [1, 10, 10])
     assert not runner._stop_decoding(7, [1, 2, 7])
+
+
+def test_decoder_can_preserve_function_call_markers():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    tokenizer = Tokenizer(WordLevel({"<unk>": 0, "<start_function_call>": 3}, unk_token="<unk>"))
+    tokenizer.add_special_tokens(["<start_function_call>"])
+    runner = _DemoDynamic(_FakeRunner([3]), include_position_ids=False)
+    runner._tokenizer = tokenizer
+
+    assert runner.run("1") == ""
+    assert "<start_function_call>" in runner.run("1", skip_special_tokens=False)
+
+
+def test_all_configured_stop_tokens_are_honored(monkeypatch):
+    monkeypatch.setattr(f"{__name__}._CONFIG", replace(_CONFIG, eos_token_id=[2, 3]))
+    for runner in (
+        _DemoDynamic(_FakeRunner([3]), include_position_ids=False),
+        _DemoStatic(_FakeRunner([3])),
+    ):
+        assert runner._eos_token_id == 2
+        assert runner.run("1") == "3"
+        assert runner._n_tokens_gen == 1
 
 
 def test_smollm2_stop_rules_are_preserved():
