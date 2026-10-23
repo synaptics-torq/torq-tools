@@ -159,3 +159,92 @@ def test_group_query_heads_matches_repeated_kv():
     expected, actual = run_model(repeated, feeds), run_model(editor.graph, feeds)
     for name in expected:
         np.testing.assert_allclose(actual[name], expected[name], rtol=1e-5, atol=1e-6)
+
+
+def _attention_layer(style: str, heads: int, kv_heads: int, max_len: int, head_dim: int, chunk: int) -> gs.Graph:
+    """One static-capacity attention layer as LFM2.5 ("grouped") or Gemma 3 ("broadcast", one KV head) export it."""
+    group = heads // kv_heads
+    q = gs.Variable("q", dtype=np.float32, shape=[1, heads, chunk, head_dim])
+    position_ids = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    inputs, nodes, cache = [q, position_ids], [], {}
+    for role in ("key", "value"):
+        past = gs.Variable(f"past_key_values.0.{role}", dtype=np.float32, shape=[1, kv_heads, max_len, head_dim])
+        new = gs.Variable(f"new_{role}", dtype=np.float32, shape=[1, kv_heads, chunk, head_dim])
+        cache[role] = gs.Variable(f"present.0.{role}", dtype=np.float32, shape=[1, kv_heads, max_len, head_dim])
+        nodes.append(gs.Node("Concat", f"{role}_concat", inputs=[past, new], outputs=[cache[role]], attrs={"axis": -2}))
+        inputs += [past, new]
+    v = {n: gs.Variable(n) for n in ("q_s", "q_g", "k_t", "k_s", "s", "s_rows", "p", "p_rows", "o")}
+    attn = gs.Variable("attn", dtype=np.float32, shape=[1, heads, chunk, head_dim])
+    scale = gs.Constant("scale", np.array(0.5, np.float32))
+    base = "/model/layers.0/self_attn/"
+    nodes += [
+        gs.Node("Mul", "q_scale", inputs=[q, scale], outputs=[v["q_s"]]),
+        gs.Node("Transpose", "k_transpose", inputs=[cache["key"]], outputs=[v["k_t"]], attrs={"perm": [0, 1, 3, 2]}),
+    ]
+    if style == "broadcast":
+        nodes += [
+            gs.Node("Mul", "k_scale", inputs=[v["k_t"], scale], outputs=[v["k_s"]]),
+            gs.Node("MatMul", base + "MatMul", inputs=[v["q_s"], v["k_s"]], outputs=[v["s"]]),
+            gs.Node("Softmax", base + "Softmax", inputs=[v["s"]], outputs=[v["p"]], attrs={"axis": -1}),
+            gs.Node("MatMul", base + "MatMul_1", inputs=[v["p"], cache["value"]], outputs=[attn]),
+        ]
+    else:
+        rows = group * chunk
+        nodes += [
+            gs.Node("Reshape", "q_group", inputs=[v["q_s"], gs.Constant("q_rows", np.array([0, kv_heads, rows, head_dim]))], outputs=[v["q_g"]]),
+            gs.Node("MatMul", base + "MatMul", inputs=[v["q_g"], v["k_t"]], outputs=[v["s"]]),
+            gs.Node("Reshape", "s_rows", inputs=[v["s"], gs.Constant("s_shape", np.array([0, kv_heads, group, chunk, -1]))], outputs=[v["s_rows"]]),
+            gs.Node("Softmax", base + "Softmax", inputs=[v["s_rows"]], outputs=[v["p"]], attrs={"axis": -1}),
+            gs.Node("Reshape", "p_rows", inputs=[v["p"], gs.Constant("p_shape", np.array([0, kv_heads, rows, -1]))], outputs=[v["p_rows"]]),
+            gs.Node("MatMul", base + "MatMul_1", inputs=[v["p_rows"], cache["value"]], outputs=[v["o"]]),
+            gs.Node("Reshape", "ungroup", inputs=[v["o"], gs.Constant("o_shape", np.array([0, heads, chunk, head_dim]))], outputs=[attn]),
+        ]
+    return graph(nodes=nodes, inputs=inputs, outputs=[attn, cache["key"], cache["value"]])
+
+
+@pytest.mark.parametrize(
+    ("style", "heads", "kv_heads", "chunk"),
+    [("hf", 4, 2, 1), ("grouped", 6, 2, 1), ("grouped", 6, 2, 2), ("broadcast", 4, 1, 1), ("broadcast", 4, 1, 3)],
+)
+def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk):
+    max_len, head_dim = 6, 4
+    if style == "hf":
+        editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
+    else:
+        editor = QwenOnnxGraphEditor(_attention_layer(style, heads, kv_heads, max_len, head_dim, chunk), onnx.TensorProto.FLOAT)
+        cur_len = editor.graph.layer(
+            name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
+            outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],
+        )[0]
+        editor.apply_edit(ReplaceDynamicKVCache(editor.graph, "test", cur_len=cur_len, max_tokens=max_len, chunk_len=chunk))
+        editor.apply_edit(MaskFutureAttentionScores(
+            editor.graph, "test", cur_len=cur_len, max_tokens=max_len,
+            export_dtype=onnx.TensorProto.FLOAT, chunk_len=chunk,
+        ))
+    editor.combine_kv_io_tensors([1, kv_heads, max_len, head_dim])
+    if style == "hf":
+        editor.group_query_heads(heads, kv_heads, head_dim)
+    blended = clone_graph(editor.graph)
+    editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk)
+    read_only = editor.to_onnx()
+    assert not [n for n in editor.graph.nodes if n.op == "Where" and n.outputs[0].name.startswith("present")]
+    # torq-compile 2.3.0 miscompiles a Where over a constant condition, so the causal mask is a float constant.
+    assert not [n for n in editor.graph.nodes if n.op == "Where" and isinstance(n.inputs[0], gs.Constant)]
+
+    rng = np.random.default_rng(0)
+    blended_cache = rng.standard_normal((1, 2 * kv_heads, max_len, head_dim)).astype(np.float32)  # stale rows must not leak in
+    read_only_cache = blended_cache.transpose(0, 2, 1, 3).copy()
+    for pos in range(0, max_len - chunk + 1, chunk):
+        feeds = {
+            "q": rng.standard_normal((1, heads, chunk, head_dim)).astype(np.float32),
+            "new_key": rng.standard_normal((1, kv_heads, chunk, head_dim)).astype(np.float32),
+            "new_value": rng.standard_normal((1, kv_heads, chunk, head_dim)).astype(np.float32),
+            "position_ids": np.array([[pos]], dtype=np.int64),
+        }
+        expected = run_model(blended, {**feeds, "past_key_values.0.key_value": blended_cache})
+        actual = run_model(read_only, {**feeds, "past_key_values.0.key_value": read_only_cache})
+        np.testing.assert_allclose(actual["attn"], expected["attn"], rtol=1e-5, atol=1e-6)
+        assert actual["present.0.key_value"].shape == (1, chunk, 2 * kv_heads, head_dim)
+        blended_cache = expected["present.0.key_value"]
+        read_only_cache[:, pos:pos + chunk] = actual["present.0.key_value"]
+    np.testing.assert_array_equal(read_only_cache, blended_cache.transpose(0, 2, 1, 3))

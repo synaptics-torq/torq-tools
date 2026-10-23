@@ -53,6 +53,7 @@ def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
         allow_no_opt=False,
         dynamic_models=True,
         keep_individual_kv_io=True,
+        read_only_kv_cache=True,
     )
 
     parser.add_argument(

@@ -282,7 +282,7 @@ class QwenStatic(QwenBase, StaticDecoderOnlyRunner):
             return StaticDecoderOnlyRunner._init_cache(self)
         dtype = np.dtype(ml_dtypes.bfloat16)
         if self._combined_kv_io:
-            return {f"past_key_values.{i}.key_value": np.zeros([1, 2 * self._n_kv_heads, self._max_gen_tokens, self._head_dim], dtype=dtype) for i in range(self._n_layers)}
+            return {name: self._kv_cache_zeros(name, dtype) for name in (f"past_key_values.{i}.key_value" for i in range(self._n_layers))}
         return {f"past_key_values.{i}.{typ}": np.zeros([1, self._n_kv_heads, self._max_gen_tokens, self._head_dim], dtype=dtype) for i in range(self._n_layers) for typ in ("key", "value")}
 
     def _run_split_part(

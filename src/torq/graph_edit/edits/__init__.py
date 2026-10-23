@@ -32,6 +32,7 @@ from .transformer import (
     ConvertToStaticIndex,
     GroupQueryHeads,
     MaskFutureAttentionScores,
+    ReadOnlyKVCache,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "AddCurrLenInput",
     "ConvertToStaticIndex",
     "GroupQueryHeads",
+    "ReadOnlyKVCache",
     "DequantizeProjectionsMatMul",
     "DecomposeLayerNormalization",
     "RemoveIsNaN",

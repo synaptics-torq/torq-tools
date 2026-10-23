@@ -94,9 +94,17 @@ class DecoderOnlyRunner(ABC):
     @abstractmethod
     def _init_cache(self) -> dict[str, np.ndarray]: ...
 
-    def _update_cache(self, new_values: list[np.ndarray]):
+    def _update_cache(self, new_values: list[np.ndarray], start_pos: int):
         for k, v in zip(self._kv_cache.keys(), new_values):
-            self._kv_cache[k] = v
+            cache = self._kv_cache[k]
+            rows_axis = next((a for a, (n, c) in enumerate(zip(v.shape, cache.shape)) if n < c), None)
+            if rows_axis is None:
+                self._kv_cache[k] = v
+            else:
+                # Read-only KV cache graphs output only the new rows.
+                index = [slice(None)] * cache.ndim
+                index[rows_axis] = slice(start_pos, start_pos + v.shape[rows_axis])
+                cache[tuple(index)] = v
 
     @abstractmethod
     def _llm_step(self, token: int, curr_seq_len: int) -> tuple[int, list[np.ndarray]]: ...
@@ -117,7 +125,7 @@ class DecoderOnlyRunner(ABC):
         return None
 
     def _reset_cache(self):
-        self._kv_cache.update(self._reset_cache_state)
+        self._kv_cache.update(deepcopy(self._reset_cache_state))
 
     def _format_input_tokens(self, input: list[int]) -> list[int]:
         """Cap the prompt at ``max_inp_len``.
@@ -165,7 +173,7 @@ class DecoderOnlyRunner(ABC):
         next_token: int | None = None
         for token in prompt_tokens:
             next_token, cache = self._llm_step(token, num_tokens_gen)
-            self._update_cache(cache)
+            self._update_cache(cache, num_tokens_gen)
             num_tokens_gen += 1
         return next_token, num_tokens_gen
 
@@ -280,7 +288,7 @@ class DynamicDecoderOnlyRunner(DecoderOnlyRunner):
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
             next_token, cache = self._llm_step(next_token, curr_seq_len)
-            self._update_cache(cache)
+            self._update_cache(cache, curr_seq_len)
             gen_tokens.append(next_token)
             curr_seq_len += 1
         self._n_tokens_gen = len(gen_tokens)
@@ -329,14 +337,18 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
             top_p=top_p,
         )
 
+    def _kv_cache_zeros(self, name: str, dtype=np.float32) -> np.ndarray:
+        """Zeros in the shape of the model's ``name`` cache input; time-major combined K/V if unknown."""
+        shape = self._model.input_shapes.get(name)
+        if shape is None:
+            shape = [1, self._max_gen_tokens, 2 * self._n_kv_heads, self._head_dim]
+        return np.zeros(shape, dtype=dtype)
+
     def _init_cache(self) -> dict[str, np.ndarray]:
         if self._combined_kv_io:
             return {
-                f"past_key_values.{i}.key_value": np.zeros(
-                    [1, 2 * self._n_kv_heads, self._max_gen_tokens, self._head_dim],
-                    dtype=np.float32,
-                )
-                for i in range(self._n_layers)
+                name: self._kv_cache_zeros(name)
+                for name in (f"past_key_values.{i}.key_value" for i in range(self._n_layers))
             }
         return {
             f"past_key_values.{i}.{typ}": np.zeros(
@@ -399,7 +411,7 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
                 chunk,
                 curr_seq_len,
             )
-            self._update_cache(cache)
+            self._update_cache(cache, curr_seq_len)
             chunk_start += self._prefill_size
             curr_seq_len += self._prefill_size
 
@@ -425,7 +437,7 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
                 self._logger.warning("Max generation tokens reached, stopping early")
                 break
             next_token, cache = self._llm_step(next_token, curr_seq_len)
-            self._update_cache(cache)
+            self._update_cache(cache, curr_seq_len)
             gen_tokens.append(next_token)
             curr_seq_len += 1
         self._n_tokens_gen = len(gen_tokens)

@@ -114,6 +114,7 @@ Flag breakdown:
 | `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. **On by default** — opt out with `--no-split-lm-head`. |
 | `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step (default: `64`; pass `0` to disable); requires `--split-lm-head` (on by default). See [Batched prefill](#3-batched-prefill). |
 | `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. **On by default** — opt out with `--no-extract-embeddings`. |
+| `--no-read-only-kv-cache` | export the pre-2.4 KV caches (head-major, written back whole every step). By default the time-major caches are read-only inputs and the decode and prefill models output only the new rows; see the [Qwen README](../qwen/README.md#read-only-kv-cache) |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
 | `--compile-flags …` | extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
 

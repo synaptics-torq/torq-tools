@@ -33,6 +33,8 @@ class _FakeTokenizer:
 
 
 class _FakeModel:
+    input_shapes = {}
+
     def __init__(self, model_path):
         self.model_path = model_path
 
@@ -132,6 +134,8 @@ def test_infer_smollm2_selects_the_vmfb_loader_for_vmfb_inputs(tmp_path, monkeyp
     runners = []
 
     class _FakeVMFB:
+        input_shapes = {}
+
         def __init__(self, model_path, n_threads=None):
             runners.append(str(model_path))
             self.model_path = model_path
@@ -181,6 +185,8 @@ def test_infer_smollm2_forwards_size_and_local_assets(tmp_path, monkeypatch):
     model.write_bytes(b"onnx")
 
     class _FakeORT:
+        input_shapes = {}
+
         def __init__(self, model_path, n_threads=None):
             self.model_path = model_path
 

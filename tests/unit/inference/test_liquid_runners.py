@@ -41,6 +41,8 @@ class _FakeRunner:
     (e.g. VMFB), which exposes no `_sess`.
     """
 
+    input_shapes = {}
+
     def __init__(self, input_names: list[str] | None = None):
         self.model_path = Path("model.onnx")
         self.calls = []

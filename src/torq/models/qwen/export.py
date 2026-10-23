@@ -131,6 +131,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         keep_individual_kv_io: bool = False,
         split_lm_head: bool = False,
         split_model: bool = False,
+        read_only_kv_cache: bool = True,
         weight_quantization: str | None = None,
         gptq_checkpoint: str | os.PathLike | None = None,
     ):
@@ -142,6 +143,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         # Splitting the transformer always splits off the LM head as well.
         self._split_lm_head = split_lm_head or split_model
         self._split_model = split_model
+        self._read_only_kv_cache = read_only_kv_cache
         self._weight_quantization = weight_quantization
         self._gptq_checkpoint = (
             Path(gptq_checkpoint) if gptq_checkpoint else None
@@ -151,6 +153,12 @@ class QwenModelExporter(OnnxModelExporterBase):
             raise ValueError(
                 "`--split-model` / `--split-lm-head` are currently supported "
                 "only for static Qwen exports"
+            )
+
+        if read_only_kv_cache and static_models and (not self._split_lm_head or keep_individual_kv_io):
+            raise ValueError(
+                "`--read-only-kv-cache` needs the combined KV cache I/O and `--split-lm-head`; "
+                "add `--no-read-only-kv-cache` otherwise"
             )
 
         if self._weight_quantization is not None and not self._split_lm_head:
@@ -469,8 +477,9 @@ class QwenModelExporter(OnnxModelExporterBase):
                         head_dim,
                     ]
                 )
-                # One cache write per layer instead of split, blend and concat.
-                editor.blend_combined_kv_in_place()
+                if not self._read_only_kv_cache:
+                    # One cache write per layer instead of split, blend and concat.
+                    editor.blend_combined_kv_in_place()
 
             self._logger.info(
                 "(model) Extracted Qwen token embeddings to '%s'",
@@ -573,6 +582,12 @@ class QwenModelExporter(OnnxModelExporterBase):
                 self._config.num_key_value_heads,
                 head_dim,
             )
+            if self._read_only_kv_cache:
+                editor.read_only_kv_cache(
+                    self._config.num_attention_heads,
+                    self._config.num_key_value_heads,
+                    head_dim,
+                )
 
         editor.reorder_graph_input("position_ids", 1)
 
@@ -1425,6 +1440,7 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         convert_dtypes=convert_dtypes,
         keep_individual_kv_io=args.keep_individual_kv_io,
         split_model=args.split_model,
+        read_only_kv_cache=args.read_only_kv_cache,
         split_lm_head=args.split_lm_head,
         weight_quantization=weight_quantization,
         gptq_checkpoint=_resolve_gptq_checkpoint(args),

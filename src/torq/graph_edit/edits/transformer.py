@@ -791,6 +791,239 @@ class GroupQueryHeads(OnnxGraphEdit):
             "Grouped %d query heads over %d KV heads at '%s'", heads, kv_heads, node.name
         )
 
+@dataclass
+class ReadOnlyKVCache(OnnxGraphEdit):
+    """
+    Read the combined KV caches without writing them, and output only the new rows.
+
+    After ``ReplaceDynamicKVCache`` and ``combine_kv_io_tensors`` every step reads
+    each ``[1, 2 * kv, L, D]`` cache, blends the ``T`` new rows into it with a
+    full-size Where, transposes all of K for the scores and returns the whole cache.
+    This rewrites each attention layer so that it only reads the cache::
+
+        Qg      = Reshape(Q * k_scale, [1, kv, g * T, D])           # g = heads / kv
+        s_past  = (K_past @ Qg^T)^T + past_mask                     # [1, kv, g * T, L]
+        s_new   = Qg @ k_new^T + causal_mask                        # [1, kv, g * T, T]
+        p       = Softmax(Concat(s_past, s_new))
+        O       = p[..., :L] @ V_past + p[..., L:] @ v_new          # -> [1, heads, T, D]
+        present = Transpose(Concat(k_new, v_new), [0, 2, 1, 3])     # [1, T, 2 * kv, D]
+
+    The softmax covers the same keys as before, so the output is unchanged. The
+    past mask keeps cache rows before the chunk start, the causal mask the new rows
+    up to each query's own. The cache input becomes time-major ``[1, L, 2 * kv, D]``:
+    K and V of KV head ``i`` are strided slices of it, so no part of the cache is
+    transposed or copied, and the ``T`` new rows of a step are one contiguous block
+    that the runtime writes into the cache at the chunk start position.
+
+    Matches a Softmax between a scores MatMul ``Q @ [Mul(k_scale)] Transpose(K)``
+    (with any mask Add and a 5-D row Reshape in between) and a context MatMul
+    ``p @ V``, where K and V are the ``ReplaceDynamicKVCache`` blends of a combined
+    cache input. The query may be grouped by KV head (``[1, kv, g * T, D]``) or one
+    row per head over a single KV head (``[1, heads, T, D]``).
+
+    Args:
+        num_heads (int): Number of query heads
+        num_kv_heads (int): Number of key/value heads
+        head_dim (int): Head dimension
+        chunk_len (int): Number of new rows per step
+    """
+
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    chunk_len: int = 1
+
+    @staticmethod
+    def _cache_blend(tensor: gs.Tensor, chunk_len: int):
+        """Return ``(update_mask, new_rows, past_slice)`` of a KV cache blend."""
+        blend = _producer(tensor, "Where")
+        if blend is None:
+            return None
+        mask, placed, past = blend.inputs
+        if chunk_len > 1:
+            # Rows placed by a one-hot MatMul (ReplaceDynamicKVCache).
+            place = _producer(placed, "MatMul")
+            if place is None:
+                return None
+            placed = place.inputs[1]
+        past_slice = _producer(past, "Slice")
+        if past_slice is None or not isinstance(past_slice.inputs[1], gs.Constant):
+            return None
+        return mask, placed, past_slice
+
+    def _pattern(self, softmax: gs.Node):
+        tensor = softmax.inputs[0]
+        while (node := tensor.inputs[0] if tensor.inputs else None) is not None and node.op in ("Add", "Reshape"):
+            tensor = node.inputs[0]
+        scores = _producer(tensor, "MatMul")
+        probs = softmax.outputs[0]
+        if scores is None or len(probs.outputs) != 1:
+            return None
+        context = probs.outputs[0]
+        if context.op == "Reshape" and len(context.outputs[0].outputs) == 1:
+            context = context.outputs[0].outputs[0]
+        if context.op != "MatMul":
+            return None
+
+        q, k = scores.inputs
+        k_scale = 1.0
+        if (scaled := _scale_of(_producer(k, "Mul"))) is not None:
+            k, k_scale = scaled
+        transpose = _producer(k, "Transpose")
+        if transpose is None or list(transpose.attrs.get("perm", [])) != [0, 1, 3, 2]:
+            return None
+        k_blend = self._cache_blend(transpose.inputs[0], self.chunk_len)
+        v_blend = self._cache_blend(context.inputs[1], self.chunk_len)
+        if k_blend is None or v_blend is None:
+            return None
+        cache = k_blend[2].inputs[0]
+        if cache not in self.graph.inputs or v_blend[2].inputs[0] is not cache:
+            return None
+        present = next(
+            (user.outputs[0] for user in transpose.inputs[0].outputs
+             if user.op == "Concat" and user.outputs[0] in self.graph.outputs),
+            None,
+        )
+        if present is None:
+            return None
+        return q, k_scale, k_blend, v_blend, cache, present, context
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "Softmax" and self._pattern(node) is not None
+
+    def _position(self, update_mask: gs.Tensor) -> gs.Tensor:
+        """Chunk start position compared against the cache rows in the update mask."""
+        node = update_mask.inputs[0]
+        if node.op == "And":
+            node = node.inputs[0].inputs[0]
+        return node.inputs[1]
+
+    def _masks(self, position: gs.Tensor, max_len: int, rows: int, dtype) -> tuple[gs.Tensor, gs.Tensor | None]:
+        """Past-row mask ``[1, 1, 1, L]`` and causal new-row mask ``[1, 1, rows, T]``, shared by all layers."""
+        tensors = self.graph.tensors()
+        keep = tensors.get("attn_mask_keep") or gs.Constant("attn_mask_keep", np.asarray(0.0, dtype=np.float32))
+        block = tensors.get("attn_mask_block") or gs.Constant("attn_mask_block", np.asarray(-1e9, dtype=np.float32))
+        if (past_mask := tensors.get("kv_past_mask")) is None:
+            time_axis = gs.Constant(
+                "kv_time_axis",
+                np.arange(max_len, dtype=np.dtype(position.dtype or np.int64)).reshape(1, 1, 1, max_len),
+            )
+            before = self.graph.layer(
+                name="kv_past_rows", op="Less", inputs=[time_axis, position],
+                outputs=[gs.Variable("kv_past_rows_bool", dtype=onnx.TensorProto.BOOL, shape=[1, 1, 1, max_len])],
+            )[0]
+            past_mask = self.graph.layer(
+                name="kv_past_mask", op="Where", inputs=[before, keep, block],
+                outputs=[gs.Variable("kv_past_mask", dtype=dtype, shape=[1, 1, 1, max_len])],
+            )[0]
+        new_mask = None
+        if self.chunk_len > 1 and (new_mask := tensors.get("kv_new_mask")) is None:
+            # Query row r is chunk row r % T; it sees new rows up to its own. A float
+            # constant, as torq-compile 2.3.0 miscompiles a Where over a constant boolean tensor.
+            t = self.chunk_len
+            causal = np.arange(t)[None, :] <= (np.arange(rows) % t)[:, None]
+            new_mask = gs.Constant(
+                "kv_new_mask",
+                np.where(causal, keep.values, block.values).astype(np.float32).reshape(1, 1, rows, t),
+                export_dtype=getattr(block, "export_dtype", None),
+            )
+        return past_mask, new_mask
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Softmax")
+        q, k_scale, k_blend, v_blend, cache, present, context = self._pattern(node)
+        base = node.name.rsplit("/", 1)[0] + "/ReadOnlyKV/"
+        heads, kv, d, t = self.num_heads, self.num_kv_heads, self.head_dim, self.chunk_len
+        rows = heads // kv * t
+        max_len = cache.shape[2]
+        dtype = q.dtype or np.float32
+        k_new, v_new = k_blend[1], v_blend[1]
+        k_offset = int(k_blend[2].inputs[1].values.ravel()[0])
+        v_offset = int(v_blend[2].inputs[1].values.ravel()[0])
+
+        def var(name, shape):
+            return gs.Variable(base + name, dtype=dtype, shape=shape)
+
+        def layer(op, name, inputs, shape, **attrs):
+            return self.graph.layer(name=base + name, op=op, inputs=inputs, outputs=[var(name, shape)], attrs=attrs)[0]
+
+        def head(tensor, axis, index, shape, name):
+            """Index ``index`` of ``axis``, reshaped to ``shape``."""
+            sliced = layer("Slice", name + "_slice", [
+                tensor, np.array([index], dtype=np.int64), np.array([index + 1], dtype=np.int64),
+                np.array([axis], dtype=np.int64),
+            ], None)
+            return layer("Reshape", name, [sliced, np.array(shape, dtype=np.int64)], shape)
+
+        # Time-major cache: K and V of KV head i are strided [1, L, D] slices.
+        cache.shape = [1, max_len, 2 * kv, d]
+        k_heads = [head(cache, 2, k_offset + i, [1, max_len, d], f"k{i}") for i in range(kv)]
+        v_heads = [head(cache, 2, v_offset + i, [1, max_len, d], f"v{i}") for i in range(kv)]
+        past_mask, new_mask = self._masks(self._position(k_blend[0]), max_len, rows, dtype)
+
+        if k_scale != 1.0:
+            q = layer("Mul", "q_scaled", [q, np.array(k_scale, dtype=np.float32)], None)
+        qg = layer("Reshape", "q", [q, np.array([1, kv, rows, d], dtype=np.int64)], [1, kv, rows, d])
+        if rows > d:
+            # Prefill: transposing each [L, D] K slice is cheaper than the [L, rows] scores.
+            past_scores = [
+                layer("MatMul", f"scores{i}", [
+                    head(qg, 1, i, [1, rows, d], f"q{i}"),
+                    layer("Transpose", f"k_t{i}", [k_heads[i]], [1, d, max_len], perm=[0, 2, 1]),
+                ], [1, rows, max_len])
+                for i in range(kv)
+            ]
+            past_scores = layer("Concat", "scores_heads", past_scores, [kv, rows, max_len], axis=0)
+            past_scores = layer("Reshape", "past_scores", [past_scores, np.array([1, kv, rows, max_len], dtype=np.int64)], [1, kv, rows, max_len])
+        else:
+            q_t = layer("Transpose", "q_t", [qg], [1, kv, d, rows], perm=[0, 1, 3, 2])
+            past_scores = [
+                layer("MatMul", f"scores_t{i}", [k_heads[i], head(q_t, 1, i, [1, d, rows], f"q_t{i}")], [1, max_len, rows])
+                for i in range(kv)
+            ]
+            past_scores = layer("Concat", "scores_t_heads", past_scores, [kv, max_len, rows], axis=0)
+            past_scores = layer("Reshape", "scores_t", [past_scores, np.array([1, kv, max_len, rows], dtype=np.int64)], [1, kv, max_len, rows])
+            past_scores = layer("Transpose", "past_scores", [past_scores], [1, kv, rows, max_len], perm=[0, 1, 3, 2])
+        past_scores = layer("Add", "past_scores_masked", [past_scores, past_mask], [1, kv, rows, max_len])
+        k_new_t = layer("Transpose", "k_new_t", [k_new], [1, kv, d, t], perm=[0, 1, 3, 2])
+        new_scores = layer("MatMul", "new_scores", [qg, k_new_t], [1, kv, rows, t])
+        if new_mask is not None:
+            new_scores = layer("Add", "new_scores_masked", [new_scores, new_mask], [1, kv, rows, t])
+        scores = layer("Concat", "scores", [past_scores, new_scores], [1, kv, rows, max_len + t], axis=-1)
+        probs = layer("Softmax", "probs", [scores], [1, kv, rows, max_len + t], axis=-1)
+        past_probs, new_probs = self.graph.layer(
+            name=base + "probs_split", op="Split", attrs={"axis": -1},
+            inputs=[probs, np.array([max_len, t], dtype=np.int64)],
+            outputs=[var("past_probs", [1, kv, rows, max_len]), var("new_probs", [1, kv, rows, t])],
+        )
+        past_context = [
+            layer("MatMul", f"context{i}", [head(past_probs, 1, i, [1, rows, max_len], f"probs{i}"), v_heads[i]], [1, rows, d])
+            for i in range(kv)
+        ]
+        past_context = layer("Concat", "context_heads", past_context, [kv, rows, d], axis=0)
+        past_context = layer("Reshape", "past_context", [past_context, np.array([1, kv, rows, d], dtype=np.int64)], [1, kv, rows, d])
+        new_context = layer("MatMul", "new_context", [new_probs, v_new], [1, kv, rows, d])
+        context_sum = layer("Add", "context_sum", [past_context, new_context], [1, kv, rows, d])
+        attended = layer("Reshape", "context", [context_sum, np.array([1, heads, t, d], dtype=np.int64)], [1, heads, t, d])
+        context_out = context.outputs[0]
+        rewire_consumers(list(context_out.outputs), context_out, attended)
+        if any(out is context_out for out in self.graph.outputs):
+            attended.name, context_out.name = context_out.name, context_out.name + "_blended"
+            self.graph.outputs = [attended if out is context_out else out for out in self.graph.outputs]
+
+        # Output only the new rows, time-major like the cache.
+        new_rows = layer("Concat", "new_kv", [k_new, v_new], [1, 2 * kv, t, d], axis=1)
+        rows_out = self.graph.layer(
+            name=base + "present", op="Transpose", attrs={"perm": [0, 2, 1, 3]}, inputs=[new_rows],
+            outputs=[gs.Variable(present.name, dtype=present.dtype or dtype, shape=[1, t, 2 * kv, d])],
+        )[0]
+        present.name += "_blended"
+        self.graph.outputs = [rows_out if out is present else out for out in self.graph.outputs]
+        node.inputs.clear()
+        node.outputs.clear()
+
+        self._logger.debug("Made the KV cache '%s' read-only at '%s'", cache.name, node.name)
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
