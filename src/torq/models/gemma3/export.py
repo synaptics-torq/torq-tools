@@ -72,8 +72,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         split_weights: bool = False,
         weight_quantization: Literal["int4", "int8"] | None = None,
         gptq_checkpoint: str | os.PathLike | None = None,
+        read_only_kv_cache: bool = True,
         **edit_args
     ):
+        if read_only_kv_cache and keep_individual_kv_io:
+            raise ValueError(
+                "`--read-only-kv-cache` needs the combined KV cache I/O; "
+                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
+            )
         if gptq_checkpoint is not None and weight_quantization != "int4":
             raise ValueError("--gptq-checkpoint needs --weight-quantization int4")
         if weight_quantization is not None and (dynamic_quantize or convert_dtypes):
@@ -86,6 +92,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
+        self._read_only_kv_cache = read_only_kv_cache
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
@@ -462,6 +469,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 self._max_gen_tokens,                                           # L
                 self._config.head_dim                                           # D
             ])
+            if self._read_only_kv_cache:
+                editor.read_only_kv_cache(
+                    self._config.num_attention_heads,
+                    self._config.num_key_value_heads,
+                    self._config.head_dim,
+                    self._batch_prefill if component == "model_prefill" else 1,
+                )
 
         if self._trim_vocab:
             spec = self._get_trimmed_vocab_spec()
@@ -690,6 +704,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         broadcast_ops=args.broadcast_ops,
         weight_quantization=weight_quantization,
         gptq_checkpoint=gptq_checkpoint,
+        read_only_kv_cache=args.read_only_kv_cache,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:

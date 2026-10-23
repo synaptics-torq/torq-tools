@@ -30,7 +30,9 @@ from .transformer import (
     CollapseGQABroadcast,
     CombineKVCacheMixin,
     ConvertToStaticIndex,
+    GroupQueryHeads,
     MaskFutureAttentionScores,
+    ReadOnlyKVCache,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
@@ -45,6 +47,8 @@ __all__ = [
     "MaskFutureAttentionScores",
     "AddCurrLenInput",
     "ConvertToStaticIndex",
+    "GroupQueryHeads",
+    "ReadOnlyKVCache",
     "DequantizeProjectionsMatMul",
     "DecomposeLayerNormalization",
     "RemoveIsNaN",

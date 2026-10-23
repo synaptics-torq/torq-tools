@@ -109,6 +109,8 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # handled separately (see _extract_embed_lut).
         self._extract_embeddings = False
         self._keep_individual_kv_io = keep_individual_kv_io
+        # The VL demo engine writes whole caches back, and the image prefill chain shares them.
+        self._read_only_kv_cache = False
         self._max_gen_tokens = max_gen_tokens
         # --split-lm-head (gemma3-style, as in LiquidModelExporter) turns the
         # decode model and, when exported, the batch-prefill model into

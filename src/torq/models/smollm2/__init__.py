@@ -31,6 +31,7 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         extract_embeddings=True,
         dynamic_models=True,
         keep_individual_kv_io=True,
+        read_only_kv_cache=True,
         replace_int_bf16_cast=True,
     )
     add_graph_edit_harness_args(parser)

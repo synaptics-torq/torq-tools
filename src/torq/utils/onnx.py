@@ -63,6 +63,7 @@ def add_onnx_args(
     extract_embeddings: bool = False,
     dynamic_models: bool = False,
     keep_individual_kv_io: bool = False,
+    read_only_kv_cache: bool = False,
     replace_int_bf16_cast: bool = False,
 ):
     """Shared export-pipeline args for every model exporter.
@@ -211,6 +212,16 @@ def add_onnx_args(
             action="store_true",
             default=False,
             help="Keep KV I/O as separate key, value tensors instead of combining"
+        )
+    if read_only_kv_cache:
+        group.add_argument(
+            "--read-only-kv-cache",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Read the time-major KV caches without writing them and output only the new rows, "
+                "which the runtime writes into the caches at position_ids (default: %(default)s)"
+            ),
         )
     if replace_int_bf16_cast:
         group.add_argument(

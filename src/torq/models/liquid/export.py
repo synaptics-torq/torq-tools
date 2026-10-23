@@ -104,10 +104,17 @@ class LiquidModelExporter(OnnxModelExporterBase):
         dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         split_weights: bool = False,
+        read_only_kv_cache: bool = True,
         **edit_args
     ):
+        if read_only_kv_cache and keep_individual_kv_io:
+            raise ValueError(
+                "`--read-only-kv-cache` needs the combined KV cache I/O; "
+                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
+            )
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
+        self._read_only_kv_cache = read_only_kv_cache
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._model_size = model_size
@@ -1212,6 +1219,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 self._max_gen_tokens,       # L
                 self._head_dim              # D
             ])
+            if self._read_only_kv_cache:
+                editor.read_only_kv_cache(
+                    self._num_attention_heads,
+                    self._num_key_value_heads,
+                    self._head_dim,
+                    self._batch_prefill if component.endswith("_prefill") else 1,
+                )
 
         editor.reorder_graph_input("position_ids", 1)
         new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=False)
@@ -1659,6 +1673,7 @@ def export_liquid_from_args(args: argparse.Namespace):
         dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         split_weights=args.split_weights,
+        read_only_kv_cache=args.read_only_kv_cache,
         broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,

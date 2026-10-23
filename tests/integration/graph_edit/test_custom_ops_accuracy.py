@@ -181,7 +181,7 @@ def test_skip_simplified_layernorm_matches_original_op():
 # GroupQueryAttention  ->  expanded RoPE + KV-concat + scaled-dot-product attn
 # ---------------------------------------------------------------------------
 def _gqa_reference(q, k, v, past_k, past_v, cos_cache, sin_cache, pos,
-                   nh, kvh, hd, scale):
+                   nh, kvh, hd, scale, bias=None):
     B, S = q.shape[0], q.shape[1]
     # RoPE angles are recomputed from inv_freq = atan2(sin[1], cos[1]).
     inv_freq = np.arctan2(sin_cache[1], cos_cache[1]).astype(np.float32)
@@ -215,6 +215,8 @@ def _gqa_reference(q, k, v, past_k, past_v, cos_cache, sin_cache, pos,
     Vx = np.repeat(present_v, rf, axis=1)
 
     scores = (Q * scale) @ np.swapaxes(Kx, -1, -2)
+    if bias is not None:
+        scores = scores + bias
     weights = _softmax(scores, axis=-1)
     out = weights @ Vx
     out = out.transpose(0, 2, 1, 3).reshape(B, S, nh * hd)
@@ -302,7 +304,7 @@ def test_group_query_attention_chunk_matches_reference():
     """Batched prefill: each query/key row is rotated by its own position."""
     rng = np.random.default_rng(3)
     B, S = 1, 2                     # S == chunk_len
-    nh, kvh, hd = 4, 2, 4
+    nh, kvh, hd = 6, 2, 4           # group 3 != S, so row/group mix-ups show
     past_len = 2
     pos_start = past_len            # seqlen_k = chunk start position
     scale = 1.0 / (hd ** 0.5)
@@ -319,6 +321,11 @@ def test_group_query_attention_chunk_matches_reference():
     pk_val = rng.standard_normal((B, kvh, past_len, hd)).astype(np.float32)
     pv_val = rng.standard_normal((B, kvh, past_len, hd)).astype(np.float32)
     slk_val = np.array([pos_start], dtype=np.int32)
+    # Causal bias: row t sees the past and chunk rows <= t.
+    total = past_len + S
+    bias_val = np.where(
+        np.arange(total)[None, :] <= past_len + np.arange(S)[:, None], 0, -1e9,
+    ).astype(np.float32).reshape(B, 1, S, total)
 
     q = gs.Variable("q", np.float32, [B, S, nh * hd])
     k = gs.Variable("k", np.float32, [B, S, kvh * hd])
@@ -329,13 +336,14 @@ def test_group_query_attention_chunk_matches_reference():
     tsl = gs.Constant("total_seq_len", np.array([pos_start + S], dtype=np.int32))
     cosc = gs.Constant("cos_cache", cos_cache)
     sinc = gs.Constant("sin_cache", sin_cache)
+    bias = gs.Variable("attn_bias", np.float32, [B, 1, S, total])
 
     attn = gs.Variable("attn", np.float32)
     present_key = gs.Variable("present_key", np.float32)
     present_value = gs.Variable("present_value", np.float32)
     gqa = gs.Node(
         "GroupQueryAttention", "layer/attn/GroupQueryAttention",
-        inputs=[q, k, v, pk, pv, slk, tsl, cosc, sinc],
+        inputs=[q, k, v, pk, pv, slk, tsl, cosc, sinc, gs.Variable.empty(), bias],
         outputs=[attn, present_key, present_value],
         attrs={"num_heads": nh, "kv_num_heads": kvh}, domain="com.microsoft",
     )
@@ -344,7 +352,7 @@ def test_group_query_attention_chunk_matches_reference():
 
     g = graph(
         nodes=[gqa, ident],
-        inputs=[q, k, v, pk, pv, slk],
+        inputs=[q, k, v, pk, pv, slk, bias],
         outputs=[attn_out, present_key, present_value],
         opset=OPSET,
     )
@@ -355,11 +363,13 @@ def test_group_query_attention_chunk_matches_reference():
     feeds = {
         "q": q_val, "k": k_val, "v": v_val,
         "past_key": pk_val, "past_value": pv_val, "seqlen_k": slk_val,
+        "attn_bias": bias_val,
     }
     actual = _run(g, feeds)
     ref_attn, ref_pk, ref_pv = _gqa_reference(
         q_val, k_val, v_val, pk_val, pv_val,
         cos_cache, sin_cache, [pos_start + t for t in range(S)], nh, kvh, hd, scale,
+        bias=bias_val,
     )
 
     got_attn, got_pk, got_pv = list(actual.values())

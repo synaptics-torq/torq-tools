@@ -37,6 +37,8 @@ class _FakeTokenizer:
 
 
 class _FakeRunner:
+    input_shapes = {}
+
     def __init__(self, tokens: list[int] | None = None):
         self.model_path = Path("model.onnx")
         self.tokens = tokens or [3]
@@ -168,10 +170,31 @@ def test_static_runner_builds_combined_and_separate_cache_shapes():
         "past_key_values.0.key_value",
         "past_key_values.1.key_value",
     ]
-    assert combined._kv_cache["past_key_values.0.key_value"].shape == (1, 6, 7, 5)
+    assert combined._kv_cache["past_key_values.0.key_value"].shape == (1, 7, 6, 5)
     assert len(separate._kv_cache) == 4
     assert separate._kv_cache["past_key_values.0.key"].shape == (1, 3, 7, 5)
 
+
+
+class _RowsRunner(_FakeRunner):
+    """Read-only KV cache graph: outputs one new time-major row per cache, filled with the position."""
+
+    def infer(self, inputs):
+        logits, *cache = super().infer(inputs)
+        pos = inputs["position_ids"].item()
+        return [logits, *(np.full(c[:, :1].shape, pos + 1, np.float32) for c in cache)]
+
+
+def test_static_runner_writes_read_only_cache_rows_at_their_position():
+    runner = _DemoStatic(_RowsRunner(tokens=[3, 3, 2]))
+    runner.run("12")
+    rows = runner._kv_cache["past_key_values.1.key_value"][0, :, 0, 0]
+    np.testing.assert_array_equal(rows, [1, 2, 3, 0, 0, 0, 0])
+
+    # A new run starts from a clean cache, not the rows written by the last one.
+    runner.run("1")
+    rows = runner._kv_cache["past_key_values.1.key_value"][0, :, 0, 0]
+    np.testing.assert_array_equal(rows, [1, 0, 0, 0, 0, 0, 0])
 
 def test_static_runner_uses_token_embeddings_and_token_lut():
     model = _FakeRunner(tokens=[1])

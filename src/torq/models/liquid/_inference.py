@@ -453,9 +453,8 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
                 )
             else:
                 if self._combined_kv_io:
-                    cache[f"past_key_values.{i}.key_value"] = np.zeros(
-                        (1, 2 * self._n_kv_heads, self._max_gen_tokens, self._head_dim), dtype=np.float32
-                    )
+                    name = f"past_key_values.{i}.key_value"
+                    cache[name] = self._kv_cache_zeros(name)
                 else:
                     cache[_kv_input_name(i, "key")] = np.zeros(
                         (1, self._n_kv_heads, self._max_gen_tokens, self._head_dim), dtype=np.float32

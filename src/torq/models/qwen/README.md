@@ -26,8 +26,8 @@ The command does these steps:
    the output vocabulary to Latin text, punctuation and digits
    (`token_id_lut.npy`) and writes the LM head as a separate model.
 4. It rewrites attention: grouped-query attention reads the KV heads
-   directly, and one Where per layer writes the new token into the combined
-   K/V cache.
+   directly, and the time-major K/V caches are read-only inputs; the model
+   outputs only the new token's rows (see [Read-only KV cache](#read-only-kv-cache)).
 5. It quantizes all MatMul weights of the transformer and the LM head to INT4
    `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
    GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
@@ -94,6 +94,7 @@ warning. Flags after `--compile-flags` come last and take precedence.
 | `--gptq-checkpoint DIR` | Local GPTQ checkpoint, made with [`int4quant/run_gptq.py`](int4quant/README.md) |
 | `--split-model` | Also split the transformer into Part A and Part B |
 | `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings, so this fails for Qwen3-0.6B |
+| `--no-read-only-kv-cache` | Export the pre-2.4 caches: head-major, written back whole every step (see [Read-only KV cache](#read-only-kv-cache)) |
 | `--hf-repo`, `--onnx-source-dir` | Override the source model |
 | `--skip-torq` | Stop after the ONNX export |
 | `--compile-flags …` | Extra `torq-compile` flags (must be last) |
@@ -111,6 +112,17 @@ models/<hf-repo>/export/torq/converted/static/
 
 The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen3`
 and `qwen2_5` demos run this directory.
+
+## Read-only KV cache
+
+The transformer only reads its KV caches. Each layer's cache is a time-major `[1, 256, 2 * kv, D]` input (K heads, then V heads), and `present.{i}.key_value` holds only the step's new `[1, 1, 2 * kv, D]` rows, which the runtime writes into the cache at `position_ids` before the next step. The new token attends to the past cache and to itself in one softmax, so the output is unchanged. The cache is never blended, transposed or copied on the NPU, and the runtime makes no per-call copy of tied caches. The same `ReadOnlyKVCache` graph edit is applied by the Gemma 3, LFM2.5 and SmolLM2 exporters, including their batched prefill models. `--no-read-only-kv-cache` exports the earlier layout, which the torq-examples demos before v2.4.0 expect.
+
+Qwen3-0.6B on an SL2610 board at 1 GHz (torq-runtime 2.3.0, torq-examples chat demo):
+
+| | decode | compiler DMA estimate per step |
+|---|---|---|
+| `--no-read-only-kv-cache` | 6.0 tok/s | 410 MB |
+| default | 8.5 tok/s | 323 MB |
 
 ## Split model
 

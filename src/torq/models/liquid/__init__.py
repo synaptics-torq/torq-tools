@@ -45,6 +45,7 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         extract_embeddings=True,
         dynamic_models=True,
         keep_individual_kv_io=True,
+        read_only_kv_cache=True,
     )
     parser.add_argument(
         "--simulate-bf16",
