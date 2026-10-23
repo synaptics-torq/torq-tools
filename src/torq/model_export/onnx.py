@@ -149,14 +149,16 @@ class OnnxModelExporterBase(ABC):
         src_dir = Path(src_dir or self._export_paths["model"].parent)
         dst_dir = Path(dst_dir)
         dst_dir.mkdir(parents=True, exist_ok=True)
-        asset_names = ["config.json", "tokenizer.json"]
+        patterns = ["*.json", "*.jinja", "*.model", "*.tiktoken", "*.txt", "*.spm", "*.vocab"]
         if include_npy_data:
-            asset_names.extend(p.name for p in src_dir.glob("*.npy"))
-        for asset_name in asset_names:
-            src_path = src_dir / asset_name
-            if not src_path.exists():
-                continue
-            shutil.copy2(src_path, dst_dir / asset_name)
+            patterns.append("*.npy")
+        for pattern in patterns:
+            for src_path in src_dir.glob(pattern):
+                # Compiler flags describe this stage, not the source stage.
+                if src_path.is_file() and src_path.name != "compile_flags.json":
+                    dst_path = dst_dir / src_path.name
+                    if src_path.resolve() != dst_path.resolve():
+                        shutil.copy2(src_path, dst_path)
 
     # Dtypes --torq-convert-io-dtype converts the vmfb I/O to.
     _RUNTIME_DTYPE_MAP: Final[dict[str, type]] = {
@@ -166,18 +168,19 @@ class OnnxModelExporterBase(ABC):
 
     def _stage_runtime_dtype_artefacts(self, variant_roots: set[Path]) -> None:
         """Copy each variant's ``.npy`` artefacts into ``self._torq_dir`` in
-        the runtime dtype the compiled vmfbs expect, and its ``config.json`` and
-        ``tokenizer.json``, so that the compiled dir is complete for the runners.
+        the runtime dtype the compiled vmfbs expect, along with runtime metadata,
+        so that the compiled dir is complete for the runners.
         """
         for root in sorted(variant_roots):
             self._copy_runtime_assets(self._torq_dir, root, include_npy_data=False)
             for npy in sorted(root.glob("*.npy")):
                 data = np.load(npy)
-                data = data.astype(
-                    self._RUNTIME_DTYPE_MAP.get(data.dtype.name, data.dtype), copy=False
-                )
                 dst = self._torq_dir / npy.name
-                np.save(dst, data)
+                if (dtype := self._RUNTIME_DTYPE_MAP.get(data.dtype.name)) is not None:
+                    data = data.astype(dtype, copy=False)
+                    np.save(dst, data)
+                else:
+                    shutil.copy2(npy, dst)
                 self._logger.info(
                     "(Torq-export) Staged '%s' (%s) -> '%s'", npy.name, data.dtype, dst
                 )
@@ -424,6 +427,7 @@ class OnnxModelExporterBase(ABC):
                     else:
                         child.unlink()
         self._export_dir.mkdir(parents=True, exist_ok=True)
+        self._copy_runtime_assets(self._export_dir, self._onnx_dir)
         self._write_compile_flags_snapshot(self._export_dir)
 
         if self._static_models:
@@ -611,6 +615,8 @@ class OnnxModelExporterBase(ABC):
         if self._convert_dir.exists():
             shutil.rmtree(self._convert_dir, ignore_errors=True)
         self._convert_dir.mkdir(parents=True, exist_ok=True)
+        for root in sorted({Path(path).parent for path in self._export_paths.values()}):
+            self._copy_runtime_assets(self._convert_dir, root)
         self._write_compile_flags_snapshot(self._convert_dir)
         for comp, model_path in self._export_paths.items():
             if comp in skip:
@@ -633,7 +639,7 @@ class OnnxModelExporterBase(ABC):
                 continue
             data_orig: np.ndarray = np.load(data_orig_npy)
             data_converted = data_orig.astype(target_dtype)
-            data_converted_npy = converted_model_path.parent / data_orig_npy.name
+            data_converted_npy = self._convert_dir / data_orig_npy.name
             np.save(data_converted_npy, data_converted)
             self._logger.debug("(ONNX-convert) Saved converted external data to '%s'", str(data_converted_npy))
 
@@ -685,15 +691,16 @@ class OnnxModelExporterBase(ABC):
                 compiler_path=compiler_path,
             )
             self._logger.info("(Torq-export) Successfully exported '%s/%s.vmfb'", str(self._torq_dir), onnx_path.stem)
+        roots = {
+            Path(onnx_path).parent
+            for comp, onnx_path in self._export_paths.items()
+            if comp not in skip
+        }
         if "--torq-convert-io-dtype" in (torq_compile_args or []):
-            # The vmfb I/O is converted by the compiler: stage the matching
-            # runtime-dtype artefacts next to the vmfbs.
-            roots = {
-                Path(onnx_path).parent
-                for comp, onnx_path in self._export_paths.items()
-                if comp not in skip
-            }
             self._stage_runtime_dtype_artefacts(roots)
+        else:
+            for root in sorted(roots):
+                self._copy_runtime_assets(self._torq_dir, root)
         self._name_trimmed_lm_head(
             *{Path(p).parent for c, p in self._export_paths.items() if c not in skip}
         )

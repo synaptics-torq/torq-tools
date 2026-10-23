@@ -526,11 +526,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)
-        self._copy_runtime_assets(
-            Path(model_path).parent,
-            self._onnx_dir,
-            include_npy_data=False,
-        )
 
     def validate_onnx(self, n_iters: int = 5):
         validate_decoder_only_onnx(
@@ -559,13 +554,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         ]
         if self._trim_vocab:
             external_data.append((self._export_paths["model"].parent / "token_id_lut.npy", np.dtype(np.int32)))
-        result = super().convert_models(
+        return super().convert_models(
             convert_dir=convert_dir,
             preserve_io=preserve_io,
             external_data=external_data
         )
-        self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
-        return result
 
     def weight_quantize_models(self):
         """Quantize the MatMul weights of every component to blocks of 32 (W4A16 or W8A16).
