@@ -664,6 +664,133 @@ class CollapseGQABroadcast(OnnxGraphEdit):
             node.name, final_shape
         )
 
+def _producer(tensor: gs.Tensor, op: str) -> gs.Node | None:
+    node = tensor.inputs[0] if tensor.inputs else None
+    return node if node is not None and node.op == op else None
+
+
+def _scale_of(mul: gs.Node | None) -> tuple[gs.Tensor, float] | None:
+    """Return ``(data, scale)`` if ``mul`` multiplies by a scalar constant."""
+    if mul is None:
+        return None
+    data, const = mul.inputs
+    values = None
+    if isinstance(const, gs.Constant):
+        values = const.values
+    elif const.inputs and const.inputs[0].op == "Constant":
+        # Newer exports (e.g. Qwen3) emit the scale as a Constant node.
+        values = const.inputs[0].attrs["value"].values
+    if values is None or values.size != 1:
+        return None
+    return data, float(values.ravel()[0])
+
+@dataclass
+class GroupQueryHeads(OnnxGraphEdit):
+    """
+    Attend against the un-expanded KV caches instead of ``repeat_kv`` copies.
+
+    Exported GQA decode attention expands each ``[1, kv, S, D]`` cache to
+    ``[1, heads, S, D]`` (Unsqueeze -> Expand -> Reshape) and applies half of
+    the softmax scale to the expanded K. This rewrites the layer to::
+
+        Qg = Reshape(Q * (q_scale * k_scale), [1, kv, heads / kv, D])
+        O  = Softmax(Qg @ Transpose(K) + mask) @ V      # [1, kv, heads/kv, D]
+        O  = Reshape(O, [1, heads, 1, D])
+
+    Query head ``h`` maps to KV group ``h // (heads / kv)``, matching HF's
+    ``repeat_kv``. This removes the per-step copy and scale of the full cache.
+    Valid for single-token decode only.
+
+    Args:
+        num_heads (int): Number of query heads
+        num_kv_heads (int): Number of key/value heads
+        head_dim (int): Head dimension
+    """
+
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+
+    @staticmethod
+    def _unrepeated(tensor: gs.Tensor, *ops: str) -> gs.Tensor | None:
+        """Follow the producer chain ``ops`` back from ``tensor``; return the chain input."""
+        for op in ops:
+            node = _producer(tensor, op)
+            if node is None:
+                return None
+            tensor = node.inputs[0]
+        return tensor
+
+    def _pattern(self, scores: gs.Node):
+        q = _scale_of(_producer(scores.inputs[0], "Mul"))
+        k = _scale_of(_producer(scores.inputs[1], "Mul"))
+        if q is None or k is None:
+            return None
+        k_cache = self._unrepeated(k[0], "Transpose", "Reshape", "Expand", "Unsqueeze")
+        mask_add = next((user for user in scores.outputs[0].outputs if user.op == "Add"), None)
+        softmax = mask_add.outputs[0].outputs[0] if mask_add and mask_add.outputs[0].outputs else None
+        context = softmax.outputs[0].outputs[0] if softmax and softmax.op == "Softmax" else None
+        if k_cache is None or context is None or context.op != "MatMul":
+            return None
+        v_cache = self._unrepeated(context.inputs[1], "Reshape", "Expand", "Unsqueeze")
+        if v_cache is None:
+            return None
+        return q, k[1], k_cache, v_cache, mask_add, softmax, context
+
+    def match(self, node: gs.Node) -> bool:
+        return node.op == "MatMul" and node.name.endswith("self_attn/MatMul") and self._pattern(node) is not None
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "MatMul")
+        (q, q_scale), k_scale, k_cache, v_cache, mask_add, softmax, context = self._pattern(node)
+        base = node.name.removesuffix("MatMul")
+        heads, kv_heads, head_dim = self.num_heads, self.num_kv_heads, self.head_dim
+        group = heads // kv_heads
+        dtype = q.dtype or np.float32
+
+        q_grouped = self.graph.layer(
+            name=base + "GQA/QReshape",
+            op="Reshape",
+            inputs=[
+                self.graph.layer(
+                    name=base + "GQA/QScale",
+                    op="Mul",
+                    inputs=[q, np.array(q_scale * k_scale, dtype=np.float32)],
+                    outputs=[gs.Variable(base + "GQA/q_scaled", dtype=dtype, shape=[1, heads, 1, head_dim])],
+                )[0],
+                np.array([1, kv_heads, group, head_dim], dtype=np.int64),
+            ],
+            outputs=[gs.Variable(base + "GQA/q", dtype=dtype, shape=[1, kv_heads, group, head_dim])],
+        )[0]
+        k_transposed = self.graph.layer(
+            name=base + "GQA/KTranspose",
+            op="Transpose",
+            attrs={"perm": [0, 1, 3, 2]},
+            inputs=[k_cache],
+            outputs=[gs.Variable(base + "GQA/k_t", dtype=dtype)],
+        )[0]
+
+        # Scores [1, kv, group, S]; the [1, 1, 1, S] mask Add still broadcasts.
+        node.inputs = [q_grouped, k_transposed]
+        for tensor in (node.outputs[0], mask_add.outputs[0], softmax.outputs[0]):
+            tensor.shape = None
+
+        # Context [1, kv, group, D] -> [1, heads, 1, D] for the unchanged head merge.
+        context_out = context.outputs[0]
+        grouped_out = gs.Variable(base + "GQA/context", dtype=dtype, shape=[1, kv_heads, group, head_dim])
+        context.inputs = [context.inputs[0], v_cache]
+        context.outputs = [grouped_out]
+        self.graph.layer(
+            name=base + "GQA/ContextReshape",
+            op="Reshape",
+            inputs=[grouped_out, np.array([1, heads, 1, head_dim], dtype=np.int64)],
+            outputs=[context_out],
+        )
+
+        self._logger.debug(
+            "Grouped %d query heads over %d KV heads at '%s'", heads, kv_heads, node.name
+        )
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.

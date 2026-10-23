@@ -564,15 +564,17 @@ class QwenModelExporter(OnnxModelExporterBase):
                 len(kept_token_ids),
             )
 
+        # The IsNaN guard between Softmax and the context MatMul hides the attention pattern.
+        editor.remove_isNaN()
+
         if self._static_models:
-            editor.grouped_query_attention(
+            editor.group_query_heads(
                 self._config.num_attention_heads,
                 self._config.num_key_value_heads,
                 head_dim,
             )
 
         editor.reorder_graph_input("position_ids", 1)
-        editor.remove_isNaN()
 
         editor.resolve_static_shape_inputs()
         editor.replace_current_len_squeeze()

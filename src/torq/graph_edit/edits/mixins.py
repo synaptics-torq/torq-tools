@@ -29,6 +29,7 @@ from .transformer import (
     CollapseGQABroadcast,
     CombineKVCacheMixin,
     ConvertToStaticIndex,
+    GroupQueryHeads,
     MaskFutureAttentionScores,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
@@ -137,6 +138,10 @@ class CommonGraphEditsMixin:
 
     def collapse_gqa_broadcast(self):
         self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
+        return self
+
+    def group_query_heads(self, num_heads: int, num_kv_heads: int, head_dim: int):
+        self.apply_edit(GroupQueryHeads(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim))
         return self
 
     def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):

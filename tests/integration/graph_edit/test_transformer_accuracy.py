@@ -6,8 +6,9 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph, run_model
+from support.graph_edit import clone_graph, graph, run_model
 from torq.graph_edit.edits.transformer import MaskFutureAttentionScores, ReplaceDynamicKVCache
+from torq.models.qwen._graph import QwenOnnxGraphEditor
 
 
 pytestmark = [pytest.mark.transformer, pytest.mark.ort]
@@ -89,3 +90,72 @@ def test_attention_future_mask_advances_for_each_chunk_row():
     assert actual[0, 0, 0, 2] == 0
     assert actual[0, 0, 1, 2] > 0
     assert actual[0, 0, 1, 3] == 0
+
+
+def _gqa_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> gs.Graph:
+    """One HF-exported GQA decode layer with the projected Q, K and V as inputs."""
+    group = heads // kv_heads
+    q = gs.Variable("q", dtype=np.float32, shape=[1, heads, 1, head_dim])
+    position_ids = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    inputs, nodes, repeated = [q, position_ids], [], {}
+    for role in ("key", "value"):
+        past = gs.Variable(f"past_key_values.0.{role}", dtype=np.float32, shape=[1, kv_heads, max_len, head_dim])
+        new = gs.Variable(f"new_{role}", dtype=np.float32, shape=[1, kv_heads, 1, head_dim])
+        present = gs.Variable(f"present.0.{role}", dtype=np.float32, shape=[1, kv_heads, max_len, head_dim])
+        unsqueezed = gs.Variable(f"{role}_unsqueezed", dtype=np.float32)
+        expanded = gs.Variable(f"{role}_expanded", dtype=np.float32)
+        repeated[role] = gs.Variable(f"{role}_repeated", dtype=np.float32, shape=[1, heads, max_len, head_dim])
+        nodes += [
+            gs.Node("Concat", f"{role}_concat", inputs=[past, new], outputs=[present], attrs={"axis": -2}),
+            gs.Node("Unsqueeze", f"{role}_unsqueeze", inputs=[present, gs.Constant(f"{role}_axes", np.array([2]))],
+                    outputs=[unsqueezed]),
+            gs.Node("Expand", f"{role}_expand", outputs=[expanded], inputs=[
+                unsqueezed, gs.Constant(f"{role}_shape", np.array([1, kv_heads, group, max_len, head_dim]))]),
+            gs.Node("Reshape", f"{role}_reshape", outputs=[repeated[role]], inputs=[
+                expanded, gs.Constant(f"{role}_heads", np.array([1, heads, max_len, head_dim]))]),
+        ]
+        inputs += [past, new]
+    base = "/model/layers.0/self_attn/"
+    # Like real exports, the attention intermediates carry no dtype.
+    q_scaled, k_t, k_scaled, scores, probs = (gs.Variable(n) for n in ("q_s", "k_t", "k_s", "s", "p"))
+    attn = gs.Variable("attn", dtype=np.float32, shape=[1, heads, 1, head_dim])
+    nodes += [
+        gs.Node("Mul", "q_scale", inputs=[q, gs.Constant("q_scale_value", np.array(0.5, np.float32))], outputs=[q_scaled]),
+        gs.Node("Transpose", "k_transpose", inputs=[repeated["key"]], outputs=[k_t], attrs={"perm": [0, 1, 3, 2]}),
+        gs.Node("Mul", "k_scale", inputs=[k_t, gs.Constant("k_scale_value", np.array(0.5, np.float32))], outputs=[k_scaled]),
+        gs.Node("MatMul", base + "MatMul", inputs=[q_scaled, k_scaled], outputs=[scores]),
+        gs.Node("Softmax", base + "Softmax", inputs=[scores], outputs=[probs], attrs={"axis": -1}),
+        gs.Node("MatMul", base + "MatMul_1", inputs=[probs, repeated["value"]], outputs=[attn]),
+    ]
+    return graph(nodes=nodes, inputs=inputs, outputs=[attn, *(n.outputs[0] for n in nodes if n.op == "Concat")])
+
+
+def _static_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> QwenOnnxGraphEditor:
+    editor = QwenOnnxGraphEditor(_gqa_decode_layer(heads, kv_heads, max_len, head_dim), onnx.TensorProto.FLOAT)
+    cur_len = editor.graph.layer(
+        name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
+        outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],
+    )[0]
+    editor.replace_dynamic_kv_cache(cur_len, max_len).mask_future_attn_scores(cur_len, max_len)
+    return editor
+
+
+def test_group_query_heads_matches_repeated_kv():
+    heads, kv_heads, max_len, head_dim = 6, 2, 5, 4
+    editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
+    repeated = clone_graph(editor.graph)
+    editor.group_query_heads(heads, kv_heads, head_dim)
+    assert not [n for n in editor.graph.nodes if n.op == "Expand"]
+
+    rng = np.random.default_rng(1)
+    feeds = {
+        "q": rng.standard_normal((1, heads, 1, head_dim)).astype(np.float32),
+        "new_key": rng.standard_normal((1, kv_heads, 1, head_dim)).astype(np.float32),
+        "new_value": rng.standard_normal((1, kv_heads, 1, head_dim)).astype(np.float32),
+        "past_key_values.0.key": rng.standard_normal((1, kv_heads, max_len, head_dim)).astype(np.float32),
+        "past_key_values.0.value": rng.standard_normal((1, kv_heads, max_len, head_dim)).astype(np.float32),
+        "position_ids": np.array([[2]], dtype=np.int64),
+    }
+    expected, actual = run_model(repeated, feeds), run_model(editor.graph, feeds)
+    for name in expected:
+        np.testing.assert_allclose(actual[name], expected[name], rtol=1e-5, atol=1e-6)

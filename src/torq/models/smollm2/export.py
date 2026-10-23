@@ -127,6 +127,11 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("FoldScalarMatMul"),
+            EditSpec("GroupQueryHeads", (
+                self._config.num_attention_heads,
+                self._config.num_key_value_heads,
+                self._config.hidden_size // self._config.num_attention_heads,
+            )),
         ]
         if self._broadcast_ops is not None:
             patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
