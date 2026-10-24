@@ -48,6 +48,9 @@ def validate_decoder_only_onnx(
     lm_head_path: str | os.PathLike | None = None,
     prefill_model_path: str | os.PathLike | None = None,
     prefill_size: int | None = None,
+    prompts: tuple[str, ...] = VALIDATION_PROMPTS,
+    max_inp_len: int | None = None,
+    runner_kwargs: dict | None = None,
 ):
     """Compare the exported model's output against the unedited source ONNX.
 
@@ -55,9 +58,13 @@ def validate_decoder_only_onnx(
     under test is static or dynamic depending on how it was exported.
     `lm_head_path` chains a split LM head onto the model under test, whose own
     first output is then hidden states rather than logits. `prefill_model_path`
-    uses the fixed-size prefill model for complete prompt chunks.
+    uses the fixed-size prefill model for complete prompt chunks. `max_inp_len`
+    can allow a complete tool prompt larger than one chunk; `runner_kwargs`
+    supplies the same tool definitions to both runners.
     """
     n_threads = n_threads or os.cpu_count()
+    max_inp_len = max_inp_len if max_inp_len is not None else prefill_size
+    runner_kwargs = runner_kwargs or {}
     if static_models:
         # Only exporters that can split the model accept these component paths.
         split_model_kwargs = {}
@@ -71,37 +78,41 @@ def validate_decoder_only_onnx(
         runner = static_cls.from_onnx(
             model_path,
             max_gen_tokens,
-            max_inp_len=prefill_size,
+            max_inp_len=max_inp_len,
             n_threads=n_threads,
             instruct_model=instruct_model,
             repo_id=repo_id,
             **split_model_kwargs,
+            **runner_kwargs,
         )
     else:
         runner = dynamic_cls.from_onnx(
             model_path,
             max_gen_tokens=max_gen_tokens,
+            max_inp_len=max_inp_len,
             n_threads=n_threads,
             instruct_model=instruct_model,
             repo_id=repo_id,
+            **runner_kwargs,
         )
     val_runner = dynamic_cls.from_onnx(
         Path(reference_model_path),
-        max_inp_len=prefill_size,
+        max_inp_len=max_inp_len,
         max_gen_tokens=max_gen_tokens,
         n_threads=n_threads,
         instruct_model=instruct_model,
         repo_id=repo_id,
+        **runner_kwargs,
     )
 
     for i in range(n_iters):
-        if i >= len(VALIDATION_PROMPTS):
+        if i >= len(prompts):
             logger.warning("(ONNX-validation) No more samples to validate, stopping")
             break
 
-        input = VALIDATION_PROMPTS[i]
-        output = runner.run(input)
-        val_output = val_runner.run(input)
+        input = prompts[i]
+        output = runner.run(input, skip_special_tokens=False)
+        val_output = val_runner.run(input, skip_special_tokens=False)
         min_len = min(len(output), len(val_output))
         if output[:min_len] != val_output[:min_len]:
             result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_output},\nGenerated:\n{output}"

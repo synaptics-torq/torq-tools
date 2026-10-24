@@ -17,6 +17,7 @@ TRIM_VOCAB_GROUPS: Final[list[str]] = ["latin", "punct", "digits", "digits-non-l
 # The hosted GPTQ INT4 weights belong to this source only (270m, instruct).
 GPTQ_SOURCE_REPO: Final[str] = "google/gemma-3-270m-it"
 GPTQ_HF_REPO: Final[str] = "Synaptics/gemma-3-270-GPTQ-int4-it-torq"
+FUNCTIONGEMMA_HF_REPO: Final[str] = "google/functiongemma-270m-it"
 
 
 def add_gemma3_export_args(parser: argparse.ArgumentParser):
@@ -29,6 +30,13 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         instruct=True,
         split_lm_head=True,
         batch_prefill=True,
+    )
+    parser.add_argument(
+        "--functiongemma",
+        action="store_true",
+        help=f"Export FunctionGemma (270m only; default source: {FUNCTIONGEMMA_HF_REPO}). "
+             "Fine-tune for your function-calling task for best accuracy and override the source "
+             "with --hf-repo or --onnx-source-dir",
     )
     parser.add_argument(
         "--hf-repo",

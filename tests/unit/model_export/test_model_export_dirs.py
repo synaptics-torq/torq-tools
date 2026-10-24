@@ -106,6 +106,19 @@ def test_export_onnx_prepares_once(tmp_path):
     assert (exporter.setup_calls, exporter.load_calls) == (1, 1)
 
 
+def test_dynamic_export_preserves_source_chat_template(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "chat_template.jinja").write_text("{{ messages }}")
+    (source / "tokenizer_config.json").write_text('{"chat_template": "custom"}')
+    exporter = StubExporter(tmp_path, {"model": _identity_model()})
+
+    exporter.export_onnx(validate=False)
+
+    assert (tmp_path / "export" / "chat_template.jinja").read_text() == "{{ messages }}"
+    assert (tmp_path / "export" / "tokenizer_config.json").read_text() == '{"chat_template": "custom"}'
+
+
 def test_dynamic_quantize_models_quantizes_and_updates_export_paths(tmp_path):
     exporter = StubExporter(tmp_path, {"model": _identity_model()}, dynamic_quantize=True)
     exporter.export_onnx(validate=False)

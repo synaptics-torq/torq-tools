@@ -27,6 +27,27 @@ ONNX and skip the download entirely.
 > Note: this module exports the **fp32** model and quantizes it itself. It does
 > **not** consume pre-quantized (MatMulNBits) ONNX.
 
+## FunctionGemma
+
+FunctionGemma uses the Gemma 3 architecture and shares this exporter. Select it with `--functiongemma` (270M only):
+
+```sh
+# Published checkpoint
+torq-export-model gemma3 --functiongemma
+
+# Your fine-tuned checkpoint
+torq-export-model gemma3 --functiongemma --hf-repo org/my-functiongemma
+
+# Local ONNX export of your checkpoint
+torq-export-model gemma3 --functiongemma --onnx-source-dir ./functiongemma-onnx
+```
+
+The default source is `google/functiongemma-270m-it` (`--instruct-model` is implied). A source override is optional. Google recommends fine-tuning FunctionGemma for your function-calling task for best accuracy; see the [model card](https://huggingface.co/google/functiongemma-270m-it). Local ONNX sources must include `config.json`, `tokenizer.json`, and the source tokenizer metadata and chat template (`tokenizer_config.json` with an embedded template or a separate `chat_template.jinja`).
+
+Export validation compares a tool-call prompt, including special function-call markers, against the original ONNX using the source checkpoint's chat template, a developer instruction, and a sample tool definition. It checks export equivalence, not task accuracy. The full prompt can span multiple prefill chunks; an insufficient context limit raises an error instead of truncating the tool definition. Runners honor every stop token in the source configuration, including FunctionGemma's start-of-function-response token. Tokenizer metadata and chat templates are preserved in exported, quantized, converted, and compiled directories. The read-only KV cache and other Gemma export defaults also apply.
+
+INT4 quantization uses round-to-nearest unless you supply `--gptq-checkpoint` for this checkpoint. The hosted ordinary Gemma GPTQ weights are never selected for FunctionGemma. Programmatic `Gemma3Static` and `Gemma3Dynamic` runners accept `tools=[...]` with Hugging Face tool schemas and use the local chat template. The existing text-only inference CLI does not accept tool definitions or execute function calls.
+
 ## Pipeline overview
 
 ```
@@ -69,6 +90,8 @@ torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization non
 torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization int8
 ```
 
+To compile the float variant, use `torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization none`. A run compiles only its selected variant: the default INT4 run regenerates the intermediate `fp32/static` ONNX files, but preserves any `fp32/static/compiled` files from earlier float runs. Those compiled files can therefore have older input shapes and KV layouts than the adjacent ONNX files. The selected variant emits separate `transformer.vmfb` and `transformer_prefill.vmfb` files for decoding and prefill.
+
 If the Torq compiler Python API is not installed in the venv, point the fallback
 at a `torq-compile` binary first:
 
@@ -82,6 +105,7 @@ export TORQ_COMPILER_PATH=/path/to/torq-compile
 |---|---|
 | `-s, --model-size {270m,1b}` | Model size (default: `270m`) |
 | `--instruct-model` | Use the instruct-tuned (`-it`) variant |
+| `--functiongemma` | Export FunctionGemma 270M using its tool chat template; source overrides remain optional |
 | `-t, --max-gen-tokens N` | Static sequence length / KV-cache size (default: 256) |
 | `--convert-dtypes` | Convert the export to the dtypes Torq supports: float → bf16 **and** int64 → int32 |
 | `--extract-embeddings` | Extract the token-embedding table to `token_embeddings.npy` (model input becomes an embedding vector). **On by default** — opt out with `--no-extract-embeddings` |

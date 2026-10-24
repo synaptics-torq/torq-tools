@@ -16,6 +16,8 @@ python -m pip install -e . --extra-index-url https://download.pytorch.org/whl/cp
 python -m pip install -r tests/requirements.txt
 ```
 
+CI installs only `tests/requirements.txt`. Keep it up to date when tests need additional packages, including Jinja2 for Hugging Face chat templates. Tokenizer and mocked exporter tests should run without PyTorch or model downloads.
+
 Install optional extras only for workflows that need them:
 
 ```bash
@@ -88,6 +90,10 @@ The existing model directories use this layout:
 - `infer.py` or `validate.py`: user-facing inference and validation entry points.
 
 For decoder-only models, implement `validate_onnx()` by calling `validate_decoder_only_onnx()` from `src/torq/model_export/validation.py` with the model's static and dynamic runner classes, rather than writing the prompt loop by hand. It compares the export against the unedited source ONNX and keeps the prompt set and pass/fail reporting consistent across models.
+
+Architecture-compatible checkpoints should share an exporter. FunctionGemma uses `torq-export-model gemma3 --functiongemma`, with optional source overrides, rather than a separate model package. Its validation supplies tool definitions through `runner_kwargs` and a tool prompt through `prompts`; `max_inp_len` covers the complete prompt independently of the prefill chunk size. Never reuse a quantized checkpoint from another source model.
+
+Each exported variant must carry its runtime sidecars so its directory can be staged independently. The shared ONNX exporter copies JSON metadata, Jinja templates, tokenizer model/vocabulary files, and NumPy tables through export, quantization, conversion, and compilation with `_copy_runtime_assets()`. Keep stage-specific `compile_flags.json` snapshots separate. Copy tables before dtype conversion so converted tables win; compilation preserves their dtype unless `--torq-convert-io-dtype` requests runtime dtype conversion.
 
 Static decoders read their KV caches without writing them: after `combine_kv_io_tensors` (and, for Hugging Face GQA exports, `group_query_heads`), call `read_only_kv_cache` with the step's chunk length. Each cache becomes a time-major `[1, L, 2 * kv, D]` input and each `present.*` output holds only the step's new rows, so exporters that support it register `--read-only-kv-cache` (on by default) through `add_onnx_args(read_only_kv_cache=True)`. `DecoderOnlyRunner._update_cache` writes a cache output that is shorter than its input into the cache at the step's position, and replaces the cache with any other output; static runners take cache shapes from the model's inputs (`_kv_cache_zeros`).
 

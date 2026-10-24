@@ -320,34 +320,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             "(model) Skipping ONNX Runtime optimization for large external-data model"
         )
 
-    def _copy_runtime_assets(
-        self,
-        destination_dir: str | os.PathLike,
-        source_dir: str | os.PathLike | None = None,
-        include_tables: bool = False,
-    ) -> None:
-        source_dir = Path(source_dir or self._onnx_dir)
-        destination_dir = Path(destination_dir)
-        destination_dir.mkdir(parents=True, exist_ok=True)
-
-        for asset_name in (
-            "config.json",
-            "generation_config.json",
-            "special_tokens_map.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            # Host-side runtime tables of split exports. Only copied into the
-            # Torq dir: the converted dir holds its own bf16/int32 versions.
-            *(("token_embeddings.npy", "token_id_lut.npy") if include_tables else ()),
-        ):
-            source_path = source_dir / asset_name
-
-            if source_path.exists():
-                shutil.copy2(
-                    source_path,
-                    destination_dir / asset_name,
-                )
-
     def _make_model_static(
         self,
         model: onnx.ModelProto,
@@ -887,6 +859,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(
             Path(model_path).parent,
             self._onnx_dir,
+            include_npy_data=False,
         )
 
         self._patch_static_model(model_path)
@@ -1262,6 +1235,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(
             self._convert_dir,
             self._export_dir,
+            include_npy_data=False,
         )
 
     def export_torq(
@@ -1379,7 +1353,6 @@ class QwenModelExporter(OnnxModelExporterBase):
         self._copy_runtime_assets(
             self._torq_dir,
             self._export_paths["model"].parent,
-            include_tables=True,
         )
         self._name_trimmed_lm_head()
 

@@ -18,7 +18,7 @@ from onnx import numpy_helper
 from tokenizers import Tokenizer
 from transformers import AutoConfig
 
-from . import GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
+from . import FUNCTIONGEMMA_HF_REPO, GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
 from ._trim_vocab import (
@@ -46,6 +46,17 @@ _GEMMA3_MODEL_FILENAMES: Final[tuple[tuple[str, ...], tuple[str, ...]]] = (
 _GEMMA3_PRETRAINED_SUFFIX_SIZES: Final[frozenset[str]] = frozenset({"1b"})
 
 
+def _resolve_hf_repo(model_size: str, instruct_model: bool, hf_repo: str | None, functiongemma: bool) -> str:
+    if functiongemma and model_size != "270m":
+        raise ValueError("--functiongemma supports only --model-size 270m")
+    if hf_repo:
+        return hf_repo
+    if functiongemma:
+        return FUNCTIONGEMMA_HF_REPO
+    suffix = "-it" if instruct_model else ("-pt" if model_size in _GEMMA3_PRETRAINED_SUFFIX_SIZES else "")
+    return f"google/gemma-3-{model_size}{suffix}"
+
+
 class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def __init__(
@@ -56,6 +67,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
+        functiongemma: bool = False,
         hf_repo: str | None = None,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
@@ -75,6 +87,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         read_only_kv_cache: bool = True,
         **edit_args
     ):
+        self._hf_repo = _resolve_hf_repo(model_size, instruct_model, hf_repo, functiongemma)
         if read_only_kv_cache and keep_individual_kv_io:
             raise ValueError(
                 "`--read-only-kv-cache` needs the combined KV cache I/O; "
@@ -89,7 +102,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             )
         self._weight_quantization = weight_quantization
         self._gptq_checkpoint = Path(gptq_checkpoint) if gptq_checkpoint is not None else None
-        self._instruct_model = instruct_model
+        self._functiongemma = functiongemma
+        self._instruct_model = instruct_model or functiongemma
         self._extract_embeddings = extract_embeddings
         self._keep_individual_kv_io = keep_individual_kv_io
         self._read_only_kv_cache = read_only_kv_cache
@@ -103,16 +117,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct", "digits"))
         self._trim_byte_fallback = trim_byte_fallback
         self._hf_repo_subdir = hf_repo_subdir
-        if hf_repo:
-            self._hf_repo = hf_repo
-        else:
-            self._hf_repo = f"google/gemma-3-{model_size}"
-            if self._instruct_model:
-                self._hf_repo += "-it"
-            elif model_size in _GEMMA3_PRETRAINED_SUFFIX_SIZES:
-                # Upstream publishes the base 1B checkpoint as `-pt`; 270m has a
-                # bare repo, so the suffix cannot be applied unconditionally.
-                self._hf_repo += "-pt"
         self._source_asset_dirs = (
             [self._onnx_source_dir]
             if self._onnx_source_dir is not None
@@ -193,6 +197,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                         "special_tokens_map.json",
                         "tokenizer.json",
                         "tokenizer_config.json",
+                        "chat_template.jinja",
                     ],
                 )
                 self._logger.info("Downloaded model.onnx and peripheral files from %s", self._hf_repo)
@@ -526,13 +531,26 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)
-        self._copy_runtime_assets(
-            Path(model_path).parent,
-            self._onnx_dir,
-            include_npy_data=False,
-        )
 
     def validate_onnx(self, n_iters: int = 5):
+        validation_kwargs = {}
+        if self._functiongemma:
+            # Keep tool prompting in the runners so both graphs receive the
+            # source checkpoint's template and identical token IDs.
+            tools = [{"type": "function", "function": {
+                "name": "get_temperature",
+                "description": "Get the temperature in a city.",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                }, "required": ["city"]},
+            }}]
+            validation_kwargs = {
+                "runner_kwargs": {"tools": tools},
+                "prompts": ("What is the temperature in London?",),
+                # Prefill chunk size is independent of the complete tool prompt.
+                "max_inp_len": max(1, self._max_gen_tokens - 32),
+            }
+            n_iters = min(n_iters, 1)
         validate_decoder_only_onnx(
             self._logger,
             Gemma3Static,
@@ -547,6 +565,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_path=self._export_paths.get("lm_head"),
             prefill_model_path=self._export_paths.get("model_prefill"),
             prefill_size=self._batch_prefill,
+            **validation_kwargs,
         )
 
     def convert_models(
@@ -559,13 +578,11 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         ]
         if self._trim_vocab:
             external_data.append((self._export_paths["model"].parent / "token_id_lut.npy", np.dtype(np.int32)))
-        result = super().convert_models(
+        return super().convert_models(
             convert_dir=convert_dir,
             preserve_io=preserve_io,
             external_data=external_data
         )
-        self._copy_runtime_assets(self._convert_dir, self._export_dir, include_npy_data=False)
-        return result
 
     def weight_quantize_models(self):
         """Quantize the MatMul weights of every component to blocks of 32 (W4A16 or W8A16).
@@ -658,7 +675,7 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace, weight_quantization: str 
         return Path(args.gptq_checkpoint)
     if not args.gptq:
         return None
-    source = args.hf_repo or f"google/gemma-3-{args.model_size}{'-it' if args.instruct_model else ''}"
+    source = _resolve_hf_repo(args.model_size, args.instruct_model, args.hf_repo, args.functiongemma)
     if source != GPTQ_SOURCE_REPO or args.onnx_source_dir:
         logger.warning(
             "No hosted GPTQ weights for %s: the INT4 weights use round-to-nearest. "
@@ -686,6 +703,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         args.extract_embeddings,
         args.keep_individual_kv_io,
         not args.dynamic_models,
+        functiongemma=args.functiongemma,
         hf_repo=args.hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,

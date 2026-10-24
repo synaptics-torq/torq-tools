@@ -84,13 +84,15 @@ def test_convert_io_flag_stages_runtime_dtype_artefacts(tmp_path, monkeypatch):
     assert np.load(exporter.export_dir / "pos_ids.npy").dtype == np.int64
 
 
-def test_artefact_staging_requires_the_io_flag(tmp_path, monkeypatch):
+def test_artefact_staging_preserves_dtype_without_the_io_flag(tmp_path, monkeypatch):
     """Internal weight conversion (--torq-convert-dtypes) leaves the vmfb I/O
-    fp32, so nothing is staged."""
+    fp32, so runtime tables are staged without dtype conversion."""
     _fake_compile(monkeypatch)
     exporter = _exporter(tmp_path)
     np.save(exporter.export_dir / "token_embeddings.npy", np.zeros((2, 4), dtype=np.float32))
 
     exporter.export_torq(torq_compile_args=["--torq-convert-dtypes"])
 
-    assert not (exporter.export_dir / "compiled" / "token_embeddings.npy").exists()
+    staged = np.load(exporter.export_dir / "compiled" / "token_embeddings.npy")
+    assert staged.dtype == np.float32
+    np.testing.assert_array_equal(staged, np.zeros((2, 4), dtype=np.float32))
