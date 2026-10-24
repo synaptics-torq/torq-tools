@@ -16,6 +16,8 @@ python -m pip install -e . --extra-index-url https://download.pytorch.org/whl/cp
 python -m pip install -r tests/requirements.txt
 ```
 
+CI installs only `tests/requirements.txt`. Keep it up to date when tests need additional packages, including Jinja2 for Hugging Face chat templates. Tokenizer and mocked exporter tests should run without PyTorch or model downloads.
+
 Install optional extras only for workflows that need them:
 
 ```bash
