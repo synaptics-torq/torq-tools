@@ -56,7 +56,12 @@ moonshine = [
     "pandas",
     "tqdm",
 ]
-all = ["torq-tools[moonshine]"]
+# EmbeddingGemma-2 export: onnxsim folds the static graphs, Pillow feeds the vision check
+embeddinggemma2 = [
+    "onnxsim",
+    "pillow",
+]
+all = ["torq-tools[moonshine,embeddinggemma2]"]
 
 # The exporters read their validated torq-compile flags from compile_flags.json next
 # to their module; without this, a non-editable install has no flags.
