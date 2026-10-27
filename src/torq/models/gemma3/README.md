@@ -320,3 +320,11 @@ torq-infer-model gemma3 -m /path/to/model.vmfb --instruct-model "Capital of Fran
 bf16 ONNX cannot run through onnxruntime (no CPU bf16 MatMul kernel) — validate
 correctness on the **fp32** ONNX, and use the VMFB (or the DQL/dequantized model)
 on the board.
+
+### Experimental native batch prefill
+
+Gemma3 270M and FunctionGemma support explicit static families with `--native-batch-prefill 4,12,29,51,92,106,124 --extract-embeddings --split-lm-head --no-read-only-kv-cache --weight-quantization none`. Use an FP32 source and keep the context within the model's sliding attention window. Quantization, dtype conversion, dynamic shapes, read-only caches and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
+
+See the shared [native batch-prefill guide](../../model_export/batch_prefill.md) for export commands, compiler/runtime requirements, artifact layout, optional size probing, chunk selection and cache handling. FunctionGemma additionally needs checkpoint-specific validation.
+
+The full FP32 Gemma3-270M IT family at context 256 with sizes 4,12,29,51,92,106,124 passes sequential ONNX hidden/cache comparisons and compiles into one eight-entry version-3 VMFB using the compiler core/runtime stack. BF16 device accuracy and performance remain separate validation gates. Fixed RoPE frequencies remain verified literals alongside position controls.

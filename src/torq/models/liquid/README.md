@@ -224,3 +224,13 @@ remainder; generation always uses the decode model. Export validation compares
 the chunked runner against the unedited dynamic source ONNX.
 
 ---
+
+### Experimental native batch prefill
+
+LFM2.5 230M supports explicit static families with `--native-batch-prefill 4,7,12 --extract-embeddings --split-lm-head --no-read-only-kv-cache`. Sizes must be unique, ascending, at least four, and fit the context. Start from FP32 without dtype conversion, quantization, convolution overrides, simulated BF16, dynamic shapes or topology splitting. Vision models and LFM2.5 350M are outside this native path; ordinary separate-prefill exports remain available.
+
+The supported depthwise convolution has kernel size three, stride/dilation one, no padding or bias, and channel-major three-token state. Native chunks retain token-major activations and use one broadcast MatMul per convolution block; the history ABI remains `[1,D,3]`, oldest first.
+
+See the shared [native batch-prefill guide](../../model_export/batch_prefill.md) for compiler/runtime requirements, artifact layout, optional size probing, chunk selection and state handling. The `torq-examples` hardware runner carries both convolution and KV state across entry changes.
+
+Earlier full-model checks cover B=4/7 at context 16, including FP32 hidden/state comparisons and byte-identical Torq payloads against frontend generation from the same imported source and flags. Full-model validation has not been repeated on the rebased compiler. Device accuracy and performance remain separate validation gates. Fixed RoPE frequencies remain verified literals because preserving them as weight globals can put position computation outside the family dispatch.
