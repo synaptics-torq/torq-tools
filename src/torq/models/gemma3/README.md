@@ -4,7 +4,7 @@ Export pipeline for **Gemma-3 270M** (and 1B), converting the HuggingFace model
 to a static VMFB for the Torq board. By default the MatMul weights are **INT4**
 (block size 32, bf16 activations): GPTQ weights for the 270M instruct model,
 round-to-nearest for the other sources. The model is compiled with the
-stream-schedule prefetch (`--torq-prefetch-algorithm=stream-schedule`).
+stream-schedule prefetch (`--torq-prefetch-algorithm=stream-schedule`). Native FP32 families with legacy full-cache I/O use constant-load prefetch to retain their shared weight tiling.
 
 ## Source model
 
@@ -323,7 +323,7 @@ on the board.
 
 ### Experimental native batch prefill
 
-Gemma3 270M and FunctionGemma support explicit static families with `--native-batch-prefill 4,12,29,51,92,106,124 --extract-embeddings --split-lm-head --no-read-only-kv-cache --weight-quantization none`. Use an FP32 source and keep the context within the model's sliding attention window. Quantization, dtype conversion, dynamic shapes, read-only caches and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
+Gemma3 270M and FunctionGemma support explicit static families with `--native-batch-prefill 4,12,29,51,92,106,124 --extract-embeddings --split-lm-head`. Use an FP32 source and keep the context within the model’s sliding attention window. The default Gemma3-270M IT export uses INT4 GPTQ weights and the updated time-major, read-only KV cache, returning only the new rows for each chunk. Other checkpoints retain their normal GPTQ selection rules. Use `--weight-quantization none` for FP32 weights, and `--no-read-only-kv-cache` for the legacy full-cache layout. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
 
 See the shared [native batch-prefill guide](../../model_export/batch_prefill.md) for export commands, compiler/runtime requirements, artifact layout, optional size probing, chunk selection and cache handling. FunctionGemma additionally needs checkpoint-specific validation.
 

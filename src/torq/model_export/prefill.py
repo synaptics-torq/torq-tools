@@ -26,7 +26,8 @@ def parse_native_sizes(value: str) -> tuple[int, ...]:
 
 
 def validate_native_options(sizes, *, batch_prefill, context, minimum, static,
-                            embeddings, split_head, read_only, individual, unsupported):
+                            embeddings, split_head, read_only, individual, unsupported,
+                            supports_read_only=False):
     if sizes is None:
         return ()
     if (not sizes or any(type(b) is not int or not minimum <= b <= context for b in sizes)
@@ -34,12 +35,13 @@ def validate_native_options(sizes, *, batch_prefill, context, minimum, static,
         raise ValueError(f"--native-batch-prefill requires unique ascending sizes in [{minimum}, {context}]")
     if batch_prefill is not None:
         raise ValueError("--native-batch-prefill and --batch-prefill are mutually exclusive")
-    if not static or not embeddings or not split_head or read_only or individual or unsupported:
+    if not static or not embeddings or not split_head or (read_only and not supports_read_only) or individual or unsupported:
         raise ValueError(
             "--native-batch-prefill supports Gemma3/FunctionGemma 270M and LFM2.5 230M only; "
-            "requires static FP32 exports, --extract-embeddings, --split-lm-head, "
-            "--no-read-only-kv-cache and combined KV I/O; quantization, dtype conversion, "
-            "convolution overrides and topology splitting are unsupported"
+            "requires static exports, --extract-embeddings, --split-lm-head and combined KV I/O. "
+            "Gemma3 supports FP32 or INT4 weights and read-only caches; LFM2.5 requires FP32 "
+            "and --no-read-only-kv-cache. Explicit dtype conversion, convolution overrides "
+            "and topology splitting are unsupported"
         )
     return tuple(sizes)
 
@@ -76,7 +78,7 @@ def _signature(values):
 
 
 def _constant_roles(model):
-    """Classify the supported FP32 exporter ops by use, never by a byte threshold.
+    """Classify the supported exporter ops by use, never by a byte threshold.
 
     Projection/kernel RHS and normalization gains are resource parameters.
     Fixed RoPE frequencies are fingerprinted like parameters but stay literal:
@@ -124,9 +126,12 @@ def _constant_roles(model):
             if name not in constants:
                 continue
             tensor = constants[name]
-            if tensor.data_type != onnx.TensorProto.FLOAT:
-                if tensor.data_type in (onnx.TensorProto.FLOAT16, onnx.TensorProto.BFLOAT16, onnx.TensorProto.DOUBLE):
-                    raise ValueError(f"native family requires FP32 floating constants: {name}")
+            if node.op_type == "DequantizeLinear":
+                uses[name].add("parameter")
+                continue
+            if tensor.data_type not in (onnx.TensorProto.FLOAT, onnx.TensorProto.BFLOAT16):
+                if tensor.data_type in (onnx.TensorProto.FLOAT16, onnx.TensorProto.DOUBLE, onnx.TensorProto.INT4, onnx.TensorProto.UINT4):
+                    raise ValueError(f"unsupported native constant use: {name} at {node.op_type}")
                 continue
             scalar = not tensor.dims or all(d == 1 for d in tensor.dims)
             if node.op_type in ("Mul", "MatMul") and position_value(node.input[1 - index]):
@@ -136,6 +141,7 @@ def _constant_roles(model):
                 role = "parameter"
             elif ((node.op_type == "Pow" and index == 1)
                   or (node.op_type == "Where" and index in (1, 2))
+                  or (node.op_type == "Add" and name in ("kv_new_mask", "kv_new_mask_bf16"))
                   or (node.op_type == "Add" and position_value(node.input[1 - index]))
                   or (scalar and node.op_type in ("Add", "Sub", "Mul", "Div"))):
                 role = "control"
@@ -145,8 +151,8 @@ def _constant_roles(model):
     parameters = {}
     for name, roles in uses.items():
         tensor = constants[name]
-        if tensor.data_type == onnx.TensorProto.INT64:
-            roles = {"control"}
+        if tensor.data_type in (onnx.TensorProto.INT64, onnx.TensorProto.INT32):
+            roles.add("control")
         if len(roles) > 1:
             raise ValueError(f"native constant has mixed parameter/control uses: {name}")
         if not roles:
@@ -172,9 +178,32 @@ def import_native_family(paths: dict[int, Path], output: Path):
     entries = {}
     parameters = None
     decode_inputs = decode_outputs = None
+    read_only = False
+    shared_parameters = {}
+
+    class FamilyContextCache(onnx_importer.ContextCache):
+        def tensor_proto_to_attr(self, tensor):
+            if tensor.data_type == onnx.TensorProto.BFLOAT16 and not tensor.HasField("raw_data"):
+                return ir.DenseElementsAttr.get(numpy_helper.to_array(tensor).view("uint16"),
+                                                type=self.tensor_proto_to_builtin_type(tensor))
+            # Parameter identity is checked before each entry is imported.
+            # Reuse the resource itself, rather than eight equal byte buffers.
+            if tensor.name in parameters and tensor.HasField("raw_data"):
+                if tensor.name not in shared_parameters:
+                    if tensor.data_type in (onnx.TensorProto.INT4, onnx.TensorProto.UINT4):
+                        # ONNX packs nibbles; canonical MLIR integer storage
+                        # uses one byte per element, including for i4.
+                        values = numpy_helper.to_array(tensor).astype("uint8") & 15
+                        shared_parameters[tensor.name] = ir.DenseResourceElementsAttr.get_from_buffer(
+                            values, self._sanitize_name(tensor.name), self.tensor_proto_to_builtin_type(tensor), alignment=8)
+                    else:
+                        shared_parameters[tensor.name] = super().tensor_proto_to_attr(tensor)
+                return shared_parameters[tensor.name]
+            return super().tensor_proto_to_attr(tensor)
+
     with ir.Context() as context, ir.Location.unknown():
         module = ir.Module.create()
-        context_cache = onnx_importer.ContextCache(context)
+        context_cache = FamilyContextCache(context)
         module_cache = onnx_importer.ModuleCache(module.operation, context_cache)
         for size, path in paths.items():
             args = parse_arguments([str(path), "--data-prop", "--large-model"])
@@ -182,22 +211,38 @@ def import_native_family(paths: dict[int, Path], output: Path):
             inputs, outputs = _signature(model.graph.input), _signature(model.graph.output)
             if (len(inputs) < 3 or inputs[0]["name"] != "token_embedding"
                     or inputs[0]["shape"][:2] != [1, size]
-                    or inputs[0]["dtype"] != onnx.TensorProto.FLOAT
-                    or inputs[1] != {"name": "position_ids", "dtype": onnx.TensorProto.INT64, "shape": [1, 1]}
-                    or not outputs or outputs[0]["dtype"] != onnx.TensorProto.FLOAT
+                    or inputs[0]["dtype"] not in (onnx.TensorProto.FLOAT, onnx.TensorProto.BFLOAT16)
+                    or inputs[1] != {"name": "position_ids", "dtype": (onnx.TensorProto.INT64 if inputs[0]["dtype"] == onnx.TensorProto.FLOAT else onnx.TensorProto.INT32), "shape": [1, 1]}
+                    or not outputs or outputs[0]["dtype"] != inputs[0]["dtype"]
                     or outputs[0]["shape"] != [1, 1, inputs[0]["shape"][-1]]
                     or len(outputs) != len(inputs) - 1):
                 raise ValueError(f"unsupported native decoder ABI in {path}")
             if size == 1:
                 decode_inputs, decode_outputs = inputs, outputs
+                read_only = (inputs[2]["name"].startswith("past_key_values.")
+                             and inputs[2]["shape"] != outputs[1]["shape"])
                 for index, (inp, out) in enumerate(zip(inputs[2:], outputs[1:])):
                     expected = inp["name"].replace("past_key_values.", "present.").replace("past_conv.", "present_conv.")
+                    shape = inp["shape"]
+                    if read_only and inp["name"].startswith("past_key_values."):
+                        if len(shape) != 4 or shape[1] <= 1:
+                            raise ValueError(f"invalid time-major native cache: {inp['name']}")
+                        shape = [1, 1, *shape[2:]]
                     if (inp["name"] not in (f"past_key_values.{index}.key_value", f"past_conv.{index}")
-                            or out["name"] != expected or inp["dtype"] != onnx.TensorProto.FLOAT
-                            or (inp["shape"], inp["dtype"]) != (out["shape"], out["dtype"])):
+                            or out["name"] != expected or inp["dtype"] != inputs[0]["dtype"]
+                            or (shape, inp["dtype"]) != (out["shape"], out["dtype"])):
                         raise ValueError(f"native state input/output name, order or shape mismatch: {inp['name']}")
-            elif inputs[1:] != decode_inputs[1:] or outputs != decode_outputs or inputs[0]["shape"][2:] != decode_inputs[0]["shape"][2:]:
-                raise ValueError(f"native family state ABI differs in {path}")
+            else:
+                expected_outputs = [
+                    {**out, "shape": [1, size, *out["shape"][2:]]}
+                    if read_only and out["name"].startswith("present.") else out
+                    for out in decode_outputs
+                ]
+                if inputs[1:] != decode_inputs[1:] or outputs != expected_outputs or inputs[0]["shape"][2:] != decode_inputs[0]["shape"][2:]:
+                    raise ValueError(f"native family state ABI differs in {path}")
+            if any(size > inp["shape"][1 if read_only else 2] for inp in inputs[2:]
+                   if inp["name"].startswith("past_key_values.")):
+                raise ValueError(f"native chunk exceeds cache capacity in {path}")
             current = _constant_roles(model)
             if parameters is None:
                 parameters = current
@@ -216,7 +261,7 @@ def import_native_family(paths: dict[int, Path], output: Path):
         module.operation.verify()
         with output.open("wb") as stream:
             module.operation.write_bytecode(stream)
-    return {"version": 1, "entries": entries}
+    return {"version": 1, "entries": entries, "kv_cache_sequence_axis": 1 if read_only else 2}
 
 
 def native_compile_flags(flags):
@@ -261,7 +306,9 @@ def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
     decode = ort.InferenceSession(str(paths[1]), opts, providers=["CPUExecutionProvider"])
     specs = decode.get_inputs()
     state_specs = specs[2:]
-    context = next(s.shape[2] for s in state_specs if s.name.startswith("past_key_values."))
+    read_only = state_specs[0].shape != decode.get_outputs()[1].shape
+    axis = 1 if read_only else 2
+    context = next(s.shape[axis] for s in state_specs if s.name.startswith("past_key_values."))
     rng = np.random.default_rng(0)
     for size, path in paths.items():
         if size == 1:
@@ -273,15 +320,31 @@ def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
                              rng.normal(0, 0.1, s.shape).astype(np.float32)) for s in state_specs}
             actual = chunk.run(None, {"token_embedding": embeddings,
                                      "position_ids": np.array([[position]], dtype=np.int64), **state})
-            current = state
+            current = {name: value.copy() for name, value in state.items()}
             for offset in range(size):
                 expected = decode.run(None, {"token_embedding": embeddings[:, offset:offset + 1],
                                             "position_ids": np.array([[position + offset]], dtype=np.int64), **current})
-                current = dict(zip(state, expected[1:]))
+                for spec, value in zip(state_specs, expected[1:]):
+                    if read_only and spec.name.startswith("past_key_values."):
+                        current[spec.name][:, position + offset:position + offset + 1] = value
+                    else:
+                        current[spec.name] = value
+            expected = [expected[0], *[
+                current[s.name][:, position:position + size] if read_only and s.name.startswith("past_key_values.")
+                else current[s.name] for s in state_specs
+            ]]
             for spec, result, reference in zip(chunk.get_outputs(), actual, expected):
-                np.testing.assert_allclose(result, reference, rtol=rtol, atol=atol,
-                                           err_msg=f"B={size}, p={position}, output={spec.name}")
+                message = f"B={size}, p={position}, output={spec.name}"
+                tolerance = atol
+                if read_only:
+                    # Split past/new attention changes FP32 reduction order.
+                    # Check both total relative error and peak-scaled element
+                    # error, including cancellation near zero.
+                    tolerance = max(atol, rtol * np.max(np.abs(reference)))
+                    np.testing.assert_allclose(np.linalg.norm(result - reference), 0, rtol=0,
+                                               atol=atol + rtol * np.linalg.norm(reference), err_msg=message)
+                np.testing.assert_allclose(result, reference, rtol=rtol, atol=tolerance, err_msg=message)
             for spec, result in zip(state_specs, actual[1:]):
-                if spec.name.startswith("past_key_values."):
+                if spec.name.startswith("past_key_values.") and not read_only:
                     np.testing.assert_array_equal(result[:, :, :position], state[spec.name][:, :, :position])
                     np.testing.assert_array_equal(result[:, :, position + size:], state[spec.name][:, :, position + size:])

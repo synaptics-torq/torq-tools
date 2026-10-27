@@ -95,7 +95,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             minimum=2, static=static_models, embeddings=extract_embeddings,
             split_head=split_lm_head, read_only=read_only_kv_cache,
             individual=keep_individual_kv_io,
-            unsupported=dynamic_quantize or convert_dtypes or weight_quantization is not None or model_size != "270m",
+            supports_read_only=True,
+            unsupported=dynamic_quantize or convert_dtypes or weight_quantization not in (None, "int4") or model_size != "270m",
         )
         self._hf_repo = _resolve_hf_repo(model_size, instruct_model, hf_repo, functiongemma)
         if read_only_kv_cache and keep_individual_kv_io:
@@ -191,6 +192,14 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             }},
             split_weights=split_weights,
         )
+
+    def _model_compile_flags(self, **kwargs) -> list[str]:
+        flags = super()._model_compile_flags(**kwargs)
+        if self._native_batch_prefill and self._weight_quantization is None and not self._read_only_kv_cache:
+            # Stream prefetch shrinks the shared legacy-cache weight tiles.
+            flags = [flag for flag in flags if not flag.startswith("--torq-prefetch-algorithm=")]
+            flags.append("--torq-prefetch-algorithm=constant-loads")
+        return flags
 
     def _setup_dirs(self) -> list[Path]:
         onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir = [None] * 5
@@ -492,7 +501,8 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config.num_attention_heads,
                     self._config.num_key_value_heads,
                     self._config.head_dim,
-                    self._batch_prefill if component == "model_prefill" else 1,
+                    (int(component.removeprefix("model_prefill_")) if component.startswith("model_prefill_")
+                     else self._batch_prefill if component == "model_prefill" else 1),
                 )
 
         if self._trim_vocab:
@@ -736,8 +746,8 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace, weight_quantization: str 
 
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    if args.native_batch_prefill and (args.weight_quantization != "none" or args.dynamic_quantize or args.convert_dtypes):
-        raise ValueError("native prefill requires --weight-quantization none without quantization or dtype conversion")
+    if args.native_batch_prefill and (args.weight_quantization not in ("none", "int4") or args.dynamic_quantize or args.convert_dtypes):
+        raise ValueError("native prefill supports FP32 or INT4 weights without dynamic quantization or explicit dtype conversion")
     weight_quantization = None if args.weight_quantization == "none" else args.weight_quantization
     if weight_quantization and args.dynamic_quantize:
         logger.info("--dynamic-quantize: the weights are not quantized to %s", weight_quantization)

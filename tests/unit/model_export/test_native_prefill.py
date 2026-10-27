@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright © 2026 Synaptics Incorporated.
 
 import argparse
+import re
 
 import numpy as np
 import onnx
@@ -59,6 +60,21 @@ def test_literal_roles_are_based_on_use_and_reject_mixed():
         _constant_roles(model)
 
 
+@pytest.mark.parametrize("quantized", [False, True])
+def test_read_only_causal_mask_is_a_typed_control(quantized):
+    import ml_dtypes
+
+    name = "kv_new_mask_bf16" if quantized else "kv_new_mask"
+    values = np.ones((1,1,8,4), dtype=ml_dtypes.bfloat16 if quantized else np.float32)
+    model = h.make_model(h.make_graph([
+        h.make_node("Add", ["scores", name], ["masked"]),
+    ], "main", [], [], [numpy_helper.from_array(values, name)]))
+    assert _constant_roles(model) == {}
+    tensor = model.graph.initializer[0]
+    assert not tensor.raw_data
+    np.testing.assert_array_equal(numpy_helper.to_array(tensor), values)
+
+
 def _family_graph(size, weight=1.):
     # Full-cache identity state and a real final-token hidden output.
     inputs = [h.make_tensor_value_info("token_embedding",T.FLOAT,[1,size,4]),
@@ -85,10 +101,137 @@ def test_family_import_and_numerical_gate(tmp_path):
     metadata = import_native_family(paths,output)
     assert output.read_bytes().startswith(b"ML\xefR")
     assert set(metadata["entries"]) == {"main","main_4","main_7"}
+    from iree.compiler import ir
+
+    with ir.Context():
+        assembly = str(ir.Module.parse(output.read_bytes()))
+    assert set(re.findall(r"dense_resource<(weight[^>]*)>", assembly)) == {"weight"}
     validate_native_onnx(paths)
     onnx.save(_family_graph(7,weight=2.),paths[7])
     with pytest.raises(ValueError,match="parameters differ"):
         import_native_family(paths,output)
+
+
+def _read_only_family_graph(size):
+    model = _family_graph(size)
+    model.graph.input[2].CopyFrom(h.make_tensor_value_info("past_key_values.0.key_value", T.FLOAT, [1,16,2,4]))
+    model.graph.output[1].CopyFrom(h.make_tensor_value_info("present.0.key_value", T.FLOAT, [1,size,2,4]))
+    del model.graph.node[-1]
+    model.graph.initializer.append(numpy_helper.from_array(np.array([2], np.int64), "rows_axis"))
+    model.graph.node.extend([
+        h.make_node("Unsqueeze", ["token_embedding", "rows_axis"], ["rows"]),
+        h.make_node("Concat", ["rows", "rows"], ["present.0.key_value"], axis=2),
+    ])
+    return model
+
+
+def test_read_only_family_import_and_sequential_rows(tmp_path):
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1,4,7)}
+    for size, path in paths.items():
+        onnx.save(_read_only_family_graph(size), path)
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc")
+    assert metadata["kv_cache_sequence_axis"] == 1
+    assert metadata["entries"]["main_7"]["outputs"][1]["shape"] == [1,7,2,4]
+    validate_native_onnx(paths)
+    # A chunk returning the wrong rows must fail the populated-cache gate.
+    model = _read_only_family_graph(7)
+    model.graph.node.insert(len(model.graph.node) - 1, h.make_node("Neg", ["rows"], ["negated"]))
+    model.graph.node[-1].input[1] = "negated"
+    onnx.save(model, paths[7])
+    with pytest.raises(AssertionError):
+        validate_native_onnx(paths)
+
+
+def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    from torq.lab.quantization.onnx.weights import QuantizationConfig, WeightQuantizer
+
+    paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1,4)}
+    for size, path in paths.items():
+        model = _read_only_family_graph(size)
+        model.graph.node[0].output[0] = "raw"
+        model.graph.initializer.extend([
+            numpy_helper.from_array(np.array(1., np.float32), "scale"),
+            numpy_helper.from_array(np.zeros((1,size,4), np.float32), "kv_new_mask"),
+        ])
+        model.graph.node.insert(1, h.make_node("Mul", ["raw", "scale"], ["scaled"]))
+        model.graph.node.insert(2, h.make_node("Add", ["scaled", "kv_new_mask"], ["projected"]))
+        quantizer = WeightQuantizer()
+        quantizer._quantize_to_dql(model, quantizer._find_matmul_weights(model), QuantizationConfig.uniform(4, 2))
+        # Conversion drops these unused inputs in the synthetic row-only graph.
+        model.graph.input.extend([
+            h.make_tensor_value_info("position_ids", T.INT32, [1,1]),
+            h.make_tensor_value_info("past_key_values.0.key_value", T.BFLOAT16, [1,16,2,4]),
+        ])
+        onnx.save(model, path)
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc")
+    assert metadata["entries"]["main"]["inputs"][0]["dtype"] == T.BFLOAT16
+    assert metadata["entries"]["main_4"]["inputs"][1]["dtype"] == T.INT32
+    from iree.compiler import ir
+
+    with ir.Context():
+        assembly = str(ir.Module.parse((tmp_path / "family.mlirbc").read_bytes()))
+    resource = re.search(r'weight_quantized: "0x08000000([0-9a-fA-F]+)"', assembly)
+    assert resource and len(bytes.fromhex(resource[1])) == 16  # One byte per i4 element.
+    for suffix in ("quantized", "scales", "zero_points"):
+        model = onnx.load(paths[4])
+        tensor = next(i for i in model.graph.initializer if i.name == "weight_" + suffix)
+        original = tensor.raw_data
+        tensor.raw_data = bytes([original[0] ^ 1]) + original[1:]
+        onnx.save(model, paths[4])
+        with pytest.raises(ValueError, match="parameters differ"):
+            import_native_family(paths, tmp_path / "family.mlirbc")
+        # Restore for the next parameter mutation.
+        tensor.raw_data = original
+        onnx.save(model, paths[4])
+
+
+def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.gemma3 import export as gemma
+
+    monkeypatch.setattr(gemma.AutoConfig, "from_pretrained", Mock(return_value=SimpleNamespace(
+        hidden_size=8, vocab_size=16, num_attention_heads=2,
+    )))
+    checkpoint = Mock(return_value=tmp_path / "gptq")
+    monkeypatch.setattr(gemma, "_resolve_gptq_checkpoint", checkpoint)
+    exported = []
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_onnx", lambda self, **kwargs: exported.append(self))
+    quantize = Mock()
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "weight_quantize_models", quantize)
+    parser = argparse.ArgumentParser()
+    add_gemma3_export_args(parser)
+    args = parser.parse_args(["--instruct-model", "--native-batch-prefill", "4,7", "--skip-torq"])
+    gemma.export_gemma3_from_args(args)
+    checkpoint.assert_called_once_with(args, "int4")
+    quantize.assert_called_once()
+    assert exported[0]._read_only_kv_cache is True
+    assert exported[0]._gptq_checkpoint == tmp_path / "gptq"
+    assert exported[0]._native_batch_prefill == (4,7)
+
+
+@pytest.mark.parametrize("native,quantization,read_only,expected", [
+    (True,None,False,"constant-loads"),
+    (True,None,True,"stream-schedule"),
+    (True,"int4",True,"stream-schedule"),
+    (False,None,False,"stream-schedule"),
+])
+def test_gemma_prefetch_defaults_follow_native_cache_configuration(monkeypatch, native, quantization, read_only, expected):
+    from torq.model_export.onnx import OnnxModelExporterBase
+    from torq.models.gemma3.export import Gemma3ModelExporter
+
+    monkeypatch.setattr(OnnxModelExporterBase, "_model_compile_flags", lambda self, **kwargs: [
+        "--torq-prefetch-algorithm=stream-schedule", "--torq-convert-dtypes",
+    ])
+    exporter = Gemma3ModelExporter.__new__(Gemma3ModelExporter)
+    exporter._native_batch_prefill = (4,7) if native else ()
+    exporter._weight_quantization = quantization
+    exporter._read_only_kv_cache = read_only
+    flags = exporter._model_compile_flags()
+    assert "--torq-convert-dtypes" in flags
+    assert [f for f in flags if f.startswith("--torq-prefetch-algorithm=")] == [f"--torq-prefetch-algorithm={expected}"]
 
 
 @pytest.mark.parametrize("size", [4,7])
