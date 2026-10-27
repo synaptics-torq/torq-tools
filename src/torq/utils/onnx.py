@@ -244,6 +244,7 @@ def add_decoder_args(
     default_model_size: str | None = None,
     split_lm_head: bool = False,
     batch_prefill: bool = False,
+    native_batch_prefill: bool = False,
 ):
     """Args shared by exporters with a decoder component: the
     ``-s/--model-size`` selector (every model family) and, for LLM decoders,
@@ -269,13 +270,21 @@ def add_decoder_args(
             help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states (default: %(default)s)"
         )
     if batch_prefill:
-        parser.add_argument(
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
             "--batch-prefill",
             type=int,
             default=DEFAULT_BATCH_PREFILL,
             metavar="N",
             help="Also export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
         )
+
+        if native_batch_prefill:
+            from ..model_export.prefill import parse_native_sizes
+            group.add_argument(
+                "--native-batch-prefill", type=parse_native_sizes, metavar="B1,B2,...",
+                help="Export an experimental shared decoder family with explicit ascending sizes",
+            )
 
 
 def add_llm_args(
@@ -288,6 +297,7 @@ def add_llm_args(
     instruct: bool = False,
     split_lm_head: bool = False,
     batch_prefill: bool = False,
+    native_batch_prefill: bool = False,
 ):
     """LLM export args: ``-t/--max-gen-tokens`` and optional
     ``--instruct-model`` on top of the shared decoder args."""
@@ -312,6 +322,7 @@ def add_llm_args(
         default_model_size=default_model_size,
         split_lm_head=split_lm_head,
         batch_prefill=batch_prefill,
+        native_batch_prefill=native_batch_prefill,
     )
 
 
@@ -535,12 +546,13 @@ def _set_external_data(tensor: onnx.TensorProto, **entries: str) -> None:
 
 
 def load_onnx_lazy(path: str | os.PathLike) -> onnx.ModelProto:
-    """Load ``path`` without reading its external data.
+    """Load external weights lazily, keeping integer controls inline.
 
     External tensors keep pointing into their data file, tagged with its
     directory (onnx's ``basepath`` key). ``gs.import_onnx`` wraps them in
     ``LazyValues``, so graph edits only read the weights they touch, and
-    ``save_onnx`` copies the rest file-to-file. Inline models load as usual.
+    ``save_onnx`` copies the rest file-to-file. Integer initializers are
+    loaded inline because ONNX shape inference cannot read external controls.
     """
     path = Path(path).absolute()
     model = onnx.load(str(path), load_external_data=False)
@@ -549,6 +561,11 @@ def load_onnx_lazy(path: str | os.PathLike) -> onnx.ModelProto:
             entries = {e.key: e.value for e in tensor.external_data}
             entries["basepath"] = str(path.parent)
             _set_external_data(tensor, **entries)
+            # ONNX data propagation cannot read external shape/position controls.
+            if tensor.data_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                tensor.raw_data = _read_external_data(tensor)
+                del tensor.external_data[:]
+                tensor.ClearField("data_location")
     # Constant-node values are small: load them inline.
     for tensor in _get_attribute_tensors(model):
         if uses_external_data(tensor):

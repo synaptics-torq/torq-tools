@@ -164,3 +164,29 @@ def test_cleanup_folds_lazy_constants(tmp_path):
     assert [n.op_type for n in cleaned.graph.node] == ["MatMul"]
     (folded,) = cleaned.graph.initializer
     assert np.array_equal(numpy_helper.to_array(folded), w.T)
+
+
+@pytest.mark.parametrize("size", [124, 128, 256])
+def test_lazy_load_keeps_external_position_controls_available_to_shape_inference(tmp_path, size):
+    offsets = np.arange(size, dtype=np.int64)
+    weight = np.eye(16, dtype=np.float32)
+    model = helper.make_model(helper.make_graph([
+        helper.make_node("Add", ["position_ids", "offsets"], ["positions"]),
+        helper.make_node("MatMul", ["x", "weight"], ["y"]),
+    ], "g", [
+        helper.make_tensor_value_info("position_ids", TensorProto.INT64, [1, 1]),
+        helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 16]),
+    ], [
+        helper.make_tensor_value_info("positions", TensorProto.INT64, [1, size]),
+        helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 16]),
+    ], [numpy_helper.from_array(offsets, "offsets"), numpy_helper.from_array(weight, "weight")]),
+        opset_imports=[helper.make_opsetid("", 18)])
+    path = tmp_path / "model.onnx"
+    # ORT optimization may externalize even a 992-byte B=124 offset vector.
+    onnx.save_model(model, path, save_as_external_data=True, all_tensors_to_one_file=True,
+                    location="model.data", size_threshold=0)
+    lazy = load_onnx_lazy(path)
+    tensors = _inits(lazy)
+    assert not tensors["weight"].raw_data
+    onnx.shape_inference.infer_shapes(lazy, check_type=True, strict_mode=True, data_prop=True)
+    np.testing.assert_array_equal(numpy_helper.to_array(tensors["offsets"]), offsets)

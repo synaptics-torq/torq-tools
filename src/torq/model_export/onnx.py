@@ -94,6 +94,7 @@ class OnnxModelExporterBase(ABC):
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
 
+        self._native_batch_prefill = getattr(self, "_native_batch_prefill", ())
         self._harness: GraphEditHarness | None = None
         self._model_dtype = model_dtype
         self._config = config
@@ -226,7 +227,7 @@ class OnnxModelExporterBase(ABC):
         # The --batch-prefill exporters set _batch_prefill in their own __init__
         # (before super().__init__), so getattr: the attribute may not exist on
         # other exporters.
-        if getattr(self, "_batch_prefill", None) is None:
+        if getattr(self, "_batch_prefill", None) is None and not getattr(self, "_native_batch_prefill", ()):
             return []
         return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
 
@@ -492,6 +493,12 @@ class OnnxModelExporterBase(ABC):
                 save_onnx(load_onnx_lazy(path), path)
 
         if validate:
+            sizes = getattr(self, "_native_batch_prefill", ())
+            if sizes:
+                from .prefill import validate_native_onnx
+                validate_native_onnx({1: self._export_paths["model"], **{
+                    b: self._export_paths[f"model_prefill_{b}"] for b in sizes
+                }})
             if self._skip_export:
                 self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
             else:
@@ -652,6 +659,12 @@ class OnnxModelExporterBase(ABC):
         local_compile: bool = False,
         compiler_path: str | Path | None = None,
     ):
+        native_sizes = getattr(self, "_native_batch_prefill", ())
+        if native_sizes:
+            from .prefill import check_native_compiler, compile_native_family, native_compile_flags
+            check_native_compiler(compiler_path)
+            if skip and any(c == "model" or c.startswith("model_prefill_") for c in skip):
+                raise ValueError("cannot skip individual members of a native decoder family")
         self._prepare()
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
@@ -662,12 +675,23 @@ class OnnxModelExporterBase(ABC):
         user_args = list(torq_compile_args or [])
         quantized = self._dynamic_quantize and not self._convert_dtypes
         torq_compile_args = self._model_compile_flags(quantized=quantized, compiler_path=compiler_path) + user_args
-        if "--torq-max-nss-programs-size" not in torq_compile_args:
+        if not any(arg.split("=", 1)[0] == "--torq-max-nss-programs-size" for arg in torq_compile_args):
             torq_compile_args += self._auto_torq_compile_extras()
+        if native_sizes:
+            family_flags = native_compile_flags(torq_compile_args)
+            torq_compile_args = [flag for flag in family_flags if flag != "--torq-enable-batch-prefill"]
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
+        if native_sizes:
+            family_paths = {1: self._export_paths["model"], **{
+                size: self._export_paths[f"model_prefill_{size}"] for size in native_sizes
+            }}
+            compile_native_family(family_paths, self._torq_dir, compiler_args=family_flags,
+                                  compiler_path=compiler_path, local_compile=local_compile)
         for comp, onnx_path in self._export_paths.items():
+            if native_sizes and (comp == "model" or comp.startswith("model_prefill_")):
+                continue
             if comp in skip:
                 self._logger.info("(Torq-export) Skipping %s", comp)
                 continue
@@ -686,7 +710,7 @@ class OnnxModelExporterBase(ABC):
                 self._torq_dir,
                 opset=get_model_opset(model),
                 compiler_args=torq_compile_args,
-                use_binary=use_binary,
+                use_binary=use_binary or bool(native_sizes),
                 local_compile=local_compile,
                 compiler_path=compiler_path,
             )
