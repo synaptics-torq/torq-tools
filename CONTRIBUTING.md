@@ -82,6 +82,8 @@ For bug fixes, it is helpful to add the failing test first. A small graph that r
 
 Model exporters live under `src/torq/models/<model>/` and usually extend `OnnxModelExporterBase` from `src/torq/model_export/onnx.py`. A complete exporter normally handles source model loading, static conversion, post-static graph patches, validation, dtype conversion, and optional Torq export.
 
+Before adding batch prefill to an LLM exporter, read [Adding native batch prefill to an exporter](src/torq/model_export/doc/batch_prefill_development.md). It explains which infrastructure is reusable, which position/mask/state semantics belong to the model, how to wire an exporter, and the correctness and hardware checks needed before enabling support. An exporter that already produces correct fixed-size prefill graphs can usually reuse that builder for a native family; a decode-only graph needs the chunk semantics implemented and validated first.
+
 The existing model directories use this layout:
 
 - `export.py`: CLI argument handling and the exporter class.
