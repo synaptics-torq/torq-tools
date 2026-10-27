@@ -446,10 +446,10 @@ class SplitLMHead(OnnxGraphEdit):
     The main graph output is replaced with the LM head activation input, named
     ``hidden_states_name``. The extracted graph accepts that tensor as its only
     input and preserves either a floating-point MatMul or a dynamically
-    quantized MatMulInteger head.
+    quantized MatMulInteger head. Set ``save_to=None`` to reuse an existing head.
     """
 
-    save_to: Path | str
+    save_to: Path | str | None
     output_name: str = "logits"
     hidden_states_name: str = "last_hidden_states"
 
@@ -481,14 +481,15 @@ class SplitLMHead(OnnxGraphEdit):
     def transform(self, node: gs.Node):
         lm_head = _require_lm_head(node, self.output_name)
         hidden_states = lm_head.hidden_states
-        lm_head_graph = self._extract_lm_head_graph(lm_head)
-        lm_head_model = onnx.shape_inference.infer_shapes(
-            gs.export_onnx(lm_head_graph),
-            True, True, True
-        )
-        save_to = Path(self.save_to)
-        save_to.parent.mkdir(parents=True, exist_ok=True)
-        save_onnx(lm_head_model, save_to)
+        if self.save_to is not None:
+            lm_head_graph = self._extract_lm_head_graph(lm_head)
+            lm_head_model = onnx.shape_inference.infer_shapes(
+                gs.export_onnx(lm_head_graph), True, True, True
+            )
+            save_to = Path(self.save_to)
+            save_to.parent.mkdir(parents=True, exist_ok=True)
+            save_onnx(lm_head_model, save_to)
+            self._logger.debug("Saved split LM head to '%s'", save_to)
 
         logits = lm_head.logits
         hidden_states.name = self.hidden_states_name
@@ -505,4 +506,3 @@ class SplitLMHead(OnnxGraphEdit):
             logits.name,
             hidden_states.name,
         )
-        self._logger.debug("Saved split LM head to '%s'", save_to)

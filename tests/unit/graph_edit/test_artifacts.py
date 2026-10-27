@@ -73,20 +73,24 @@ def test_trim_lm_head_vocab_can_append_argmax_output():
     assert any(node.op == "ArgMax" for node in g.nodes)
 
 
-def test_split_lm_head_saves_model_and_exposes_hidden_states(tmp_path):
+@pytest.mark.parametrize("save_head", [True, False])
+def test_split_lm_head_saves_model_and_exposes_hidden_states(tmp_path, save_head):
     hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
     weight = gs.Constant("weight", np.arange(6, dtype=np.float32).reshape(2, 3))
     logits = gs.Variable("logits", dtype=np.float32, shape=[1, 1, 3])
     matmul = gs.Node("MatMul", "lm_head", inputs=[hidden, weight], outputs=[logits])
     g = graph(nodes=[matmul], inputs=[hidden], outputs=[logits])
-    save_to = tmp_path / "lm_head.onnx"
+    save_to = tmp_path / "lm_head.onnx" if save_head else None
 
     edit = SplitLMHead(g, "unit", save_to=save_to)
     assert edit.match(matmul)
     edit.transform(matmul)
 
-    assert save_to.exists()
-    onnx.checker.check_model(onnx.load(save_to))
+    if save_head:
+        assert save_to.exists()
+        onnx.checker.check_model(onnx.load(save_to))
+    else:
+        assert not (tmp_path / "lm_head.onnx").exists()
     assert g.outputs[0].name == "last_hidden_states"
     assert matmul.outputs == []
 

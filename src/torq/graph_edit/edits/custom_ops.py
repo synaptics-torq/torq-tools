@@ -10,7 +10,6 @@ standard ONNX ops the Torq compiler can lower.  Split out of the monolithic
 ``edits.py`` when it was refactored into the ``graph_edit.edits`` package.
 """
 
-import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -180,7 +179,8 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
     Replace GroupQueryAttention (ORT fused op) with standard ONNX ops.
 
     Decomposes into: RoPE -> KV concat -> Q*K^T*scale -> mask -> Softmax -> *V
-    Query heads are grouped per KV head, so the KV cache is never expanded.
+    By default query heads are grouped per KV head. Set ``group_queries=False``
+    to emit explicit KV broadcasting for the native family reference layout.
 
     chunk_len: fixed number of consecutive query/key positions per step.
     1 (default) is single-token decode.  For batched prefill, RoPE rotates
@@ -191,6 +191,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
     kv_num_heads: int
     head_dim: int
     chunk_len: int = 1
+    group_queries: bool = True
 
     def __post_init__(self):
         if self.chunk_len < 1:
@@ -629,10 +630,31 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         group = nh // kvh
         S = self.chunk_len
 
+        attention_k, attention_v = present_k, present_v
+        if not self.group_queries:
+            repeated = []
+            for kind, value in (("k", present_k), ("v", present_v)):
+                expanded = self.graph.layer(
+                    name=f"{prefix}/{kind}_unsqueeze", op="Unsqueeze",
+                    inputs=[value, gs.Constant(f"{prefix}/{kind}_axis", np.array([2], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/{kind}_unsqueezed", dtype=np.float32)],
+                )[0]
+                expanded = self.graph.layer(
+                    name=f"{prefix}/{kind}_expand", op="Expand",
+                    inputs=[expanded, gs.Constant(f"{prefix}/{kind}_expand_shape", np.array([1, 1, group, 1, 1], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/{kind}_expanded", dtype=np.float32)],
+                )[0]
+                repeated.append(self.graph.layer(
+                    name=f"{prefix}/{kind}_repeat", op="Reshape",
+                    inputs=[expanded, gs.Constant(f"{prefix}/{kind}_repeat_shape", np.array([0, nh, -1, hd], dtype=np.int64))],
+                    outputs=[gs.Variable(f"{prefix}/{kind}_repeated", dtype=np.float32)],
+                )[0])
+            attention_k, attention_v = repeated
+
         # Q * K^T: transpose K last two dims, then matmul
         k_t = self.graph.layer(
             name=f"{prefix}/k_transpose_attn", op="Transpose",
-            inputs=[present_k],
+            inputs=[attention_k],
             outputs=[gs.Variable(f"{prefix}/k_transposed_attn")],
             attrs={"perm": [0, 1, 3, 2]},
         )[0]
@@ -643,11 +665,13 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
             inputs=[q_rope, gs.Constant(f"{prefix}/scale", np.array(scale, dtype=np.float32))],
             outputs=[gs.Variable(f"{prefix}/q_scaled")],
         )[0]
-        q_grouped = self.graph.layer(
-            name=f"{prefix}/q_group", op="Reshape",
-            inputs=[q_scaled, gs.Constant(f"{prefix}/q_group_shape", np.array([0, kvh, group * S, hd], dtype=np.int64))],
-            outputs=[gs.Variable(f"{prefix}/q_grouped")],
-        )[0]
+        q_grouped = q_scaled
+        if self.group_queries:
+            q_grouped = self.graph.layer(
+                name=f"{prefix}/q_group", op="Reshape",
+                inputs=[q_scaled, gs.Constant(f"{prefix}/q_group_shape", np.array([0, kvh, group * S, hd], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/q_grouped")],
+            )[0]
 
         # Attention scores: Q_scaled @ K^T
         attn_scores = self.graph.layer(
@@ -655,7 +679,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
             inputs=[q_grouped, k_t],
             outputs=[gs.Variable(f"{prefix}/attn_scores", dtype=np.float32)],
         )[0]
-        if S > 1:
+        if S > 1 and self.group_queries:
             # (B, kvh, group, S, L), so the (B, 1, S, L) bias and mask broadcast per query row.
             attn_scores = self.graph.layer(
                 name=f"{prefix}/attn_scores_rows", op="Reshape",
@@ -683,7 +707,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
             outputs=[gs.Variable(f"{prefix}/attn_weights")],
             attrs={"axis": -1},
         )[0]
-        if S > 1:
+        if S > 1 and self.group_queries:
             attn_weights = self.graph.layer(
                 name=f"{prefix}/attn_weights_group", op="Reshape",
                 inputs=[attn_weights, gs.Constant(f"{prefix}/attn_group_shape", np.array([0, kvh, group * S, -1], dtype=np.int64))],
@@ -693,14 +717,15 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         # Attention output: weights @ V, (B, kvh, group * S, hd) -> (B, nh, S, hd)
         attn_output = self.graph.layer(
             name=f"{prefix}/attn_v_matmul", op="MatMul",
-            inputs=[attn_weights, present_v],
+            inputs=[attn_weights, attention_v],
             outputs=[gs.Variable(f"{prefix}/attn_output_grouped")],
         )[0]
-        attn_output = self.graph.layer(
-            name=f"{prefix}/attn_ungroup", op="Reshape",
-            inputs=[attn_output, gs.Constant(f"{prefix}/attn_heads_shape", np.array([0, nh, S, hd], dtype=np.int64))],
-            outputs=[gs.Variable(f"{prefix}/attn_output")],
-        )[0]
+        if self.group_queries:
+            attn_output = self.graph.layer(
+                name=f"{prefix}/attn_ungroup", op="Reshape",
+                inputs=[attn_output, gs.Constant(f"{prefix}/attn_heads_shape", np.array([0, nh, S, hd], dtype=np.int64))],
+                outputs=[gs.Variable(f"{prefix}/attn_output")],
+            )[0]
 
         # Transpose back: (B, nh, S, hd) -> (B, S, nh, hd) -> reshape to (B, S, nh*hd)
         attn_transposed = self.graph.layer(

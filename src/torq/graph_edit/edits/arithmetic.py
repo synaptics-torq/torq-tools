@@ -328,10 +328,13 @@ class RemoveRedundantCasts(OnnxGraphEdit):
 class FoldScalarMatMul(OnnxGraphEdit):
     """
     Fold `MatMul A @ B`, where B is a batched scalar, into Mul.
+    With ``outer_product``, also fold any contraction whose inner dimension is one.
 
     Raises:
         ValueError: If MatMul operand shapes are incompatible
     """
+
+    outer_product: bool = False
 
     def match(self, node: gs.Node) -> bool:
         if node.op != "MatMul":
@@ -341,7 +344,7 @@ class FoldScalarMatMul(OnnxGraphEdit):
         a_shape = getattr(a, "shape", None)
         b_shape = getattr(b, "shape", None)
         if a_shape and b_shape and len(a_shape) >= 2 and len(b_shape) >= 2:
-            return a_shape[-1] == 1 and b_shape[-2] == 1 and b_shape[-1] == 1
+            return a_shape[-1] == 1 and b_shape[-2] == 1 and (self.outer_product or b_shape[-1] == 1)
         return False
 
     def transform(self, node: gs.Node):
@@ -353,7 +356,7 @@ class FoldScalarMatMul(OnnxGraphEdit):
 
         if not a_shape or not b_shape or len(a_shape) < 2 or len(b_shape) < 2:
             raise ValueError("Invalid MatMul operand shapes for scalar scale matmul replacement")
-        if not (a_shape[-1] == 1 and b_shape[-2] == 1 and b_shape[-1] == 1):
+        if not (a_shape[-1] == 1 and b_shape[-2] == 1 and (self.outer_product or b_shape[-1] == 1)):
             raise ValueError(f"Expected scalar-compatible MatMul shapes, got A={a_shape}, B={b_shape}")
         
         self.graph.layer(

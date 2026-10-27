@@ -225,7 +225,8 @@ def _gqa_reference(q, k, v, past_k, past_v, cos_cache, sin_cache, pos,
             present_v.astype(np.float32))
 
 
-def test_group_query_attention_matches_reference():
+@pytest.mark.parametrize("group_queries", [True, False])
+def test_group_query_attention_matches_reference(group_queries):
     rng = np.random.default_rng(2)
     B, S = 1, 1
     nh, kvh, hd = 4, 2, 4
@@ -280,7 +281,7 @@ def test_group_query_attention_matches_reference():
         opset=OPSET,
     )
     ReplaceGroupQueryAttention(
-        g, "test", num_heads=nh, kv_num_heads=kvh, head_dim=hd
+        g, "test", num_heads=nh, kv_num_heads=kvh, head_dim=hd, group_queries=group_queries
     ).transform(gqa)
 
     feeds = {
@@ -300,7 +301,8 @@ def test_group_query_attention_matches_reference():
     np.testing.assert_allclose(got_pv, ref_pv, rtol=1e-4, atol=1e-5)
 
 
-def test_group_query_attention_chunk_matches_reference():
+@pytest.mark.parametrize("group_queries", [True, False])
+def test_group_query_attention_chunk_matches_reference(group_queries):
     """Batched prefill: each query/key row is rotated by its own position."""
     rng = np.random.default_rng(3)
     B, S = 1, 2                     # S == chunk_len
@@ -357,7 +359,7 @@ def test_group_query_attention_chunk_matches_reference():
         opset=OPSET,
     )
     ReplaceGroupQueryAttention(
-        g, "test", num_heads=nh, kv_num_heads=kvh, head_dim=hd, chunk_len=S
+        g, "test", num_heads=nh, kv_num_heads=kvh, head_dim=hd, chunk_len=S, group_queries=group_queries
     ).transform(gqa)
 
     feeds = {

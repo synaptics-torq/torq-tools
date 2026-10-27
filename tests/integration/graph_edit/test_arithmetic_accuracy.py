@@ -33,18 +33,23 @@ def test_constant_div_replacement_is_numerically_equivalent():
     assert_model_outputs_close(original, edited, feeds)
 
 
-def test_scalar_matmul_fold_is_numerically_equivalent():
+@pytest.mark.parametrize("width", [1, 7])
+def test_scalar_matmul_fold_is_numerically_equivalent(width):
     a = gs.Variable("a", dtype=np.float32, shape=[1, 4, 1])
-    b = gs.Variable("b", dtype=np.float32, shape=[1, 1])
-    y = gs.Variable("y", dtype=np.float32, shape=[1, 4, 1])
+    b = gs.Variable("b", dtype=np.float32, shape=[1, width])
+    y = gs.Variable("y", dtype=np.float32, shape=[1, 4, width])
     matmul = gs.Node("MatMul", "scale", inputs=[a, b], outputs=[y])
     original = graph(nodes=[matmul], inputs=[a, b], outputs=[y])
     edited = clone_graph(original)
-    FoldScalarMatMul(edited, "integration").transform(edited.nodes[0])
+    edit = FoldScalarMatMul(edited, "integration", outer_product=width > 1)
+    assert edit.match(edited.nodes[0])
+    if width > 1:
+        assert not FoldScalarMatMul(edited, "integration").match(edited.nodes[0])
+    edit.transform(edited.nodes[0])
 
     feeds = {
         "a": np.arange(4, dtype=np.float32).reshape(1, 4, 1),
-        "b": np.array([[2.5]], dtype=np.float32),
+        "b": np.full((1, width), 2.5, dtype=np.float32),
     }
     assert_model_outputs_close(original, edited, feeds)
 
