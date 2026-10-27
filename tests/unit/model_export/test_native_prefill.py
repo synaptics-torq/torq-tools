@@ -258,3 +258,18 @@ def test_liquid_vision_inherits_ordinary_gqa_configuration(tmp_path):
     assert attention.args[-1] is True
     with pytest.raises(ValueError,match="vision"):
         LiquidVLModelExporter(native_batch_prefill=(4,7))
+
+
+@pytest.mark.parametrize("flag", ["--torq-convert-dtypes", "--torq-convert-io-dtype",
+    "--torq-disable-slicing", "--torq-enable-split-constants-optimization",
+    "--torq-enable-annotate-tied-operands"])
+def test_native_flags_check_overrides_after_model_defaults(flag):
+    from torq.model_export.prefill import native_compile_flags
+
+    for flags in ([flag, flag + "=false"], [flag + "=0", flag]):
+        with pytest.raises(ValueError, match="incompatible option"):
+            native_compile_flags(flags)
+    flags = native_compile_flags([flag, flag + "=true", flag + "=1"])
+    assert flags.count(flag) == 1
+    assert flag + "=true" not in flags
+    assert flag + "=1" not in flags
