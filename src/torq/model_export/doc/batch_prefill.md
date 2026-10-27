@@ -24,6 +24,8 @@ Static shapes, extracted embeddings, a split language model head and combined KV
 
 Native compilation requires supplied-family support and a matching runtime with version-3 entry tables. The exporter supplies the compiler options; the hardware runners in `torq-examples` choose the exported functions through `torq.runtime`.
 
+Final decoder ONNX graphs share one `transformer.weights.data` file in their export directory, including after INT4 weight quantization. This applies regardless of `--split-weights`; the separate language model head keeps its existing storage policy. Copy the shared data file alongside any decoder graph you want to load or compile. Integer controls remain inline, and standard ONNX/ONNX Runtime loaders resolve the relative weight references. Optimization intermediates still use per-component data files; sharing reduces final export storage without changing graph construction or avoiding each graph's import and validation work.
+
 ## Optional size probe
 
 The optional probe compiles representative projection subgraphs, caches tiling results and prints an exporter option:

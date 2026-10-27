@@ -6,14 +6,20 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import onnx
 from onnx import numpy_helper
+from onnx.external_data_helper import _get_initializer_tensors, uses_external_data
 
 from ..utils.compile import _resolve_compiler, compile_mlir_for_vm
+from ..utils.onnx import (
+    _EXTERNAL_DATA_THRESHOLD, _read_external_data, _set_external_data, load_onnx_lazy,
+)
 
 
 def parse_native_sizes(value: str) -> tuple[int, ...]:
@@ -165,6 +171,53 @@ def _constant_roles(model):
             # controls to CSE too. Do this after the final export transforms.
             tensor.CopyFrom(onnx.helper.make_tensor(tensor.name, tensor.data_type, tensor.dims, data.reshape(-1).tolist()))
     return parameters
+
+
+def share_native_weights(paths):
+    """Pack final decoder initializers into one content-deduplicated data file.
+
+    Keep integer controls inline for ONNX data propagation. Preserve packed
+    INT4/BF16 bytes without conversion. Only remove exporter-owned sidecars
+    after every rewritten graph is installed; a failed write leaves the
+    original graphs and their data readable.
+    """
+    paths = [Path(path).absolute() for path in paths]
+    if not paths:
+        return
+    directory = paths[0].parent
+    if any(path.parent != directory for path in paths):
+        raise ValueError("native family ONNX files must share a directory")
+    data_path = directory / "transformer.weights.data"
+    spans = {}
+    with tempfile.TemporaryDirectory(prefix=".native-weights-", dir=directory) as tmp:
+        temporary = Path(tmp)
+        temporary_data = temporary / data_path.name
+        with temporary_data.open("wb") as stream:
+            for index, path in enumerate(paths):
+                model = load_onnx_lazy(path)
+                for tensor in _get_initializer_tensors(model):
+                    if tensor.data_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                        continue
+                    if uses_external_data(tensor):
+                        data = _read_external_data(tensor)
+                    elif tensor.HasField("raw_data") and len(tensor.raw_data) >= _EXTERNAL_DATA_THRESHOLD:
+                        data = tensor.raw_data
+                    else:
+                        continue
+                    key = (tensor.data_type, tuple(tensor.dims), hashlib.sha256(data).digest())
+                    if key not in spans:
+                        spans[key] = (stream.tell(), len(data))
+                        stream.write(data)
+                    offset, length = spans[key]
+                    tensor.ClearField("raw_data")
+                    _set_external_data(tensor, location=data_path.name, offset=str(offset), length=str(length))
+                onnx.save(model, temporary / f"{index}.onnx")
+        # Publish only complete data, without replacing any existing weights.
+        os.link(temporary_data, data_path)
+        for index, path in enumerate(paths):
+            os.replace(temporary / f"{index}.onnx", path)
+        for path in paths:
+            path.with_name(path.name + ".data").unlink(missing_ok=True)
 
 
 def _tensor_context_cache():

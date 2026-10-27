@@ -688,6 +688,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             quantized_model_path = self._quantize_dir / model_path.name
             self._save_component_model(model, quantized_model_path)
             self._export_paths[comp] = quantized_model_path
+        self._share_native_weights()
         self._copy_runtime_assets(self._quantize_dir, self._export_dir)
 
 

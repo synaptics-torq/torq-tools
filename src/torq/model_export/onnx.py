@@ -347,6 +347,14 @@ class OnnxModelExporterBase(ABC):
         """
         save_onnx(model, path, split=True)
 
+    def _share_native_weights(self):
+        if self._native_batch_prefill:
+            from .prefill import share_native_weights
+            share_native_weights([
+                path for comp, path in self._export_paths.items()
+                if comp == "model" or comp.startswith("model_prefill_")
+            ])
+
     def _editor_dump_kwargs(self, final_path: Path) -> dict:
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
 
@@ -487,9 +495,12 @@ class OnnxModelExporterBase(ABC):
                 )
             self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
 
+        self._share_native_weights()
         if not self._split_weights:
             # Single-file layout for every component that fits the 2 GiB limit.
-            for path in self._export_paths.values():
+            for comp, path in self._export_paths.items():
+                if self._native_batch_prefill and (comp == "model" or comp.startswith("model_prefill_")):
+                    continue
                 save_onnx(load_onnx_lazy(path), path)
 
         if validate:

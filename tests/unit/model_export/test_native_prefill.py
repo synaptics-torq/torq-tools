@@ -75,14 +75,14 @@ def test_read_only_causal_mask_is_a_typed_control(quantized):
     np.testing.assert_array_equal(numpy_helper.to_array(tensor), values)
 
 
-def _family_graph(size, weight=1.):
+def _family_graph(size, weight=1., width=4):
     # Full-cache identity state and a real final-token hidden output.
-    inputs = [h.make_tensor_value_info("token_embedding",T.FLOAT,[1,size,4]),
+    inputs = [h.make_tensor_value_info("token_embedding",T.FLOAT,[1,size,width]),
               h.make_tensor_value_info("position_ids",T.INT64,[1,1]),
               h.make_tensor_value_info("past_key_values.0.key_value",T.FLOAT,[1,2,16,4])]
-    outputs = [h.make_tensor_value_info("last_hidden_states",T.FLOAT,[1,1,4]),
+    outputs = [h.make_tensor_value_info("last_hidden_states",T.FLOAT,[1,1,width]),
                h.make_tensor_value_info("present.0.key_value",T.FLOAT,[1,2,16,4])]
-    initializers = [numpy_helper.from_array(np.eye(4,dtype=np.float32)*weight,"weight")]
+    initializers = [numpy_helper.from_array(np.eye(width,dtype=np.float32)*weight,"weight")]
     for name, vals in [("start",[-1]),("end",[2**63-1]),("axis",[1])]:
         initializers.append(numpy_helper.from_array(np.array(vals,np.int64),name))
     return h.make_model(h.make_graph([
@@ -164,7 +164,17 @@ def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
             h.make_tensor_value_info("position_ids", T.INT32, [1,1]),
             h.make_tensor_value_info("past_key_values.0.key_value", T.BFLOAT16, [1,16,2,4]),
         ])
-        onnx.save(model, path)
+        onnx.save_model(model, path, save_as_external_data=True, all_tensors_to_one_file=True,
+                        location=f"{path.name}.data", size_threshold=0)
+    from torq.model_export.prefill import share_native_weights
+    share_native_weights(paths.values())
+    references = []
+    for path in paths.values():
+        stored = onnx.load(path, load_external_data=False)
+        references.append({tensor.name: tuple((entry.key, entry.value) for entry in tensor.external_data)
+                           for tensor in stored.graph.initializer if tensor.name.startswith("weight_")})
+    assert references[0] == references[1]
+    assert all(references[0].values())
     metadata = import_native_family(paths, tmp_path / "family.mlirbc")
     assert metadata["entries"]["main"]["inputs"][0]["dtype"] == T.BFLOAT16
     assert metadata["entries"]["main_4"]["inputs"][1]["dtype"] == T.INT32
@@ -415,3 +425,137 @@ def test_native_flags_check_overrides_after_model_defaults(flag):
     assert flags.count(flag) == 1
     assert flag + "=true" not in flags
     assert flag + "=1" not in flags
+
+
+@pytest.mark.parametrize("split_weights", [False, True])
+def test_native_export_shares_weights_and_keeps_controls_inline(tmp_path, split_weights):
+    from support.model_export import StubExporter
+    from torq.utils.onnx import load_onnx_lazy, save_onnx
+
+    components = {}
+    for size in (1, 4, 7):
+        model = _family_graph(size, width=16)
+        model.graph.initializer.append(numpy_helper.from_array(np.arange(128 + size, dtype=np.int64), "offsets"))
+        model.graph.node.append(h.make_node("Add", ["position_ids", "offsets"], ["positions"]))
+        components["model" if size == 1 else f"model_prefill_{size}"] = model
+    # The independent head follows the ordinary --split-weights policy.
+    components["lm_head"] = _family_graph(1, width=16)
+    exporter = StubExporter(tmp_path, components, split_weights=split_weights)
+    exporter._native_batch_prefill = (4, 7)
+    exporter.export_onnx(validate=True, cleanup=False)
+
+    directory = exporter.export_dir
+    data_path = directory / "transformer.weights.data"
+    assert data_path.stat().st_size == 16 * 16 * 4
+    paths = {size: exporter._export_paths["model" if size == 1 else f"model_prefill_{size}"] for size in (1, 4, 7)}
+    references = []
+    for size, path in paths.items():
+        model = onnx.load(path, load_external_data=False)
+        tensors = {tensor.name: tensor for tensor in model.graph.initializer}
+        references.append({entry.key: entry.value for entry in tensors["weight"].external_data})
+        assert not tensors["weight"].raw_data
+        assert not tensors["offsets"].external_data
+        np.testing.assert_array_equal(numpy_helper.to_array(tensors["offsets"]), np.arange(128 + size))
+        onnx.checker.check_model(str(path), full_check=True)
+        assert not path.with_name(path.name + ".data").exists()
+    assert references == [dict(location=data_path.name, offset="0", length="1024")] * 3
+    assert (directory / "lm_head.onnx.data").exists() == split_weights
+    # Re-saving one member must not damage the shared file or its siblings.
+    save_onnx(load_onnx_lazy(paths[4]), paths[4])
+    validate_native_onnx(paths)
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    assert set(import_native_family(paths, directory / "family.mlirbc")["entries"]) == {"main", "main_4", "main_7"}
+
+
+def test_shared_weights_preserve_distinct_parameters(tmp_path):
+    from torq.model_export.prefill import share_native_weights
+    from torq.utils.onnx import save_onnx
+
+    paths = {size: tmp_path / f"decoder_{size}.onnx" for size in (1, 4)}
+    for size, path in paths.items():
+        save_onnx(_family_graph(size, weight=float(size), width=16), path, split=True)
+    share_native_weights(paths.values())
+    assert (tmp_path / "transformer.weights.data").stat().st_size == 2 * 1024
+    for size, path in paths.items():
+        np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16) * size)
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    with pytest.raises(ValueError, match="parameters differ"):
+        import_native_family(paths, tmp_path / "family.mlirbc")
+
+
+def test_shared_weights_failed_write_preserves_original_graphs(tmp_path, monkeypatch):
+    from torq.model_export.prefill import share_native_weights
+    from torq.utils.onnx import save_onnx
+
+    paths = [tmp_path / f"decoder_{size}.onnx" for size in (1, 4)]
+    for size, path in zip((1, 4), paths):
+        save_onnx(_family_graph(size, width=16), path, split=True)
+    original = {path: path.read_bytes() for path in paths}
+    save = onnx.save
+    def fail_second(model, path):
+        if path.name == "1.onnx":
+            raise OSError("disk full")
+        save(model, path)
+    monkeypatch.setattr(onnx, "save", fail_second)
+    with pytest.raises(OSError, match="disk full"):
+        share_native_weights(paths)
+    assert not (tmp_path / "transformer.weights.data").exists()
+    for path in paths:
+        assert path.read_bytes() == original[path]
+        np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16))
+
+
+def test_native_gemma_quantization_shares_the_quantized_weights(tmp_path, monkeypatch):
+    from support.model_export import StubExporter
+    from torq.models.gemma3.export import Gemma3ModelExporter
+
+    exporter = StubExporter(tmp_path, {
+        "model": _family_graph(1, width=64),
+        "model_prefill_4": _family_graph(4, width=64),
+    })
+    exporter._native_batch_prefill = (4,)
+    exporter._weight_quantization = "int4"
+    exporter._gptq_checkpoint = None
+    monkeypatch.setattr(exporter, "_summarize_weight_quantization", lambda *args: dict(
+        kl=0., cosine=1., max_abs_error=0., classification="test"), raising=False)
+    exporter.export_onnx(validate=True, cleanup=False)
+    Gemma3ModelExporter.weight_quantize_models(exporter)
+
+    assert (exporter._quantize_dir / "transformer.weights.data").exists()
+    references = []
+    for path in exporter._export_paths.values():
+        assert path.parent == exporter._quantize_dir
+        stored = onnx.load(path, load_external_data=False)
+        references.append({tensor.name: tuple((entry.key, entry.value) for entry in tensor.external_data)
+                           for tensor in stored.graph.initializer if tensor.external_data})
+        onnx.checker.check_model(str(path), full_check=True)
+        assert not path.with_name(path.name + ".data").exists()
+    assert references[0] == references[1]
+    assert references[0]
+
+
+@pytest.mark.parametrize("failure", ["publish", "install"])
+def test_shared_weights_publish_failures_leave_all_models_readable(tmp_path, monkeypatch, failure):
+    import torq.model_export.prefill as prefill
+    from torq.utils.onnx import save_onnx
+
+    paths = [tmp_path / f"decoder_{size}.onnx" for size in (1, 4)]
+    for size, path in zip((1, 4), paths):
+        save_onnx(_family_graph(size, width=16), path, split=True)
+    data_path = tmp_path / "transformer.weights.data"
+    if failure == "publish":
+        data_path.write_bytes(b"existing weights")
+    else:
+        replace = prefill.os.replace
+        def fail_second(source, destination):
+            if destination == paths[1]:
+                raise OSError("cannot install graph")
+            replace(source, destination)
+        monkeypatch.setattr(prefill.os, "replace", fail_second)
+    with pytest.raises(OSError):
+        prefill.share_native_weights(paths)
+    if failure == "publish":
+        assert data_path.read_bytes() == b"existing weights"
+    for path in paths:
+        assert path.with_name(path.name + ".data").exists()
+        np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16))
