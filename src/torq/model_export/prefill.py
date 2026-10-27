@@ -59,7 +59,7 @@ def check_native_compiler(compiler_path=None):
                                 capture_output=True, text=True, check=True, timeout=30)
     except (ImportError, OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"native prefill needs compatible compiler Python bindings and executable: {exc}") from exc
-    if "--torq-enable-batch-prefill" not in result.stdout:
+    if "--torq-enable-multi-graph" not in result.stdout:
         raise RuntimeError(
             "selected compiler does not support supplied native prefill families; "
             "use --compiler-path or TORQ_COMPILER_PATH with a native-family build"
@@ -167,6 +167,26 @@ def _constant_roles(model):
     return parameters
 
 
+def _tensor_context_cache():
+    """Importer cache supporting ONNX packed integers and 16-bit float literals."""
+    from iree.compiler import ir
+    from iree.compiler.extras import onnx_importer
+
+    class TensorContextCache(onnx_importer.ContextCache):
+        def tensor_proto_to_attr(self, tensor):
+            if tensor.data_type in (onnx.TensorProto.INT4, onnx.TensorProto.UINT4):
+                # MLIR's canonical i4 resource storage uses one byte per element.
+                values = numpy_helper.to_array(tensor).astype("uint8") & 15
+                return ir.DenseResourceElementsAttr.get_from_buffer(
+                    values, self._sanitize_name(tensor.name), self.tensor_proto_to_builtin_type(tensor), alignment=8)
+            if tensor.data_type in (onnx.TensorProto.BFLOAT16, onnx.TensorProto.FLOAT16) and not tensor.HasField("raw_data"):
+                return ir.DenseElementsAttr.get(numpy_helper.to_array(tensor).view("uint16"),
+                                                type=self.tensor_proto_to_builtin_type(tensor))
+            return super().tensor_proto_to_attr(tensor)
+
+    return TensorContextCache
+
+
 def import_native_family(paths: dict[int, Path], output: Path):
     """Import decode (key 1) and static chunks into one verified bytecode module."""
     from iree.compiler import ir
@@ -181,25 +201,13 @@ def import_native_family(paths: dict[int, Path], output: Path):
     read_only = False
     shared_parameters = {}
 
-    class FamilyContextCache(onnx_importer.ContextCache):
+    class FamilyContextCache(_tensor_context_cache()):
         def tensor_proto_to_attr(self, tensor):
-            if tensor.data_type == onnx.TensorProto.BFLOAT16 and not tensor.HasField("raw_data"):
-                return ir.DenseElementsAttr.get(numpy_helper.to_array(tensor).view("uint16"),
-                                                type=self.tensor_proto_to_builtin_type(tensor))
-            # Parameter identity is checked before each entry is imported.
-            # Reuse the resource itself, rather than eight equal byte buffers.
-            if tensor.name in parameters and tensor.HasField("raw_data"):
-                if tensor.name not in shared_parameters:
-                    if tensor.data_type in (onnx.TensorProto.INT4, onnx.TensorProto.UINT4):
-                        # ONNX packs nibbles; canonical MLIR integer storage
-                        # uses one byte per element, including for i4.
-                        values = numpy_helper.to_array(tensor).astype("uint8") & 15
-                        shared_parameters[tensor.name] = ir.DenseResourceElementsAttr.get_from_buffer(
-                            values, self._sanitize_name(tensor.name), self.tensor_proto_to_builtin_type(tensor), alignment=8)
-                    else:
-                        shared_parameters[tensor.name] = super().tensor_proto_to_attr(tensor)
-                return shared_parameters[tensor.name]
-            return super().tensor_proto_to_attr(tensor)
+            if tensor.name not in parameters:
+                return super().tensor_proto_to_attr(tensor)
+            if tensor.name not in shared_parameters:
+                shared_parameters[tensor.name] = super().tensor_proto_to_attr(tensor)
+            return shared_parameters[tensor.name]
 
     with ir.Context() as context, ir.Location.unknown():
         module = ir.Module.create()
@@ -265,8 +273,8 @@ def import_native_family(paths: dict[int, Path], output: Path):
 
 
 def native_compile_flags(flags):
-    if any(flag.startswith(("--torq-prefill-", "--torq-enable-batch-prefill")) for flag in flags):
-        raise ValueError("native sizes belong to the exporter; do not pass compiler generation/family options")
+    if any(flag.startswith("--torq-enable-multi-graph") for flag in flags):
+        raise ValueError("native exporter sets multi-graph compilation; do not pass compiler family options")
     required = ["--iree-input-type=onnx-torq", "--iree-hal-target-backends=torq", "--torq-hw=SL2610",
                 "--torq-convert-dtypes", "--torq-convert-io-dtype", "--torq-disable-slicing",
                 "--torq-enable-split-constants-optimization", "--torq-enable-annotate-tied-operands"]
@@ -281,7 +289,7 @@ def native_compile_flags(flags):
         # agree even when a model default and a user override name the same flag.
         result = [arg for arg in result if arg not in allowed]
         result.append(flag)
-    return result + ["--torq-enable-batch-prefill"]
+    return result + ["--torq-enable-multi-graph"]
 
 
 def compile_native_family(paths, output_dir, *, compiler_args, compiler_path=None, local_compile=False):

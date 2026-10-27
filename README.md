@@ -122,7 +122,7 @@ See `src/torq/utils/benchmark/README.md` for options.
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 
-For Gemma3/FunctionGemma and LFM2.5 native decoder families, see the [native batch-prefill guide](src/torq/model_export/batch_prefill.md).
+For Gemma3/FunctionGemma and LFM2.5 native decoder families, see the [native batch-prefill guide](src/torq/model_export/doc/batch_prefill.md).
 ```bash
 python3 -m src.torq.models.<model>.export
 ```

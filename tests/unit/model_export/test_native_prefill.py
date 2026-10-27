@@ -299,14 +299,13 @@ def test_rope_position_vector_control_and_left_hand_frequency_parameter():
         _constant_roles(model)
 
 
-def test_native_compile_options_are_explicit_and_generation_options_rejected():
+def test_native_compile_options_are_explicit_and_family_overrides_rejected():
     from torq.model_export.prefill import native_compile_flags
 
     flags = native_compile_flags(["--torq-max-nss-programs-size=33554432"])
-    assert flags.count("--torq-enable-batch-prefill") == 1
+    assert flags.count("--torq-enable-multi-graph") == 1
     assert "--torq-convert-io-dtype" in flags
-    assert not any(f.startswith("--torq-prefill-") for f in flags)
-    for invalid in ("--torq-prefill-batch-sizes=4", "--torq-enable-batch-prefill", "--torq-convert-io-dtype=false"):
+    for invalid in ("--torq-enable-multi-graph", "--torq-enable-multi-graph=false", "--torq-convert-io-dtype=false"):
         with pytest.raises(ValueError):
             native_compile_flags([invalid])
 
@@ -347,8 +346,8 @@ def test_export_compiles_family_once_and_keeps_family_flags_off_head(tmp_path, m
     exporter.export_torq(compiler_path=tmp_path/"compiler", torq_compile_args=["--torq-max-nss-programs-size=33554432"])
     assert [c[0] for c in calls] == ["family","head"]
     assert list(calls[0][1]) == [1,4,7]
-    assert "--torq-enable-batch-prefill" in calls[0][2]["compiler_args"]
-    assert "--torq-enable-batch-prefill" not in calls[1][2]["compiler_args"]
+    assert "--torq-enable-multi-graph" in calls[0][2]["compiler_args"]
+    assert "--torq-enable-multi-graph" not in calls[1][2]["compiler_args"]
     assert calls[1][2]["use_binary"] is True
     assert "--torq-max-nss-programs-size" not in calls[0][2]["compiler_args"]
     assert "--torq-max-nss-programs-size=33554432" in calls[0][2]["compiler_args"]

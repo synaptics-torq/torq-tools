@@ -36,6 +36,6 @@ tmp*/
 release/
 .test
 TODO*
-*.md
-!**/README*.md
+*AGENTS*.md
+CLAUDE.md
 !CONTRIBUTING.md

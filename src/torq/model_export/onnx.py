@@ -679,7 +679,7 @@ class OnnxModelExporterBase(ABC):
             torq_compile_args += self._auto_torq_compile_extras()
         if native_sizes:
             family_flags = native_compile_flags(torq_compile_args)
-            torq_compile_args = [flag for flag in family_flags if flag != "--torq-enable-batch-prefill"]
+            torq_compile_args = [flag for flag in family_flags if flag != "--torq-enable-multi-graph"]
         if self._torq_dir.exists():
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
