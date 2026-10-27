@@ -47,9 +47,8 @@ _patch_gs_bf16_converter()
 from . import add_liquid_export_args
 from ._graph import LiquidOnnxGraphEditor
 from ._inference import LiquidDynamic, LiquidStatic
-from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...model_export.onnx import OnnxModelExporterBase
 from ...utils.onnx import external_data_cwd
 
 
@@ -97,6 +96,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         *,
         max_gen_tokens: int = 256,
         batch_prefill: int | None = None,
+        native_batch_prefill: tuple[int, ...] | None = None,
         model_dtype: str = "fp32",
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -107,6 +107,15 @@ class LiquidModelExporter(OnnxModelExporterBase):
         read_only_kv_cache: bool = True,
         **edit_args
     ):
+        from ...model_export.prefill import validate_native_options
+
+        self._native_batch_prefill = validate_native_options(
+            native_batch_prefill, batch_prefill=batch_prefill, context=max_gen_tokens,
+            minimum=4, static=static_models, embeddings=extract_embeddings,
+            split_head=edit_args.get("split_lm_head", False), read_only=read_only_kv_cache,
+            individual=keep_individual_kv_io,
+            unsupported=dynamic_quantize or convert_dtypes or model_dtype != "fp32" or model_size != "230m" or edit_args.get("keep_conv1d", False) or edit_args.get("simulate_bf16", False) or edit_args.get("chunk_lm_head", False),
+        )
         if read_only_kv_cache and keep_individual_kv_io:
             raise ValueError(
                 "`--read-only-kv-cache` needs the combined KV cache I/O; "
@@ -175,6 +184,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._head_dim = int(self._config_dict.get("head_dim") or (self._hidden_size // self._num_attention_heads))
         self._conv_dim = int(self._config_dict.get("conv_dim", self._hidden_size))
         self._conv_L_cache = int(self._config_dict.get("conv_L_cache", 3))
+        if self._native_batch_prefill and self._conv_L_cache != 3:
+            raise ValueError("native LFM prefill requires a three-token convolution state")
         self._layer_types = tuple(self._config_dict["layer_types"])
         self._num_hidden_layers = int(self._config_dict["num_hidden_layers"])
         self._cfg_path = cfg_path
@@ -208,6 +219,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # their own tree so they never overwrite a unified export's artifacts.
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
         suffix = "static" if self._static_models else "dynamic"
+        if self._native_batch_prefill:
+            suffix = "native_" + "_".join(map(str, self._native_batch_prefill))
         root = self._models_dir / "export" / model_topology
         export_dir = root / self._model_dtype / suffix
         quantize_dir = root / "quantized" / suffix
@@ -290,6 +303,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         return {"model": model}
 
     def _export_path_for_component(self, component: str) -> Path:
+        if component.startswith("model_prefill_"):
+            return self._export_dir / f"transformer_prefill_{component.removeprefix('model_prefill_')}.onnx"
         if getattr(self, "_split_lm_head", False):
             filenames = {
                 "model": "transformer.onnx",
@@ -501,7 +516,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "source.convert (attention)": [
                 EditSpec("ReplaceGroupQueryAttention", (
                     self._num_attention_heads, self._num_key_value_heads, self._head_dim,
-                    ctx("chunk_len"),
+                    ctx("chunk_len"), not bool(self._native_batch_prefill),
                 )),
             ],
             "model.static": [
@@ -521,9 +536,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
         patch = [
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
-            EditSpec("CollapseGQABroadcast"),
             EditSpec("FoldScalarMatMul"),
         ]
+        if not self._native_batch_prefill:
+            patch.insert(2, EditSpec("CollapseGQABroadcast"))
         if self._broadcast_ops is not None:
             patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
         blocks["model.patch"] = patch
@@ -532,7 +548,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             )]
-        if self._batch_prefill is not None:
+        if self._batch_prefill is not None or self._native_batch_prefill:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -794,12 +810,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
             return model, 0
 
         matmul_node, transpose_node, weight = target
-        V, H = int(weight.values.shape[0]), int(weight.values.shape[1])
+        V = int(weight.values.shape[0])
         lhs_input = matmul_node.inputs[0]
         original_output = matmul_node.outputs[0]
-        original_output_name = original_output.name
         original_output_shape = list(original_output.shape) if original_output.shape else None
-        original_output_dtype = original_output.dtype
 
         chunk_outputs: list[gs.Variable] = []
         for ci, start in enumerate(range(0, V, chunk_size)):
@@ -1016,6 +1030,100 @@ class LiquidModelExporter(OnnxModelExporterBase):
             new_model.ir_version = model.ir_version
             return new_model, replaced
         return model, 0
+
+    @staticmethod
+    def _replace_native_conv1d(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
+        """Token-major three-stream convolution, with channel-major history I/O."""
+        graph = gs.import_onnx(model)
+        replaced = 0
+        for conv in list(graph.nodes):
+            if conv.op != "Conv":
+                continue
+            weight = conv.inputs[1]
+            if not isinstance(weight, gs.Constant):
+                raise ValueError("native LFM convolution needs constant weights")
+            w = weight.values
+            if (w.ndim != 3 or w.shape[1:] != (1, 3) or len(conv.inputs) != 2
+                    or conv.attrs.get("group", 1) != w.shape[0]
+                    or list(conv.attrs.get("strides", [1])) != [1]
+                    or list(conv.attrs.get("dilations", [1])) != [1]
+                    or list(conv.attrs.get("pads", [0, 0])) != [0, 0]
+                    or conv.attrs.get("auto_pad") not in (None, "NOTSET", b"NOTSET")):
+                raise ValueError("native LFM supports only unbiased depthwise K=3, stride=1 convolution")
+            channels = w.shape[0]
+            try:
+                concat = conv.i()
+                gated = concat.i(1)
+                split = gated.i()
+                layout = split.i()
+                output_slice = conv.o()
+                gate = output_slice.o()
+                output_layout = gate.o()
+                history = next(n for n in concat.outputs[0].outputs if n is not conv)
+                size = int(concat.inputs[1].shape[2])
+                valid = (concat.op == "Concat" and concat.attrs.get("axis") == 2
+                         and list(concat.inputs[0].shape) == [1, channels, 3]
+                         and gated.op == "Mul" and split.op == "Split"
+                         and split.attrs.get("axis") == 1 and len(split.outputs) == 3
+                         and layout.op == output_layout.op == "Transpose"
+                         and list(layout.attrs.get("perm", [])) == [0, 2, 1]
+                         and list(output_layout.attrs.get("perm", [])) == [0, 2, 1]
+                         and output_slice.op == history.op == "Slice" and gate.op == "Mul"
+                         and size >= 4)
+            except (IndexError, StopIteration, TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"unsupported native LFM convolution/state graph: {conv.name}")
+            base = conv.name + "/native"
+
+            def integer(tag, values):
+                return gs.Constant(base + "/" + tag, np.asarray(values, dtype=np.int64))
+
+            def operation(op, tag, inputs, shape, **attrs):
+                out = gs.Variable(base + "/" + tag, dtype=w.dtype, shape=shape)
+                graph.nodes.append(gs.Node(op=op, name=out.name, inputs=inputs, outputs=[out], attrs=attrs))
+                return out
+
+            # Eliminate the activation layout changes around the block.
+            split.inputs[0] = layout.inputs[0]
+            split.attrs["axis"] = 2
+            for out in split.outputs:
+                out.shape = [1, size, channels]
+            gated.outputs[0].shape = [1, size, channels]
+            concat.inputs[0] = operation("Transpose", "state", [concat.inputs[0]], [1, 3, channels], perm=[0, 2, 1])
+            concat.attrs["axis"] = 1
+            concat.outputs[0].shape = [1, size + 3, channels]
+            streams = []
+            for k in range(1, 4):
+                stream = operation("Slice", f"shift_{k}", [concat.outputs[0], integer(f"start_{k}", [k]),
+                    integer(f"end_{k}", [k + size]), integer(f"axis_{k}", [1]), integer(f"step_{k}", [1])], [1, size, channels])
+                streams.append(operation("Unsqueeze", f"stream_{k}", [stream, integer(f"unsqueeze_{k}", [3])], [1, size, channels, 1]))
+            stacked = operation("Concat", "stacked", streams, [1, size, channels, 3], axis=3)
+            windows = operation("Reshape", "windows", [stacked, integer("windows_shape", [size, channels, 1, 3])], [size, channels, 1, 3])
+            kernel = gs.Constant(weight.name + "_KbyN", w.reshape(channels, 3, 1).copy())
+            dots = operation("MatMul", "dots", [windows, kernel], [size, channels, 1, 1])
+            result = operation("Reshape", "result", [dots, integer("result_shape", [1, size, channels])], [1, size, channels])
+            gate.inputs = [result if x is output_slice.outputs[0] else x for x in gate.inputs]
+            gate.outputs[0].shape = [1, size, channels]
+            old = output_layout.outputs[0]
+            for consumer in list(old.outputs):
+                consumer.inputs = [gate.outputs[0] if x is old else x for x in consumer.inputs]
+            graph.outputs = [gate.outputs[0] if x is old else x for x in graph.outputs]
+            # Last three gated inputs, oldest first, retain the external ABI.
+            old_history = history.outputs[0]
+            history.inputs = [concat.outputs[0], integer("history_start", [size]),
+                              integer("history_end", [size + 3]), integer("history_axis", [1]), integer("history_step", [1])]
+            history.outputs = [gs.Variable(base + "/history", dtype=w.dtype, shape=[1, 3, channels])]
+            graph.nodes.append(gs.Node(op="Transpose", name=base + "/present", inputs=history.outputs,
+                                       outputs=[old_history], attrs={"perm": [0, 2, 1]}))
+            output_layout.outputs.clear()
+            conv.outputs.clear()
+            output_slice.outputs.clear()
+            replaced += 1
+        graph.cleanup().toposort()
+        result = gs.export_onnx(graph)
+        result.ir_version = model.ir_version
+        return result, replaced
 
     @staticmethod
     def _conv_matmul_names(model: onnx.ModelProto, conv_l_cache: int) -> list[str]:
@@ -1236,7 +1344,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # SL2610's depthwise-conv path asserts out of torq-compile on this
         # kernel.  Disabled by --keep-conv1d.
         if self._replace_conv1d:
-            new_model, n_conv = self._replace_conv1d_with_matmul(new_model)
+            if self._native_batch_prefill and component.startswith("model_prefill_"):
+                new_model, n_conv = self._replace_native_conv1d(new_model)
+            else:
+                new_model, n_conv = self._replace_conv1d_with_matmul(new_model)
             if n_conv:
                 self._logger.info(
                     "(conv-rewrite) Replaced %d depthwise Conv1D op(s) with batched MatMul",
@@ -1268,7 +1379,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("(lm-head) shape inference after split: %s", e)
 
-        if component.endswith("_prefill"):
+        if component.endswith("_prefill") or component.startswith("model_prefill_"):
             # The prefill model's LM head only needs the final position's
             # logit; slice its input before the head.  No-op when the head
             # isn't a direct MatMul (chunked --chunk-lm-head or a
@@ -1309,6 +1420,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 self._components["model_prefill"],
                 component="model_prefill",
                 chunk_len=self._batch_prefill,
+            )
+
+        for size in self._native_batch_prefill:
+            component = f"model_prefill_{size}"
+            source = self._convert_source_model(chunk_len=size, component=component)
+            self._components[component] = self._make_model_static(
+                self.check_model(source, skip_data_prop=True), component=component, chunk_len=size,
             )
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
@@ -1665,7 +1783,8 @@ def export_liquid_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill or None,
+        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
+        native_batch_prefill=args.native_batch_prefill,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
@@ -1684,6 +1803,10 @@ def export_liquid_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
+    if args.native_batch_prefill and not args.skip_torq:
+        from ...model_export.prefill import check_native_compiler, native_compile_flags
+        check_native_compiler(args.compiler_path)
+        native_compile_flags(args.compile_flags or [])
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(

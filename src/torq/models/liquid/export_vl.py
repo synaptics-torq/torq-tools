@@ -31,7 +31,6 @@ export of LFM2-VL ships **three** separate components:
 import argparse
 import json
 import os
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +102,8 @@ class LiquidVLModelExporter(LiquidModelExporter):
         static_models: bool = True,
         **edit_args,
     ):
+        if edit_args.get("native_batch_prefill") is not None:
+            raise ValueError("native batch prefill is not supported for vision models")
         # --- LFM2.5 exporter knobs (mirror LiquidModelExporter.__init__) ----
         # The VL decoder takes inputs_embeds directly; there is no Gather to
         # extract.  The token-embedding LUT lives in embed_tokens.onnx and is
