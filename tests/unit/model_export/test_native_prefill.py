@@ -159,3 +159,27 @@ def test_integer_shape_controls_stay_literals():
     assert _constant_roles(model) == {}
     assert not model.graph.initializer[0].raw_data
     assert list(model.graph.initializer[0].int64_data) == [1,4,8]
+
+
+def test_gemma_native_rope_keeps_token_layout_after_head_major_concat():
+    import onnx_graphsurgeon as gs
+    import onnxruntime as ort
+    from torq.models.gemma3.export import Gemma3ModelExporter
+
+    frequency=gs.Variable("frequency",np.float32,[1,2,7])
+    tokens=gs.Variable("tokens",np.float32,[1,7,2])
+    output=gs.Variable("output",np.float32,[1,7,4])
+    graph=gs.Graph(opset=18,inputs=[frequency],outputs=[output],nodes=[
+        gs.Node(op="Transpose",name="transpose",inputs=[frequency],outputs=[tokens],attrs={"perm":[0,2,1]}),
+        gs.Node(op="Concat",name="/model/rotary_emb/Concat",inputs=[tokens,tokens],outputs=[output],attrs={"axis":-1}),
+    ])
+    original=gs.export_onnx(graph);original.ir_version=10
+    Gemma3ModelExporter._native_rope_layout(graph)
+    graph.cleanup().toposort()
+    rewritten=gs.export_onnx(graph);rewritten.ir_version=10
+    assert next(n for n in rewritten.graph.node if n.op_type=="Concat").attribute[0].i==1
+    inputs={"frequency":np.arange(14,dtype=np.float32).reshape(1,2,7)}
+    opts=ort.SessionOptions();opts.intra_op_num_threads=1
+    expected=ort.InferenceSession(original.SerializeToString(),opts).run(None,inputs)[0]
+    actual=ort.InferenceSession(rewritten.SerializeToString(),opts).run(None,inputs)[0]
+    np.testing.assert_array_equal(actual,expected)
