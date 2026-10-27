@@ -45,6 +45,25 @@ flowchart TD
     Sweep -.->|Compile or parse failure| Stop
 ```
 
+<details>
+<summary>Selection rules and failure handling</summary>
+
+A **weight strip** is a piece of the weight matrix loaded for computation. The strip's width is the number of output features it covers.
+
+- A work layout describes the weight-strip width, whether tokens are split into smaller groups, and the order those groups and weight strips are processed.
+- Consecutive chunk sizes with the same layout form a range (called a “plateau” in the report).
+- Each range's largest size becomes a candidate when its weight-strip width is recognized.
+- Combine candidates from all constrained projections, then add size 4 and the sweep limit.
+- Only projections whose weights are split along the output dimension (N) at decode are constrained and swept.
+- Remove a candidate if any constrained projection has no recognized weight tile or reloads weights for each token group.
+- When split constants is enabled, account for its alignment rules before comparing layouts.
+- Remove a smaller candidate if a larger retained size has the same layout across all constrained projections; retain size 4 if valid.
+- No projections, no constrained projections or no surviving candidates means no recommendation.
+- Compile/parse failures also stop the sweep.
+- Empty recommendations and failures require explicit sizes; this is not a fallback to a known optimal family.
+
+The sections below explain these rules in detail.
+
 </details>
 
 ## Representative projections
