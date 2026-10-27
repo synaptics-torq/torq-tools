@@ -27,17 +27,28 @@ def test_invalid_sizes(value):
 def test_cli_sizes_replace_default_without_accepting_explicit_legacy(add_args):
     parser = argparse.ArgumentParser()
     add_args(parser)
-    assert parser.parse_args([]).batch_prefill == 64
-    assert parser.parse_args(["--native-batch-prefill", "4,7"]).native_batch_prefill == (4, 7)
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--batch-prefill", "0", "--native-batch-prefill", "4,7"])
+    defaults = parser.parse_args([])
+    assert defaults.batch_prefill == 64
+    assert defaults.native_batch_prefill is False
+    assert defaults.batch_prefill_sizes is None
+    automatic = parser.parse_args(["--native-batch-prefill"])
+    assert automatic.native_batch_prefill is True
+    assert automatic.batch_prefill_sizes is None
+    explicit = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,7"])
+    assert explicit.native_batch_prefill is True
+    assert explicit.batch_prefill_sizes == (4, 7)
+    for size in ("0", "64"):
+        for arguments in (["--batch-prefill", size, "--native-batch-prefill"],
+                          ["--native-batch-prefill", "--batch-prefill", size]):
+            with pytest.raises(SystemExit):
+                parser.parse_args(arguments)
 
 
-@pytest.mark.parametrize("override", [dict(sizes=(4,4)), dict(sizes=(7,4)), dict(sizes=(1,4)),
+@pytest.mark.parametrize("override", [dict(sizes=()), dict(sizes=(4,4)), dict(sizes=(7,4)), dict(sizes=(1,4)),
     dict(sizes=(4,17)), dict(sizes=(2,), minimum=4), dict(read_only=True), dict(static=False),
     dict(embeddings=False), dict(split_head=False), dict(individual=True), dict(unsupported=True), dict(batch_prefill=64)])
 def test_reject_unsupported_options(override):
-    options = dict(sizes=(4,7), batch_prefill=None, context=16, minimum=2, static=True,
+    options = dict(sizes=(4,7), enabled=True, batch_prefill=None, context=16, minimum=2, static=True,
                    embeddings=True, split_head=True, read_only=False, individual=False, unsupported=False)
     options.update(override)
     with pytest.raises(ValueError):
@@ -197,7 +208,8 @@ def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
         onnx.save(model, paths[4])
 
 
-def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sizes", [None, (4, 7)])
+def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, monkeypatch, sizes):
     from types import SimpleNamespace
     from unittest.mock import Mock
     from torq.models.gemma3 import export as gemma
@@ -208,18 +220,36 @@ def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, 
     checkpoint = Mock(return_value=tmp_path / "gptq")
     monkeypatch.setattr(gemma, "_resolve_gptq_checkpoint", checkpoint)
     exported = []
-    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_onnx", lambda self, **kwargs: exported.append(self))
+    export_options = []
+    def record_export(self, **kwargs):
+        exported.append(self)
+        export_options.append(kwargs)
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_onnx", record_export)
     quantize = Mock()
     monkeypatch.setattr(gemma.Gemma3ModelExporter, "weight_quantize_models", quantize)
     parser = argparse.ArgumentParser()
     add_gemma3_export_args(parser)
-    args = parser.parse_args(["--instruct-model", "--native-batch-prefill", "4,7", "--skip-torq"])
+    from torq.model_export import prefill
+    check_compiler = Mock()
+    monkeypatch.setattr(prefill, "check_native_compiler", check_compiler)
+    arguments = ["--instruct-model", "--native-batch-prefill", "--skip-torq", "--compiler-path", "/selected/compiler"]
+    if sizes is not None:
+        arguments += ["--batch-prefill-sizes", ",".join(map(str, sizes))]
+    arguments += ["--compile-flags", "--torq-max-nss-programs-size=33554432"]
+    args = parser.parse_args(arguments)
     gemma.export_gemma3_from_args(args)
     checkpoint.assert_called_once_with(args, "int4")
     quantize.assert_called_once()
     assert exported[0]._read_only_kv_cache is True
     assert exported[0]._gptq_checkpoint == tmp_path / "gptq"
-    assert exported[0]._native_batch_prefill == (4,7)
+    assert export_options[0]["compiler_path"] == args.compiler_path
+    assert export_options[0]["torq_compile_args"] == args.compile_flags
+    assert exported[0]._native_prefill_enabled is True
+    assert exported[0]._native_batch_prefill == (sizes or ())
+    if sizes is None:
+        check_compiler.assert_called_once_with(args.compiler_path)
+    else:
+        check_compiler.assert_not_called()
 
 
 @pytest.mark.parametrize("native,quantization,read_only,expected", [
@@ -236,6 +266,7 @@ def test_gemma_prefetch_defaults_follow_native_cache_configuration(monkeypatch, 
         "--torq-prefetch-algorithm=stream-schedule", "--torq-convert-dtypes",
     ])
     exporter = Gemma3ModelExporter.__new__(Gemma3ModelExporter)
+    exporter._native_prefill_enabled = native
     exporter._native_batch_prefill = (4,7) if native else ()
     exporter._weight_quantization = quantization
     exporter._read_only_kv_cache = read_only
@@ -409,7 +440,7 @@ def test_liquid_vision_inherits_ordinary_gqa_configuration(tmp_path):
     attention=exporter.graph_edit_blocks()["source.convert (attention)"][0]
     assert attention.args[-1] is True
     with pytest.raises(ValueError,match="vision"):
-        LiquidVLModelExporter(native_batch_prefill=(4,7))
+        LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7))
 
 
 @pytest.mark.parametrize("flag", ["--torq-convert-dtypes", "--torq-convert-io-dtype",
@@ -559,3 +590,171 @@ def test_shared_weights_publish_failures_leave_all_models_readable(tmp_path, mon
     for path in paths:
         assert path.with_name(path.name + ".data").exists()
         np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16))
+
+
+@pytest.mark.parametrize("family", ["gemma3", "gemma3-int4", "liquid"])
+@pytest.mark.parametrize("mode", ["ordinary", "explicit", "automatic"])
+def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
+    import json
+    import sys
+    from types import SimpleNamespace
+    from torq.model_export import prefill_sizes as probe
+    from torq.models.gemma3.export import Gemma3ModelExporter
+    from torq.models.liquid.export import LiquidModelExporter
+
+    source = tmp_path / "source"
+    source.mkdir()
+    config = dict(hidden_size=32, vocab_size=16, num_attention_heads=2, num_key_value_heads=1,
+                  head_dim=4, conv_dim=4, conv_L_cache=3, num_hidden_layers=2,
+                  layer_types=["conv", "full_attention"], sliding_window=16)
+    (source / "config.json").write_text(json.dumps(config))
+    (source / "tokenizer.json").write_text("{}")
+    onnx.save(_family_graph(1, width=32), source / "model.onnx")
+    options = dict(models_dir=tmp_path / "models", onnx_source_dir=source, max_gen_tokens=16,
+                   extract_embeddings=True, split_lm_head=True, read_only_kv_cache=False,
+                   native_batch_prefill=mode != "ordinary",
+                   batch_prefill_sizes=(4, 7) if mode == "explicit" else None)
+    if family.startswith("gemma3"):
+        monkeypatch.setattr("torq.models.gemma3.export.AutoConfig.from_pretrained",
+                            lambda *args, **kwargs: SimpleNamespace(**config))
+        exporter = Gemma3ModelExporter(**options, weight_quantization="int4" if family == "gemma3-int4" else None)
+    else:
+        exporter = LiquidModelExporter("230m", **options)
+    cls = type(exporter)
+    monkeypatch.setattr(cls, "_model_compile_flags", lambda self, **kwargs: ["--torq-prefetch-algorithm=constant-loads"])
+    monkeypatch.setattr(cls, "_load_onnx", lambda self: {"model": _family_graph(1, width=32)})
+    def make_chunks(self, source_model=None):
+        return {f"model_prefill_{size}": _family_graph(size, width=32)
+                for size in self._native_batch_prefill}
+    monkeypatch.setattr(cls, "_make_native_prefill", make_chunks)
+    def make_static(self):
+        self._components = {"model": _family_graph(1, width=32), **{
+            f"model_prefill_{size}": _family_graph(size, width=32) for size in self._native_batch_prefill
+        }}
+    monkeypatch.setattr(cls, "make_static", make_static)
+    monkeypatch.setattr(cls, "optimize_model", lambda *args: None)
+    exports = []
+    quantized_components = []
+    def patch_decoder(self, path, component):
+        exports.append(component)
+        model = onnx.load(path)
+        weight = next(i for i in model.graph.initializer if i.name == "weight")
+        weight.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(weight) * 3, "weight"))
+        onnx.save(model, path)
+    monkeypatch.setattr(cls, "apply_post_static_patches", patch_decoder)
+    if family == "gemma3-int4":
+        def summarize(self, path, *args):
+            quantized_components.append(path.name)
+            return dict(kl=0, cosine=1, max_abs_error=0, classification="test")
+        monkeypatch.setattr(cls, "_summarize_weight_quantization", summarize)
+    probed_weights = []
+    recommend = probe.recommend
+    def inspect_final(path, *args, **kwargs):
+        assert path == exporter._export_paths["model"]
+        assert path != source / "model.onnx"
+        model = onnx.load(path)
+        assert ("quantized" in path.parts) == (family == "gemma3-int4")
+        if family == "gemma3-int4":
+            assert any(i.data_type == T.INT4 for i in model.graph.initializer)
+            assert any(n.op_type == "DequantizeLinear" for n in model.graph.node)
+        else:
+            weight = next(i for i in model.graph.initializer if i.name == "weight")
+            np.testing.assert_array_equal(numpy_helper.to_array(weight), np.eye(32) * 3)
+        probed_weights.append([(i.name, i.data_type, tuple(i.dims), i.raw_data)
+                               for i in model.graph.initializer])
+        return recommend(path, *args, **kwargs)
+    monkeypatch.setattr(probe, "recommend", inspect_final)
+    monkeypatch.setattr(cls, "validate_onnx", lambda self: None)
+    calls = []
+    def run_probe(tool, path, chip, flags):
+        assert tool == sys.executable
+        assert chip == "SL2610"
+        assert "--torq-prefetch-algorithm=constant-loads" in flags
+        assert "--torq-enable-split-constants-optimization" in flags
+        assert "--torq-enable-multi-graph" not in flags
+        assert "--torq-max-nss-programs-size=33554432" in flags
+        calls.append(path.name)
+        return ""
+    monkeypatch.setattr(probe, "run_probe", run_probe)
+    monkeypatch.setattr(probe, "_parse_tile_and_fuse",
+                        lambda _, m, k, n: probe.ProbeResult(m, 4 if m == 7 else 8, False, False))
+    exporter.describe_graph_edits()
+    assert calls == []  # Read-only plans never trigger compilation.
+    exporter.export_onnx(validate=True, cleanup=False, compiler_path=sys.executable,
+                         torq_compile_args=["--torq-max-nss-programs-size=33554432"])
+    if family == "gemma3-int4":
+        if mode == "automatic":
+            assert not calls  # Wait for the normal decoder quantization.
+            assert exporter._native_batch_prefill == ()
+        exporter.weight_quantize_models()
+    if mode == "automatic":
+        final = onnx.load(exporter._export_paths["model"])
+        assert probed_weights == [[(i.name, i.data_type, tuple(i.dims), i.raw_data)
+                                   for i in final.graph.initializer]]
+    expected = (4, 7, 16) if mode == "automatic" else (4, 7) if mode == "explicit" else ()
+    assert exporter._native_batch_prefill == expected
+    assert set(exporter._export_paths) == {"model", *(f"model_prefill_{size}" for size in expected)}
+    assert bool(calls) == (mode == "automatic")
+    assert exporter.export_dir.name == "static"
+    assert exporter._quantize_dir.name == "static"
+    assert exporter._convert_dir.name == "static"
+    assert sorted(exports) == sorted(exporter._export_paths)  # Each graph exported once.
+    if family == "gemma3-int4":
+        assert len(quantized_components) == len(exporter._export_paths)
+        assert len(set(quantized_components)) == len(quantized_components)
+    assert exporter._torq_dir.parent == (exporter._quantize_dir if family == "gemma3-int4"
+                                        else exporter.export_dir)
+    if mode == "automatic":
+        assert len(calls) == 14  # Decode plus B=4..16, bounded by the context.
+        assert json.loads((exporter._models_dir / "prefill-probes/prefill_sizes.json").read_text())["chosen"] == list(expected)
+        if family.startswith("gemma3"):
+            assert all(f"model_prefill_{size}" in exporter._opt_configs for size in expected)
+
+
+@pytest.mark.parametrize("chosen", [None, [], [1, 4], [4, 4], [7, 4], [17]])
+def test_automatic_sizes_reject_no_recommendation_or_invalid_sizes(tmp_path, monkeypatch, chosen):
+    from types import SimpleNamespace
+    from torq.model_export import prefill_sizes
+    from torq.model_export.prefill import probe_native_sizes
+
+    monkeypatch.setattr(prefill_sizes, "recommend", lambda *args, **kwargs:
+                        None if chosen is None else SimpleNamespace(chosen=chosen))
+    with pytest.raises(RuntimeError, match="--batch-prefill-sizes"):
+        probe_native_sizes(tmp_path / "source.onnx", context=16, minimum=4,
+                           compiler_args=[], compiler_path=None, work_dir=tmp_path)
+
+
+def test_automatic_probe_failure_keeps_exported_decoder(tmp_path, monkeypatch):
+    from support.model_export import StubExporter
+    from torq.model_export import prefill_sizes
+
+    exporter = StubExporter(tmp_path, {"model": _family_graph(1)})
+    exporter._native_prefill_enabled = True
+    exporter._max_gen_tokens = 16
+    monkeypatch.setattr(exporter, "_model_compile_flags", lambda **kwargs: [])
+    def fail(path, *args, **kwargs):
+        assert path == exporter._export_paths["model"]
+        onnx.checker.check_model(str(path))
+        raise prefill_sizes.ProbeError("compile failed")
+    monkeypatch.setattr(prefill_sizes, "recommend", fail)
+    with pytest.raises(RuntimeError, match="--batch-prefill-sizes.*compile failed"):
+        exporter.export_onnx(validate=False)
+    assert exporter._native_batch_prefill == ()
+    assert set(exporter._export_paths) == {"model"}
+    onnx.checker.check_model(str(exporter._export_paths["model"]))
+    assert exporter.load_calls == 1
+
+
+@pytest.mark.parametrize("enabled,sizes,static,error", [
+    (False, (4, 7), True, "requires --native-batch-prefill"),
+    (True, None, False, "requires static exports"),
+    ((4, 7), None, True, "must be a boolean"),
+])
+def test_native_mode_validation_before_source_loading(enabled, sizes, static, error):
+    from torq.models.gemma3.export import Gemma3ModelExporter
+    from torq.models.liquid.export import LiquidModelExporter
+
+    for cls in (Gemma3ModelExporter, LiquidModelExporter):
+        with pytest.raises(ValueError, match=error):
+            cls(native_batch_prefill=enabled, batch_prefill_sizes=sizes, static_models=static,
+                extract_embeddings=True, split_lm_head=True, read_only_kv_cache=False)

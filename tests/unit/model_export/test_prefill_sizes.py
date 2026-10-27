@@ -59,7 +59,7 @@ def test_probe_drops_restream_and_no_fit(monkeypatch, tmp_path):
 def test_recommendation_uses_exporter_option():
     from torq.model_export.prefill_sizes import ProbeReport
 
-    assert ProbeReport([4, 7, 12], [], 12, 16).sizes_flag() == "--native-batch-prefill 4,7,12"
+    assert ProbeReport([4, 7, 12], [], 12, 16).sizes_flag() == "--native-batch-prefill --batch-prefill-sizes 4,7,12"
 
 
 def _model(tmp_path, dtype=None, *, quantized=False):
@@ -242,3 +242,30 @@ def test_structural_dedup_preserves_splat_and_quantization_changes(tmp_path):
         model.graph.output.append(h.make_tensor_value_info(name + '_out', T.FLOAT, [1, 1, 16]))
     onnx.save(model, path)
     assert len(probe.extract_projections(path)) == 2
+
+
+
+def test_source_probe_excludes_the_independent_native_head(monkeypatch, tmp_path):
+    import numpy as np
+    import onnx
+    from onnx import helper as h, numpy_helper
+    from torq.model_export import prefill_sizes as probe
+
+    model = h.make_model(h.make_graph([
+        h.make_node("MatMul", ["x", "projection"], ["hidden"]),
+        h.make_node("MatMul", ["hidden", "head"], ["logits"]),
+    ], "source", [h.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 8])],
+        [h.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, [1, 32])], [
+        numpy_helper.from_array(np.ones((8, 16), np.float32), "projection"),
+        numpy_helper.from_array(np.ones((16, 32), np.float32), "head"),
+    ]))
+    path = tmp_path / "source.onnx"
+    onnx.save(model, path)
+    assert probe.extract_weight_shapes(path) == [(8, 16), (16, 32)]
+    monkeypatch.setattr(probe, "run_probe", lambda *args: "")
+    monkeypatch.setattr(probe, "_parse_tile_and_fuse",
+                        lambda _, m, k, n: probe.ProbeResult(m, 8, False, False))
+    report = probe.recommend(path, "SL2610", [], tmp_path, cap=4, context_length=8,
+                             tool=sys.executable, exclude_lm_head=True)
+    assert [(shape.k, shape.n) for shape in report.shapes] == [(8, 16)]
+    assert report.chosen == [4]

@@ -95,6 +95,7 @@ class OnnxModelExporterBase(ABC):
         self._logger = logging.getLogger(self.__class__.__name__)
 
         self._native_batch_prefill = getattr(self, "_native_batch_prefill", ())
+        self._native_prefill_enabled = getattr(self, "_native_prefill_enabled", False)
         self._harness: GraphEditHarness | None = None
         self._model_dtype = model_dtype
         self._config = config
@@ -227,7 +228,9 @@ class OnnxModelExporterBase(ABC):
         # The --batch-prefill exporters set _batch_prefill in their own __init__
         # (before super().__init__), so getattr: the attribute may not exist on
         # other exporters.
-        if getattr(self, "_batch_prefill", None) is None and not getattr(self, "_native_batch_prefill", ()):
+        if (getattr(self, "_batch_prefill", None) is None
+                and not getattr(self, "_native_prefill_enabled", False)
+                and not getattr(self, "_native_batch_prefill", ())):
             return []
         return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]
 
@@ -347,6 +350,35 @@ class OnnxModelExporterBase(ABC):
         """
         save_onnx(model, path, split=True)
 
+    def _complete_native_prefill(self):
+        if not self._native_prefill_enabled or self._native_batch_prefill:
+            return
+        from .prefill import native_compile_flags, probe_native_sizes, share_native_weights, validate_native_onnx
+
+        compiler_path = self._prefill_compiler_path
+        flags = native_compile_flags(self._model_compile_flags(compiler_path=compiler_path)
+                                     + self._prefill_compile_args)
+        self._native_batch_prefill = probe_native_sizes(
+            self._export_paths["model"], context=self._max_gen_tokens, minimum=4,
+            compiler_args=flags, compiler_path=compiler_path,
+            work_dir=self._models_dir / "prefill-probes",
+        )
+        if "model" in self._opt_configs:
+            self._opt_configs.update({f"model_prefill_{size}": self._opt_configs["model"]
+                                      for size in self._native_batch_prefill})
+        components = self._make_native_prefill()
+        self._components.update(components)
+        self._export_components(components, cleanup=self._prefill_cleanup)
+        base_paths = {1: self._export_path_for_component("model"), **{
+            size: self._export_path_for_component(f"model_prefill_{size}")
+            for size in self._native_batch_prefill
+        }}
+        if self._prefill_validate:
+            validate_native_onnx(base_paths)
+        share_native_weights(base_paths.values())
+        if getattr(self, "_weight_quantization", None):
+            self.weight_quantize_models(components=components)
+
     def _share_native_weights(self):
         if self._native_batch_prefill:
             from .prefill import share_native_weights
@@ -414,7 +446,12 @@ class OnnxModelExporterBase(ABC):
                 vi.name = rename_map[vi.name]
         return model
 
-    def export_onnx(self, validate: bool = True, cleanup: bool = True):
+    def export_onnx(self, validate: bool = True, cleanup: bool = True, *,
+                    compiler_path=None, torq_compile_args=None):
+        self._prefill_compiler_path = compiler_path
+        self._prefill_compile_args = list(torq_compile_args or [])
+        self._prefill_cleanup = cleanup
+        self._prefill_validate = validate
         self._prepare()
         # Reset the export dir here rather than in __init__ so that constructing
         # an exporter (e.g. to render --view-graph-edits) never destroys a
@@ -442,7 +479,33 @@ class OnnxModelExporterBase(ABC):
         if self._static_models:
             self.make_static()
 
-        for comp, model in self._components.items():
+        self._export_components(self._components, cleanup=cleanup)
+
+        self._share_native_weights()
+        if not self._split_weights:
+            # Single-file layout for every component that fits the 2 GiB limit.
+            for comp, path in self._export_paths.items():
+                if self._native_batch_prefill and (comp == "model" or comp.startswith("model_prefill_")):
+                    continue
+                save_onnx(load_onnx_lazy(path), path)
+
+        if validate:
+            sizes = getattr(self, "_native_batch_prefill", ())
+            if sizes:
+                from .prefill import validate_native_onnx
+                validate_native_onnx({1: self._export_paths["model"], **{
+                    b: self._export_paths[f"model_prefill_{b}"] for b in sizes
+                }})
+            if self._skip_export:
+                self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
+            else:
+                self.validate_onnx()
+
+        if not getattr(self, "_weight_quantization", None):
+            self._complete_native_prefill()
+
+    def _export_components(self, components, *, cleanup):
+        for comp, model in components.items():
             if comp in self._skip_export:
                 self._logger.info("Skipping export of component %s", comp)
                 continue
@@ -495,25 +558,6 @@ class OnnxModelExporterBase(ABC):
                 )
             self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
 
-        self._share_native_weights()
-        if not self._split_weights:
-            # Single-file layout for every component that fits the 2 GiB limit.
-            for comp, path in self._export_paths.items():
-                if self._native_batch_prefill and (comp == "model" or comp.startswith("model_prefill_")):
-                    continue
-                save_onnx(load_onnx_lazy(path), path)
-
-        if validate:
-            sizes = getattr(self, "_native_batch_prefill", ())
-            if sizes:
-                from .prefill import validate_native_onnx
-                validate_native_onnx({1: self._export_paths["model"], **{
-                    b: self._export_paths[f"model_prefill_{b}"] for b in sizes
-                }})
-            if self._skip_export:
-                self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
-            else:
-                self.validate_onnx()
 
     def dynamic_quantize_models(
         self,
@@ -671,12 +715,15 @@ class OnnxModelExporterBase(ABC):
         compiler_path: str | Path | None = None,
     ):
         native_sizes = getattr(self, "_native_batch_prefill", ())
-        if native_sizes:
+        if native_sizes or self._native_prefill_enabled:
             from .prefill import check_native_compiler, compile_native_family, native_compile_flags
             check_native_compiler(compiler_path)
             if skip and any(c == "model" or c.startswith("model_prefill_") for c in skip):
                 raise ValueError("cannot skip individual members of a native decoder family")
+        self._prefill_compiler_path = compiler_path
+        self._prefill_compile_args = list(torq_compile_args or [])
         self._prepare()
+        native_sizes = self._native_batch_prefill
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
         skip = skip or []
         # The model's validated flag set (see _model_compile_flags) comes first,

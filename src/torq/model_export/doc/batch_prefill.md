@@ -12,9 +12,13 @@ Use the torq-tools native export workflow for Gemma3 270M IT, FunctionGemma 270M
 torq-export-model gemma3 --instruct-model \
     --weight-quantization none --extract-embeddings --split-lm-head \
     --no-read-only-kv-cache --max-gen-tokens 256 \
-    --native-batch-prefill 4,12,29,51,92,106,124 \
+    --native-batch-prefill \
     --compiler-path /path/to/torq-compile
 ```
+
+Native prefill is off by default. `--native-batch-prefill` is mutually exclusive with the older fixed-size `--batch-prefill N`, including `--batch-prefill 0`. `--batch-prefill-sizes` defaults to None: when native mode is enabled, the exporter probes the normally exported single-token decoder after graph edits, optimization and any selected weight quantization. The separate logits head is excluded. It uses the selected compiler, model defaults and `--compile-flags`, scans up to 128 tokens bounded by `--max-gen-tokens`, and stores `prefill_sizes.json` plus its reusable cache under the model root's `prefill-probes/` directory. A failed or empty probe stops the export and asks for explicit sizes. Automatic selection uses the final decoder weight representation: INT4 exports are probed after quantization, including their packed weights, scales, zero points and dequantization operations. The exported decoder is retained; only the selected prefill graphs are then built, validated and quantized as needed. Native families use the same standard `static/` directory as ordinary static exports, with no chunk-size list in the path.
+
+To pin sizes and bypass probing, add `--batch-prefill-sizes 4,12,29,51,92,106,124` alongside `--native-batch-prefill`. Sizes alone do not enable native mode. Automatic probing needs a compatible compiler even with `--skip-torq`; explicit sizes allow ONNX-only exports without running the compiler.
 
 The unquantized tools export remains FP32; compiler dtype conversion produces BF16 floating I/O and i32 positions. Gemma3 also supports the default INT4 GPTQ weights: omit `--weight-quantization none` and `--no-read-only-kv-cache` to use INT4 weights with the updated time-major, read-only cache. INT4 ONNX uses BF16 activations and i32 positions before compilation. The exporter imports all entries into `compiled/transformer.mlirbc`, compiles `compiled/transformer.vmfb`, compiles the separate language model head, and records the original state ABI and compiler flags in `compiled/transformer.family.json`. Keep this metadata and the runtime assets beside the VMFB.
 
@@ -39,7 +43,7 @@ python -m torq.model_export.prefill_sizes transformer.onnx \
     --torq-prefetch-algorithm=stream-schedule
 ```
 
-Run the probe on the decoder ONNX in the weight format you will compile, with matching compiler flags. FP32, FP16 and BF16 projections retain their source types; INT4 projections retain packed weights, scales, zero points and the dequantization chain. FP32 input cannot predict an INT4 export. Imported ONNX `.mlir` and `.mlirbc` sources are also accepted. Apply the printed `--native-batch-prefill ...` option to a subsequent export. The probe writes `prefill_sizes.json`. Its isolated projections omit surrounding activation producers and attention, so validate the complete family before pinning sizes. Structurally equivalent projections share a representative; different types or quantization structures remain separate even at the same logical shape. The cache fingerprints the extracted graph and real constants. Only direct BF16 constants use the BF16 split grid; other representations use observed strip widths. A failed probe makes no recommendation; provide explicit sizes.
+Run the probe on the decoder ONNX in the weight format you will compile, with matching compiler flags. FP32, FP16 and BF16 projections retain their source types; INT4 projections retain packed weights, scales, zero points and the dequantization chain. FP32 input cannot predict an INT4 export. Imported ONNX `.mlir` and `.mlirbc` sources are also accepted. Apply the printed `--native-batch-prefill --batch-prefill-sizes ...` options to a subsequent export. The probe writes `prefill_sizes.json`. Its isolated projections omit surrounding activation producers and attention, so validate the complete family before pinning sizes. Structurally equivalent projections share a representative; different types or quantization structures remain separate even at the same logical shape. The cache fingerprints the extracted graph and real constants. Only direct BF16 constants use the BF16 split grid; other representations use observed strip widths. A failed probe makes no recommendation; provide explicit sizes.
 
 ## Runtime contract
 

@@ -323,7 +323,7 @@ on the board.
 
 ### Experimental native batch prefill
 
-Gemma3 270M and FunctionGemma support explicit static families with `--native-batch-prefill 4,12,29,51,92,106,124 --extract-embeddings --split-lm-head`. Use an FP32 source and keep the context within the model’s sliding attention window. The default Gemma3-270M IT export uses INT4 GPTQ weights and the updated time-major, read-only KV cache, returning only the new rows for each chunk. Other checkpoints retain their normal GPTQ selection rules. Use `--weight-quantization none` for FP32 weights, and `--no-read-only-kv-cache` for the legacy full-cache layout. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
+Gemma3 270M and FunctionGemma support opt-in native static families with the `--native-batch-prefill` flag. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
 
 See the shared [native batch-prefill guide](../../model_export/doc/batch_prefill.md) for export commands, compiler/runtime requirements, artifact layout, optional size probing, chunk selection and cache handling. FunctionGemma additionally needs checkpoint-specific validation.
 

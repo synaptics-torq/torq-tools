@@ -274,7 +274,9 @@ def add_decoder_args(
         group.add_argument(
             "--batch-prefill",
             type=int,
-            default=DEFAULT_BATCH_PREFILL,
+            # argparse otherwise treats an explicit interned default as absent
+            # from the mutually exclusive group. String defaults are type-converted.
+            default=str(DEFAULT_BATCH_PREFILL),
             metavar="N",
             help="Also export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
         )
@@ -282,8 +284,12 @@ def add_decoder_args(
         if native_batch_prefill:
             from ..model_export.prefill import parse_native_sizes
             group.add_argument(
-                "--native-batch-prefill", type=parse_native_sizes, metavar="B1,B2,...",
-                help="Export an experimental shared decoder family with explicit ascending sizes",
+                "--native-batch-prefill", action="store_true",
+                help="Opt in to an experimental shared decoder family (incompatible with --batch-prefill)",
+            )
+            parser.add_argument(
+                "--batch-prefill-sizes", type=parse_native_sizes, default=None, metavar="B1,B2,...",
+                help="Native prefill sizes in ascending order; requires --native-batch-prefill (default: probe automatically)",
             )
 
 

@@ -163,7 +163,7 @@ def extract_weight_shapes(model_path) -> List[Tuple[int, int]]:
     return list(dict.fromkeys((p.k, p.n) for p in extract_projections(model_path)))
 
 
-def extract_projections(model_path, model=None) -> List[_Projection]:
+def extract_projections(model_path, model=None, exclude_lm_head=False) -> List[_Projection]:
     """Keep one actual constant-backed projection per graph/type structure."""
     from iree.compiler import ir
 
@@ -173,10 +173,10 @@ def extract_projections(model_path, model=None) -> List[_Projection]:
             return _projections_mlir(ir.Module.parse(path.read_bytes()))
         if path.suffix != '.onnx':
             raise ProbeError(f'need .onnx or imported .mlir/.mlirbc: {path.name}')
-        return _projections_onnx(model if model is not None else onnx_load(path), path.parent)
+        return _projections_onnx(model if model is not None else onnx_load(path), path.parent, exclude_lm_head)
 
 
-def _projections_onnx(model, data_dir):
+def _projections_onnx(model, data_dir, exclude_lm_head=False):
     import numpy as np
     import onnx
     from iree.compiler.extras import onnx_importer
@@ -202,6 +202,8 @@ def _projections_onnx(model, data_dir):
     projections = []
     seen = set()
     for node in model.graph.node:
+        if exclude_lm_head and 'logits' in node.output:
+            continue  # Native families compile the language model head separately.
         if node.op_type not in ('MatMul', 'Gemm') or not is_constant(node.input[1]):
             continue  # attention matmuls do not have constant weights
         if not all(is_constant(i) for i in node.input[2:]):
@@ -501,7 +503,7 @@ class ProbeReport:
     def sizes_flag(self) -> Optional[str]:
         if not self.chosen:
             return None
-        return "--native-batch-prefill " + ",".join(str(b) for b in self.chosen)
+        return "--native-batch-prefill --batch-prefill-sizes " + ",".join(str(b) for b in self.chosen)
 
     def log_lines(self) -> List[str]:
         lines = [
@@ -629,6 +631,7 @@ def recommend(
     cap: Optional[int] = None,
     context_length: Optional[int] = None,
     tool: Optional[str] = None,
+    exclude_lm_head: bool = False,
 ) -> Optional[ProbeReport]:
     """Probe the tiler and recommend sizes.
 
@@ -662,7 +665,7 @@ def recommend(
         if context_length is None:
             context_length = _context_length_from_onnx(onnx_model)
 
-    projections = extract_projections(model_path, onnx_model)
+    projections = extract_projections(model_path, onnx_model, exclude_lm_head)
     if not projections:
         warnings.append(f"no matmul weight shapes found in {model_path.name}; choose explicit sizes")
         _finish(None, warnings, started, cap, context_length, work_dir, model_path, chip, tool, flags, [], None)
@@ -848,7 +851,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m torq.model_export.prefill_sizes",
         description="Probe the matmul tiler and print the recommended "
-        "--native-batch-prefill sizes for the model exporter.",
+        "--native-batch-prefill --batch-prefill-sizes options for the model exporter.",
     )
     parser.add_argument("model", help="the .onnx or imported .mlir/.mlirbc source")
     parser.add_argument("--chip", help="HW chip identifier, passed to --torq-hw in torq-compile", 

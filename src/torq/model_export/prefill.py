@@ -31,14 +31,20 @@ def parse_native_sizes(value: str) -> tuple[int, ...]:
     return sizes
 
 
-def validate_native_options(sizes, *, batch_prefill, context, minimum, static,
+def validate_native_options(sizes, *, enabled, batch_prefill, context, minimum, static,
                             embeddings, split_head, read_only, individual, unsupported,
                             supports_read_only=False):
-    if sizes is None:
+    if type(enabled) is not bool:
+        raise ValueError("native_batch_prefill must be a boolean; supply sizes via batch_prefill_sizes")
+    if not enabled:
+        if sizes is not None:
+            raise ValueError("--batch-prefill-sizes requires --native-batch-prefill")
         return ()
-    if (not sizes or any(type(b) is not int or not minimum <= b <= context for b in sizes)
+    if context < minimum:
+        raise ValueError(f"native prefill requires a context of at least {minimum}")
+    if sizes is not None and (not sizes or any(type(b) is not int or not minimum <= b <= context for b in sizes)
             or any(a >= b for a, b in zip(sizes, sizes[1:]))):
-        raise ValueError(f"--native-batch-prefill requires unique ascending sizes in [{minimum}, {context}]")
+        raise ValueError(f"--batch-prefill-sizes requires unique ascending sizes in [{minimum}, {context}]")
     if batch_prefill is not None:
         raise ValueError("--native-batch-prefill and --batch-prefill are mutually exclusive")
     if not static or not embeddings or not split_head or (read_only and not supports_read_only) or individual or unsupported:
@@ -49,7 +55,23 @@ def validate_native_options(sizes, *, batch_prefill, context, minimum, static,
             "and --no-read-only-kv-cache. Explicit dtype conversion, convolution overrides "
             "and topology splitting are unsupported"
         )
-    return tuple(sizes)
+    return tuple(sizes) if sizes is not None else ()
+
+
+def probe_native_sizes(model_path, *, context, minimum, compiler_args, compiler_path, work_dir):
+    """Select sizes from the exported decoder in its final weight representation."""
+    from .prefill_sizes import ProbeError, recommend
+
+    try:
+        report = recommend(model_path, "SL2610", compiler_args, work_dir,
+                           context_length=context, tool=compiler_path, exclude_lm_head=True)
+    except (ProbeError, OSError) as exc:
+        raise RuntimeError(f"native prefill size probe failed; set --batch-prefill-sizes explicitly: {exc}") from exc
+    sizes = tuple(report.chosen) if report is not None else ()
+    if (not sizes or any(type(b) is not int or not minimum <= b <= context for b in sizes)
+            or any(a >= b for a, b in zip(sizes, sizes[1:]))):
+        raise RuntimeError("native prefill probe found no valid family; set --batch-prefill-sizes explicitly")
+    return sizes
 
 
 def check_native_compiler(compiler_path=None):

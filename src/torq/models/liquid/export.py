@@ -96,7 +96,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
         *,
         max_gen_tokens: int = 256,
         batch_prefill: int | None = None,
-        native_batch_prefill: tuple[int, ...] | None = None,
+        native_batch_prefill: bool = False,
+        batch_prefill_sizes: tuple[int, ...] | None = None,
         model_dtype: str = "fp32",
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -109,8 +110,9 @@ class LiquidModelExporter(OnnxModelExporterBase):
     ):
         from ...model_export.prefill import validate_native_options
 
+        self._native_prefill_enabled = native_batch_prefill
         self._native_batch_prefill = validate_native_options(
-            native_batch_prefill, batch_prefill=batch_prefill, context=max_gen_tokens,
+            batch_prefill_sizes, enabled=native_batch_prefill, batch_prefill=batch_prefill, context=max_gen_tokens,
             minimum=4, static=static_models, embeddings=extract_embeddings,
             split_head=edit_args.get("split_lm_head", False), read_only=read_only_kv_cache,
             individual=keep_individual_kv_io,
@@ -184,7 +186,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._head_dim = int(self._config_dict.get("head_dim") or (self._hidden_size // self._num_attention_heads))
         self._conv_dim = int(self._config_dict.get("conv_dim", self._hidden_size))
         self._conv_L_cache = int(self._config_dict.get("conv_L_cache", 3))
-        if self._native_batch_prefill and self._conv_L_cache != 3:
+        if self._native_prefill_enabled and self._conv_L_cache != 3:
             raise ValueError("native LFM prefill requires a three-token convolution state")
         self._layer_types = tuple(self._config_dict["layer_types"])
         self._num_hidden_layers = int(self._config_dict["num_hidden_layers"])
@@ -219,8 +221,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # their own tree so they never overwrite a unified export's artifacts.
         model_topology = "split_lm_head" if self._split_lm_head else "unified"
         suffix = "static" if self._static_models else "dynamic"
-        if self._native_batch_prefill:
-            suffix = "native_" + "_".join(map(str, self._native_batch_prefill))
         root = self._models_dir / "export" / model_topology
         export_dir = root / self._model_dtype / suffix
         quantize_dir = root / "quantized" / suffix
@@ -516,7 +516,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "source.convert (attention)": [
                 EditSpec("ReplaceGroupQueryAttention", (
                     self._num_attention_heads, self._num_key_value_heads, self._head_dim,
-                    ctx("chunk_len"), not bool(self._native_batch_prefill),
+                    ctx("chunk_len"), not self._native_prefill_enabled,
                 )),
             ],
             "model.static": [
@@ -538,7 +538,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             EditSpec("CollapseReshapeChain"),
             EditSpec("FoldScalarMatMul"),
         ]
-        if not self._native_batch_prefill:
+        if not self._native_prefill_enabled:
             patch.insert(2, EditSpec("CollapseGQABroadcast"))
         if self._broadcast_ops is not None:
             patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
@@ -548,7 +548,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             )]
-        if self._batch_prefill is not None or self._native_batch_prefill:
+        if self._batch_prefill is not None or self._native_prefill_enabled:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -1344,7 +1344,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # SL2610's depthwise-conv path asserts out of torq-compile on this
         # kernel.  Disabled by --keep-conv1d.
         if self._replace_conv1d:
-            if self._native_batch_prefill and component.startswith("model_prefill_"):
+            if self._native_prefill_enabled and component.startswith("model_prefill_"):
                 new_model, n_conv = self._replace_native_conv1d(new_model)
             else:
                 new_model, n_conv = self._replace_conv1d_with_matmul(new_model)
@@ -1422,12 +1422,17 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 chunk_len=self._batch_prefill,
             )
 
+        self._components.update(self._make_native_prefill())
+
+    def _make_native_prefill(self):
+        components = {}
         for size in self._native_batch_prefill:
             component = f"model_prefill_{size}"
             source = self._convert_source_model(chunk_len=size, component=component)
-            self._components[component] = self._make_model_static(
+            components[component] = self._make_model_static(
                 self.check_model(source, skip_data_prop=True), component=component, chunk_len=size,
             )
+        return components
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)
@@ -1785,6 +1790,7 @@ def export_liquid_from_args(args: argparse.Namespace):
         max_gen_tokens=args.max_gen_tokens,
         batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
         native_batch_prefill=args.native_batch_prefill,
+        batch_prefill_sizes=args.batch_prefill_sizes,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
@@ -1803,11 +1809,12 @@ def export_liquid_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    if args.native_batch_prefill and not args.skip_torq:
+    if args.native_batch_prefill and (not args.skip_torq or args.batch_prefill_sizes is None):
         from ...model_export.prefill import check_native_compiler, native_compile_flags
         check_native_compiler(args.compiler_path)
         native_compile_flags(args.compile_flags or [])
-    exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
+                         compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(
             skip=args.dynamic_quantization_skip_model,

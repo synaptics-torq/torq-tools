@@ -102,12 +102,13 @@ class LiquidVLModelExporter(LiquidModelExporter):
         static_models: bool = True,
         **edit_args,
     ):
-        if edit_args.get("native_batch_prefill") is not None:
+        if edit_args.get("native_batch_prefill") or edit_args.get("batch_prefill_sizes") is not None:
             raise ValueError("native batch prefill is not supported for vision models")
         # --- LFM2.5 exporter knobs (mirror LiquidModelExporter.__init__) ----
         # The VL decoder takes inputs_embeds directly; there is no Gather to
         # extract.  The token-embedding LUT lives in embed_tokens.onnx and is
         # handled separately (see _extract_embed_lut).
+        self._native_prefill_enabled = False
         self._extract_embeddings = False
         self._keep_individual_kv_io = keep_individual_kv_io
         # The VL demo engine writes whole caches back, and the image prefill chain shares them.
