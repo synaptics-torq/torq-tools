@@ -48,6 +48,19 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         read_only_kv_cache=True,
     )
     parser.add_argument(
+        "--gguf",
+        type=str,
+        default=None,
+        metavar="PATH | REPO:FILE",
+        help=(
+            "Build from a llama.cpp GGUF checkpoint (a local file or '<hf_repo>:<file>.gguf', "
+            "e.g. 'LiquidAI/LFM2.5-350M-GGUF:LFM2.5-350M-QAD-Q4_0.gguf'). The GGUF weights "
+            "replace those of the upstream source ONNX, and its Q4_0 matrices are kept "
+            "as INT4 DequantizeLinear (variant 'q4_0'); outputs go to "
+            "<models-dir>/liquid-2p5-<size>-<gguf name>/"
+        ),
+    )
+    parser.add_argument(
         "--simulate-bf16",
         action="store_true",
         default=False,

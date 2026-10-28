@@ -3,6 +3,8 @@
 
 import argparse
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -46,10 +48,12 @@ _patch_gs_bf16_converter()
 
 from . import add_liquid_export_args
 from ._graph import LiquidOnnxGraphEditor
+from .gguf import apply_gguf_q4_0, apply_gguf_q6_k_lm_head, gguf_to_source_onnx, resolve_gguf
 from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...utils.compile import get_iree_version, read_compile_flags_file, select_compile_flags_entry
 from ...utils.onnx import external_data_cwd
 
 
@@ -88,6 +92,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
         5. Optionally converts the static fp32 ONNX to bf16 and compiles to IREE.
     """
 
+    # Set by __init__ for --gguf exports; subclasses that build their own
+    # sources (LFM2-VL) never set it.
+    _gguf_path: Path | None = None
+
     def __init__(
         self,
         model_size: Literal["350m", "230m"] = "350m",
@@ -105,8 +113,14 @@ class LiquidModelExporter(OnnxModelExporterBase):
         convert_dtypes: bool = False,
         split_weights: bool = False,
         read_only_kv_cache: bool = True,
+        gguf: str | os.PathLike | None = None,
         **edit_args
     ):
+        if gguf is not None and (dynamic_quantize or convert_dtypes):
+            raise ValueError(
+                "`--gguf` carries the GGUF's own Q4_0 weights; it cannot be combined "
+                "with `--dynamic-quantize` or `--convert-dtypes`"
+            )
         if read_only_kv_cache and keep_individual_kv_io:
             raise ValueError(
                 "`--read-only-kv-cache` needs the combined KV cache I/O; "
@@ -118,6 +132,16 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._model_size = model_size
+        # --gguf: the source ONNX is rebuilt from a GGUF (with --onnx-source-dir,
+        # or else the canonical upstream source, as the graph template) and
+        # everything lands under its own `liquid-2p5-<size>-<variant>/` tree.
+        self._gguf_path = resolve_gguf(gguf) if gguf is not None else None
+        self._base_models_dir = Path(models_dir)
+        model_root = f"liquid-2p5-{model_size}"
+        if self._gguf_path is not None:
+            variant = self._gguf_path.stem.lower()
+            variant = re.sub(rf"^lfm2\.5-{model_size}-", "", variant)
+            model_root = f"{model_root}-{variant}"
         self._hf_repo = HF_REPO_BASE[model_size]
         self._hf_repo_onnx = HF_REPO_ONNX[model_size]
         self._broadcast_ops = edit_args.get("broadcast_ops", None)
@@ -158,6 +182,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
         cfg_path: Path | None = None
+        if self._gguf_path is not None and onnx_source_dir is None:
+            cand = self._gguf_template_dir() / "config.json"
+            if cand.exists():
+                cfg_path = cand
         if onnx_source_dir is not None:
             cand = Path(onnx_source_dir) / "config.json"
             if cand.exists():
@@ -187,7 +215,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             # under its HF-repo dir). This must match download_source.py's
             # `<models-dir>/liquid-2p5-<size>/` layout so a pre-fetched source
             # is reused instead of re-downloaded, and matches the README paths.
-            Path(models_dir) / f"liquid-2p5-{model_size}",
+            Path(models_dir) / model_root,
             show_model_info=show_model_info,
             dynamic_quantize=dynamic_quantize,
             convert_dtypes=convert_dtypes,
@@ -196,8 +224,26 @@ class LiquidModelExporter(OnnxModelExporterBase):
             opt_configs={},
         )
 
-    def _setup_dirs(self) -> list[Path]:
+    def _gguf_template_dir(self) -> Path:
+        """Upstream ONNX whose graph the GGUF weights are dropped into."""
         if self._onnx_source_dir is not None:
+            return Path(self._onnx_source_dir)
+        return (self._base_models_dir / f"liquid-2p5-{self._model_size}"
+                / "source" / "onnx" / self._model_dtype)
+
+    def _setup_gguf_source(self) -> Path:
+        template = self._gguf_template_dir()
+        if not template.exists() or not any(template.glob("model.onnx*")):
+            self._download_from_hf(template)
+        onnx_dir = self._models_dir / "source" / "onnx" / self._model_dtype
+        if not (onnx_dir / "model.onnx").exists():
+            gguf_to_source_onnx(self._gguf_path, template, onnx_dir)
+        return onnx_dir
+
+    def _setup_dirs(self) -> list[Path]:
+        if self._gguf_path is not None:
+            onnx_dir = self._setup_gguf_source()
+        elif self._onnx_source_dir is not None:
             onnx_dir = Path(self._onnx_source_dir)
         else:
             onnx_dir = self._models_dir / "source" / "onnx" / self._model_dtype
@@ -212,10 +258,12 @@ class LiquidModelExporter(OnnxModelExporterBase):
         export_dir = root / self._model_dtype / suffix
         quantize_dir = root / "quantized" / suffix
         convert_dir = root / "bf16" / suffix
+        if self._gguf_path is not None:
+            quantize_dir = root / "q4_0" / suffix
         # Compiled artifacts live in the variant that is actually compiled
         # (see the base class contract for _setup_dirs).
         variant_dir = convert_dir if self._convert_dtypes else (
-            quantize_dir if self._dynamic_quantize else export_dir)
+            quantize_dir if self._dynamic_quantize or self._gguf_path is not None else export_dir)
         torq_dir = variant_dir / "compiled"
         return onnx_dir, export_dir, quantize_dir, convert_dir, torq_dir
 
@@ -1463,6 +1511,34 @@ class LiquidModelExporter(OnnxModelExporterBase):
             except Exception as e:
                 self._logger.error("(ONNX-validation) [iter %d] failed: %s", i, e)
 
+    def _model_compile_flags(self, *, quantized: bool = False, compiler_path=None) -> list[str]:
+        flags = super()._model_compile_flags(quantized=quantized, compiler_path=compiler_path)
+        if self._gguf_path is None:
+            return flags
+        entry = select_compile_flags_entry(
+            read_compile_flags_file(self._compile_flags_file()), get_iree_version(compiler_path)
+        )
+        return flags + list(entry.get("gguf_q4_0") or [])
+
+    def apply_gguf_weights(self) -> None:
+        """Write the `q4_0` variant: every exported component with the GGUF's Q4_0
+        weights carried as INT4 DequantizeLinear, and a Q6_K lm_head as INT8
+        DequantizeLinear (see :mod:`.gguf`)."""
+        if self._gguf_path is None:
+            return
+        self._prepare()
+        if self._quantize_dir.exists():
+            shutil.rmtree(self._quantize_dir, ignore_errors=True)
+        self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir)
+        for comp, model_path in self._export_paths.items():
+            dst = self._quantize_dir / Path(model_path).name
+            if not (Path(model_path).name == "lm_head.onnx"
+                    and apply_gguf_q6_k_lm_head(self._gguf_path, model_path, dst)):
+                apply_gguf_q4_0(self._gguf_path, model_path, dst)
+            self._export_paths[comp] = dst
+        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
+
     def dynamic_quantize_models(
         self,
         quantize_dir: str | os.PathLike | None = None,
@@ -1679,12 +1755,14 @@ def export_liquid_from_args(args: argparse.Namespace):
         keep_conv1d=args.keep_conv1d,
         chunk_lm_head=args.chunk_lm_head,
         split_lm_head=args.split_lm_head,
+        gguf=args.gguf,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    exporter.apply_gguf_weights()
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(
             skip=args.dynamic_quantization_skip_model,

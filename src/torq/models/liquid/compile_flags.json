@@ -21,6 +21,10 @@
       "--torq-convert-dtypes",
       "--torq-convert-io-dtype",
       "--torq-disable-slicing"
+    ],
+    "gguf_q4_0": [
+      "--torq-prefetch-algorithm=stream-schedule",
+      "--torq-prefetch-matmul-tile-budget-percent=35"
     ]
   }
 }

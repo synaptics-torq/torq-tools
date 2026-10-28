@@ -56,7 +56,9 @@ moonshine = [
     "pandas",
     "tqdm",
 ]
-all = ["torq-tools[moonshine]"]
+# LFM2.5 export from a llama.cpp GGUF (torq-export-model liquid --gguf)
+gguf = ["gguf"]
+all = ["torq-tools[moonshine,gguf]"]
 
 # The exporters read their validated torq-compile flags from compile_flags.json next
 # to their module; without this, a non-editable install has no flags.
