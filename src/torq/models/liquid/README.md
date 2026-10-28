@@ -224,3 +224,61 @@ remainder; generation always uses the decode model. Export validation compares
 the chunked runner against the unedited dynamic source ONNX.
 
 ---
+
+## 4. GGUF checkpoints (e.g. LFM2.5-350M QAD Q4_0)
+
+Some LFM2.5 checkpoints are published only as llama.cpp GGUF, such as the
+quantization-aware-distilled
+[`LFM2.5-350M-QAD-Q4_0.gguf`](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF).
+`--gguf` builds the Torq model from one, keeping its 4-bit weights:
+
+```sh
+pip install gguf          # or: pip install -e ".[gguf]"
+torq-export-model liquid --models-dir models \
+  --gguf LiquidAI/LFM2.5-350M-GGUF:LFM2.5-350M-QAD-Q4_0.gguf
+```
+
+`--gguf` takes a local file or `<hf_repo>:<file>.gguf`. What happens
+([`gguf.py`](gguf.py)):
+
+1. **Source ONNX.** The upstream `LiquidAI/LFM2.5-*-ONNX` graph (the canonical
+   source of Section 0, or `--onnx-source-dir`) is the template. Every weight
+   initializer is replaced by the matching GGUF tensor, dequantized to fp32.
+   This gives `<models-dir>/liquid-2p5-<size>-<gguf name>/source/onnx/fp32/`,
+   e.g. `liquid-2p5-350m-qad-q4_0/`. Q4_0 dequantizes exactly, so this graph
+   computes with the GGUF's weights. A wrong name or layout mapping fails
+   loudly: every tensor is checked against the template weight (cosine).
+2. **Export.** The regular static export runs on it, including the ONNX
+   validation against the dynamic source.
+3. **`q4_0` variant.** Each MatMul whose GGUF weight is Q4_0 reads it through
+   `DequantizeLinear(INT4, axis=0, block_size=32, scale fp32, zero_point 0)`, and a
+   Q6_K tied embedding used as the lm_head through
+   `DequantizeLinear(INT8, axis=0, block_size=16, scale fp32, zero_point 0)`. The codes
+   and scales are unpacked from the GGUF blocks, not re-quantized, and must reproduce
+   the fp32 weight bit for bit. Other GGUF types (F32 norms, conv kernels) stay float.
+4. **Compile.** `export/split_lm_head/q4_0/static/compiled/` is compiled with the
+   model's flag set plus the `gguf_q4_0` group of
+   [`compile_flags.json`](compile_flags.json) (`--torq-prefetch-algorithm=stream-schedule`,
+   matmul tile budget 35%).
+
+`--gguf` cannot be combined with `--dynamic-quantize` or `--convert-dtypes`.
+The compiler's `--torq-convert-dtypes` still runs the activations in bf16.
+
+> [!IMPORTANT]
+> Q4_0 block scales are signed (llama.cpp sets `d = max / -8`). Compilers up to
+> torq-compiler `main` 34c25b88 reject negative scales in the mixed-quant matmul
+> (about half the matmuls fall back to a slower path and the read-only KV graph loses
+> the second NSS slice), and `main` also needs two scalar-multiplication fixes in
+> `MulPattern.cpp` for this model to compute correctly. The published build was
+> compiled with those fixes.
+
+QAD Q4_0 on SL2619 (2 GHz CPU, 1 GHz NPU), measured against llama.cpp running the same
+GGUF on the board's CPU:
+
+| | Torq | llama.cpp (2 threads) |
+|---|---|---|
+| Decoder body / lm_head / prefill (8) vmfb | 163 / 76 / 165 MB | |
+| Decode | 13.96 tok/s | 14.27 tok/s |
+| Prefill, 8-token chunks | 73.2 tok/s | 50.4 tok/s |
+| Next-token top-1 vs llama.cpp, 841 chat-answer positions | 98.2% | |
+| Host ONNX (fp32 activations) vs llama.cpp | 98.7% (same as transformers loading the GGUF) | |
