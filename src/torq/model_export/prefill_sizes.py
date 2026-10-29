@@ -179,6 +179,7 @@ def extract_projections(model_path, model=None, exclude_lm_head=False) -> List[_
 def _projections_onnx(model, data_dir, exclude_lm_head=False):
     import numpy as np
     import onnx
+    from iree.compiler import ir
     from iree.compiler.extras import onnx_importer
     from .prefill import _tensor_context_cache
 
@@ -246,7 +247,8 @@ def _projections_onnx(model, data_dir, exclude_lm_head=False):
         cache = _tensor_context_cache()(module.context)
         importer = onnx_importer.NodeImporter.define_function(info.main_graph, module.operation, context_cache=cache)
         importer.import_all()
-        projections.extend(_projections_mlir(module))
+        with module.context, ir.Location.unknown():
+            projections.extend(_projections_mlir(module))
     return projections
 
 
@@ -267,7 +269,7 @@ def _projections_mlir(module):
             def visit(value):
                 if value in visited:
                     return True
-                if not ir.OpResult.isinstance(value):
+                if not isinstance(value, ir.OpResult):
                     return False
                 producer = value.owner
                 if producer.regions or producer.name == 'util.global.load':
