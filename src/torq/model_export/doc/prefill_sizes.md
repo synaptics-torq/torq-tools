@@ -160,4 +160,8 @@ Compare the resulting `(effective width, M tiled, M outer)` signatures across al
 
 Report choices, plateaus and candidate rejection reasons in `prefill_sizes.json`. Cache individual probe results by extracted graph content (including weights), batch size, target, filtered flags, compiler path/mtime and probe version. Changing the representative's constants or graph invalidates its cached results.
 
+LFM2.5 automatic sizing excludes the single-window channel-wise convolution rewrite, `[C,1,K] @ [C,K,1]` for C > 1. These MatMuls use independent kernels per channel rather than a shared projection across tokens. The exclusion applies to ONNX and imported MLIR sources; other unsupported batched weight shapes still fail the probe. Recommendations use the remaining shared projections and do not estimate convolution tiling or performance.
+
+For LFM compiler builds affected by slow constant-prefetch scheduling, pass `--torq-constant-prefetch=false` to both the probe and final compilation. This disables an optional scheduling pass and must be recorded alongside performance measurements.
+
 The heuristic does not score attention, softmax, other elementwise work outside the projection, surrounding fused-producer memory or runtime prompt scheduling. Validate the complete family on the target device. Raising context from 256 to 1024 does not expand the default sweep beyond 128 or add attention work to these probes.

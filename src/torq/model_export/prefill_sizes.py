@@ -289,6 +289,14 @@ def _projections_mlir(module):
             if not weight:
                 raise ProbeError(f'unsupported projection weight type: {op.operands[1].type}')
             dims = [int(d) for d in weight[1].split(',')]
+            # LFM's depthwise-convolution rewrite is [C,1,K] @ [C,K,1].
+            # C indexes independent kernels, not tokens sharing a projection.
+            if (str(op.attributes['name']) == '"onnx.MatMul"' and len(dims) == 3
+                    and dims[0] > 1 and dims[1] > 0 and dims[2] == 1
+                    and re.fullmatch(rf'!torch.vtensor<\[{dims[0]},1,{dims[1]}\],[^>]+>',
+                                     str(op.operands[0].type))):
+                logger.info('Skipping channel-wise convolution MatMul with weight shape %s', dims)
+                continue
             while len(dims) > 2 and dims[0] == 1:
                 dims.pop(0)
             if len(dims) != 2 or min(dims) <= 0:

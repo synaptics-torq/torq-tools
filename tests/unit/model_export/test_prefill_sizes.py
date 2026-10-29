@@ -269,3 +269,68 @@ def test_source_probe_excludes_the_independent_native_head(monkeypatch, tmp_path
                              tool=sys.executable, exclude_lm_head=True)
     assert [(shape.k, shape.n) for shape in report.shapes] == [(8, 16)]
     assert report.chosen == [4]
+
+
+@pytest.mark.parametrize('source_format', ['onnx', 'mlir', 'mlirbc'])
+def test_lfm_channelwise_convolution_does_not_block_projection_sweep(tmp_path, monkeypatch, source_format):
+    import onnx
+    from onnx import helper as h, TensorProto as T
+    from iree.compiler import ir
+    from iree.compiler.extras import onnx_importer
+    from torq.model_export import prefill_sizes as probe
+
+    path = _model(tmp_path)
+    model = onnx.load(path)
+    model.graph.initializer.append(h.make_tensor('kernel', T.FLOAT, [1024, 3, 1], [0.25] * 3072))
+    model.graph.input.append(h.make_tensor_value_info('window', T.FLOAT, [1024, 1, 3]))
+    model.graph.node.append(h.make_node('MatMul', ['window', 'kernel'], ['conv']))
+    model.graph.output.append(h.make_tensor_value_info('conv', T.FLOAT, [1024, 1, 1]))
+    if source_format == 'onnx':
+        onnx.save(model, path)
+    else:
+        info = onnx_importer.ModelInfo(model)
+        module = info.create_module()
+        importer = onnx_importer.NodeImporter.define_function(info.main_graph, module.operation)
+        importer.import_all()
+        path = tmp_path / f'decoder.{source_format}'
+        if source_format == 'mlir':
+            path.write_text(str(module))
+        else:
+            with path.open('wb') as stream:
+                module.operation.write_bytecode(stream)
+    assert probe.extract_weight_shapes(path) == [(8, 16)]
+    calls = []
+    def run_probe(tool, path, chip, flags):
+        with ir.Context():
+            text = str(ir.Module.parse(path.read_bytes()))
+        assert '1024' not in text
+        calls.append(path.name)
+        return ''
+    monkeypatch.setattr(probe, 'run_probe', run_probe)
+    monkeypatch.setattr(probe, '_parse_tile_and_fuse',
+                        lambda _, m, k, n: probe.ProbeResult(m, 8, False, False))
+    report = probe.recommend(path, 'SL2610', [], tmp_path, cap=7, context_length=256,
+                             tool=sys.executable)
+    assert report.chosen == [4, 7]
+    assert len(calls) == 5  # decode and every candidate from four through seven
+    assert [(s.k, s.n) for s in report.shapes] == [(8, 16)]
+
+
+@pytest.mark.parametrize('weight_shape,activation_shape', [
+    ([4, 3, 2], [4, 1, 3]),  # batched projections are still unsupported
+    ([4, 3, 1], [4, 2, 3]),  # only the single-window convolution is excluded
+])
+def test_other_batched_matmuls_still_require_explicit_sizes(tmp_path, weight_shape, activation_shape):
+    import math
+    import onnx
+    from onnx import helper as h, TensorProto as T
+    from torq.model_export import prefill_sizes as probe
+
+    model = h.make_model(h.make_graph([h.make_node('MatMul', ['x', 'w'], ['y'])], 'main',
+        [h.make_tensor_value_info('x', T.FLOAT, activation_shape)],
+        [h.make_tensor_value_info('y', T.FLOAT, [4, activation_shape[1], weight_shape[-1]])],
+        [h.make_tensor('w', T.FLOAT, weight_shape, [0.25] * math.prod(weight_shape))]))
+    path = tmp_path / 'batched.onnx'
+    onnx.save(model, path)
+    with pytest.raises(probe.ProbeError, match='unsupported projection weight shape'):
+        probe.extract_projections(path)
