@@ -1422,7 +1422,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 chunk_len=self._batch_prefill,
             )
 
-        self._components.update(self._make_native_prefill())
 
     def _make_native_prefill(self):
         components = {}

@@ -550,6 +550,8 @@ def test_native_gemma_quantization_shares_the_quantized_weights(tmp_path, monkey
     monkeypatch.setattr(exporter, "_summarize_weight_quantization", lambda *args: dict(
         kl=0., cosine=1., max_abs_error=0., classification="test"), raising=False)
     exporter.export_onnx(validate=True, cleanup=False)
+    monkeypatch.setattr(exporter, "_quantize_components",
+                        Gemma3ModelExporter._quantize_components.__get__(exporter), raising=False)
     Gemma3ModelExporter.weight_quantize_models(exporter)
 
     assert (exporter._quantize_dir / "transformer.weights.data").exists()
@@ -592,9 +594,10 @@ def test_shared_weights_publish_failures_leave_all_models_readable(tmp_path, mon
         np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16))
 
 
-@pytest.mark.parametrize("family", ["gemma3", "gemma3-int4", "liquid"])
+@pytest.mark.parametrize("family,read_only", [("gemma3", False), ("gemma3-int4", False),
+                                             ("liquid", False), ("gemma3", True), ("gemma3-int4", True)])
 @pytest.mark.parametrize("mode", ["ordinary", "explicit", "automatic"])
-def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
+def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_only):
     import json
     import sys
     from types import SimpleNamespace
@@ -611,7 +614,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
     (source / "tokenizer.json").write_text("{}")
     onnx.save(_family_graph(1, width=32), source / "model.onnx")
     options = dict(models_dir=tmp_path / "models", onnx_source_dir=source, max_gen_tokens=16,
-                   extract_embeddings=True, split_lm_head=True, read_only_kv_cache=False,
+                   extract_embeddings=True, split_lm_head=True, read_only_kv_cache=read_only,
                    native_batch_prefill=mode != "ordinary",
                    batch_prefill_sizes=(4, 7) if mode == "explicit" else None)
     if family.startswith("gemma3"):
@@ -620,6 +623,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
         exporter = Gemma3ModelExporter(**options, weight_quantization="int4" if family == "gemma3-int4" else None)
     else:
         exporter = LiquidModelExporter("230m", **options)
+    monkeypatch.setattr("torq.model_export.prefill.check_native_compiler", lambda *a: None)
     cls = type(exporter)
     monkeypatch.setattr(cls, "_model_compile_flags", lambda self, **kwargs: ["--torq-prefetch-algorithm=constant-loads"])
     monkeypatch.setattr(cls, "_load_onnx", lambda self: {"model": _family_graph(1, width=32)})
@@ -628,9 +632,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
                 for size in self._native_batch_prefill}
     monkeypatch.setattr(cls, "_make_native_prefill", make_chunks)
     def make_static(self):
-        self._components = {"model": _family_graph(1, width=32), **{
-            f"model_prefill_{size}": _family_graph(size, width=32) for size in self._native_batch_prefill
-        }}
+        self._components = {"model": _family_graph(1, width=32)}
     monkeypatch.setattr(cls, "make_static", make_static)
     monkeypatch.setattr(cls, "optimize_model", lambda *args: None)
     exports = []
@@ -686,7 +688,8 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode):
         if mode == "automatic":
             assert not calls  # Wait for the normal decoder quantization.
             assert exporter._native_batch_prefill == ()
-        exporter.weight_quantize_models()
+        exporter.weight_quantize_models(validate=True, cleanup=False, compiler_path=sys.executable,
+                                        torq_compile_args=["--torq-max-nss-programs-size=33554432"])
     if mode == "automatic":
         final = onnx.load(exporter._export_paths["model"])
         assert probed_weights == [[(i.name, i.data_type, tuple(i.dims), i.raw_data)
@@ -732,6 +735,7 @@ def test_automatic_probe_failure_keeps_exported_decoder(tmp_path, monkeypatch):
     exporter._native_prefill_enabled = True
     exporter._max_gen_tokens = 16
     monkeypatch.setattr(exporter, "_model_compile_flags", lambda **kwargs: [])
+    monkeypatch.setattr("torq.model_export.prefill.check_native_compiler", lambda *a: None)
     def fail(path, *args, **kwargs):
         assert path == exporter._export_paths["model"]
         onnx.checker.check_model(str(path))
@@ -758,3 +762,20 @@ def test_native_mode_validation_before_source_loading(enabled, sizes, static, er
         with pytest.raises(ValueError, match=error):
             cls(native_batch_prefill=enabled, batch_prefill_sizes=sizes, static_models=static,
                 extract_embeddings=True, split_lm_head=True, read_only_kv_cache=False)
+
+
+def test_automatic_compiler_check_preserves_previous_export(tmp_path, monkeypatch):
+    from support.model_export import StubExporter
+
+    exporter = StubExporter(tmp_path, {"model": _family_graph(1)})
+    exporter._native_prefill_enabled = True
+    previous_dir = tmp_path / "export"
+    previous_dir.mkdir(parents=True)
+    previous = previous_dir / "previous.onnx"
+    previous.write_bytes(b"previous export")
+    def reject(*args):
+        raise RuntimeError("compiler unavailable")
+    monkeypatch.setattr("torq.model_export.prefill.check_native_compiler", reject)
+    with pytest.raises(RuntimeError, match="compiler unavailable"):
+        exporter.export_onnx()
+    assert previous.read_bytes() == b"previous export"

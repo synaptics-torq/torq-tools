@@ -579,7 +579,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 chunk_len=self._batch_prefill,
             )
 
-        self._components.update(self._make_native_prefill(source_model))
 
     def _make_native_prefill(self, source_model=None):
         if not self._native_batch_prefill:
@@ -649,30 +648,36 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             external_data=external_data
         )
 
-    def weight_quantize_models(self, *, components=None):
-        """Quantize the MatMul weights of every component to blocks of 32 (W4A16 or W8A16).
+    def weight_quantize_models(self, *, components=None, validate=True, cleanup=True,
+                               compiler_path=None, torq_compile_args=None):
+        """Prepare the quantized variant, then complete its native family."""
+        self._prepare()
+        if components is None and self._quantize_dir.exists():
+            shutil.rmtree(self._quantize_dir, ignore_errors=True)
+        self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir)
+        self._quantize_components(self._export_paths if components is None else components)
+        if components is None:
+            chunks = self._complete_native_prefill(validate=validate, cleanup=cleanup,
+                                          compiler_path=compiler_path, torq_compile_args=torq_compile_args)
+            if chunks:
+                self._quantize_components(chunks)
+        self._share_native_weights()
+        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
 
-        Each weight becomes a block-wise DequantizeLinear of INT4/INT8 values with bf16 scales;
-        the activations stay bf16. With a GPTQ checkpoint (``--gptq-checkpoint``) its weights
-        replace round-to-nearest; the vocabulary-trimmed LM head keeps the columns of
-        token_id_lut.npy. The rest of the model is converted to bf16 and int32.
-        """
+    def _quantize_components(self, components):
+        """Quantize only the supplied components without preparing directories."""
         from torq.lab.quantization.onnx.weights import (
             QuantizationConfig,
             WeightQuantizer,
             load_gptq_weights,
         )
 
-        self._prepare()
         bits = 4 if self._weight_quantization == "int4" else 8
-        if components is None and self._quantize_dir.exists():
-            shutil.rmtree(self._quantize_dir, ignore_errors=True)
-        self._quantize_dir.mkdir(parents=True, exist_ok=True)
-        self._write_compile_flags_snapshot(self._quantize_dir)
         lut_path = self._export_paths["model"].parent / "token_id_lut.npy"
         lut = np.load(lut_path) if lut_path.exists() else None
         for comp, model_path in self._export_paths.items():
-            if components is not None and comp not in components:
+            if comp not in components:
                 continue
             self._logger.info(
                 "(ONNX-quantize) Quantizing the weights of '%s' to INT%d, block size 32%s...",
@@ -699,11 +704,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             quantized_model_path = self._quantize_dir / model_path.name
             self._save_component_model(model, quantized_model_path)
             self._export_paths[comp] = quantized_model_path
-        self._share_native_weights()
-        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
-        if components is None:
-            self._complete_native_prefill()
-
 
     @staticmethod
     def _summarize_weight_quantization(model_path, model, matmul_info, precomputed, bits) -> dict:
@@ -818,7 +818,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
             per_tensor=args.dynamic_quantize_per_tensor,
         )
     if weight_quantization:
-        exporter.weight_quantize_models()
+        exporter.weight_quantize_models(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
+                                        compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if convert_dtypes:
         exporter.convert_models(preserve_io=args.preserve_io_dtypes)
     if not args.skip_torq:

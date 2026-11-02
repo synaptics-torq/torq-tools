@@ -36,6 +36,12 @@ The script installs torq-tools in editable mode with `--no-deps` (skipping the b
 
 Generated model artifacts should stay in ignored locations such as `models/`, `.torq/`, or pytest `tmp_path`. Large generated files like `.onnx`, `.tflite`, `.vmfb`, and `.mlir` are usually better to reproduce from commands than to commit.
 
+## Keeping changes small
+
+Before changing shared export or compiler code, trace its callers and write a short design note stating required behavior, unchanged configurations, the ownership boundary, code being removed, and runnable completion checks. Reuse existing helpers before adding abstractions; a shared helper needs real consumers with the same contract. Keep model semantics in model packages and pass stage settings explicitly rather than saving them for later calls.
+
+Each stage should make its input artifacts, outputs, and deletion ownership clear. Preserve external data, tensor names, shapes, and dtypes deliberately. Test shared changes with both consumers and leave a focused runnable regression for nontrivial logic. Report production lines added/deleted, retired paths, checks actually run, and manual validation gaps. Do not add dependencies, hooks, flags, or experimental paths without a concrete consumer.
+
 ## Adding Graph Edits
 
 Graph edits live under `src/torq/graph_edit/edits/`. Pick the domain module that best matches the operator family, such as `arithmetic.py`, `shape.py`, `padding.py`, `conv.py`, `rnn.py`, `transformer.py`, or `artifacts.py`. If a helper is useful to more than one edit, `_helpers.py` is the right home for it.

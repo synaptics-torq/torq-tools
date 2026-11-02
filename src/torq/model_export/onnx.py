@@ -350,42 +350,46 @@ class OnnxModelExporterBase(ABC):
         """
         save_onnx(model, path, split=True)
 
-    def _complete_native_prefill(self):
-        if not self._native_prefill_enabled or self._native_batch_prefill:
+    def _native_family_paths(self, paths=None):
+        paths = self._export_paths if paths is None else paths
+        return {size: paths["model" if size == 1 else f"model_prefill_{size}"]
+                for size in (1, *self._native_batch_prefill)}
+
+    def _complete_native_prefill(self, *, validate=True, cleanup=True,
+                                 compiler_path=None, torq_compile_args=None):
+        if not self._native_prefill_enabled:
             return
         from .prefill import native_compile_flags, probe_native_sizes, share_native_weights, validate_native_onnx
 
-        compiler_path = self._prefill_compiler_path
-        flags = native_compile_flags(self._model_compile_flags(compiler_path=compiler_path)
-                                     + self._prefill_compile_args)
-        self._native_batch_prefill = probe_native_sizes(
-            self._export_paths["model"], context=self._max_gen_tokens, minimum=4,
-            compiler_args=flags, compiler_path=compiler_path,
-            work_dir=self._models_dir / "prefill-probes",
-        )
+        if not self._native_batch_prefill:
+            flags = native_compile_flags(self._model_compile_flags(compiler_path=compiler_path)
+                                         + list(torq_compile_args or []))
+            self._native_batch_prefill = probe_native_sizes(
+                self._export_paths["model"], context=self._max_gen_tokens, minimum=4,
+                compiler_args=flags, compiler_path=compiler_path,
+                work_dir=self._models_dir / "prefill-probes",
+            )
         if "model" in self._opt_configs:
             self._opt_configs.update({f"model_prefill_{size}": self._opt_configs["model"]
                                       for size in self._native_batch_prefill})
-        components = self._make_native_prefill()
+        if all(f"model_prefill_{size}" in self._export_paths for size in self._native_batch_prefill):
+            return {}
+        components = {key: model for key, model in self._make_native_prefill().items()
+                      if key not in self._export_paths}
         self._components.update(components)
-        self._export_components(components, cleanup=self._prefill_cleanup)
-        base_paths = {1: self._export_path_for_component("model"), **{
-            size: self._export_path_for_component(f"model_prefill_{size}")
-            for size in self._native_batch_prefill
-        }}
-        if self._prefill_validate:
+        self._export_components(components, cleanup=cleanup)
+        base_paths = self._native_family_paths({
+            key: self._export_path_for_component(key) for key in self._export_paths
+        })
+        if validate:
             validate_native_onnx(base_paths)
         share_native_weights(base_paths.values())
-        if getattr(self, "_weight_quantization", None):
-            self.weight_quantize_models(components=components)
+        return components
 
     def _share_native_weights(self):
-        if self._native_batch_prefill:
+        if self._native_batch_prefill and all(f"model_prefill_{b}" in self._export_paths for b in self._native_batch_prefill):
             from .prefill import share_native_weights
-            share_native_weights([
-                path for comp, path in self._export_paths.items()
-                if comp == "model" or comp.startswith("model_prefill_")
-            ])
+            share_native_weights(self._native_family_paths().values())
 
     def _editor_dump_kwargs(self, final_path: Path) -> dict:
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
@@ -448,10 +452,10 @@ class OnnxModelExporterBase(ABC):
 
     def export_onnx(self, validate: bool = True, cleanup: bool = True, *,
                     compiler_path=None, torq_compile_args=None):
-        self._prefill_compiler_path = compiler_path
-        self._prefill_compile_args = list(torq_compile_args or [])
-        self._prefill_cleanup = cleanup
-        self._prefill_validate = validate
+        if self._native_prefill_enabled and not self._native_batch_prefill:
+            from .prefill import check_native_compiler, native_compile_flags
+            check_native_compiler(compiler_path)
+            native_compile_flags(torq_compile_args or [])
         self._prepare()
         # Reset the export dir here rather than in __init__ so that constructing
         # an exporter (e.g. to render --view-graph-edits) never destroys a
@@ -491,18 +495,17 @@ class OnnxModelExporterBase(ABC):
 
         if validate:
             sizes = getattr(self, "_native_batch_prefill", ())
-            if sizes:
+            if sizes and all(f"model_prefill_{b}" in self._export_paths for b in sizes):
                 from .prefill import validate_native_onnx
-                validate_native_onnx({1: self._export_paths["model"], **{
-                    b: self._export_paths[f"model_prefill_{b}"] for b in sizes
-                }})
+                validate_native_onnx(self._native_family_paths())
             if self._skip_export:
                 self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
             else:
                 self.validate_onnx()
 
-        if not getattr(self, "_weight_quantization", None):
-            self._complete_native_prefill()
+        if self._native_batch_prefill or not getattr(self, "_weight_quantization", None):
+            self._complete_native_prefill(validate=validate, cleanup=cleanup,
+                                          compiler_path=compiler_path, torq_compile_args=torq_compile_args)
 
     def _export_components(self, components, *, cleanup):
         for comp, model in components.items():
@@ -720,8 +723,6 @@ class OnnxModelExporterBase(ABC):
             check_native_compiler(compiler_path)
             if skip and any(c == "model" or c.startswith("model_prefill_") for c in skip):
                 raise ValueError("cannot skip individual members of a native decoder family")
-        self._prefill_compiler_path = compiler_path
-        self._prefill_compile_args = list(torq_compile_args or [])
         self._prepare()
         native_sizes = self._native_batch_prefill
         self._torq_dir = Path(torq_export_dir or self._torq_dir)
@@ -742,13 +743,11 @@ class OnnxModelExporterBase(ABC):
             shutil.rmtree(self._torq_dir, ignore_errors=True)
         self._torq_dir.mkdir(parents=True, exist_ok=True)
         if native_sizes:
-            family_paths = {1: self._export_paths["model"], **{
-                size: self._export_paths[f"model_prefill_{size}"] for size in native_sizes
-            }}
+            family_paths = self._native_family_paths()
             compile_native_family(family_paths, self._torq_dir, compiler_args=family_flags,
                                   compiler_path=compiler_path, local_compile=local_compile)
         for comp, onnx_path in self._export_paths.items():
-            if native_sizes and (comp == "model" or comp.startswith("model_prefill_")):
+            if native_sizes and onnx_path in family_paths.values():
                 continue
             if comp in skip:
                 self._logger.info("(Torq-export) Skipping %s", comp)
