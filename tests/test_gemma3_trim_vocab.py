@@ -9,7 +9,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.processors import TemplateProcessing
 
-from torq.models.gemma3._trim_vocab import (
+from torq.model_export.vocab_trimming import (
     build_trimmed_vocab_spec,
     load_json,
 )
@@ -112,3 +112,25 @@ class Gemma3TrimVocabTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_shared_selection_tokenizer_representations():
+    from tokenizers.models import Unigram
+
+    tokens = ["<unk>", "Hello", "?", "٣", "<0x41>", "日本"]
+    for model in (BPE(vocab=dict(zip(tokens, range(len(tokens)))), merges=[], unk_token="<unk>"),
+                  Unigram([(token, -1.0) for token in tokens], unk_id=0)):
+        tokenizer = Tokenizer(model)
+        tokenizer.add_special_tokens(["<special>"])
+        import json
+        payload = json.loads(tokenizer.to_str())
+        payload["added_tokens"].append({"id": True})
+        payload["post_processor"] = {"special_tokens": {"required": {"ids": [9, False]}}}
+        for config in (None, {"nested": [{"eos_token_id": 8, "bad_token_id": True}]}):
+            spec = build_trimmed_vocab_spec(tokenizer, payload, config, ["digits-non-latin", "digits-non-latin"],
+                          byte_fallback=True)
+            assert spec.selected_groups == ("digits-non-latin",)
+            assert spec.kept_model_ids == (3, 4)
+            assert spec.extra_token_ids == ((6, 9) if config is None else (6, 8, 9))
+            assert spec.byte_token_ids == (4,)
+            assert build_trimmed_vocab_spec(tokenizer, payload, config, [], byte_fallback=False).kept_model_ids == ()

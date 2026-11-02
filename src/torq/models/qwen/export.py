@@ -21,7 +21,7 @@ from huggingface_hub import snapshot_download
 from tokenizers import Tokenizer
 from transformers import AutoConfig
 
-from ._trim_vocab import build_qwen_trimmed_vocab_spec
+from ...model_export.vocab_trimming import build_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
@@ -483,7 +483,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 config_path.read_text()
             )
 
-            spec = build_qwen_trimmed_vocab_spec(
+            spec = build_trimmed_vocab_spec(
                 tokenizer,
                 tokenizer_json,
                 config_json,

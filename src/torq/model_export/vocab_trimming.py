@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
 from tokenizers import Tokenizer
 
 COMMON_ES_EN_PUNCT = {
@@ -78,14 +77,6 @@ def load_json(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def save_json(path: str | Path, payload: dict[str, Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(payload, f, ensure_ascii=True, indent=2)
-        f.write("\n")
-
-
 def _is_latin_char(ch: str) -> bool:
     if not ch:
         return False
@@ -148,7 +139,7 @@ def build_token_groups(tokenizer: Tokenizer, vocab_size: int) -> dict[str, list[
     return groups
 
 
-def _collect_required_token_ids(config_json: dict[str, Any], tokenizer_json: dict[str, Any]) -> set[int]:
+def _collect_required_token_ids(config_json: dict[str, Any] | None, tokenizer_json: dict[str, Any]) -> set[int]:
     required_ids: set[int] = set()
 
     def _walk(obj: Any) -> None:

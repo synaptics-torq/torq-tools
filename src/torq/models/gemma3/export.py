@@ -21,7 +21,7 @@ from transformers import AutoConfig
 from . import FUNCTIONGEMMA_HF_REPO, GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
 from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
-from ._trim_vocab import (
+from ...model_export.vocab_trimming import (
     TrimmedVocabSpec,
     build_trimmed_vocab_spec,
     load_json,
