@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from shutil import which
 
@@ -156,11 +156,6 @@ def onnx_load(path: Path):
     import onnx
 
     return onnx.load(str(path), load_external_data=False)
-
-
-def extract_weight_shapes(model_path) -> List[Tuple[int, int]]:
-    """Distinct logical projection shapes, including constant dequantization."""
-    return list(dict.fromkeys((p.k, p.n) for p in extract_projections(model_path)))
 
 
 def extract_projections(model_path, model=None, exclude_lm_head=False) -> List[_Projection]:
@@ -479,16 +474,17 @@ def _plateau(b_start: int, b_end: int, sig) -> Dict:
     }
 
 
-def _scan_shape(shape, cap: int, probe: Callable[[int], ProbeResult]) -> _ShapeScan:
+def _scan_shape(shape, points: Dict[int, ProbeResult]) -> _ShapeScan:
     """Record every supported batch size, including narrow dips and returns."""
     k, n = shape
-    decode = probe(1)
+    decode = points[1]
     scan = _ShapeScan(k, n, decode.width, snap_grid=decode.snap_grid)
-    scan.points[1] = decode
+    scan.points = points
     if not scan.constrained:
         return scan
-    for b in range(4, cap + 1):
-        result = scan.points[b] = probe(b)
+    for b, result in sorted(points.items()):
+        if b == 1:
+            continue
         if scan.plateaus and result.signature() == (
             scan.plateaus[-1]["width"], scan.plateaus[-1]["m_tiled"], scan.plateaus[-1]["m_outer"]
         ):
@@ -676,13 +672,15 @@ def recommend(
             context_length = _context_length_from_onnx(onnx_model)
 
     projections = extract_projections(model_path, onnx_model, exclude_lm_head)
+    report = ProbeReport([], [], cap, context_length, warnings=warnings)
     if not projections:
         warnings.append(f"no matmul weight shapes found in {model_path.name}; choose explicit sizes")
-        _finish(None, warnings, started, cap, context_length, work_dir, model_path, chip, tool, flags, [], None)
+        _finish(report, started, work_dir, model_path, chip, tool, flags)
         return None
 
     if context_length is not None:
         cap = min(cap, context_length)
+    report.cap = cap
 
     probe_dir = work_dir / "prefill_probes"
     probe_dir.mkdir(parents=True, exist_ok=True)
@@ -702,15 +700,18 @@ def recommend(
         cache.put(projection.key, result)
         return result
 
-    scans: List[_ShapeScan] = []
+    scans = report.shapes
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PROBE_JOBS) as pool:
             decode = list(pool.map(lambda p: make_probe(p, 1), projections))
             jobs = [(p, b) for p, result in zip(projections, decode)
                     if result.width is not None for b in range(4, cap + 1)]
-            list(pool.map(lambda job: make_probe(*job), jobs))
+            results = list(pool.map(lambda job: make_probe(*job), jobs))
+        points = {p.key: {1: result} for p, result in zip(projections, decode)}
+        for (p, b), result in zip(jobs, results):
+            points[p.key][b] = result
         for p in projections:
-            scan = _scan_shape((p.k, p.n), cap, lambda b, p=p: cache.get(p.key, b))
+            scan = _scan_shape((p.k, p.n), points[p.key])
             scan.projection = p.key
             scans.append(scan)
 
@@ -737,25 +738,26 @@ def recommend(
         # Four is the minimum supported by every native decoder exporter.
         candidates = sorted(b for b in candidate_set if b >= 4)
 
-        sig_at = {(i, b): scan.points[b]
-                  for i, scan in enumerate(constrained) for b in candidates}
     except (ProbeError, OSError):
         cache.save()  # keep the successful probes for the next run
         raise
+    try:
+        cache.save()
+    except OSError as exc:
+        logger.warning("prefill probe: could not save cache: %s", exc)
 
     if not constrained:
         warnings.append(
             "no weight is tiled along N at decode; the sizes are unconstrained, choose explicit sizes"
         )
-        _finish(None, warnings, started, cap, context_length, work_dir, model_path, chip, tool, flags, scans, None, cache)
+        _finish(report, started, work_dir, model_path, chip, tool, flags)
         return None
 
-    chosen: List[int] = []
-    report = ProbeReport(chosen, scans, cap, context_length, warnings=warnings)
+    chosen = report.chosen
     for b in candidates:
         reason = "kept"
-        for i, scan in enumerate(constrained):
-            r = sig_at[(i, b)]
+        for scan in constrained:
+            r = scan.points[b]
             if r.width is None:
                 reason = f"[{scan.k},{scan.n}] no tile fit (skipped by the tiler)"
                 break
@@ -773,13 +775,13 @@ def recommend(
     def effective_sig(b):
         return tuple(
             (
-                snap(sig_at[(i, b)].width, scan.decode_width)
-                if split_requested and scan.snap_grid and sig_at[(i, b)].width is not None
-                else sig_at[(i, b)].width,
-                sig_at[(i, b)].m_tiled,
-                sig_at[(i, b)].m_outer,
+                snap(scan.points[b].width, scan.decode_width)
+                if split_requested and scan.snap_grid and scan.points[b].width is not None
+                else scan.points[b].width,
+                scan.points[b].m_tiled,
+                scan.points[b].m_outer,
             )
-            for i, scan in enumerate(constrained)
+            for scan in constrained
         )
 
     sigs = {b: effective_sig(b) for b in chosen}
@@ -802,35 +804,15 @@ def recommend(
             "no probe candidates (cap too small)" if not candidates
             else "every probed candidate was dropped; choose explicit sizes"
         )
-        _finish(None, warnings, started, cap, context_length, work_dir, model_path, chip, tool, flags, scans, report, cache)
+        _finish(report, started, work_dir, model_path, chip, tool, flags)
         return None
-    return _finish(chosen, warnings, started, cap, context_length, work_dir, model_path, chip, tool, flags, scans, report, cache)
+    return _finish(report, started, work_dir, model_path, chip, tool, flags)
 
 
-def _finish(
-    chosen: Optional[List[int]],
-    warnings: List[str],
-    started: float,
-    cap: int,
-    context: Optional[int],
-    work_dir: Path,
-    model: Path,
-    chip: str,
-    tool: str,
-    flags: List[str],
-    scans: List[_ShapeScan],
-    report: Optional[ProbeReport] = None,
-    cache: Optional[_ProbeCache] = None,
-) -> Optional[ProbeReport]:
-    """Log the outcome, persist the JSON, and (re)build the report."""
-    if report is None:
-        report = ProbeReport(chosen or [], scans, cap, context, warnings=list(warnings),
-                             elapsed=time.perf_counter() - started)
-    else:
-        report.chosen = chosen or []
-        report.warnings = list(warnings)
-        report.elapsed = time.perf_counter() - started
-    for w in warnings:
+def _finish(report, started, work_dir, model, chip, tool, flags):
+    """Log and persist the completed report."""
+    report.elapsed = time.perf_counter() - started
+    for w in report.warnings:
         logger.warning("prefill probe: %s", w)
     for line in report.log_lines():
         logger.info(line)
@@ -839,8 +821,6 @@ def _finish(
         (work_dir / _JSON_NAME).write_text(
             json.dumps(report.to_json(model, chip, tool, flags), indent=1, default=str)
         )
-        if cache is not None:
-            cache.save()
     except OSError as exc:
         logger.warning("prefill probe: could not write %s: %s", _JSON_NAME, exc)
     return report

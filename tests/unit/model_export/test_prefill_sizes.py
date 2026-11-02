@@ -261,7 +261,7 @@ def test_source_probe_excludes_the_independent_native_head(monkeypatch, tmp_path
     ]))
     path = tmp_path / "source.onnx"
     onnx.save(model, path)
-    assert probe.extract_weight_shapes(path) == [(8, 16), (16, 32)]
+    assert list(dict.fromkeys((p.k, p.n) for p in probe.extract_projections(path))) == [(8, 16), (16, 32)]
     monkeypatch.setattr(probe, "run_probe", lambda *args: "")
     monkeypatch.setattr(probe, "_parse_tile_and_fuse",
                         lambda _, m, k, n: probe.ProbeResult(m, 8, False, False))
@@ -298,7 +298,7 @@ def test_lfm_channelwise_convolution_does_not_block_projection_sweep(tmp_path, m
         else:
             with path.open('wb') as stream:
                 module.operation.write_bytecode(stream)
-    assert probe.extract_weight_shapes(path) == [(8, 16)]
+    assert list(dict.fromkeys((p.k, p.n) for p in probe.extract_projections(path))) == [(8, 16)]
     calls = []
     def run_probe(tool, path, chip, flags):
         with ir.Context():
