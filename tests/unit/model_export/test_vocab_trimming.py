@@ -110,11 +110,8 @@ class Gemma3TrimVocabTests(unittest.TestCase):
         self.assertIn(3, spec.kept_model_ids)  # <unk>
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def test_shared_selection_tokenizer_representations():
+    import json
     from tokenizers.models import Unigram
 
     tokens = ["<unk>", "Hello", "?", "٣", "<0x41>", "日本"]
@@ -122,7 +119,6 @@ def test_shared_selection_tokenizer_representations():
                   Unigram([(token, -1.0) for token in tokens], unk_id=0)):
         tokenizer = Tokenizer(model)
         tokenizer.add_special_tokens(["<special>"])
-        import json
         payload = json.loads(tokenizer.to_str())
         payload["added_tokens"].append({"id": True})
         payload["post_processor"] = {"special_tokens": {"required": {"ids": [9, False]}}}
@@ -134,3 +130,7 @@ def test_shared_selection_tokenizer_representations():
             assert spec.extra_token_ids == ((6, 9) if config is None else (6, 8, 9))
             assert spec.byte_token_ids == (4,)
             assert build_trimmed_vocab_spec(tokenizer, payload, config, [], byte_fallback=False).kept_model_ids == ()
+
+
+if __name__ == "__main__":
+    unittest.main()

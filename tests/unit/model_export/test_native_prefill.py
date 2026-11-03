@@ -240,6 +240,9 @@ def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, 
     gemma.export_gemma3_from_args(args)
     checkpoint.assert_called_once_with(args, "int4")
     quantize.assert_called_once()
+    assert quantize.call_args.kwargs == dict(
+        validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
+        compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     assert exported[0]._read_only_kv_cache is True
     assert exported[0]._gptq_checkpoint == tmp_path / "gptq"
     assert export_options[0]["compiler_path"] == args.compiler_path
