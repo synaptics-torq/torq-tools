@@ -57,10 +57,10 @@ Graph transforms applied automatically (each one used to be a separate host-side
 source .venv/bin/activate
 cd torq-tools-dev
 
-torq-export-model liquid --models-dir models --batch-prefill --no-read-only-kv-cache
+torq-export-model liquid --models-dir models --batch-prefill
 ```
 
-Like the other models (gemma3, smollm2), this single command **exports and compiles**: by default it produces the static split-lm-head ONNX set (embedding extraction and batch prefill on) and then compiles it to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Batch prefill requires FP32 export weights and full-cache outputs (`--no-read-only-kv-cache`); the compiler converts dtypes for the board. For a converted decode-only variant, use `--no-batch-prefill --convert-dtypes`. To export decode-only ONNX, replace `--batch-prefill` with `--no-batch-prefill --skip-torq`.
+Like the other models (gemma3, smollm2), this single command **exports and compiles**: by default it produces the static split-lm-head ONNX set (embedding extraction and batch prefill on) and then compiles it to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Batch prefill requires FP32 export weights and supports the default read-only KV cache; the compiler converts dtypes for the board. Use `--no-read-only-kv-cache` only when full-cache outputs are needed. For a converted decode-only variant, use `--no-batch-prefill --convert-dtypes`. To export decode-only ONNX, replace `--batch-prefill` with `--no-batch-prefill --skip-torq`.
 
 Flag breakdown:
 
@@ -141,7 +141,7 @@ Output: `model.vmfb` (~712 MB for the full bf16 build, ~553 MB without lm_head, 
 
 For a copy-paste export command, compiler prerequisites (2.3.5 or newer), and a success checklist, use the [shared batch-prefill quick start](../../model_export/doc/batch_prefill.md#lfm25).
 
-LFM2.5 230M and 350M compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context. **NOTE:** The LFM2-VL text decoder is covered by its own section in [README_VL.md](README_VL.md#batch-prefill).
+LFM2.5 230M and 350M compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context. Both the default time-major read-only KV cache and the optional full-cache layout are supported. Read-only chunks output B new KV rows while convolution outputs remain complete replacement states. **NOTE:** The LFM2-VL text decoder is covered by its own section in [README_VL.md](README_VL.md#batch-prefill).
 
 The supported depthwise convolution has kernel size three, stride/dilation one, no padding or bias, and channel-major three-token state. Native chunks retain token-major activations and use one broadcast MatMul per convolution block; the history ABI remains `[1,D,3]`, oldest first.
 

@@ -154,9 +154,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
             batch_prefill=batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
+            native_supports_read_only=True,
             native_unsupported=unsupported,
             native_supported="LFM2.5 230M or 350M only, with FP32 weights and "
-                             "--no-read-only-kv-cache; explicit dtype conversion, "
+                             "combined KV I/O; explicit dtype conversion, "
                              "convolution overrides and topology splitting are "
                              "unsupported",
         )
@@ -500,7 +501,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "source.convert (attention)": [
                 EditSpec("ReplaceGroupQueryAttention", (
                     self._num_attention_heads, self._num_key_value_heads, self._head_dim,
-                    ctx("chunk_len"), not self._batch_prefill_enabled,
+                    ctx("chunk_len"), not self._batch_prefill_enabled or self._read_only_kv_cache,
                 )),
             ],
             "model.static": [
@@ -1338,6 +1339,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                     self._num_attention_heads,
                     self._num_key_value_heads,
                     self._head_dim,
+                    int(component.removeprefix("model_prefill_")) if component.startswith("model_prefill_") else 1,
                 )
 
         editor.reorder_graph_input("position_ids", 1)

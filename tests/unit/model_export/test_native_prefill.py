@@ -145,6 +145,36 @@ def _read_only_family_graph(size, width=4):
     return model
 
 
+def test_read_only_family_with_convolution_state_first(tmp_path):
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    paths = {size: tmp_path / f"decoder_{size}.onnx" for size in (1, 4, 7)}
+    for size, path in paths.items():
+        model = _read_only_family_graph(size)
+        model.graph.input.insert(2, h.make_tensor_value_info("past_conv.0", T.FLOAT, [1, 4, 3]))
+        model.graph.output.insert(1, h.make_tensor_value_info("present_conv.0", T.FLOAT, [1, 4, 3]))
+        model.graph.node[1].output[0] = "last_token"
+        for name, values in (("history_start", [-3]), ("history_end", [2**63 - 1]), ("history_axis", [2])):
+            model.graph.initializer.append(numpy_helper.from_array(np.array(values, np.int64), name))
+        model.graph.node.extend([
+            h.make_node("Transpose", ["token_embedding"], ["conv_tokens"], perm=[0, 2, 1]),
+            h.make_node("Concat", ["past_conv.0", "conv_tokens"], ["history"], axis=2),
+            h.make_node("Slice", ["history", "history_start", "history_end", "history_axis"], ["present_conv.0"]),
+            h.make_node("ReduceSum", ["present_conv.0", "history_axis"], ["history_sum"], keepdims=1),
+            h.make_node("Transpose", ["history_sum"], ["history_hidden"], perm=[0, 2, 1]),
+            h.make_node("Add", ["last_token", "history_hidden"], ["last_hidden_states"]),
+        ])
+        onnx.save(model, path)
+    contract = _contract(paths[1], read_only=True)
+    assert contract.states[0].seq_axis is None
+    assert contract.states[1].rows_only
+    validate_native_onnx(paths, contract=contract)
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc", contract)
+    assert metadata["kv_cache_sequence_axis"] == 1
+    outputs = metadata["entries"]["main_7"]["outputs"]
+    assert outputs[1]["shape"] == [1, 4, 3]
+    assert outputs[2]["shape"] == [1, 7, 2, 4]
+
+
 def test_read_only_family_import_and_sequential_rows(tmp_path):
     pytest.importorskip("iree.compiler.extras.onnx_importer")
     paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1,4,7)}
@@ -825,7 +855,7 @@ def test_shared_weights_publish_failures_leave_all_models_readable(tmp_path, mon
 
 
 @pytest.mark.parametrize("family,read_only", [("gemma3", False), ("gemma3-int4", False),
-                                             ("liquid", False), ("gemma3", True), ("gemma3-int4", True)])
+                                             ("liquid", False), ("liquid", True), ("gemma3", True), ("gemma3-int4", True)])
 @pytest.mark.parametrize("mode", ["ordinary", "explicit", "automatic"])
 def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_only):
     import json

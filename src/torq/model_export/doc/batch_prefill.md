@@ -19,7 +19,7 @@ Run one of these commands from the installed torq-tools environment. Each explic
 | Supported model | Weight format | Size selection | Required cache layout |
 | --- | --- | --- | --- |
 | Gemma3 270M / FunctionGemma 270M | FP32 or INT4 | Automatic or explicit | Full-cache or read-only |
-| LFM2.5 230M / 350M | FP32 | Automatic or explicit | Full-cache |
+| LFM2.5 230M / 350M | FP32 | Automatic or explicit | Read-only (default) or full-cache |
 | Qwen3-0.6B / Qwen2.5-0.5B-Instruct | FP32 or INT4 | Automatic for FP32; explicit for INT4 | Read-only |
 | SmolLM2 135M / 360M | FP32 | Automatic or explicit | Read-only |
 | LFM2-VL 450M text decoder | FP32 | Explicit only | Full-cache |
@@ -42,10 +42,10 @@ For INT4, omit `--weight-quantization none`. Embedding extraction and the split 
 
 ```sh
 torq-export-model liquid --model-size 350m --batch-prefill \
-    --no-read-only-kv-cache --max-gen-tokens 256
+    --max-gen-tokens 256
 ```
 
-Use `--model-size 230m` for the smaller model. Keep FP32 export weights and full-cache outputs; do not add `--convert-dtypes`. Compilation converts floating types as needed.
+Use `--model-size 230m` for the smaller model. Keep FP32 export weights and the default read-only cache; do not add `--convert-dtypes`. `--no-read-only-kv-cache` selects full-cache outputs when needed. Compilation converts floating types as needed.
 
 ### Qwen
 
@@ -103,7 +103,7 @@ The unquantized tools export remains FP32; compiler dtype conversion produces BF
 
 Native Gemma3 FP32 exports with legacy full-cache I/O retain constant-load prefetch; stream scheduling shrinks their shared weight tiles and regresses throughput. INT4 and read-only-cache exports retain the model’s stream-schedule default. Explicit `--compile-flags` still override these defaults.
 
-Static shapes, extracted embeddings, a split language model head and combined KV state are required. Sizes must be unique, strictly ascending and fit the context. Gemma3 supports FP32 or INT4 weights and either cache layout. LFM2.5 sizes must be at least four and require FP32 weights with full-cache outputs. Qwen sizes must be at least four and require the read-only cache with FP32 or INT4 weights; INT4 needs explicit `--batch-prefill-sizes` because automatic probing only covers the FP32 family. SmolLM2 sizes must be at least four and require FP32 weights with the read-only cache; `--split-lm-head` is opt-in there (its exports keep the head in-graph by default). LFM2-VL's text decoder requires `--split-lm-head`, `--batch-prefill-sizes` (no automatic probe) and the full-state cache; its vision build options are not yet validated with native families. Dynamic quantization, explicit dtype conversion, sliding-window execution, vision and arbitrary layer splitting need separate support.
+Static shapes, extracted embeddings, a split language model head and combined KV state are required. Sizes must be unique, strictly ascending and fit the context. Gemma3 supports FP32 or INT4 weights and either cache layout. LFM2.5 sizes must be at least four and require FP32 weights with either read-only or full-cache outputs. Qwen sizes must be at least four and require the read-only cache with FP32 or INT4 weights; INT4 needs explicit `--batch-prefill-sizes` because automatic probing only covers the FP32 family. SmolLM2 sizes must be at least four and require FP32 weights with the read-only cache; `--split-lm-head` is opt-in there (its exports keep the head in-graph by default). LFM2-VL's text decoder requires `--split-lm-head`, `--batch-prefill-sizes` (no automatic probe) and the full-state cache; its vision build options are not yet validated with native families. Dynamic quantization, explicit dtype conversion, sliding-window execution, vision and arbitrary layer splitting need separate support.
 
 Native compilation requires supplied-family support and a matching runtime with version-3 entry tables. The exporter supplies the compiler options; the hardware runners in `torq-examples` choose the exported functions through `torq.runtime`.
 

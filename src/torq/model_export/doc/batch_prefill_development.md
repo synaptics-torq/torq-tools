@@ -45,7 +45,7 @@ The current attention cache contracts are:
 
 Here H is the KV-head count, L is the exported context capacity and d is the head dimension. Every call must satisfy `0 <= p` and `p+B <= L`. Convolution states use their own fixed shapes and replacement rules. Rolling context, alternative state layouts and additional recurrent state types require explicit support in the exporter, importer, validator and hardware runner.
 
-The family contract declares KV and convolution states separately, including whether each output contains only new rows. LFM2.5 batch prefill currently enables only full-cache KV I/O; its exporter rejects read-only caches. Supporting read-only batch prefill requires validating the hybrid model's graph rewrites, mixed state updates and runtime behavior before enabling that configuration. Gemma3, Qwen and SmolLM2 support read-only batch-prefill caches.
+The family contract declares KV and convolution states separately, including whether each output contains only new rows. LFM2.5 supports read-only KV caches alongside full convolution-state outputs, as well as the optional full-cache KV layout. Its source conversion keeps queries grouped by KV head for the read-only rewrite, and its post-static pass supplies each entry's chunk length. Gemma3, Qwen and SmolLM2 also support read-only batch-prefill caches.
 
 ### Parameters and ONNX representation
 

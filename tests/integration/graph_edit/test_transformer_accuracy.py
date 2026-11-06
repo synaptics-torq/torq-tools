@@ -204,9 +204,9 @@ def _attention_layer(style: str, heads: int, kv_heads: int, max_len: int, head_d
 
 @pytest.mark.parametrize(
     ("style", "heads", "kv_heads", "chunk"),
-    [("hf", 4, 2, 1), ("grouped", 6, 2, 1), ("grouped", 6, 2, 2), ("broadcast", 4, 1, 1), ("broadcast", 4, 1, 3)],
+    [("hf", 4, 2, 1), ("grouped", 6, 2, 1), ("grouped", 6, 2, 2), ("liquid", 6, 2, 1), ("liquid", 6, 2, 4), ("broadcast", 4, 1, 1), ("broadcast", 4, 1, 3)],
 )
-def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk):
+def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk, tmp_path):
     max_len, head_dim = 6, 4
     if style == "hf":
         editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
@@ -221,12 +221,30 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk)
             editor.graph, "test", cur_len=cur_len, max_tokens=max_len,
             export_dtype=onnx.TensorProto.FLOAT, chunk_len=chunk,
         ))
+    if style == "liquid":
+        import json
+        from torq.models.liquid.export import LiquidModelExporter
+
+        (tmp_path / "config.json").write_text(json.dumps(dict(
+            hidden_size=heads * head_dim, vocab_size=16, num_attention_heads=heads,
+            num_key_value_heads=kv_heads, head_dim=head_dim,
+            layer_types=["full_attention"], num_hidden_layers=1,
+        )))
+        exporter = LiquidModelExporter(
+            onnx_source_dir=tmp_path, models_dir=tmp_path, max_gen_tokens=max_len,
+            batch_prefill=True, extract_embeddings=True, split_lm_head=True,
+        )
+        # Exercise the exporter's post-static path, including chunk-length forwarding.
+        path = tmp_path / "attention.onnx"
+        onnx.save(editor.to_onnx(), path)
+        exporter._patch_static_model(path, "model" if chunk == 1 else f"model_prefill_{chunk}")
+        liquid_model = onnx.load(path)
     editor.combine_kv_io_tensors([1, kv_heads, max_len, head_dim])
     if style == "hf":
         editor.group_query_heads(heads, kv_heads, head_dim)
     blended = clone_graph(editor.graph)
     editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk)
-    read_only = editor.to_onnx()
+    read_only = liquid_model if style == "liquid" else editor.to_onnx()
     assert not [n for n in editor.graph.nodes if n.op == "Where" and n.outputs[0].name.startswith("present")]
     # torq-compile 2.3.0 miscompiles a Where over a constant condition, so the causal mask is a float constant.
     assert not [n for n in editor.graph.nodes if n.op == "Where" and isinstance(n.inputs[0], gs.Constant)]
