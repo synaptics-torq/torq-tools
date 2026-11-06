@@ -1,10 +1,6 @@
 # Gemma-3 (270M-IT) export for Torq
 
-Export pipeline for **Gemma-3 270M** (and 1B), converting the HuggingFace model
-to a static VMFB for the Torq board. By default the MatMul weights are **INT4**
-(block size 32, bf16 activations): GPTQ weights for the 270M instruct model,
-round-to-nearest for the other sources. The model is compiled with the
-stream-schedule prefetch (`--torq-prefetch-algorithm=stream-schedule`). Native FP32 families with legacy full-cache I/O use constant-load prefetch to retain their shared weight tiling.
+Export pipeline for **Gemma-3 270M** (and 1B), converting the HuggingFace model to a static VMFB for the Torq board. By default the MatMul weights are **INT4** (block size 32, bf16 activations): GPTQ weights for the 270M instruct model, round-to-nearest for the other sources. The model is compiled with the stream-schedule prefetch (`--torq-prefetch-algorithm=stream-schedule`). Native FP32 families with legacy full-cache I/O use constant-load prefetch to retain their shared weight tiling.
 
 ## Source model
 
@@ -17,15 +13,11 @@ The source is downloaded automatically from HuggingFace via Optimum on first run
 | `1b`   | `google/gemma-3-1b-pt` |
 | `1b --instruct-model` | `google/gemma-3-1b-it` |
 
-> Upstream publishes the base 1B checkpoint as `-pt`, unlike 270M which has a
-> bare repo, so plain `-s 1b` resolves to `google/gemma-3-1b-pt`.
+> Upstream publishes the base 1B checkpoint as `-pt`, unlike 270M which has a bare repo, so plain `-s 1b` resolves to `google/gemma-3-1b-pt`.
 
-Override the source with `--hf-repo <repo>` (optionally `--hf-repo-subdir`) to
-point at a pre-exported ONNX repo, or `--onnx-source-dir <dir>` to use a local
-ONNX and skip the download entirely.
+Override the source with `--hf-repo <repo>` (optionally `--hf-repo-subdir`) to point at a pre-exported ONNX repo, or `--onnx-source-dir <dir>` to use a local ONNX and skip the download entirely.
 
-> Note: this module exports the **fp32** model and quantizes it itself. It does
-> **not** consume pre-quantized (MatMulNBits) ONNX.
+> Note: this module exports the **fp32** model and quantizes it itself. It does **not** consume pre-quantized (MatMulNBits) ONNX.
 
 ## FunctionGemma
 
@@ -67,19 +59,9 @@ From the torq-tools virtual environment:
 torq-export-model gemma3 --instruct-model --trim-vocab
 ```
 
-This is the model of the torq-examples `gemma3` demo
-(`Synaptics/gemma-3-270-GPTQ-int4-it-torq`). The command downloads the source
-and the GPTQ INT4 weights (the `gptq/` folder of that repository), builds the
-static model with a trimmed vocabulary and a separate LM head, quantizes the
-weights to INT4, and compiles the decoder family `transformer.vmfb`
-(single-token decode plus prefill chunks) and `lm_head.vmfb.trim` (the
-trimmed-vocabulary LM head). Equivalent module form: `python -m torq.models.gemma3.export …`.
+This is the model of the torq-examples `gemma3` demo (`Synaptics/gemma-3-270-GPTQ-int4-it-torq`). The command downloads the source and the GPTQ INT4 weights (the `gptq/` folder of that repository), builds the static model with a trimmed vocabulary and a separate LM head, quantizes the weights to INT4, and compiles the decoder family `transformer.vmfb` (single-token decode plus prefill chunks) and `lm_head.vmfb.trim` (the trimmed-vocabulary LM head). Equivalent module form: `python -m torq.models.gemma3.export …`.
 
-The `.vmfb` files and the host files (`token_embeddings.npy` in bf16,
-`token_id_lut.npy` in int32, `tokenizer.json`, `config.json`) are in
-`models/google/gemma-3-270m-it/export/trim/split_lm_head/quantized/static/compiled/`.
-Copy this directory to the board and pass its `transformer.vmfb` with `-m` to
-the torq-examples `gemma3` demo.
+The `.vmfb` files and the host files (`token_embeddings.npy` in bf16, `token_id_lut.npy` in int32, `tokenizer.json`, `config.json`) are in `models/google/gemma-3-270m-it/export/trim/split_lm_head/quantized/static/compiled/`. Copy this directory to the board and pass its `transformer.vmfb` with `-m` to the torq-examples `gemma3` demo.
 
 Other variants:
 
@@ -93,8 +75,7 @@ torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization int
 
 To compile the float variant, use `torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization none`. A run compiles only its selected variant: the default INT4 run regenerates the intermediate `fp32/static` ONNX files, but preserves any `fp32/static/compiled` files from earlier float runs. Those compiled files can therefore have older input shapes and KV layouts than the adjacent ONNX files. The selected variant compiles the decoder family (decode plus prefill chunks) into one `transformer.vmfb`.
 
-If the Torq compiler Python API is not installed in the venv, point the fallback
-at a `torq-compile` binary first:
+If the Torq compiler Python API is not installed in the venv, point the fallback at a `torq-compile` binary first:
 
 ```sh
 export TORQ_COMPILER_PATH=/path/to/torq-compile
@@ -143,22 +124,11 @@ models/<repo>/export/<full|trim>/<unified|split_lm_head>/
                                             variant dir that is compiled
 ```
 
-The compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory
-of the variant that is actually compiled — `quantized/` with weight quantization
-(the default) or `--dynamic-quantize`, `converted/` with `--convert-dtypes`, else
-the base `<dtype>/` dir. Each
-variant dir is self-contained (ONNX + runtime assets + `compiled/`), so it can
-be deployed as-is; regenerating a variant's ONNX wipes its stale `compiled/`
-alongside it, so a compiled model can never outlive the source it was built
-from.
+The compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory of the variant that is actually compiled — `quantized/` with weight quantization (the default) or `--dynamic-quantize`, `converted/` with `--convert-dtypes`, else the base `<dtype>/` dir. Each variant dir is self-contained (ONNX + runtime assets + `compiled/`), so it can be deployed as-is; regenerating a variant's ONNX wipes its stale `compiled/` alongside it, so a compiled model can never outlive the source it was built from.
 
-`<full|trim>` follows `--trim-vocab`; `<unified|split_lm_head>` follows
-`--split-lm-head` (default: `split_lm_head`). The exact paths are printed at
-the end of the run.
+`<full|trim>` follows `--trim-vocab`; `<unified|split_lm_head>` follows `--split-lm-head` (default: `split_lm_head`). The exact paths are printed at the end of the run.
 
-With `--split-lm-head` the model file is **not** `model.onnx` — each directory
-above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
-(hidden states → logits) instead:
+With `--split-lm-head` the model file is **not** `model.onnx` — each directory above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx` (hidden states → logits) instead:
 
 ```
 models/<repo>/export/<full|trim>/split_lm_head/<dtype>/static/
@@ -167,57 +137,32 @@ models/<repo>/export/<full|trim>/split_lm_head/<dtype>/static/
     lm_head.onnx                        ← standalone LM head
 ```
 
-Inference and export validation pick up the companion `lm_head.onnx`
-automatically when it sits next to the transformer. The local runners process
-prompts one token at a time through `transformer.onnx`; batched prompt chunks
-run through the compiled family on the board, with both sharing
-`lm_head.onnx` (see [Batch prefill](#batch-prefill)).
+Inference and export validation pick up the companion `lm_head.onnx` automatically when it sits next to the transformer. The local runners process prompts one token at a time through `transformer.onnx`; batched prompt chunks run through the compiled family on the board, with both sharing `lm_head.onnx` (see [Batch prefill](#batch-prefill)).
 
 ## Weight quantization (int4 / int8)
 
 ### INT4 with GPTQ (one command, the default)
 
-The exporter quantizes the MatMul weights in the same run. For the 270M
-instruct source it uses GPTQ INT4 weights (asymmetric, group size 32 along the
-input features) from the `gptq/` folder of `Synaptics/gemma-3-270-GPTQ-int4-it-torq`
-instead of round-to-nearest weights:
+The exporter quantizes the MatMul weights in the same run. For the 270M instruct source it uses GPTQ INT4 weights (asymmetric, group size 32 along the input features) from the `gptq/` folder of `Synaptics/gemma-3-270-GPTQ-int4-it-torq` instead of round-to-nearest weights:
 
 ```sh
 torq-export-model gemma3 --instruct-model --trim-vocab
 ```
 
-- The LM head is split (default). The vocabulary is trimmed and the exporter
-  also quantizes the trimmed LM head rows with the GPTQ weights.
-- For each model, the log shows a "Quantization summary" line: KL divergence,
-  cosine similarity and max absolute error of the logits against the fp32 model.
-- Output: `models/<repo>/export/trim/split_lm_head/quantized/static/`
-  (`transformer.onnx`, the `transformer_prefill_<B>.onnx` chunks,
-  `lm_head.onnx`) and `compiled/` (the family VMFB and host files: `.npy` in
-  the runtime dtype, `tokenizer.json`, `config.json`).
-- The batched prefill chunks in the compiled family (batch prefill is on by
-  default) halve the time to the first token for long prompts. Their
-  "Quantization summary" lines show high values: the check feeds them inputs
-  that do not match a prefill chunk, so they do not measure the chunks'
-  accuracy.
+- The LM head is split (default). The vocabulary is trimmed and the exporter also quantizes the trimmed LM head rows with the GPTQ weights.
+- For each model, the log shows a "Quantization summary" line: KL divergence, cosine similarity and max absolute error of the logits against the fp32 model.
+- Output: `models/<repo>/export/trim/split_lm_head/quantized/static/` (`transformer.onnx`, the `transformer_prefill_<B>.onnx` chunks, `lm_head.onnx`) and `compiled/` (the family VMFB and host files: `.npy` in the runtime dtype, `tokenizer.json`, `config.json`).
+- The batched prefill chunks in the compiled family (batch prefill is on by default) halve the time to the first token for long prompts. Their "Quantization summary" lines show high values: the check feeds them inputs that do not match a prefill chunk, so they do not measure the chunks' accuracy.
 
-To use your own GPTQ checkpoint (compressed-tensors `pack-quantized` safetensors,
-group size 32), pass `--gptq-checkpoint DIR`. Other sources (another `--hf-repo`,
-the base model, `-s 1b`) and `--no-gptq` use round-to-nearest INT4 weights.
-`--dynamic-quantize` turns the weight quantization off.
+To use your own GPTQ checkpoint (compressed-tensors `pack-quantized` safetensors, group size 32), pass `--gptq-checkpoint DIR`. Other sources (another `--hf-repo`, the base model, `-s 1b`) and `--no-gptq` use round-to-nearest INT4 weights. `--dynamic-quantize` turns the weight quantization off.
 
 ### INT4 / INT8 with torq-quantize-model
 
-Quantization can also be a **separate step** applied to the fp32 static ONNX, using the
-`torq-quantize-model` tool from the `torq-compiler` dependency
-(`torq.lab.quantization.onnx`; see the torq-compiler user manual for the full
-flag reference). It quantizes MatMul weights to int8 / int4 / bf16 and can
-either emit a DequantizeLinear (DQL) model or a single dequantized-bf16
-model ready to compile.
+Quantization can also be a **separate step** applied to the fp32 static ONNX, using the `torq-quantize-model` tool from the `torq-compiler` dependency (`torq.lab.quantization.onnx`; see the torq-compiler user manual for the full flag reference). It quantizes MatMul weights to int8 / int4 / bf16 and can either emit a DequantizeLinear (DQL) model or a single dequantized-bf16 model ready to compile.
 
 ### 1. Export the fp32 static ONNX (quantization input)
 
-Skip the bf16 conversion and the compile so you keep the fp32 static graph
-(plus embeddings / vocab LUT used by sensitivity analysis):
+Skip the bf16 conversion and the compile so you keep the fp32 static graph (plus embeddings / vocab LUT used by sensitivity analysis):
 
 ```sh
 torq-export-model gemma3 \
@@ -230,8 +175,7 @@ torq-export-model gemma3 \
 
 ### 2. Quantize
 
-Quantize each model of the export directory (`transformer.onnx`,
-`lm_head.onnx`) the same way:
+Quantize each model of the export directory (`transformer.onnx`, `lm_head.onnx`) the same way:
 
 ```sh
 # int8 (ORT-matching asymmetric uint8, block_size 32) as a DQL model
@@ -249,16 +193,11 @@ torq-quantize-model weights -i transformer.onnx -o transformer_int8_bf16.onnx \
 torq-quantize-model weights -i transformer.onnx -o out.onnx --bits 4 --skip-layers lm_head
 ```
 
-Output modes: `--bits N` → DQL model; `--bits N --dequantize-weights` →
-dequantized bf16 model; `--bits 16` → pure fp32→bf16 (no quantization).
+Output modes: `--bits N` → DQL model; `--bits N --dequantize-weights` → dequantized bf16 model; `--bits 16` → pure fp32→bf16 (no quantization).
 
 ### 3. Per-layer sensitivity → mixed int8/int4 config (optional)
 
-`analyze` measures each MatMul's quantization impact (KL divergence vs fp32) and
-writes a per-layer config (this is the real equivalent of the "layer sensitivity"
-workflow — it lives in `torq-quantize-model`, not a standalone script). It needs
-the `token_embeddings.npy` (and `token_id_lut.npy` for trimmed-vocab models) from
-the export:
+`analyze` measures each MatMul's quantization impact (KL divergence vs fp32) and writes a per-layer config (this is the real equivalent of the "layer sensitivity" workflow — it lives in `torq-quantize-model`, not a standalone script). It needs the `token_embeddings.npy` (and `token_id_lut.npy` for trimmed-vocab models) from the export:
 
 ```sh
 torq-quantize-model analyze weights -i transformer.onnx -o sensitivity.json \
@@ -274,26 +213,17 @@ torq-quantize-model weights -i transformer.onnx -o transformer_mixed_bf16.onnx \
 
 ### 4. Compile the quantized model
 
-For a standalone compile (outside the pipeline), both DQL and dequantized-bf16
-outputs are directly importable by IREE.
+For a standalone compile (outside the pipeline), both DQL and dequantized-bf16 outputs are directly importable by IREE.
 
-Every export dir carries its validated `torq-compile` flags: the export writes
-the flags of [`compile_flags.json`](compile_flags.json) for the installed
-compiler version into the export dir. The compile helper loads them:
+Every export dir carries its validated `torq-compile` flags: the export writes the flags of [`compile_flags.json`](compile_flags.json) for the installed compiler version into the export dir. The compile helper loads them:
 
 ```sh
 python -m torq.utils.compile transformer_mixed_bf16.onnx -o transformer.vmfb
 ```
 
-In a torq-compiler-only environment (no torq-tools), invoke `torq-compile` with
-each flag from `compile_flags.json` in the export dir.
+In a torq-compiler-only environment (no torq-tools), invoke `torq-compile` with each flag from `compile_flags.json` in the export dir.
 
-The flags include `--torq-convert-io-dtype`, so the compiled model takes bf16
-embeddings and int32 token IDs. The one-command export writes the host files in
-these dtypes. A standalone compile keeps them in fp32 and int64; the demo still
-runs with them (the runner casts the embedding row), but you can convert them
-(optional). This halves the size of `token_embeddings.npy` and makes the files
-match the hosted ones:
+The flags include `--torq-convert-io-dtype`, so the compiled model takes bf16 embeddings and int32 token IDs. The one-command export writes the host files in these dtypes. A standalone compile keeps them in fp32 and int64; the demo still runs with them (the runner casts the embedding row), but you can convert them (optional). This halves the size of `token_embeddings.npy` and makes the files match the hosted ones:
 
 ```sh
 python -c "import numpy as np, ml_dtypes; np.save('token_embeddings.npy', np.load('token_embeddings.npy').astype(ml_dtypes.bfloat16)); np.save('token_id_lut.npy', np.load('token_id_lut.npy').astype(np.int32))"
@@ -320,11 +250,11 @@ torq-infer-model gemma3 -m /path/to/model.vmfb --instruct-model "Capital of Fran
 # module form: python -m torq.models.gemma3.infer …
 ```
 
-bf16 ONNX cannot run through onnxruntime (no CPU bf16 MatMul kernel) — validate
-correctness on the **fp32** ONNX, and use the VMFB (or the DQL/dequantized model)
-on the board.
+bf16 ONNX cannot run through onnxruntime (no CPU bf16 MatMul kernel) — validate correctness on the **fp32** ONNX, and use the VMFB (or the DQL/dequantized model) on the board.
 
 ### Batch prefill
+
+For a copy-paste export command, compiler prerequisites (2.3.5 or newer), and a success checklist, use the [shared batch-prefill quick start](../../model_export/doc/batch_prefill.md#gemma3-and-functiongemma).
 
 Gemma3 270M and FunctionGemma compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this path.
 

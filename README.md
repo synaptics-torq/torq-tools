@@ -16,8 +16,7 @@ torq_tools_dir=$(readlink -f torq-tools)
 Please see the [documentation](https://synaptics-torq.github.io/torq-compiler/v/latest/user-manual/getting_started.html#quickstart) on installing the compiler Python package.
 
 ### Option 1: Install with pip
-Installing via pip makes `torq-tools` available system-wide (or within your virtual environment).
-A virtual environment is **strongly recommended**, as this project depends on several large packages.
+Installing via pip makes `torq-tools` available system-wide (or within your virtual environment). A virtual environment is **strongly recommended**, as this project depends on several large packages.
 
 ```bash
 cd your_project
@@ -49,14 +48,12 @@ pip install -r requirements.txt
 
 You can make the submodule importable under the `torq` namespace using either of the following techniques:
 
-**Technique A: Add to site-packages**
-Add the submodule path permanently to the Python environment by creating a .pth file in your site-packages directory:
+**Technique A: Add to site-packages** Add the submodule path permanently to the Python environment by creating a .pth file in your site-packages directory:
 ```bash
 echo "$torq_tools_dir/src" >> $(python3 -c 'import site; print(site.getsitepackages()[0])')/torq.pth
 ```
 
-**Technique B: Add to sys.path at runtime**
-Append the `src/` directory from the submodule to the Python path, e.g. in your project’s initialization code:
+**Technique B: Add to sys.path at runtime** Append the `src/` directory from the submodule to the Python path, e.g. in your project’s initialization code:
 ```python
 import sys
 sys.path.append("external/torq-tools/src")
@@ -80,8 +77,7 @@ pip install -r "$torq_tools_dir/src/torq/models/moonshine/requirements.txt"
 ```
 
 #### Moonshine Streaming (separate environment)
-`moonshine_streaming` requires `transformers` 5.x, which is incompatible with the `optimum`-based exporters in the base environment (they cap `transformers` below 4.58). **Do not** install it into the base environment: pip will report dependency conflicts, and the `optimum`-based exporters (gemma3, smollm2, liquid, siglip2, non-streaming moonshine) break under `transformers` 5.x.
-Set up the dedicated environment with the helper script:
+`moonshine_streaming` requires `transformers` 5.x, which is incompatible with the `optimum`-based exporters in the base environment (they cap `transformers` below 4.58). **Do not** install it into the base environment: pip will report dependency conflicts, and the `optimum`-based exporters (gemma3, smollm2, liquid, siglip2, non-streaming moonshine) break under `transformers` 5.x. Set up the dedicated environment with the helper script:
 
 ```bash
 bash src/torq/models/moonshine_streaming/install_requirements.sh
@@ -95,22 +91,11 @@ The script creates `.venv-moonshine-streaming` at the repository root (pass a di
 
 ### Available tools
 #### Clean up ONNX exporter artifacts
-Model-agnostic cleanup for ONNX graphs that don't go through a full `torq.models` exporter.
-Composes the `CollapseUnrolledConcat` and `FoldConvBatchNorm` graph edits with ORT-backed constant folding:
-it collapses per-element unrolled stack/unbind Concats back into their source tensor,
-evaluates all-constant subgraphs (positional-embedding builders, constant weight prep, ...) into initializers,
-and folds exported eval-mode BatchNorm (`Conv -> Mul -> Add`) into the conv weights.
-Run it on fp32 graphs, before dtype conversion.
+Model-agnostic cleanup for ONNX graphs that don't go through a full `torq.models` exporter. Composes the `CollapseUnrolledConcat` and `FoldConvBatchNorm` graph edits with ORT-backed constant folding: it collapses per-element unrolled stack/unbind Concats back into their source tensor, evaluates all-constant subgraphs (positional-embedding builders, constant weight prep, ...) into initializers, and folds exported eval-mode BatchNorm (`Conv -> Mul -> Add`) into the conv weights. Run it on fp32 graphs, before dtype conversion.
 ```bash
 torq-cleanup-model onnx model_fp32.onnx -o model_clean.onnx --verify
 ```
-`--verify` re-runs both models under onnxruntime on random inputs and asserts the outputs still match.
-Individual passes can be disabled with `--skip {collapse-concat,fold-constants,fold-conv-bn}`,
-and the graph edits are also usable on their own via `--apply-graph-edit` on any model exporter.
-Constants larger than `--fold-size-threshold` bytes (default 16 MiB) are not folded, so folding
-can't blow up a model by materializing e.g. a transposed lm_head matrix.
-The pipeline is idempotent and fails safe, so every model exporter also runs it on each exported
-component by default (before dtype conversion); opt out with `--no-onnx-cleanup`.
+`--verify` re-runs both models under onnxruntime on random inputs and asserts the outputs still match. Individual passes can be disabled with `--skip {collapse-concat,fold-constants,fold-conv-bn}`, and the graph edits are also usable on their own via `--apply-graph-edit` on any model exporter. Constants larger than `--fold-size-threshold` bytes (default 16 MiB) are not folded, so folding can't blow up a model by materializing e.g. a transposed lm_head matrix. The pipeline is idempotent and fails safe, so every model exporter also runs it on each exported component by default (before dtype conversion); opt out with `--no-onnx-cleanup`.
 #### Benchmark quantized models
 Run a quantized (VMFB or ONNX) Gemma3 model over a standard question set and compare two runs (throughput, time-to-first-token, answers):
 ```bash
@@ -119,10 +104,9 @@ python -m src.torq.utils.benchmark compare -a results_int8.json -b results_mixed
 ```
 See `src/torq/utils/benchmark/README.md` for options.
 #### Export supported ONNX models to static graphs
-Model export pipelines generate static graphs in the model’s original runtime.
-These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
+Model export pipelines generate static graphs in the model’s original runtime. These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 
-For Gemma3/FunctionGemma and LFM2.5 native decoder families, see the [native batch-prefill guide](src/torq/model_export/doc/batch_prefill.md).
+For batch-prefill export and compilation of Gemma3/FunctionGemma, LFM2.5, Qwen, SmolLM2 and the LFM2-VL text decoder, start with the [batch-prefill quick start](src/torq/model_export/doc/batch_prefill.md). It includes compiler prerequisites (2.3.5 or newer), one command per supported configuration and the expected output artifacts.
 ```bash
 python3 -m src.torq.models.<model>.export
 ```
@@ -135,11 +119,7 @@ To export a static Moonshine Streaming model (fixed audio chunk, with dtype conv
 python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280 --convert-dtypes
 ```
 > [!NOTE]
-> Moonshine Streaming requires a separate virtual environment since `transformers` 5.x
-> conflicts with the base `optimum`-based exporters; see [Install extras](#moonshine-streaming-separate-environment).
-The exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
-> e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side
-> `*.npy` LUTs and a `streaming_config.json`.
+> Moonshine Streaming requires a separate virtual environment since `transformers` 5.x conflicts with the base `optimum`-based exporters; see [Install extras](#moonshine-streaming-separate-environment). The exporter always produces static models and needs `--chunk-len` (audio samples per chunk, e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side `*.npy` LUTs and a `streaming_config.json`.
 
 
 #### Run inference
@@ -152,8 +132,7 @@ Example: run Moonshine inference with ONNX and VMFB backends:
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_tiny_onnx/ -s tiny
 python -m src.torq.models.moonshine.infer apostle.wav -m models/moonshine_iree_onnx/ -s tiny --max-inp-len 80000 --max-dec-len 30
 ```
-Example: run Moonshine Streaming inference (point `-m` at an export dir containing
-`encoder.onnx`, `decoder.onnx`, the `*.npy` LUTs and `tokenizer.json`):
+Example: run Moonshine Streaming inference (point `-m` at an export dir containing `encoder.onnx`, `decoder.onnx`, the `*.npy` LUTs and `tokenizer.json`):
 ```bash
 python -m src.torq.models.moonshine_streaming.infer apostle.wav \
   -m models/UsefulSensors/moonshine-streaming-tiny/export/float/static -s tiny
