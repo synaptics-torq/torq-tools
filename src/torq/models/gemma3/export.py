@@ -89,18 +89,33 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         read_only_kv_cache: bool = True,
         **edit_args
     ):
-        from ...model_export.prefill import validate_native_options
-
-        self._native_prefill_enabled = native_batch_prefill
-        self._native_batch_prefill = validate_native_options(
-            batch_prefill_sizes, enabled=native_batch_prefill, batch_prefill=batch_prefill, context=max_gen_tokens,
-            minimum=2, static=static_models, embeddings=extract_embeddings,
-            split_head=split_lm_head, read_only=read_only_kv_cache,
-            individual=keep_individual_kv_io,
-            supports_read_only=True,
-            unsupported=dynamic_quantize or convert_dtypes or weight_quantization not in (None, "int4") or model_size != "270m",
-        )
         self._hf_repo = _resolve_hf_repo(model_size, instruct_model, hf_repo, functiongemma)
+        unsupported = (dynamic_quantize or convert_dtypes
+                       or weight_quantization not in (None, "int4") or model_size != "270m")
+        super().__init__(
+            "fp32",
+            static_models,
+            None,
+            Path(models_dir) / self._hf_repo,
+            show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
+            convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
+            max_gen_tokens=max_gen_tokens,
+            extract_embeddings=extract_embeddings,
+            split_lm_head=split_lm_head,
+            read_only_kv_cache=read_only_kv_cache,
+            keep_individual_kv_io=keep_individual_kv_io,
+            batch_prefill=batch_prefill,
+            native_batch_prefill=native_batch_prefill,
+            batch_prefill_sizes=batch_prefill_sizes,
+            native_minimum=2,
+            native_supports_read_only=True,
+            native_unsupported=unsupported,
+            native_supported="Gemma3/FunctionGemma 270M only, with FP32 or INT4 weights and "
+                             "either cache layout; explicit dtype conversion and dynamic "
+                             "quantization are unsupported",
+        )
         if read_only_kv_cache and keep_individual_kv_io:
             raise ValueError(
                 "`--read-only-kv-cache` needs the combined KV cache I/O; "
@@ -117,15 +132,10 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._gptq_checkpoint = Path(gptq_checkpoint) if gptq_checkpoint is not None else None
         self._functiongemma = functiongemma
         self._instruct_model = instruct_model or functiongemma
-        self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
-        self._read_only_kv_cache = read_only_kv_cache
-        self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
         )
         self._trim_vocab = trim_vocab
-        self._split_lm_head = split_lm_head
         self._export_model_filenames = _GEMMA3_MODEL_FILENAMES[0 if split_lm_head else 1]
         self._trim_vocab_groups = tuple(trim_vocab_groups or ("latin", "punct", "digits"))
         self._trim_byte_fallback = trim_byte_fallback
@@ -162,38 +172,13 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             raise ValueError("`--trim-vocab` is currently supported only for static Gemma exports")
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static Gemma exports")
-        if batch_prefill is not None:
-            if batch_prefill < 1:
-                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
-            if batch_prefill > max_gen_tokens:
-                raise ValueError(
-                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
-                )
-            if not self._split_lm_head:
-                raise ValueError(
-                    "`--batch-prefill` requires `--split-lm-head` "
-                    "(disable the prefill export with `--batch-prefill 0`)"
-                )
-        self._batch_prefill = batch_prefill
 
         opt_config = ORTOptimizerConfig(
             num_heads=self._config.num_attention_heads,
             hidden_size=self._config.hidden_size,
         )
+        self._opt_configs = {"model": opt_config, "model_prefill": opt_config}
 
-        super().__init__(
-            "fp32",
-            static_models,
-            self._config,
-            Path(models_dir) / self._hf_repo,
-            show_model_info=show_model_info,
-            dynamic_quantize=dynamic_quantize,
-            convert_dtypes=convert_dtypes,
-            opt_configs={"model": opt_config, "model_prefill": opt_config, **{
-                f"model_prefill_{size}": opt_config for size in self._native_batch_prefill
-            }},
-            split_weights=split_weights,
-        )
 
     def _model_compile_flags(self, **kwargs) -> list[str]:
         flags = super()._model_compile_flags(**kwargs)
@@ -662,7 +647,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                                           compiler_path=compiler_path, torq_compile_args=torq_compile_args)
             if chunks:
                 self._quantize_components(chunks)
-        self._share_native_weights()
+        self._settle_native_family(validate=False)
         self._copy_runtime_assets(self._quantize_dir, self._export_dir)
 
     def _quantize_components(self, components):
@@ -804,10 +789,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    if args.native_batch_prefill and (not args.skip_torq or args.batch_prefill_sizes is None):
-        from ...model_export.prefill import check_native_compiler, native_compile_flags
-        check_native_compiler(args.compiler_path)
-        native_compile_flags(args.compile_flags or [])
+    from ...model_export.prefill import check_native_cli_args
+    check_native_cli_args(args)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

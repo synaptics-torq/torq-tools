@@ -82,7 +82,7 @@ class OnnxModelExporterBase(ABC):
         self,
         model_dtype: str,
         static_models: bool,
-        config: Mapping[str, Any],
+        config: Mapping[str, Any] | None,
         models_dir: str | os.PathLike,
         *,
         show_model_info: bool = False,
@@ -91,11 +91,55 @@ class OnnxModelExporterBase(ABC):
         opt_configs: Mapping[str, ORTOptimizerConfig] | None = None,
         skip_export: list[str] | None = None,
         split_weights: bool = False,
+        max_gen_tokens: int = 0,
+        extract_embeddings: bool = False,
+        split_lm_head: bool = False,
+        read_only_kv_cache: bool = False,
+        keep_individual_kv_io: bool = False,
+        batch_prefill: int | None = None,
+        native_batch_prefill: bool = False,
+        batch_prefill_sizes: tuple[int, ...] | None = None,
+        native_minimum: int = 2,
+        native_supports_read_only: bool = False,
+        native_unsupported: bool = False,
+        native_supported: str = "",
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
-
-        self._native_batch_prefill = getattr(self, "_native_batch_prefill", ())
-        self._native_prefill_enabled = getattr(self, "_native_prefill_enabled", False)
+        # The batch-prefill option handling lives here, before any subclass
+        # source-loading, so invalid options fail without touching the disk.
+        # Each model passes its supported-configuration text (native_supported)
+        # and its unsupported-condition flag (native_unsupported).
+        from .prefill import validate_native_options
+        self._native_prefill_enabled = native_batch_prefill
+        self._native_batch_prefill = validate_native_options(
+            batch_prefill_sizes, enabled=native_batch_prefill, batch_prefill=batch_prefill,
+            context=max_gen_tokens, minimum=native_minimum, static=static_models,
+            embeddings=extract_embeddings, split_head=split_lm_head,
+            read_only=read_only_kv_cache, individual=keep_individual_kv_io,
+            supports_read_only=native_supports_read_only, unsupported=native_unsupported,
+            supported=native_supported,
+        )
+        if batch_prefill is not None:
+            if batch_prefill < 1:
+                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
+            if batch_prefill > max_gen_tokens:
+                raise ValueError(
+                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
+                )
+            if not split_lm_head:
+                raise ValueError(
+                    "`--batch-prefill` requires `--split-lm-head` "
+                    "(disable the prefill export with `--batch-prefill 0`)"
+                )
+        # Siblings that predate the base owning these options (smollm2, qwen,
+        # moonshine, VL) still assign them before super(); preserve those
+        # values, otherwise take the parameters.
+        self._batch_prefill = getattr(self, "_batch_prefill", batch_prefill)
+        self._extract_embeddings = getattr(self, "_extract_embeddings", extract_embeddings)
+        self._keep_individual_kv_io = getattr(self, "_keep_individual_kv_io", keep_individual_kv_io)
+        self._read_only_kv_cache = getattr(self, "_read_only_kv_cache", read_only_kv_cache)
+        self._split_lm_head = getattr(self, "_split_lm_head", split_lm_head)
+        self._max_gen_tokens = getattr(self, "_max_gen_tokens", max_gen_tokens)
         self._harness: GraphEditHarness | None = None
         self._model_dtype = model_dtype
         self._config = config
@@ -225,9 +269,9 @@ class OnnxModelExporterBase(ABC):
 
     def _auto_torq_compile_extras(self) -> list[str]:
         """torq-compile flags derived from this run's export options."""
-        # The --batch-prefill exporters set _batch_prefill in their own __init__
-        # (before super().__init__), so getattr: the attribute may not exist on
-        # other exporters.
+        # The --batch-prefill exporters set _batch_prefill either through the
+        # base constructor or in their own __init__ before super() (VL), so
+        # getattr: the attribute may not exist on other exporters.
         if (getattr(self, "_batch_prefill", None) is None
                 and not getattr(self, "_native_prefill_enabled", False)
                 and not getattr(self, "_native_batch_prefill", ())):
@@ -398,10 +442,18 @@ class OnnxModelExporterBase(ABC):
         share_native_weights(base_paths.values())
         return components
 
-    def _share_native_weights(self):
-        if self._native_batch_prefill and all(f"model_prefill_{b}" in self._export_paths for b in self._native_batch_prefill):
-            from .prefill import share_native_weights
-            share_native_weights(self._native_family_paths().values())
+    def _settle_native_family(self, *, validate=True):
+        """Everything the export does only for a complete family: validate
+        (ORT) and share the weights of every already-exported member."""
+        if not (self._native_batch_prefill and all(f"model_prefill_{size}" in self._export_paths
+                                                   for size in self._native_batch_prefill)):
+            return
+        from .prefill import share_native_weights
+        paths = self._native_family_paths()
+        if validate:
+            from .prefill import validate_native_onnx
+            validate_native_onnx(paths, contract=self._native_family_contract(paths[1]))
+        share_native_weights(paths.values())
 
     def _editor_dump_kwargs(self, final_path: Path) -> dict:
         """Editor kwargs enabling per-edit graph dumps next to the final model file.
@@ -497,7 +549,7 @@ class OnnxModelExporterBase(ABC):
 
         self._export_components(self._components, cleanup=cleanup)
 
-        self._share_native_weights()
+        self._settle_native_family(validate=validate)
         if not self._split_weights:
             # Single-file layout for every component that fits the 2 GiB limit.
             for comp, path in self._export_paths.items():
@@ -506,10 +558,6 @@ class OnnxModelExporterBase(ABC):
                 save_onnx(load_onnx_lazy(path), path)
 
         if validate:
-            sizes = getattr(self, "_native_batch_prefill", ())
-            if sizes and all(f"model_prefill_{b}" in self._export_paths for b in sizes):
-                from .prefill import validate_native_onnx
-                validate_native_onnx(self._native_family_paths(), contract=self._native_family_contract())
             if self._skip_export:
                 self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
             else:

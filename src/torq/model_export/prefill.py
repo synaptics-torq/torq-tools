@@ -35,7 +35,7 @@ def parse_native_sizes(value: str) -> tuple[int, ...]:
 
 def validate_native_options(sizes, *, enabled, batch_prefill, context, minimum, static,
                             embeddings, split_head, read_only, individual, unsupported,
-                            supports_read_only=False):
+                            supports_read_only=False, supported=""):
     if type(enabled) is not bool:
         raise ValueError("native_batch_prefill must be a boolean; supply sizes via batch_prefill_sizes")
     if not enabled:
@@ -51,13 +51,17 @@ def validate_native_options(sizes, *, enabled, batch_prefill, context, minimum, 
         raise ValueError("--native-batch-prefill and --batch-prefill are mutually exclusive")
     if not static or not embeddings or not split_head or (read_only and not supports_read_only) or individual or unsupported:
         raise ValueError(
-            "--native-batch-prefill supports Gemma3/FunctionGemma 270M and LFM2.5 230M only; "
-            "requires static exports, --extract-embeddings, --split-lm-head and combined KV I/O. "
-            "Gemma3 supports FP32 or INT4 weights and read-only caches; LFM2.5 requires FP32 "
-            "and --no-read-only-kv-cache. Explicit dtype conversion, convolution overrides "
-            "and topology splitting are unsupported"
+            "--native-batch-prefill requires static exports, --extract-embeddings, "
+            f"--split-lm-head and combined KV I/O; {supported}"
         )
     return tuple(sizes) if sizes is not None else ()
+
+
+def check_native_cli_args(args):
+    """Fail fast on the compiler and flag set before any destructive export work."""
+    if args.native_batch_prefill and (not args.skip_torq or args.batch_prefill_sizes is None):
+        check_native_compiler(args.compiler_path)
+        native_compile_flags(args.compile_flags or [])
 
 
 def probe_native_sizes(model_path, *, context, minimum, compiler_args, compiler_path, work_dir):

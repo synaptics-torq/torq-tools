@@ -451,6 +451,23 @@ def test_liquid_vision_inherits_ordinary_gqa_configuration(tmp_path):
         LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7))
 
 
+def test_liquid_vision_constructor_preserves_pre_super_options(tmp_path):
+    import json
+    from torq.models.liquid.export_vl import LiquidVLModelExporter
+
+    config=dict(hidden_size=8,vocab_size=16,num_attention_heads=2,num_key_value_heads=1,
+                head_dim=4,conv_dim=8,conv_L_cache=3,num_hidden_layers=2,layer_types=["conv","full_attention"])
+    (tmp_path/"config.json").write_text(json.dumps(config))
+    exporter=LiquidVLModelExporter(onnx_source_dir=tmp_path,models_dir=tmp_path,batch_prefill=16,
+                                   max_gen_tokens=32,keep_individual_kv_io=True,split_lm_head=True)
+    # These attributes are assigned before the base __init__; the base must preserve them.
+    assert exporter._batch_prefill == 16
+    assert exporter._max_gen_tokens == 32
+    assert exporter._keep_individual_kv_io is True
+    assert exporter._split_lm_head is True
+    assert exporter._read_only_kv_cache is False
+
+
 @pytest.mark.parametrize("flag", ["--torq-convert-dtypes", "--torq-convert-io-dtype",
     "--torq-disable-slicing", "--torq-enable-split-constants-optimization",
     "--torq-enable-annotate-tied-operands"])

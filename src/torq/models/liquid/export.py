@@ -108,25 +108,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         read_only_kv_cache: bool = True,
         **edit_args
     ):
-        from ...model_export.prefill import validate_native_options
-
-        self._native_prefill_enabled = native_batch_prefill
-        self._native_batch_prefill = validate_native_options(
-            batch_prefill_sizes, enabled=native_batch_prefill, batch_prefill=batch_prefill, context=max_gen_tokens,
-            minimum=4, static=static_models, embeddings=extract_embeddings,
-            split_head=edit_args.get("split_lm_head", False), read_only=read_only_kv_cache,
-            individual=keep_individual_kv_io,
-            unsupported=dynamic_quantize or convert_dtypes or model_dtype != "fp32" or model_size != "230m" or edit_args.get("keep_conv1d", False) or edit_args.get("simulate_bf16", False) or edit_args.get("chunk_lm_head", False),
-        )
-        if read_only_kv_cache and keep_individual_kv_io:
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O; "
-                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
-            )
-        self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
-        self._read_only_kv_cache = read_only_kv_cache
-        self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._model_size = model_size
         self._hf_repo = HF_REPO_BASE[model_size]
@@ -148,23 +129,47 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # apply to every component independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
         self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
+        unsupported = (dynamic_quantize or convert_dtypes or model_dtype != "fp32" or model_size != "230m"
+                       or edit_args.get("keep_conv1d", False) or edit_args.get("simulate_bf16", False)
+                       or edit_args.get("chunk_lm_head", False))
+        super().__init__(
+            "fp32",
+            static_models,
+            None,
+            # Nest all artifacts under a per-model subdir (like gemma3 nests
+            # under its HF-repo dir). This must match download_source.py's
+            # `<models-dir>/liquid-2p5-<size>/` layout so a pre-fetched source
+            # is reused instead of re-downloaded, and matches the README paths.
+            Path(models_dir) / f"liquid-2p5-{model_size}",
+            show_model_info=show_model_info,
+            dynamic_quantize=dynamic_quantize,
+            convert_dtypes=convert_dtypes,
+            split_weights=split_weights,
+            # LFM2's custom ops break the ORT bert optimizer; skip it.
+            opt_configs={},
+            max_gen_tokens=max_gen_tokens,
+            extract_embeddings=extract_embeddings,
+            split_lm_head=self._split_lm_head,
+            read_only_kv_cache=read_only_kv_cache,
+            keep_individual_kv_io=keep_individual_kv_io,
+            batch_prefill=batch_prefill,
+            native_batch_prefill=native_batch_prefill,
+            batch_prefill_sizes=batch_prefill_sizes,
+            native_minimum=4,
+            native_unsupported=unsupported,
+            native_supported="LFM2.5 230M only, with FP32 weights and --no-read-only-kv-cache; "
+                             "explicit dtype conversion, convolution overrides and topology "
+                             "splitting are unsupported",
+        )
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
-        if batch_prefill is not None:
-            if batch_prefill < 1:
-                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
-            if batch_prefill > max_gen_tokens:
-                raise ValueError(
-                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
-                )
-            if not self._split_lm_head:
-                raise ValueError(
-                    "`--batch-prefill` requires `--split-lm-head` "
-                    "(disable the prefill export with `--batch-prefill 0`)"
-                )
-            if not static_models:
-                raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
-        self._batch_prefill = batch_prefill
+        if read_only_kv_cache and keep_individual_kv_io:
+            raise ValueError(
+                "`--read-only-kv-cache` needs the combined KV cache I/O; "
+                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
+            )
+        if self._batch_prefill is not None and not static_models:
+            raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
 
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
@@ -191,23 +196,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._layer_types = tuple(self._config_dict["layer_types"])
         self._num_hidden_layers = int(self._config_dict["num_hidden_layers"])
         self._cfg_path = cfg_path
-
-        super().__init__(
-            "fp32",
-            static_models,
-            self._config_dict,
-            # Nest all artifacts under a per-model subdir (like gemma3 nests
-            # under its HF-repo dir). This must match download_source.py's
-            # `<models-dir>/liquid-2p5-<size>/` layout so a pre-fetched source
-            # is reused instead of re-downloaded, and matches the README paths.
-            Path(models_dir) / f"liquid-2p5-{model_size}",
-            show_model_info=show_model_info,
-            dynamic_quantize=dynamic_quantize,
-            convert_dtypes=convert_dtypes,
-            split_weights=split_weights,
-            # LFM2's custom ops break the ORT bert optimizer; skip it.
-            opt_configs={},
-        )
+        self._config = self._config_dict
 
     def _setup_dirs(self) -> list[Path]:
         if self._onnx_source_dir is not None:
@@ -1808,10 +1797,8 @@ def export_liquid_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    if args.native_batch_prefill and (not args.skip_torq or args.batch_prefill_sizes is None):
-        from ...model_export.prefill import check_native_compiler, native_compile_flags
-        check_native_compiler(args.compiler_path)
-        native_compile_flags(args.compile_flags or [])
+    from ...model_export.prefill import check_native_cli_args
+    check_native_cli_args(args)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:
