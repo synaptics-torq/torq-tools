@@ -269,6 +269,7 @@ def add_decoder_args(
             default=True,
             help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states (default: %(default)s)"
         )
+    group = None
     if batch_prefill:
         group = parser.add_mutually_exclusive_group()
         group.add_argument(
@@ -281,16 +282,21 @@ def add_decoder_args(
             help="Also export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
         )
 
-        if native_batch_prefill:
-            from ..model_export.prefill import parse_native_sizes
-            group.add_argument(
-                "--native-batch-prefill", action="store_true",
-                help="Opt in to an experimental shared decoder family (incompatible with --batch-prefill)",
-            )
-            parser.add_argument(
-                "--batch-prefill-sizes", type=parse_native_sizes, default=None, metavar="B1,B2,...",
-                help="Native prefill sizes in ascending order; requires --native-batch-prefill (default: probe automatically)",
-            )
+    if native_batch_prefill:
+        # Exporters without a legacy prefill builder (smollm2) expose the
+        # native flags only: the legacy --batch-prefill flag would be inert
+        # and its default-64 would fail the base's split-head check.
+        if group is None:
+            group = parser.add_mutually_exclusive_group()
+        from ..model_export.prefill import parse_native_sizes
+        group.add_argument(
+            "--native-batch-prefill", action="store_true",
+            help="Opt in to an experimental shared decoder family (incompatible with --batch-prefill)",
+        )
+        parser.add_argument(
+            "--batch-prefill-sizes", type=parse_native_sizes, default=None, metavar="B1,B2,...",
+            help="Native prefill sizes in ascending order; requires --native-batch-prefill (default: probe automatically)",
+        )
 
 
 def add_llm_args(

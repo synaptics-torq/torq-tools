@@ -38,6 +38,10 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         static_models: bool = True,
         *,
         max_gen_tokens: int = 64,
+        batch_prefill: int | None = None,
+        native_batch_prefill: bool = False,
+        batch_prefill_sizes: tuple[int, ...] | None = None,
+        split_lm_head: bool = False,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -82,7 +86,36 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             opt_configs={"model": ORTOptimizerConfig(
                 num_heads=self._config.num_attention_heads,
                 hidden_size=self._config.hidden_size
-            )}
+            )},
+            max_gen_tokens=max_gen_tokens,
+            extract_embeddings=extract_embeddings,
+            split_lm_head=split_lm_head,
+            read_only_kv_cache=read_only_kv_cache,
+            keep_individual_kv_io=keep_individual_kv_io,
+            batch_prefill=batch_prefill,
+            native_batch_prefill=native_batch_prefill,
+            batch_prefill_sizes=batch_prefill_sizes,
+            native_minimum=4,
+            native_supports_read_only=True,
+            native_unsupported=(
+                model_size not in ("135M", "360M")
+                or dynamic_quantize
+                or convert_dtypes
+                or split_weights
+                or not read_only_kv_cache
+            ),
+            native_supported=(
+                "SmolLM2 135M and 360M only, with FP32 weights, "
+                "--extract-embeddings, --split-lm-head and --read-only-kv-cache; "
+                "1.7B, dynamic quantization, dtype conversion and "
+                "--split-weights are unsupported"
+            ),
+            # 30/32 layers make this the deepest native family: the read-only
+            # attention past/new split's FP32 reduction-order noise amplifies
+            # through the residual stack to ~1e-3 at maximum history depth
+            # (taps verified the attention itself matches sequential decode
+            # to <1e-6), so the gate uses a wider rtol.
+            native_validation_rtol=1e-3,
         )
 
     def _setup_dirs(self) -> list[Path]:
@@ -125,10 +158,10 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
     def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
         make_static = [EditSpec("RemoveIsNaN")]
         make_static_kv = [
-            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"))),
-            EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"))),
+            EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
+            EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len"))),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
-            EditSpec("ConvertToStaticIndex"),
+            EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
         ]
         patch = [
             EditSpec("EliminateTranspose"),
@@ -138,6 +171,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 self._config.num_attention_heads,
                 self._config.num_key_value_heads,
                 self._config.hidden_size // self._config.num_attention_heads,
+                ctx("chunk_len"),
             )),
         ]
         if self._broadcast_ops is not None:
@@ -154,7 +188,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         }
 
     def _make_model_static(
-        self, model: onnx.ModelProto
+        self, model: onnx.ModelProto, chunk_len: int = 1
     ) -> onnx.ModelProto:
         """
         Make model static by replacing dynamic dimensions with fixed values and applying necessary transformations.
@@ -182,7 +216,14 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component("model")),
         )
-        editor.fix_io(self._max_gen_tokens)
+        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
+        # The chunk's queries span start..start+B-1; decode is the single start.
+        # Fail closed: a chunk whose rotary chain was not recognized would
+        # export wrong positions that only the ORT gate could catch.
+        if chunk_len > 1 and not editor.fix_native_rotary_positions(chunk_len):
+            raise ValueError(
+                "SmolLM2 native chunk: the rotary position chain was not recognized"
+            )
 
         blocks = self.graph_edit_blocks()
         # Remove isNaN ops
@@ -208,13 +249,14 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 "cur_len": cur_len,
                 "max_tokens": self._max_gen_tokens,
                 "export_dtype": self._onnx_export_dtype,
+                "chunk_len": chunk_len,
             },
         )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         return new_model
 
-    def _patch_static_model(self, model_path: str | os.PathLike):
+    def _patch_static_model(self, model_path: str | os.PathLike, component: str = "model"):
         model = load_onnx_lazy(model_path)
         editor = SmolLM2OnnxGraphEditor.from_onnx(
             model,
@@ -222,11 +264,20 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             **self._editor_dump_kwargs(Path(model_path)),
         )
 
+        # Native prefill chunks carry B tokens; decode is the single-token body.
+        chunk_len = (
+            int(component.removeprefix("model_prefill_"))
+            if component.startswith("model_prefill_")
+            else 1
+        )
+
         embeddings_npy = Path(model_path).parent / "token_embeddings.npy"
         editor.apply_specs(
             self.graph_edit_blocks()["model.patch"],
             self._harness,
-            {"embeddings_path": embeddings_npy},
+            # The chunk reuses decode's extracted table; only decode saves it.
+            {"embeddings_path": embeddings_npy if component == "model" else None,
+             "chunk_len": chunk_len},
         )
 
         if self._extract_embeddings:
@@ -244,7 +295,19 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                     self._config.num_attention_heads,
                     self._config.num_key_value_heads,
                     self._config.hidden_size // self._config.num_attention_heads,
+                    chunk_len,
                 )
+
+        if self._split_lm_head:
+            if component == "model":
+                lm_head_path = Path(model_path).parent / "lm_head.onnx"
+                editor.split_lm_head(lm_head_path)
+                self._export_paths["lm_head"] = lm_head_path
+            else:
+                # The chunk reuses decode's lm_head.onnx: cut the graph at the
+                # head and keep the last token's hidden row for the family ABI.
+                editor.split_lm_head(None)
+                editor.take_last_token_hidden(chunk_len)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         self._save_component_model(new_model, model_path)
@@ -254,8 +317,23 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._components["model"] = self.check_model(self._components["model"])
         self._components["model"] = self._make_model_static(self._components["model"])
 
-    def apply_post_static_patches(self, model_path: str | os.PathLike, _):
-        self._patch_static_model(model_path)
+    def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
+        components = {}
+        source_model = self._load_onnx()["model"]
+        for size in self._native_batch_prefill:
+            self._logger.info(
+                "(model_prefill_%d) Making graph static with %d tokens...",
+                size,
+                size,
+            )
+            components[f"model_prefill_{size}"] = self._make_model_static(
+                source_model,
+                chunk_len=size,
+            )
+        return components
+
+    def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
+        self._patch_static_model(model_path, component)
         self._copy_runtime_assets(
             Path(model_path).parent,
             self._onnx_dir,
@@ -274,6 +352,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             instruct_model=self._instruct_model,
             repo_id=self._hf_repo,
             n_iters=n_iters,
+            lm_head_path=self._export_paths.get("lm_head"),
         )
 
     def convert_models(
@@ -298,6 +377,11 @@ def export_smollm2_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
+        # SmolLM2 has no legacy prefill builder: the shared --batch-prefill
+        # flag is not registered for it, so there is nothing to forward.
+        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill_sizes=args.batch_prefill_sizes,
+        split_lm_head=args.split_lm_head,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
@@ -312,6 +396,8 @@ def export_smollm2_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
+    from ...model_export.prefill import check_native_cli_args
+    check_native_cli_args(args)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(

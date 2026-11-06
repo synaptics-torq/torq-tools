@@ -23,6 +23,16 @@ def add_smollm2_export_args(parser: argparse.ArgumentParser):
         default_model_size=DEFAULT_MODEL_SIZE,
         max_gen_tokens=DEFAULT_GEN_TOKENS,
         instruct=True,
+        native_batch_prefill=True,
+    )
+    # Deliberate CLI exception to the other models' default-True: enabling it
+    # by default would rename every existing SmolLM2 export's artifacts and
+    # break the current runners/demos (council-7, OD11a).
+    parser.add_argument(
+        "--split-lm-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Split the final LM head into lm_head.onnx; the model then outputs hidden states (default: %(default)s)",
     )
     add_onnx_args(
         parser,

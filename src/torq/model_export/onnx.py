@@ -103,6 +103,8 @@ class OnnxModelExporterBase(ABC):
         native_supports_read_only: bool = False,
         native_unsupported: bool = False,
         native_supported: str = "",
+        native_validation_rtol: float = 1e-4,
+        native_validation_atol: float = 1e-4,
     ):
         self._logger = logging.getLogger(self.__class__.__name__)
         # The batch-prefill option handling lives here, before any subclass
@@ -119,6 +121,11 @@ class OnnxModelExporterBase(ABC):
             supports_read_only=native_supports_read_only, unsupported=native_unsupported,
             supported=native_supported,
         )
+        # Deeper stacks accumulate more FP32 reduction-order noise from the
+        # read-only past/new attention split; a model may pass a wider
+        # validation tolerance. The default is unchanged for every family.
+        self._native_validation_rtol = native_validation_rtol
+        self._native_validation_atol = native_validation_atol
         if batch_prefill is not None:
             if batch_prefill < 1:
                 raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
@@ -438,7 +445,8 @@ class OnnxModelExporterBase(ABC):
             key: self._export_path_for_component(key) for key in self._export_paths
         })
         if validate:
-            validate_native_onnx(base_paths, contract=self._native_family_contract(base_paths[1]))
+            validate_native_onnx(base_paths, contract=self._native_family_contract(base_paths[1]),
+                                 rtol=self._native_validation_rtol, atol=self._native_validation_atol)
         share_native_weights(base_paths.values())
         return components
 
@@ -452,7 +460,8 @@ class OnnxModelExporterBase(ABC):
         paths = self._native_family_paths()
         if validate:
             from .prefill import validate_native_onnx
-            validate_native_onnx(paths, contract=self._native_family_contract(paths[1]))
+            validate_native_onnx(paths, contract=self._native_family_contract(paths[1]),
+                                 rtol=self._native_validation_rtol, atol=self._native_validation_atol)
         share_native_weights(paths.values())
 
     def _editor_dump_kwargs(self, final_path: Path) -> dict:

@@ -6,7 +6,7 @@ Hardware native VMFB execution is provided by `torq-examples` through `torq.runt
 
 ## Export and compile
 
-Use the torq-tools native export workflow for Gemma3 270M IT, FunctionGemma 270M, FP32 LFM2.5 230M/350M, or Qwen3-0.6B / Qwen2.5-0.5B-Instruct with FP32 or INT4 weights. For example, from the torq-tools environment:
+Use the torq-tools native export workflow for Gemma3 270M IT, FunctionGemma 270M, FP32 LFM2.5 230M/350M, Qwen3-0.6B / Qwen2.5-0.5B-Instruct with FP32 or INT4 weights, or FP32 SmolLM2 135M/360M. For example, from the torq-tools environment:
 
 ```sh
 torq-export-model gemma3 --instruct-model \
@@ -24,7 +24,7 @@ The unquantized tools export remains FP32; compiler dtype conversion produces BF
 
 Native Gemma3 FP32 exports with legacy full-cache I/O retain constant-load prefetch; stream scheduling shrinks their shared weight tiles and regresses throughput. INT4 and read-only-cache exports retain the model’s stream-schedule default. Explicit `--compile-flags` still override these defaults.
 
-Static shapes, extracted embeddings, a split language model head and combined KV state are required. Sizes must be unique, strictly ascending and fit the context. Gemma3 supports FP32 or INT4 weights and either cache layout. LFM2.5 sizes must be at least four and require FP32 weights with full-cache outputs. Qwen sizes must be at least four and require the read-only cache with FP32 or INT4 weights; INT4 needs explicit `--batch-prefill-sizes` because automatic probing only covers the FP32 family. Dynamic quantization, explicit dtype conversion, sliding-window execution, vision and arbitrary layer splitting need separate support.
+Static shapes, extracted embeddings, a split language model head and combined KV state are required. Sizes must be unique, strictly ascending and fit the context. Gemma3 supports FP32 or INT4 weights and either cache layout. LFM2.5 sizes must be at least four and require FP32 weights with full-cache outputs. Qwen sizes must be at least four and require the read-only cache with FP32 or INT4 weights; INT4 needs explicit `--batch-prefill-sizes` because automatic probing only covers the FP32 family. SmolLM2 sizes must be at least four and require FP32 weights with the read-only cache; `--split-lm-head` is opt-in there (its exports keep the head in-graph by default). Dynamic quantization, explicit dtype conversion, sliding-window execution, vision and arbitrary layer splitting need separate support.
 
 Native compilation requires supplied-family support and a matching runtime with version-3 entry tables. The exporter supplies the compiler options; the hardware runners in `torq-examples` choose the exported functions through `torq.runtime`.
 

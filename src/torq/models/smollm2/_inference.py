@@ -180,6 +180,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        lm_head: InferenceRunner | None = None,
     ):
         repo_id = repo_id or _default_repo_id(instruct_model)
         if config_path is None:
@@ -196,6 +197,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
             DEFAULT_SYS_PROMPT if instruct_model else None,
             combined_kv_io=combined_kv_io,
             token_embeddings=self._find_token_embeddings(model.model_path),
+            lm_head=lm_head,
         )
 
     @classmethod
@@ -210,6 +212,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Static":
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
@@ -220,6 +223,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
+            lm_head=ORTInferenceRunner(lm_head_path, n_threads=n_threads) if lm_head_path is not None else None,
         )
 
     @classmethod
@@ -234,6 +238,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
+        lm_head_path: str | os.PathLike | None = None,
     ) -> "SmolLM2Static":
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
@@ -244,6 +249,7 @@ class SmolLM2Static(SmolLM2Base, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
+            lm_head=VMFBInferenceRunner(lm_head_path, n_threads=n_threads) if lm_head_path is not None else None,
         )
 
     @staticmethod

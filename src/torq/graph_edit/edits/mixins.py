@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import numpy as np
+import onnx_graphsurgeon as gs
+
 from .arithmetic import (
     DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
@@ -156,6 +159,52 @@ class CommonGraphEditsMixin:
     def split_lm_head(self, save_to, output_name="logits", hidden_states_name="last_hidden_states"):
         self.apply_edit(SplitLMHead(self._graph, self._graph_name, save_to, output_name, hidden_states_name))
         return self
+
+    def take_last_token_hidden(self, chunk_len: int) -> bool:
+        """
+        Slice the chunk's ``last_hidden_states`` output to its last token row.
+
+        Decode emits the single token's hidden state; a prefill chunk emits all
+        ``chunk_len`` rows, and the family ABI keeps the last token's
+        ``[1, 1, D]`` so the split LM head can run unchanged.
+
+        Returns:
+            True when the output was sliced.
+        """
+
+        if chunk_len <= 1:
+            return False
+
+        output = next(
+            (t for t in self.graph.outputs if t.name == "last_hidden_states"),
+            None,
+        )
+        if output is None:
+            raise ValueError("expected a 'last_hidden_states' graph output")
+
+        output.name = "chunk_hidden_states"
+        hidden = self.graph.layer(
+            name="last_hidden_states_last_token",
+            op="Slice",
+            inputs=[
+                output,
+                np.array([chunk_len - 1], dtype=np.int64),
+                np.array([chunk_len], dtype=np.int64),
+                np.array([1], dtype=np.int64),
+            ],
+            outputs=[gs.Variable(
+                "last_hidden_states",
+                dtype=output.dtype or np.float32,
+                shape=[1, 1, output.shape[-1] if output.shape else None],
+            )],
+        )[0]
+
+        index = self.graph.outputs.index(output)
+        self.graph.outputs[index] = hidden
+
+        self._logger.info("Sliced the chunk hidden output to its last token")
+
+        return True
 
     def eliminate_rank0_gather(self):
         self.apply_edit(EliminateRank0Gather(self._graph, self._graph_name))

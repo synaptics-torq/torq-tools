@@ -1214,3 +1214,192 @@ def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypat
         check_compiler.assert_called_once_with(Path("/selected/compiler"))
     else:
         check_compiler.assert_not_called()
+
+
+# --- SmolLM2 onboarding ------------------------------------------------------
+
+@pytest.mark.parametrize("size", [4, 7])
+def test_smollm2_native_rotary_positions_match_sequential_tokens(size):
+    import onnx_graphsurgeon as gs
+    import onnxruntime as ort
+    from torq.models.smollm2._graph import SmolLM2OnnxGraphEditor
+
+    heads, width = 3, 4  # D/2 = 2
+
+    def rotary_graph(seq):
+        freq = numpy_helper.from_array(np.random.default_rng(1).normal(size=(1, width // 2, 1)).astype(np.float32), "freq")
+        axes = numpy_helper.from_array(np.array([1], np.int64), "axes")
+        return h.make_model(h.make_graph([
+            h.make_node("Unsqueeze", ["position_ids", "axes"], ["position_3d"]),
+            h.make_node("Cast", ["position_3d"], ["position"], to=T.FLOAT),
+            h.make_node("MatMul", ["freq", "position"], ["angles"], name="rotary_emb/MatMul"),
+            h.make_node("Concat", ["angles", "angles"], ["angles_cat"], axis=1),
+            h.make_node("Transpose", ["angles_cat"], ["angles_t"], perm=[0, 2, 1]),
+            h.make_node("Cos", ["angles_t"], ["cos"]),
+            h.make_node("Unsqueeze", ["cos", "axes"], ["cos_b"]),
+            h.make_node("Mul", ["q", "cos_b"], ["rot"]),
+        ], "/model", [
+            h.make_tensor_value_info("q", T.FLOAT, [1, heads, seq, width]),
+            h.make_tensor_value_info("position_ids", T.INT64, [1, 1]),
+        ], [h.make_tensor_value_info("rot", T.FLOAT, [1, heads, seq, width])], [freq, axes]))
+
+    rng = np.random.default_rng(3)
+    reference = ort.InferenceSession(rotary_graph(1).SerializeToString())
+    chunk_model = rotary_graph(size)
+    # fix_io(chunk_len) sets the sequence_length dim of position_ids to B;
+    # the edit must restore the ABI start position [1, 1].
+    dims = chunk_model.graph.input[1].type.tensor_type.shape.dim
+    dims[1].dim_value = size
+    editor = SmolLM2OnnxGraphEditor(gs.import_onnx(chunk_model))
+    assert editor.fix_native_rotary_positions(size)
+    assert list(editor.graph.inputs[1].shape) == [1, 1]
+    chunk = ort.InferenceSession(editor.to_onnx().SerializeToString())
+
+    query = rng.normal(size=(1, heads, size, width)).astype(np.float32)
+    for start in (0, 5):
+        expected = np.concatenate(
+            [reference.run(["rot"], {"q": query[:, :, offset:offset + 1],
+                                     "position_ids": np.array([[start + offset]], dtype=np.int64)})[0]
+             for offset in range(size)],
+            axis=2,
+        )
+        actual = chunk.run(["rot"], {"q": query, "position_ids": np.array([[start]], dtype=np.int64)})[0]
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    decode = SmolLM2OnnxGraphEditor(gs.import_onnx(rotary_graph(1)))
+    assert not decode.fix_native_rotary_positions(1)
+
+
+def test_smollm2_native_gates_supported_configs():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    from torq.models.smollm2 import export as smollm2_export
+    from torq.models.smollm2.export import SmolLM2ModelExporter
+
+    config = SimpleNamespace(hidden_size=576, vocab_size=49152, num_attention_heads=9, num_key_value_heads=3)
+    def construct(**overrides):
+        options = dict(
+            static_models=True,
+            max_gen_tokens=256,
+            extract_embeddings=True,
+            split_lm_head=True,
+            read_only_kv_cache=True,
+            batch_prefill=None,
+            native_batch_prefill=True,
+            batch_prefill_sizes=(4, 12),
+        )
+        options.update(overrides)
+        return SmolLM2ModelExporter(**options)
+
+    with patch.object(smollm2_export, "_repo_id_for_size", return_value="repo"), \
+         patch.object(smollm2_export.AutoConfig, "from_pretrained", return_value=config):
+        # OD4: 135M and 360M in; 1.7B out.
+        for model_size in ("135M", "360M"):
+            exporter = construct(model_size=model_size)
+            assert exporter._native_batch_prefill == (4, 12)
+        for override in (dict(model_size="1.7B"), dict(dynamic_quantize=True),
+                         dict(convert_dtypes=True), dict(split_weights=True),
+                         dict(read_only_kv_cache=False)):
+            with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+                construct(**override)
+        # Sizes without the native flag fail before any source loading.
+        with pytest.raises(ValueError, match="requires --native-batch-prefill"):
+            construct(native_batch_prefill=False, batch_prefill_sizes=(4, 12))
+
+
+def test_smollm2_split_lm_head_defaults_off():
+    import argparse
+    from torq.models.smollm2 import add_smollm2_export_args
+
+    parser = argparse.ArgumentParser()
+    add_smollm2_export_args(parser)
+    defaults = parser.parse_args([])
+    assert defaults.split_lm_head is False
+    assert defaults.native_batch_prefill is False
+    # No legacy prefill builder: the inert --batch-prefill flag is not
+    # registered, so plain runs cannot trip the base's split-head check.
+    assert not hasattr(defaults, "batch_prefill")
+    gate = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,12", "--split-lm-head"])
+    assert gate.split_lm_head is True and gate.batch_prefill_sizes == (4, 12)
+
+
+def test_smollm2_static_runner_wires_the_split_lm_head(tmp_path, monkeypatch):
+    import json
+    from unittest.mock import Mock
+    import torq.models.smollm2._inference as smollm2_inf
+
+    config = {"num_hidden_layers": 2, "num_key_value_heads": 1, "hidden_size": 8,
+              "num_attention_heads": 2, "bos_token_id": 1, "eos_token_id": 2,
+              "pad_token_id": 3}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    model_runner = Mock()
+    model_runner.model_path = tmp_path / "model.onnx"
+    model_runner.input_shapes = {}
+    head_runner = Mock()
+    monkeypatch.setattr(smollm2_inf, "ORTInferenceRunner",
+                        Mock(side_effect=[model_runner, head_runner]))
+
+    class _FakeTokenizer:
+        def encode(self, text, **kwargs):
+            class _Encoded:
+                ids = [1]
+            return _Encoded()
+
+        def decode(self, ids, **kwargs):
+            return "<tok>"
+
+    monkeypatch.setattr(smollm2_inf, "_load_tokenizer", Mock(return_value=_FakeTokenizer()))
+    monkeypatch.setattr(smollm2_inf, "_hf_hub_download", Mock(return_value=str(config_path)))
+    monkeypatch.setattr(smollm2_inf.SmolLM2Static, "_find_token_embeddings", Mock(return_value=None))
+
+    split = smollm2_inf.SmolLM2Static.from_onnx(
+        tmp_path / "model.onnx", 16, lm_head_path=tmp_path / "lm_head.onnx")
+    assert split._lm_head is head_runner
+    assert split._lm_head.infer.called is False  # wired, not invoked here
+
+    smollm2_inf.ORTInferenceRunner.reset_mock()
+    smollm2_inf.ORTInferenceRunner.side_effect = [model_runner]
+    plain = smollm2_inf.SmolLM2Static.from_onnx(tmp_path / "model.onnx", 16)
+    assert plain._lm_head is None
+    assert smollm2_inf.ORTInferenceRunner.call_count == 1
+
+
+
+def test_native_validation_tolerance_defaults_and_override():
+    import inspect
+    import torq.model_export.prefill as prefill
+    from unittest.mock import Mock, patch
+    from torq.model_export.onnx import OnnxModelExporterBase
+    from torq.models.smollm2.export import SmolLM2ModelExporter
+
+    # The shared default is unchanged (1e-4/1e-4).
+    signature = inspect.signature(OnnxModelExporterBase.__init__)
+    assert signature.parameters["native_validation_rtol"].default == 1e-4
+    assert signature.parameters["native_validation_atol"].default == 1e-4
+
+    calls = []
+    def record_validate(paths, *, contract, rtol=1e-4, atol=1e-4):
+        calls.append((rtol, atol))
+    with patch.object(prefill, "validate_native_onnx", record_validate), \
+         patch.object(prefill, "share_native_weights", lambda *a: None):
+        stub = SmolLM2ModelExporter.__new__(SmolLM2ModelExporter)
+        stub._native_prefill_enabled = True
+        stub._native_batch_prefill = (4,)
+        stub._native_validation_rtol = 1e-3
+        stub._native_validation_atol = 1e-4
+        stub._export_dir = None
+        stub._export_paths = {"model": "m"}
+        stub._export_path_for_component = lambda key: f"{key}.onnx"
+        stub._components = {}
+        stub._opt_configs = {}
+        stub._make_native_prefill = lambda: {"model_prefill_4": None}
+        stub._export_components = lambda comps, **kw: stub._export_paths.update(
+            {k: f"{k}.onnx" for k in comps})
+        stub._native_family_paths = lambda paths=None: {1: "m", 4: "model_prefill_4.onnx"}
+        stub._native_family_contract = lambda path=None: None
+        stub._complete_native_prefill(validate=True)
+        calls.clear()
+        stub._settle_native_family(validate=True)
+    assert calls == [(1e-3, 1e-4)]
