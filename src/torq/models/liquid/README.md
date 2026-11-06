@@ -227,8 +227,8 @@ the chunked runner against the unedited dynamic source ONNX.
 
 ### Experimental native batch prefill
 
-LFM2.5 230M supports opt-in native static families with `--native-batch-prefill`. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context. 
-**NOTE:** Vision models and LFM2.5 350M are outside this native path; ordinary separate-prefill exports remain available.
+LFM2.5 230M and 350M support opt-in native static families with `--native-batch-prefill`. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context.
+**NOTE:** Vision models are outside this native path; ordinary separate-prefill exports remain available.
 
 The supported depthwise convolution has kernel size three, stride/dilation one, no padding or bias, and channel-major three-token state. Native chunks retain token-major activations and use one broadcast MatMul per convolution block; the history ABI remains `[1,D,3]`, oldest first.
 

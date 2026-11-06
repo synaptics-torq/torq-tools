@@ -129,7 +129,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # apply to every component independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
         self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
-        unsupported = (dynamic_quantize or convert_dtypes or model_dtype != "fp32" or model_size != "230m"
+        unsupported = (dynamic_quantize or convert_dtypes or model_dtype != "fp32"
                        or edit_args.get("keep_conv1d", False) or edit_args.get("simulate_bf16", False)
                        or edit_args.get("chunk_lm_head", False))
         super().__init__(
@@ -157,9 +157,10 @@ class LiquidModelExporter(OnnxModelExporterBase):
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
             native_unsupported=unsupported,
-            native_supported="LFM2.5 230M only, with FP32 weights and --no-read-only-kv-cache; "
-                             "explicit dtype conversion, convolution overrides and topology "
-                             "splitting are unsupported",
+            native_supported="LFM2.5 230M or 350M only, with FP32 weights and "
+                             "--no-read-only-kv-cache; explicit dtype conversion, "
+                             "convolution overrides and topology splitting are "
+                             "unsupported",
         )
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
@@ -1115,6 +1116,28 @@ class LiquidModelExporter(OnnxModelExporterBase):
         return result, replaced
 
     @staticmethod
+    def _fold_static_attention_mask(graph: gs.Graph) -> int:
+        """Fold a residual all-ones attention_mask input into a constant.
+
+        The LFM2.5-350M shared convolution slices attention_mask into a
+        history-validity window; static exports always run with a full
+        (all-ones) mask, so the input becomes a constant and drops out of
+        the graph I/O. Models without such a chain (230M) are untouched.
+        """
+        mask = graph.tensors().get("attention_mask")
+        if mask is None or not mask.outputs:
+            return 0
+        mask_const = gs.Constant(
+            "attention_mask", np.ones(mask.shape, dtype=mask.dtype)
+        )
+        for consumer in list(mask.outputs):
+            for index, tensor in enumerate(consumer.inputs):
+                if tensor is mask:
+                    consumer.inputs[index] = mask_const
+        graph.inputs = [t for t in graph.inputs if t is not mask]
+        return 1
+
+    @staticmethod
     def _conv_matmul_names(model: onnx.ModelProto, conv_l_cache: int) -> list[str]:
         """Names of the MatMul nodes the conv1d replacement emitted.
 
@@ -1325,6 +1348,8 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 )
 
         editor.reorder_graph_input("position_ids", 1)
+        if self._fold_static_attention_mask(editor.graph):
+            self._logger.info("(model) Folded all-ones attention_mask input to a constant")
         new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=False)
         # Re-run shape inference + iteratively fold residual Shape ops so
         # intermediate dims are concrete integers, not dim_param symbols.
@@ -1411,6 +1436,16 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 chunk_len=self._batch_prefill,
             )
 
+
+    def _native_family_contract(self, path=None):
+        # The 350M shared convolution folds its attention-mask history window
+        # to a per-entry all-ones literal whose shape depends on B, so it
+        # cannot be fingerprinted as a family parameter. Declared through the
+        # contract; a no-op on 230M, which has no such constant.
+        from dataclasses import replace
+
+        return replace(super()._native_family_contract(path),
+                       constant_roles={"/model/shared_conv/Mask_Unsqueeze_Last/output_0_folded": "control"})
 
     def _make_native_prefill(self):
         components = {}

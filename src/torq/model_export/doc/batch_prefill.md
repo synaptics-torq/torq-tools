@@ -6,7 +6,7 @@ Hardware native VMFB execution is provided by `torq-examples` through `torq.runt
 
 ## Export and compile
 
-Use the torq-tools native export workflow for Gemma3 270M IT, FunctionGemma 270M or FP32 LFM2.5 230M. For example, from the torq-tools environment:
+Use the torq-tools native export workflow for Gemma3 270M IT, FunctionGemma 270M or FP32 LFM2.5 230M/350M. For example, from the torq-tools environment:
 
 ```sh
 torq-export-model gemma3 --instruct-model \

@@ -546,6 +546,46 @@ def test_decoder_states_rejects_unknown_state_names():
         decoder_states(model, read_only=False)
 
 
+def test_fold_static_attention_mask_folds_input_to_ones_constant():
+    import onnx_graphsurgeon as gs
+    from torq.models.liquid.export import LiquidModelExporter
+
+    mask = gs.Variable("attention_mask", np.int64, [1, 4])
+    sliced = gs.Variable("sliced", np.int64, [1, 3])
+    casted = gs.Variable("casted", np.float32, [1, 3])
+    graph = gs.Graph(
+        inputs=[mask],
+        outputs=[casted],
+        nodes=[
+            gs.Node(op="Slice", name="Slice_Mask",
+                    inputs=[mask,
+                            gs.Constant("s", np.array([1], dtype=np.int64)),
+                            gs.Constant("e", np.array([4], dtype=np.int64)),
+                            gs.Constant("a", np.array([1], dtype=np.int64))],
+                    outputs=[sliced]),
+            gs.Node(op="Cast", name="Mask_Cast", inputs=[sliced], outputs=[casted],
+                    attrs={"to": 1}),
+        ],
+        opset=18,
+    )
+    assert LiquidModelExporter._fold_static_attention_mask(graph) == 1
+    assert "attention_mask" not in [t.name for t in graph.inputs]
+    folded = next(n for n in graph.nodes if n.name == "Slice_Mask").inputs[0]
+    assert isinstance(folded, gs.Constant)
+    assert folded.values.dtype == np.int64
+    assert folded.values.shape == (1, 4) and (folded.values == 1).all()
+    exported = gs.export_onnx(graph)
+    assert not any(i.name == "attention_mask" for i in exported.graph.input)
+
+    x = gs.Variable("x", np.float32, [1])
+    y = gs.Variable("y", np.float32, [1])
+    plain = gs.Graph(inputs=[x], outputs=[y],
+                     nodes=[gs.Node(op="Identity", name="id", inputs=[x], outputs=[y])],
+                     opset=18)
+    assert LiquidModelExporter._fold_static_attention_mask(plain) == 0
+    assert [t.name for t in plain.inputs] == ["x"]
+
+
 def test_validate_rejects_state_count_mismatch(tmp_path):
     paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1, 4)}
     for b, path in paths.items():
