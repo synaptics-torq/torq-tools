@@ -115,16 +115,16 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
                     scatter_mask,
                     gs.Constant(
                         output.name + "_scatter_one",
-                        np.asarray(1, dtype=np.dtype(new_cache_val.dtype)),
+                        np.asarray(1, dtype=np.dtype(new_cache_val.dtype or output.dtype or past_cache_vals.dtype)),
                     ),
                     gs.Constant(
                         output.name + "_scatter_zero",
-                        np.asarray(0, dtype=np.dtype(new_cache_val.dtype)),
+                        np.asarray(0, dtype=np.dtype(new_cache_val.dtype or output.dtype or past_cache_vals.dtype)),
                     ),
                 ],
                 outputs=[gs.Variable(
                     output.name + "_scatter_weights_float",
-                    dtype=new_cache_val.dtype,
+                    dtype=new_cache_val.dtype or output.dtype or past_cache_vals.dtype,
                     shape=[1, 1, self.max_tokens, self.chunk_len],
                 )],
             )[0]
@@ -134,7 +134,7 @@ class ReplaceDynamicKVCache(OnnxGraphEdit):
                 inputs=[scatter_weights, new_cache_val],
                 outputs=[gs.Variable(
                     output.name + "_placed_new",
-                    dtype=new_cache_val.dtype,
+                    dtype=new_cache_val.dtype or output.dtype or past_cache_vals.dtype,
                     shape=list(past_cache_vals.shape),
                 )],
             )[0]
@@ -693,13 +693,13 @@ class GroupQueryHeads(OnnxGraphEdit):
     ``[1, heads, S, D]`` (Unsqueeze -> Expand -> Reshape) and applies half of
     the softmax scale to the expanded K. This rewrites the layer to::
 
-        Qg = Reshape(Q * (q_scale * k_scale), [1, kv, heads / kv, D])
-        O  = Softmax(Qg @ Transpose(K) + mask) @ V      # [1, kv, heads/kv, D]
-        O  = Reshape(O, [1, heads, 1, D])
+        Qg = Reshape(Q * (q_scale * k_scale), [1, kv, heads / kv * T, D])
+        O  = Softmax(Qg @ Transpose(K) + mask) @ V      # [1, kv, heads/kv * T, D]
+        O  = Reshape(O, [1, heads, T, D])
 
     Query head ``h`` maps to KV group ``h // (heads / kv)``, matching HF's
-    ``repeat_kv``. This removes the per-step copy and scale of the full cache.
-    Valid for single-token decode only.
+    ``repeat_kv``. Decode uses ``T = 1``; a prefill chunk passes its token count
+    as ``chunk_len``.
 
     Args:
         num_heads (int): Number of query heads
@@ -710,6 +710,12 @@ class GroupQueryHeads(OnnxGraphEdit):
     num_heads: int
     num_kv_heads: int
     head_dim: int
+    chunk_len: int = 1
+
+    def __post_init__(self):
+        if self.chunk_len < 1:
+            raise ValueError("chunk_len must be positive")
+        return super().__post_init__()
 
     @staticmethod
     def _unrepeated(tensor: gs.Tensor, *ops: str) -> gs.Tensor | None:
@@ -746,6 +752,7 @@ class GroupQueryHeads(OnnxGraphEdit):
         base = node.name.removesuffix("MatMul")
         heads, kv_heads, head_dim = self.num_heads, self.num_kv_heads, self.head_dim
         group = heads // kv_heads
+        tokens = group * self.chunk_len
         dtype = q.dtype or np.float32
 
         q_grouped = self.graph.layer(
@@ -756,11 +763,11 @@ class GroupQueryHeads(OnnxGraphEdit):
                     name=base + "GQA/QScale",
                     op="Mul",
                     inputs=[q, np.array(q_scale * k_scale, dtype=np.float32)],
-                    outputs=[gs.Variable(base + "GQA/q_scaled", dtype=dtype, shape=[1, heads, 1, head_dim])],
+                    outputs=[gs.Variable(base + "GQA/q_scaled", dtype=dtype, shape=[1, heads, self.chunk_len, head_dim])],
                 )[0],
-                np.array([1, kv_heads, group, head_dim], dtype=np.int64),
+                np.array([1, kv_heads, tokens, head_dim], dtype=np.int64),
             ],
-            outputs=[gs.Variable(base + "GQA/q", dtype=dtype, shape=[1, kv_heads, group, head_dim])],
+            outputs=[gs.Variable(base + "GQA/q", dtype=dtype, shape=[1, kv_heads, tokens, head_dim])],
         )[0]
         k_transposed = self.graph.layer(
             name=base + "GQA/KTranspose",
@@ -770,20 +777,20 @@ class GroupQueryHeads(OnnxGraphEdit):
             outputs=[gs.Variable(base + "GQA/k_t", dtype=dtype)],
         )[0]
 
-        # Scores [1, kv, group, S]; the [1, 1, 1, S] mask Add still broadcasts.
+        # Scores [1, kv, group * T, S]; the [1, 1, 1, S] mask Add still broadcasts.
         node.inputs = [q_grouped, k_transposed]
         for tensor in (node.outputs[0], mask_add.outputs[0], softmax.outputs[0]):
             tensor.shape = None
 
-        # Context [1, kv, group, D] -> [1, heads, 1, D] for the unchanged head merge.
+        # Context [1, kv, group * T, D] -> [1, heads, T, D] for the unchanged head merge.
         context_out = context.outputs[0]
-        grouped_out = gs.Variable(base + "GQA/context", dtype=dtype, shape=[1, kv_heads, group, head_dim])
+        grouped_out = gs.Variable(base + "GQA/context", dtype=dtype, shape=[1, kv_heads, tokens, head_dim])
         context.inputs = [context.inputs[0], v_cache]
         context.outputs = [grouped_out]
         self.graph.layer(
             name=base + "GQA/ContextReshape",
             op="Reshape",
-            inputs=[grouped_out, np.array([1, heads, 1, head_dim], dtype=np.int64)],
+            inputs=[grouped_out, np.array([1, heads, self.chunk_len, head_dim], dtype=np.int64)],
             outputs=[context_out],
         )
 

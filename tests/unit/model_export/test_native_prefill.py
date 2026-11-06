@@ -15,6 +15,7 @@ from torq.model_export.prefill import (
 )
 from torq.models.gemma3 import add_gemma3_export_args
 from torq.models.liquid import add_liquid_export_args
+from torq.models.qwen import add_qwen_export_args
 
 
 @pytest.mark.parametrize("value", ["", "1", "4,4", "7,4", "4,", "4, 7", "04,7", "-4", "4.0", "４"])
@@ -23,7 +24,7 @@ def test_invalid_sizes(value):
         parse_native_sizes(value)
 
 
-@pytest.mark.parametrize("add_args", [add_gemma3_export_args, add_liquid_export_args])
+@pytest.mark.parametrize("add_args", [add_gemma3_export_args, add_liquid_export_args, add_qwen_export_args])
 def test_cli_sizes_replace_default_without_accepting_explicit_legacy(add_args):
     parser = argparse.ArgumentParser()
     add_args(parser)
@@ -902,3 +903,314 @@ def test_automatic_compiler_check_preserves_previous_export(tmp_path, monkeypatc
     with pytest.raises(RuntimeError, match="compiler unavailable"):
         exporter.export_onnx()
     assert previous.read_bytes() == b"previous export"
+
+
+# --- Qwen onboarding ---------------------------------------------------------
+
+@pytest.mark.parametrize("size", [4, 7])
+def test_qwen_native_rotary_positions_match_sequential_tokens(size):
+    import onnx_graphsurgeon as gs
+    import onnxruntime as ort
+    from torq.models.qwen._graph import QwenOnnxGraphEditor
+
+    heads, width = 2, 4
+
+    def rotary_graph(query_shape):
+        freq_raw = numpy_helper.from_array(np.random.default_rng(1).normal(size=(1, width // 2, 1)).astype(np.float32), "freq_raw")
+        freq_shape = numpy_helper.from_array(np.array([1, width // 2, 1], np.int64), "freq_shape")
+        axes = numpy_helper.from_array(np.array([1], np.int64), "axis")
+        return h.make_model(h.make_graph([
+            h.make_node("Unsqueeze", ["position_ids", "axis"], ["position_3d"]),
+            h.make_node("Cast", ["position_3d"], ["position"], to=T.FLOAT),
+            h.make_node("Expand", ["freq_raw", "freq_shape"], ["freq_expanded"]),
+            h.make_node("Cast", ["freq_expanded"], ["freq"], to=T.FLOAT),
+            h.make_node("MatMul", ["freq", "position"], ["angles"], name="rotary_emb/MatMul"),
+            h.make_node("Transpose", ["angles"], ["angles_t"], perm=[0, 2, 1]),
+            h.make_node("Concat", ["angles_t", "angles_t"], ["both"], axis=-1),
+            h.make_node("Cos", ["both"], ["cos"]),
+            h.make_node("Unsqueeze", ["cos", "axis"], ["cos_b"]),
+            h.make_node("Mul", ["q", "cos_b"], ["rot"]),
+        ], "/model", [
+            h.make_tensor_value_info("q", T.FLOAT, query_shape),
+            h.make_tensor_value_info("position_ids", T.INT64, [1, 1]),
+        ], [h.make_tensor_value_info("rot", T.FLOAT, query_shape)], [freq_raw, freq_shape, axes]))
+
+    rng = np.random.default_rng(3)
+    reference = ort.InferenceSession(rotary_graph([1, heads, 1, width]).SerializeToString())
+    chunk_model = rotary_graph([1, heads, size, width])
+    editor = QwenOnnxGraphEditor(gs.import_onnx(chunk_model))
+    assert editor.fix_native_rotary_positions(size)
+    assert "Add" in {node.op for node in gs.import_onnx(editor.to_onnx()).nodes}
+    chunk = ort.InferenceSession(editor.to_onnx().SerializeToString())
+
+    query = rng.normal(size=(1, heads, size, width)).astype(np.float32)
+    for start in (0, 5):
+        expected = np.concatenate(
+            [reference.run(["rot"], {"q": query[:, :, offset:offset + 1],
+                                     "position_ids": np.array([[start + offset]], dtype=np.int64)})[0]
+             for offset in range(size)],
+            axis=2,
+        )
+        actual = chunk.run(["rot"], {"q": query, "position_ids": np.array([[start]], dtype=np.int64)})[0]
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    decode = QwenOnnxGraphEditor(gs.import_onnx(rotary_graph([1, heads, 1, width])))
+    assert not decode.fix_native_rotary_positions(1)
+
+
+def test_qwen_native_rotary_positions_is_a_noop_without_the_qwen3_subgraph():
+    import onnx_graphsurgeon as gs
+    from torq.models.qwen._graph import QwenOnnxGraphEditor
+
+    model = h.make_model(h.make_graph([
+        h.make_node("Identity", ["x"], ["y"]),
+    ], "main", [h.make_tensor_value_info("x", T.FLOAT, [1, 1])], [h.make_tensor_value_info("y", T.FLOAT, [1, 1])]))
+    assert not QwenOnnxGraphEditor(gs.import_onnx(model)).fix_native_rotary_positions(4)
+
+
+@pytest.mark.parametrize("size", [4, 7])
+def test_qwen_legacy_rotary_one_hot_matches_sequential_gathers(size):
+    import onnx_graphsurgeon as gs
+    import onnxruntime as ort
+    from torq.models.qwen._graph import QwenOnnxGraphEditor
+
+    positions, width = 32, 4
+    tables = [
+        numpy_helper.from_array(np.random.default_rng(seed).normal(size=(positions, width)).astype(np.float32),
+                                f"rotary_emb_cache_{index}")
+        for index, seed in enumerate((11, 12))
+    ]
+
+    def legacy_graph():
+        nodes = [
+            h.make_node("Gather", ["rotary_emb_cache_0", "position_ids"], ["selected_0"], axis=0),
+            h.make_node("Gather", ["rotary_emb_cache_1", "position_ids"], ["selected_1"], axis=0),
+            h.make_node("Identity", ["selected_0"], ["out_0"]),
+            h.make_node("Identity", ["selected_1"], ["out_1"]),
+        ]
+        return h.make_model(h.make_graph(
+            nodes,
+            "main",
+            [h.make_tensor_value_info("position_ids", T.INT64, [1, 1])],
+            [h.make_tensor_value_info(name, T.FLOAT, [1, 1, width]) for name in ("out_0", "out_1")],
+            tables,
+        ))
+
+    reference = ort.InferenceSession(legacy_graph().SerializeToString())
+    editor = QwenOnnxGraphEditor(gs.import_onnx(legacy_graph()))
+    assert editor.rotary_gather_to_onehot_matmul(size) == 2
+    chunk = ort.InferenceSession(editor.to_onnx().SerializeToString())
+
+    for start in (0, 7):
+        expected = [
+            np.concatenate(
+                [reference.run(None, {"position_ids": np.array([[start + offset]], dtype=np.int64)})[index]
+                 for offset in range(size)],
+                axis=1,
+            )
+            for index in range(2)
+        ]
+        actual = chunk.run(None, {"position_ids": np.array([[start]], dtype=np.int64)})
+        for result, want in zip(actual, expected):
+            np.testing.assert_allclose(result, want, rtol=1e-6, atol=1e-6)
+
+    # Decode keeps the existing one-hot path unchanged.
+    decode = QwenOnnxGraphEditor(gs.import_onnx(legacy_graph()))
+    assert decode.rotary_gather_to_onehot_matmul() == 2
+    single = ort.InferenceSession(decode.to_onnx().SerializeToString())
+    for start in (0, 7):
+        np.testing.assert_allclose(
+            single.run(None, {"position_ids": np.array([[start]], dtype=np.int64)}),
+            reference.run(None, {"position_ids": np.array([[start]], dtype=np.int64)}),
+            rtol=1e-6, atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("size", [1, 4])
+def test_qwen_take_last_token_hidden_slices_the_chunk_row(size):
+    import onnx_graphsurgeon as gs
+    from torq.models.qwen._graph import QwenOnnxGraphEditor
+
+    model = h.make_model(h.make_graph([
+        h.make_node("Identity", ["x"], ["last_hidden_states"]),
+    ], "main", [h.make_tensor_value_info("x", T.FLOAT, [1, size, 4])],
+               [h.make_tensor_value_info("last_hidden_states", T.FLOAT, [1, size, 4])]))
+    editor = QwenOnnxGraphEditor(gs.import_onnx(model))
+    assert editor.take_last_token_hidden(size) is (size > 1)
+    import onnxruntime as ort
+    if size > 1:
+        session = ort.InferenceSession(editor.to_onnx().SerializeToString())
+        values = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+        np.testing.assert_array_equal(session.run(None, {"x": values})[0], values[:, -1:])
+
+
+@pytest.mark.parametrize("quantization,convert,split_model,individual,read_only,expected", [
+    ("none", False, False, False, True, (4, 12)),
+    ("int4", True, False, False, True, (4, 12)),
+    ("none", True, False, False, True, ValueError),
+    ("int8", True, False, False, True, ValueError),
+    ("none", False, True, False, True, ValueError),
+    ("none", False, False, True, False, ValueError),
+    ("none", False, False, False, False, ValueError),
+])
+def test_qwen_native_gates_supported_configs(quantization, convert, split_model, individual, read_only, expected):
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    from torq.models.qwen import export as qwen_export
+    from torq.models.qwen.export import QwenModelExporter
+
+    config = SimpleNamespace(hidden_size=1024, vocab_size=16384, num_attention_heads=16, num_key_value_heads=8)
+    with patch.object(qwen_export.AutoConfig, "from_pretrained", return_value=config):
+        options = dict(
+            static_models=True,
+            max_gen_tokens=256,
+            convert_dtypes=convert,
+            keep_individual_kv_io=individual,
+            split_lm_head=True,
+            split_model=split_model,
+            read_only_kv_cache=read_only,
+            weight_quantization=None if quantization == "none" else quantization,
+            batch_prefill=None,
+            native_batch_prefill=True,
+            batch_prefill_sizes=(4, 12),
+        )
+        if expected is ValueError:
+            with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+                QwenModelExporter(**options)
+        else:
+            exporter = QwenModelExporter(**options)
+            assert exporter._native_batch_prefill == expected
+            # Embedding extraction is implicit in --split-lm-head for Qwen.
+            assert exporter._extract_embeddings is True
+
+
+def test_qwen_native_contract_declares_undecidable_constants():
+    from torq.models.qwen.export import QwenModelExporter
+
+    # Rotary MatMul fed by Cast(Cast(Expand(table))) on the frequency side and
+    # Cast(Unsqueeze(position_ids)) on the position side, like both Qwen
+    # sources; plus a Qwen2.5-style projection bias Add.
+    model = h.make_model(h.make_graph([
+        h.make_node("Unsqueeze", ["position_ids", "axes"], ["position_3d"]),
+        h.make_node("Cast", ["position_3d"], ["position"], to=T.FLOAT),
+        h.make_node("Expand", ["freq_table", "freq_shape"], ["freq_expanded"]),
+        h.make_node("Cast", ["freq_expanded"], ["freq_cast"], to=T.FLOAT),
+        h.make_node("MatMul", ["freq_cast", "position"], ["angles"], name="rotary_emb/MatMul"),
+        h.make_node("MatMul", ["x", "weight"], ["projected"]),
+        h.make_node("Add", ["bias", "projected"], ["biased"]),
+    ], "main", [
+        h.make_tensor_value_info("position_ids", T.INT64, [1, 1]),
+        h.make_tensor_value_info("x", T.FLOAT, [1, 1, 4]),
+    ], [], [
+        numpy_helper.from_array(np.ones((1, 4, 1), np.float32), "freq_table"),
+        numpy_helper.from_array(np.array([1, 4, 1], np.int64), "freq_shape"),
+        numpy_helper.from_array(np.array([1], np.int64), "axes"),
+        numpy_helper.from_array(np.ones((4,), np.float32), "weight"),
+        numpy_helper.from_array(np.ones((4,), np.float32), "bias"),
+    ]))
+
+    assert QwenModelExporter._native_contract_roles(model) == {
+        "freq_table": "frequency", "bias": "parameter",
+    }
+
+    # A table feeding the MatMul directly is the classifier's own frequency
+    # rule's job, and a scalar Add is its control rule's: no declarations.
+    direct = h.make_model(h.make_graph([
+        h.make_node("MatMul", ["freq_direct", "position"], ["angles"], name="rotary_emb/MatMul"),
+        h.make_node("MatMul", ["x", "weight"], ["projected"]),
+        h.make_node("Add", ["scale", "projected"], ["scaled"]),
+    ], "main", [], [], [
+        numpy_helper.from_array(np.ones((1, 4, 1), np.float32), "freq_direct"),
+        numpy_helper.from_array(np.ones((4,), np.float32), "weight"),
+        numpy_helper.from_array(np.array(0.5, np.float32), "scale"),
+    ]))
+    assert QwenModelExporter._native_contract_roles(direct) == {}
+
+
+def test_qwen_native_int4_auto_sizes_rejected(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from torq.models.qwen import export as qwen_export
+    from torq.models.qwen.export import QwenModelExporter
+
+    config = SimpleNamespace(hidden_size=1024, vocab_size=16384, num_attention_heads=16, num_key_value_heads=8)
+    with patch.object(qwen_export.AutoConfig, "from_pretrained", return_value=config):
+        with pytest.raises(ValueError, match="requires explicit --batch-prefill-sizes"):
+            QwenModelExporter(
+                static_models=True,
+                max_gen_tokens=256,
+                split_lm_head=True,
+                read_only_kv_cache=True,
+                weight_quantization="int4",
+                native_batch_prefill=True,
+                batch_prefill_sizes=None,
+            )
+
+
+def test_qwen_native_quantized_chunk_names_must_match_decode():
+    from types import SimpleNamespace
+    from torq.models.qwen.export import QwenModelExporter
+
+    def matmuls(*names):
+        return [(SimpleNamespace(name=name), name + ".w", None) for name in names]
+
+    exporter = QwenModelExporter.__new__(QwenModelExporter)
+    exporter._check_native_quantized_component("model.onnx", matmuls("a", "b"))
+    exporter._check_native_quantized_component("model_prefill_4.onnx", matmuls("a", "b"))
+    with pytest.raises(ValueError, match="different MatMul set"):
+        exporter._check_native_quantized_component("model_prefill_4.onnx", matmuls("a", "renamed_b"))
+
+
+@pytest.mark.parametrize("sizes,weight,convert_expected", [
+    ((4, 12), "none", False),
+    ((4, 12), "int4", True),
+    (None, "none", False),
+])
+def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypatch, sizes, weight, convert_expected):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.qwen import export as qwen
+
+    monkeypatch.setattr(qwen.AutoConfig, "from_pretrained", Mock(return_value=SimpleNamespace(
+        hidden_size=1024, vocab_size=16384, num_attention_heads=16, num_key_value_heads=8)))
+    exported = []
+    def record_export(self, **kwargs):
+        exported.append((self, kwargs))
+    monkeypatch.setattr(qwen.QwenModelExporter, "export_onnx", record_export)
+    converted = []
+    def record_convert(self, **kwargs):
+        converted.append((self, kwargs))
+    monkeypatch.setattr(qwen.QwenModelExporter, "convert_models", record_convert)
+
+    parser = argparse.ArgumentParser()
+    add_qwen_export_args(parser)
+    from torq.model_export import prefill
+    check_compiler = Mock()
+    monkeypatch.setattr(prefill, "check_native_compiler", check_compiler)
+
+    arguments = [
+        "--native-batch-prefill", "--skip-torq", "--compiler-path", "/selected/compiler",
+        "--no-gptq", "--weight-quantization", weight,
+    ]
+    if sizes is not None:
+        arguments += ["--batch-prefill-sizes", ",".join(map(str, sizes))]
+    args = parser.parse_args(arguments)
+    qwen.export_qwen_from_args(args)
+
+    exporter, options = exported[0]
+    assert exporter._native_prefill_enabled is True
+    assert exporter._native_batch_prefill == (sizes or ())
+    assert exporter._batch_prefill is None
+    assert exporter._read_only_kv_cache is True
+    assert exporter._split_lm_head is True
+    assert exporter._convert_dtypes is convert_expected
+    assert options["compiler_path"] == Path("/selected/compiler")
+    assert options["torq_compile_args"] == (args.compile_flags or [])
+    assert len(converted) == int(convert_expected)
+    # Explicit sizes skip the compiler preflight with --skip-torq; auto
+    # sizes probe, so the selected compiler is checked before any export.
+    if sizes is None:
+        check_compiler.assert_called_once_with(Path("/selected/compiler"))
+    else:
+        check_compiler.assert_not_called()

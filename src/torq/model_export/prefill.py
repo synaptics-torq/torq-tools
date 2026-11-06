@@ -188,6 +188,9 @@ def _constant_roles(model, overrides=None):
         node = producers.get(name)
         if node is None:
             return False
+        if node.op_type == "Cast":
+            # Dtype plumbing between the normalization and its consumers.
+            return normalized_value(node.input[0])
         if node.op_type == "Mul":
             return any(normalized_value(value) for value in node.input)
         if node.op_type == "Div" and len(node.input) == 2:

@@ -16,7 +16,7 @@ An exporter that already produces correct fixed-size prefill graphs can usually 
 
 Reuse the shared helpers and existing chunk-aware graph edits before adding a model-specific rewrite. Native hardware execution belongs in `torq-examples`; adding an exporter does not require adding native VMFB dispatch to the torq-tools inference runners.
 
-The current supported scope is Gemma3/FunctionGemma 270M and LFM2.5 230M/350M. The supported configuration checks are deliberate. Extending them to another model requires validating its graph and state contract, and may require extending the shared ABI or constant classifier. Merely removing an unsupported-model check does not establish support.
+The current supported scope is Gemma3/FunctionGemma 270M, LFM2.5 230M/350M and Qwen3-0.6B / Qwen2.5-0.5B-Instruct. The supported configuration checks are deliberate. Extending them to another model requires validating its graph and state contract, and may require extending the shared ABI or constant classifier. Merely removing an unsupported-model check does not establish support.
 
 ## Semantic requirements
 

@@ -224,7 +224,7 @@ class QwenOnnxGraphEditor(
 
         return rewritten
 
-    def rotary_gather_to_onehot_matmul(self) -> int:
+    def rotary_gather_to_onehot_matmul(self, chunk_len: int = 1) -> int:
         """
         Replace ``Gather(rotary_table, position_ids)`` with a one-hot MatMul.
 
@@ -234,6 +234,10 @@ class QwenOnnxGraphEditor(
         ``onehot(position_ids) @ table`` selects the same row on the NPU and is
         exact (a single non-zero product). Gathers of the same table share one
         MatMul, and all tables share one one-hot vector.
+
+        With ``chunk_len`` the single start position becomes the chunk's
+        consecutive positions, selecting ``chunk_len`` table rows and keeping
+        the selected tensor's rank (``[1, B, D]`` vs decode's ``[1, 1, D]``).
 
         Returns:
             Number of Gather nodes replaced.
@@ -255,14 +259,37 @@ class QwenOnnxGraphEditor(
             raise ValueError("Rotary Gathers use different index tensors")
 
         num_positions = gathers[0].inputs[0].values.shape[0]
+        index_dtype = indices.dtype or np.int64
 
-        # [1, 1] positions -> [1, 1, 1] == arange(P) -> [1, 1, P] one-hot.
-        positions = self.graph.layer(
-            name="rotary_onehot/Unsqueeze",
-            op="Unsqueeze",
-            inputs=[indices, np.array([-1], dtype=np.int64)],
-            outputs=[gs.Variable("rotary_onehot/positions", dtype=indices.dtype)],
-        )[0]
+        if chunk_len == 1:
+            # [1, 1] positions -> [1, 1, 1] == arange(P) -> [1, 1, P] one-hot.
+            positions = self.graph.layer(
+                name="rotary_onehot/Unsqueeze",
+                op="Unsqueeze",
+                inputs=[indices, np.array([-1], dtype=np.int64)],
+                outputs=[gs.Variable("rotary_onehot/positions", dtype=index_dtype)],
+            )[0]
+            arange_shape = (num_positions,)
+            onehot_shape = [1, 1, num_positions]
+        else:
+            # [1, 1] start + arange(B) -> [1, B, 1] chunk positions (decode's
+            # rank), so == arange(P) broadcasts to the [1, B, P] one-hot and
+            # the selected table keeps decode's rank, [1, B, D].
+            positions = self.graph.layer(
+                name="rotary_onehot/ChunkPositions",
+                op="Add",
+                inputs=[
+                    indices,
+                    gs.Constant(
+                        "rotary_onehot/chunk_offsets",
+                        np.arange(chunk_len, dtype=index_dtype).reshape(1, chunk_len, 1),
+                    ),
+                ],
+                outputs=[gs.Variable("rotary_onehot/positions", dtype=index_dtype, shape=[1, chunk_len, 1])],
+            )[0]
+            arange_shape = (num_positions,)
+            onehot_shape = [1, chunk_len, num_positions]
+
         is_position = self.graph.layer(
             name="rotary_onehot/Equal",
             op="Equal",
@@ -270,7 +297,7 @@ class QwenOnnxGraphEditor(
                 positions,
                 gs.Constant(
                     "rotary_onehot/arange",
-                    np.arange(num_positions, dtype=indices.dtype or np.int64),
+                    np.arange(num_positions, dtype=index_dtype).reshape(arange_shape),
                 ),
             ],
             outputs=[gs.Variable("rotary_onehot/mask", dtype=np.bool_)],
@@ -284,7 +311,7 @@ class QwenOnnxGraphEditor(
                 gs.Variable(
                     "rotary_onehot",
                     dtype=np.float32,
-                    shape=[1, 1, num_positions],
+                    shape=onehot_shape,
                 )
             ],
         )[0]
@@ -301,7 +328,7 @@ class QwenOnnxGraphEditor(
                         gs.Variable(
                             f"{table.name}/selected",
                             dtype=np.float32,
-                            shape=[1, 1, table.values.shape[1]],
+                            shape=onehot_shape[:-1] + [table.values.shape[1]],
                         )
                     ],
                 )[0]
@@ -322,6 +349,133 @@ class QwenOnnxGraphEditor(
         )
 
         return len(gathers)
+
+    def fix_native_rotary_positions(self, chunk_len: int) -> bool:
+        """
+        Expand the shared rotary position to the chunk's consecutive positions.
+
+        Qwen3 computes cos/sin as ``inv_freq [1, D/2, 1] @ position`` where
+        ``position`` is the decode start position cast to float, ``[1, 1, 1]``.
+        A prefill chunk's queries span ``start..start+B-1``, so the position
+        becomes ``start + arange(B)``, ``[1, 1, B]``. The shared chain then
+        emits ``[1, B, D]`` cos/sin, whose per-layer Unsqueeze broadcasts over
+        heads like decode's ``[1, 1, D]`` does.
+
+        Returns:
+            True when the Qwen3 rotary subgraph was rewired; legacy exports
+            use the table-Gather path (:meth:`rotary_gather_to_onehot_matmul`)
+            and return False here.
+        """
+
+        if chunk_len <= 1:
+            return False
+
+        matmul = next(
+            (
+                node
+                for node in self.graph.nodes
+                if node.op == "MatMul" and "rotary_emb" in node.name
+            ),
+            None,
+        )
+        if matmul is None or len(matmul.inputs) != 2:
+            return False
+
+        def derives_from_position(tensor, depth=5):
+            current = tensor
+            for _ in range(depth):
+                if current.name == "position_ids":
+                    return True
+                if not current.inputs:
+                    return False
+                producer = current.inputs[0]
+                if producer.op not in ("Cast", "Unsqueeze"):
+                    return False
+                current = producer.inputs[0]
+            return False
+
+        position = next(
+            (
+                inp
+                for inp in matmul.inputs
+                if derives_from_position(inp)
+            ),
+            None,
+        )
+        if position is None:
+            return False
+
+        dtype = position.dtype or np.float32
+        chunk_positions = self.graph.layer(
+            name="/model/rotary_emb/chunk_positions",
+            op="Add",
+            inputs=[
+                position,
+                gs.Constant(
+                    "/model/rotary_emb/chunk_offsets",
+                    np.arange(chunk_len, dtype=dtype).reshape(1, 1, chunk_len),
+                ),
+            ],
+            outputs=[gs.Variable(
+                "/model/rotary_emb/position_values",
+                dtype=dtype,
+                shape=[1, 1, chunk_len],
+            )],
+        )[0]
+        matmul.inputs[1] = chunk_positions
+
+        self._logger.info(
+            "Expanded the rotary position to %d consecutive chunk positions",
+            chunk_len,
+        )
+
+        return True
+
+    def take_last_token_hidden(self, chunk_len: int) -> bool:
+        """
+        Slice the chunk's ``last_hidden_states`` output to its last token row.
+
+        Decode emits the single token's hidden state; a prefill chunk emits all
+        ``chunk_len`` rows, and the family ABI keeps the last token's
+        ``[1, 1, D]`` so the split LM head can run unchanged.
+
+        Returns:
+            True when the output was sliced.
+        """
+
+        if chunk_len <= 1:
+            return False
+
+        output = next(
+            (t for t in self.graph.outputs if t.name == "last_hidden_states"),
+            None,
+        )
+        if output is None:
+            raise ValueError("expected a 'last_hidden_states' graph output")
+
+        output.name = "chunk_hidden_states"
+        hidden = self.graph.layer(
+            name="last_hidden_states_last_token",
+            op="Slice",
+            inputs=[
+                output,
+                np.array([chunk_len - 1], dtype=np.int64),
+                np.array([chunk_len], dtype=np.int64),
+                np.array([1], dtype=np.int64),
+            ],
+            outputs=[gs.Variable(
+                "last_hidden_states",
+                dtype=output.dtype or np.float32,
+                shape=[1, 1, output.shape[-1] if output.shape else None],
+            )],
+        )[0]
+
+        index = self.graph.outputs.index(output)
+        self.graph.outputs[index] = hidden
+
+        self._logger.info("Sliced the chunk hidden output to its last token")
+
+        return True
 
     def materialize_tied_lm_head(self) -> bool:
         """
@@ -1228,6 +1382,7 @@ class QwenOnnxGraphEditor(
         seq_len: int,
         dims: list[FixedDimMapping] | None = None,
         *,
+        chunk_len: int = 1,
         batch_dim: str = "batch_size",
         seq_len_dim: str = "sequence_length",
         past_seq_len_dim: str = "past_sequence_length",
@@ -1243,7 +1398,7 @@ class QwenOnnxGraphEditor(
             FixedDimMapping(
                 seq_len_dim,
                 DimMatchType.EXACT,
-                1,
+                chunk_len,
             ),
             FixedDimMapping(
                 past_seq_len_dim,

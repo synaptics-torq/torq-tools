@@ -47,6 +47,7 @@ from ...model_export.onnx import (
     ORTOptimizerConfig,
     OnnxModelExporterBase,
 )
+from ...utils.onnx import load_onnx_lazy
 from ...utils.logging import configure_logging
 
 
@@ -124,6 +125,9 @@ class QwenModelExporter(OnnxModelExporterBase):
         hf_repo: str = DEFAULT_HF_REPO,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
+        batch_prefill: int | None = None,
+        native_batch_prefill: bool = False,
+        batch_prefill_sizes: tuple[int, ...] | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -207,7 +211,41 @@ class QwenModelExporter(OnnxModelExporterBase):
                     hidden_size=self._config.hidden_size,
                 )
             },
+            max_gen_tokens=max_gen_tokens,
+            extract_embeddings=split_lm_head,
+            split_lm_head=split_lm_head,
+            read_only_kv_cache=read_only_kv_cache,
+            keep_individual_kv_io=keep_individual_kv_io,
+            batch_prefill=batch_prefill,
+            native_batch_prefill=native_batch_prefill,
+            batch_prefill_sizes=batch_prefill_sizes,
+            native_minimum=4,
+            native_supports_read_only=True,
+            native_unsupported=(
+                (convert_dtypes and weight_quantization is None)
+                or weight_quantization not in (None, "int4")
+                or split_model
+                or keep_individual_kv_io
+                or not read_only_kv_cache
+            ),
+            native_supported=(
+                "Qwen3-0.6B and Qwen2.5-0.5B-Instruct only, with FP32 or INT4 "
+                "weights and --read-only-kv-cache; int8, split-model topology, "
+                "individual KV I/O and full-state caches are unsupported"
+            ),
         )
+
+        if (
+            self._native_prefill_enabled
+            and not self._native_batch_prefill
+            and self._weight_quantization is not None
+        ):
+            # Qwen quantizes in convert_models, which never probes; without
+            # explicit sizes an INT4 run would silently export decode-only.
+            raise ValueError(
+                "Qwen INT4 native prefill requires explicit --batch-prefill-sizes; "
+                "automatic size probing is only supported for the FP32 family"
+            )
 
     def _setup_dirs(self) -> list[Path]:
         if (
@@ -323,6 +361,7 @@ class QwenModelExporter(OnnxModelExporterBase):
     def _make_model_static(
         self,
         model: onnx.ModelProto,
+        chunk_len: int = 1,
     ) -> onnx.ModelProto:
         """Replace Qwen dynamic dimensions and decoder state with static forms."""
 
@@ -333,11 +372,13 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
         )
 
-        editor.fix_io(self._max_gen_tokens)
+        editor.fix_io(self._max_gen_tokens, chunk_len=chunk_len)
         editor.remove_redundant_casts()
         # No-op for Qwen3; required for legacy Qwen2/Qwen2.5 exports.
         if editor.fold_legacy_rotary_cache(self._max_gen_tokens):
-            editor.rotary_gather_to_onehot_matmul()
+            editor.rotary_gather_to_onehot_matmul(chunk_len)
+        elif chunk_len > 1:
+            editor.fix_native_rotary_positions(chunk_len)
 
         position_ids = next(
             (
@@ -377,13 +418,15 @@ class QwenModelExporter(OnnxModelExporterBase):
             .replace_dynamic_kv_cache(
                 current_length,
                 self._max_gen_tokens,
+                chunk_len,
             )
             .mask_future_attn_scores(
                 current_length,
                 self._max_gen_tokens,
+                chunk_len,
             )
             .add_curr_len_input(current_length)
-            .convert_to_static_index()
+            .convert_to_static_index(chunk_len)
         )
 
         editor.resolve_static_shape_inputs()
@@ -405,6 +448,7 @@ class QwenModelExporter(OnnxModelExporterBase):
     def _patch_static_model(
         self,
         model_path: str | os.PathLike,
+        component: str = "model",
     ) -> None:
         model = onnx.load(model_path)
 
@@ -419,21 +463,30 @@ class QwenModelExporter(OnnxModelExporterBase):
             hidden_size // self._config.num_attention_heads
         )
 
+        # Native prefill chunks carry B tokens; decode is the single-token body.
+        chunk_len = (
+            int(component.removeprefix("model_prefill_"))
+            if component.startswith("model_prefill_")
+            else 1
+        )
+        is_chunk = chunk_len > 1
+
         if self._split_lm_head:
             embeddings_npy = (
                 Path(model_path).parent / "token_embeddings.npy"
             )
 
+            # The chunk reuses decode's extracted table; only decode saves it.
             editor.extract_token_embeddings(
                 hidden_size,
                 self._config.vocab_size,
-                embeddings_npy,
+                None if is_chunk else embeddings_npy,
                 inp_name="token_embedding",
             )
 
             token_embedding = editor.graph.tensors()["token_embedding"]
             token_embedding.dtype = np.float32
-            token_embedding.shape = [1, 1, hidden_size]
+            token_embedding.shape = [1, chunk_len, hidden_size]
 
             editor.reorder_graph_input(
                 "token_embedding",
@@ -453,16 +506,34 @@ class QwenModelExporter(OnnxModelExporterBase):
                     # One cache write per layer instead of split, blend and concat.
                     editor.blend_combined_kv_in_place()
 
-            self._logger.info(
-                "(model) Extracted Qwen token embeddings to '%s'",
-                str(embeddings_npy),
-            )
+            if not is_chunk:
+                self._logger.info(
+                    "(model) Extracted Qwen token embeddings to '%s'",
+                    str(embeddings_npy),
+                )
 
         editor.eliminate_transposes()
         editor.collapse_reshape_chains()
         editor.fold_scalar_matmul()
 
-        if self._split_lm_head:
+        if self._split_lm_head and is_chunk:
+            # The chunk reuses decode's lm_head.onnx: cut the graph at the head
+            # MatMul and keep the last token's hidden row for the family ABI.
+            lm_head_matmul = next(
+                node
+                for node in editor.graph.nodes
+                if node.op == "MatMul"
+                and node.outputs
+                and node.outputs[0].name == "logits"
+            )
+
+            lm_head_matmul.inputs[0].dtype = np.float32
+            lm_head_matmul.inputs[0].shape = [1, chunk_len, hidden_size]
+
+            editor.split_lm_head(None)
+            editor.take_last_token_hidden(chunk_len)
+
+        if self._split_lm_head and not is_chunk:
             tokenizer_path = (
                 Path(model_path).parent / "tokenizer.json"
             )
@@ -553,12 +624,14 @@ class QwenModelExporter(OnnxModelExporterBase):
                 self._config.num_attention_heads,
                 self._config.num_key_value_heads,
                 head_dim,
+                chunk_len,
             )
             if self._read_only_kv_cache:
                 editor.read_only_kv_cache(
                     self._config.num_attention_heads,
                     self._config.num_key_value_heads,
                     head_dim,
+                    chunk_len,
                 )
 
         editor.reorder_graph_input("position_ids", 1)
@@ -627,15 +700,17 @@ class QwenModelExporter(OnnxModelExporterBase):
 
         patched_model = self.check_model(patched_model)
 
+        external_data_name = f"{Path(model_path).stem}.onnx_data"
+
         convert_model_to_external_data(
             patched_model,
             all_tensors_to_one_file=True,
-            location="model.onnx_data",
+            location=external_data_name,
             size_threshold=1024,
             convert_attribute=False,
         )
 
-        external_data_path = Path(model_path).parent / "model.onnx_data"
+        external_data_path = Path(model_path).parent / external_data_name
 
         if external_data_path.exists():
             external_data_path.unlink()
@@ -851,10 +926,107 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._components["model"]
         )
 
+    def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
+        components = {}
+        source_model = self._load_onnx()["model"]
+        for size in self._native_batch_prefill:
+            self._logger.info(
+                "(model_prefill_%d) Making Qwen graph static with %d tokens...",
+                size,
+                size,
+            )
+            components[f"model_prefill_{size}"] = self._make_model_static(
+                source_model,
+                chunk_len=size,
+            )
+        return components
+
+    @staticmethod
+    def _native_contract_roles(model: onnx.ModelProto) -> dict[str, str]:
+        """Constants the shared classifier cannot decide, declared by graph use.
+
+        - the rotary inv_freq table, when it reaches the shared rotary MatMul
+          through Expand plumbing the position-use trace cannot follow
+          (role: frequency);
+        - vector projection biases added to a MatMul output, as in the
+          Qwen2.5 sources (role: parameter).
+        """
+        producers = {out: node for node in model.graph.node for out in node.output}
+        constants = {i.name: i for i in model.graph.initializer}
+        for node in model.graph.node:
+            if node.op_type == "Constant":
+                constants[node.output[0]] = node.attribute[0].t
+
+        roles: dict[str, str] = {}
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or "rotary_emb" not in node.name:
+                continue
+            for input_name in node.input:
+                current, producer = input_name, producers.get(input_name)
+                while producer is not None and producer.op_type == "Cast":
+                    current, producer = producer.input[0], producers.get(producer.input[0])
+                if producer is not None and producer.op_type == "Expand":
+                    roles[producer.input[0]] = "frequency"
+
+        for node in model.graph.node:
+            if node.op_type != "Add" or len(node.input) != 2:
+                continue
+            for index in (0, 1):
+                name = node.input[index]
+                tensor = constants.get(name)
+                if tensor is None or not tensor.dims or all(d == 1 for d in tensor.dims):
+                    continue
+                sibling = node.input[1 - index]
+                producer = producers.get(sibling)
+                if producer is not None and producer.op_type == "MatMul":
+                    roles[name] = "parameter"
+        return roles
+
+    def _native_family_contract(self, path=None):
+        from dataclasses import replace
+
+        contract = super()._native_family_contract(path)
+        model = load_onnx_lazy(path or self._export_paths["model"])
+        if (roles := self._native_contract_roles(model)):
+            # Source-level names; the declaration fails loudly if the rotary
+            # or bias structure of the export drifts.
+            contract = replace(
+                contract,
+                constant_roles={**dict(contract.constant_roles), **roles},
+            )
+        return contract
+
+    def _drop_family_sidecars(self) -> None:
+        # Qwen's large-model saves use <stem>.onnx_data sidecars, which
+        # share_native_weights does not remove; once the family points at the
+        # shared transformer.weights.data they are orphans.
+        if not (self._native_batch_prefill and all(
+            f"model_prefill_{size}" in self._export_paths
+            for size in self._native_batch_prefill
+        )):
+            return
+        for path in self._native_family_paths().values():
+            orphan = path.with_name(path.stem + ".onnx_data")
+            if orphan.exists():
+                orphan.unlink()
+
+    def _complete_native_prefill(self, *, validate=True, cleanup=True,
+                                 compiler_path=None, torq_compile_args=None):
+        components = super()._complete_native_prefill(
+            validate=validate, cleanup=cleanup,
+            compiler_path=compiler_path, torq_compile_args=torq_compile_args,
+        )
+        self._drop_family_sidecars()
+        return components
+
+    def _settle_native_family(self, *, validate=True):
+        super()._settle_native_family(validate=validate)
+        self._drop_family_sidecars()
+
     def apply_post_static_patches(
         self,
         model_path: str | os.PathLike,
-        _,
+        component: str,
     ) -> None:
         self._copy_runtime_assets(
             Path(model_path).parent,
@@ -862,7 +1034,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             include_npy_data=False,
         )
 
-        self._patch_static_model(model_path)
+        self._patch_static_model(model_path, component)
 
         self._finalize_static_shapes(model_path)
 
@@ -960,6 +1132,31 @@ class QwenModelExporter(OnnxModelExporterBase):
             if inferred_path.exists():
                 inferred_path.unlink()
 
+    def _check_native_quantized_component(
+        self, name: str, matmul_info: list
+    ) -> None:
+        """Record the decode transformer's quantized MatMul names and check a
+        native chunk against them.
+
+        GPTQ weights bind per node name, so a chunk whose name set drifts from
+        decode's would silently take round-to-nearest weights for the drifted
+        nodes.
+        """
+        names = {node.name for node, _, _ in matmul_info}
+        if name == "model.onnx":
+            self._native_decode_quantized_layers = names
+            return
+        if name.startswith("model_prefill_"):
+            decode_names = getattr(self, "_native_decode_quantized_layers", None)
+            if decode_names is not None and names != decode_names:
+                missing = sorted(decode_names - names)
+                extra = sorted(names - decode_names)
+                raise ValueError(
+                    f"{name} quantizes a different MatMul set than the decode "
+                    f"transformer (missing {missing[:4]}, extra {extra[:4]}); "
+                    "GPTQ weights bind per node name"
+                )
+
     def convert_models(
         self,
         convert_dir: str | os.PathLike | None = None,
@@ -1051,6 +1248,9 @@ class QwenModelExporter(OnnxModelExporterBase):
             }
             if not self._split_model:
                 quantized_components.add("model.onnx")
+            quantized_components.update(
+                f"model_prefill_{size}.onnx" for size in self._native_batch_prefill
+            )
 
             if (
                 self._split_lm_head
@@ -1097,6 +1297,10 @@ class QwenModelExporter(OnnxModelExporterBase):
                     matmul_info,
                     quant_config,
                     **dql_kwargs,
+                )
+
+                self._check_native_quantized_component(
+                    model_path.name, matmul_info
                 )
 
                 self._logger.info(
@@ -1238,6 +1442,10 @@ class QwenModelExporter(OnnxModelExporterBase):
             include_npy_data=False,
         )
 
+        # DQL/bf16 families cannot run on CPU ORT; the import gate is their
+        # validation. Re-share the converted family's weights.
+        self._settle_native_family(validate=False)
+
     def export_torq(
         self,
         torq_export_dir: str | os.PathLike | None = None,
@@ -1273,6 +1481,13 @@ class QwenModelExporter(OnnxModelExporterBase):
         if self._split_model:
             skip = list(skip) + ["model"]
 
+        if self._native_batch_prefill:
+            from ...model_export.prefill import check_native_compiler
+
+            check_native_compiler(compiler_path)
+            if any(c == "model" or c.startswith("model_prefill_") for c in skip):
+                raise ValueError("cannot skip individual members of a native decoder family")
+
         if self._torq_dir.exists():
             shutil.rmtree(
                 self._torq_dir,
@@ -1290,7 +1505,43 @@ class QwenModelExporter(OnnxModelExporterBase):
         )
         common_flags = list(flags_entry.get("common") or [])
 
+        family_paths: dict[int, Path] = {}
+        if self._native_batch_prefill:
+            from ...model_export.prefill import (
+                compile_native_family,
+                native_compile_flags,
+            )
+
+            family_paths = self._native_family_paths()
+
+            family_args = common_flags + list(torq_compile_args or [])
+            if not any(
+                arg.split("=", 1)[0] == "--torq-max-nss-programs-size"
+                for arg in family_args
+            ):
+                family_args += self._auto_torq_compile_extras()
+
+            compile_native_family(
+                family_paths,
+                self._torq_dir,
+                self._native_family_contract(),
+                compiler_args=native_compile_flags(family_args),
+                compiler_path=compiler_path,
+                local_compile=local_compile,
+            )
+
+            self._logger.info(
+                "(Torq-export) Compiled the native decoder family @ '%s'",
+                str(self._torq_dir),
+            )
+
         for comp, onnx_path in self._export_paths.items():
+            if onnx_path in family_paths.values():
+                self._logger.info(
+                    "(Torq-export) Skipping %s (compiled in the native family)",
+                    comp,
+                )
+                continue
             if comp in skip:
                 self._logger.info(
                     "(Torq-export) Skipping %s",
@@ -1332,7 +1583,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 self._torq_dir,
                 opset=opset,
                 compiler_args=compiler_args,
-                use_binary=use_binary,
+                use_binary=use_binary or bool(family_paths),
                 local_compile=local_compile,
                 compiler_path=compiler_path,
             )
@@ -1407,6 +1658,9 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         hf_repo=hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
+        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
+        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill_sizes=args.batch_prefill_sizes,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
@@ -1419,11 +1673,16 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         gptq_checkpoint=_resolve_gptq_checkpoint(args),
     )
 
+    from ...model_export.prefill import check_native_cli_args
+    check_native_cli_args(args)
+
     # The generic ONNX cleanup serializes the whole model in memory. The Qwen
     # models have more than 2 GB of fp32 weights, so the cleanup cannot run.
     exporter.export_onnx(
         validate=not args.skip_validation,
         cleanup=False,
+        compiler_path=args.compiler_path,
+        torq_compile_args=args.compile_flags or [],
     )
 
     if convert_dtypes:

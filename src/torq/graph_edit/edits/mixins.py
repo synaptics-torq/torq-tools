@@ -50,12 +50,12 @@ class CommonGraphEditsMixin:
     self._export_dtype, self.apply_edit).
     """
 
-    def replace_dynamic_kv_cache(self, cur_len, max_tokens):
-        self.apply_edit(ReplaceDynamicKVCache(self._graph, self._graph_name, cur_len, max_tokens))
+    def replace_dynamic_kv_cache(self, cur_len, max_tokens, chunk_len: int = 1):
+        self.apply_edit(ReplaceDynamicKVCache(self._graph, self._graph_name, cur_len, max_tokens, chunk_len))
         return self
 
-    def mask_future_attn_scores(self, cur_len, max_tokens):
-        self.apply_edit(MaskFutureAttentionScores(self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype))
+    def mask_future_attn_scores(self, cur_len, max_tokens, chunk_len: int = 1):
+        self.apply_edit(MaskFutureAttentionScores(self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype, chunk_len=chunk_len))
         return self
 
     def add_curr_len_input(self, cur_len):
@@ -68,8 +68,8 @@ class CommonGraphEditsMixin:
         )
         return self
 
-    def convert_to_static_index(self):
-        self.apply_edit(ConvertToStaticIndex(self._graph, self._graph_name))
+    def convert_to_static_index(self, chunk_len: int = 1):
+        self.apply_edit(ConvertToStaticIndex(self._graph, self._graph_name, chunk_len))
         return self
 
     def replace_simplified_layer_norm(self):
@@ -141,8 +141,8 @@ class CommonGraphEditsMixin:
         self.apply_edit(CollapseGQABroadcast(self._graph, self._graph_name))
         return self
 
-    def group_query_heads(self, num_heads: int, num_kv_heads: int, head_dim: int):
-        self.apply_edit(GroupQueryHeads(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim))
+    def group_query_heads(self, num_heads: int, num_kv_heads: int, head_dim: int, chunk_len: int = 1):
+        self.apply_edit(GroupQueryHeads(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim, chunk_len))
         return self
 
     def read_only_kv_cache(self, num_heads: int, num_kv_heads: int, head_dim: int, chunk_len: int = 1):
