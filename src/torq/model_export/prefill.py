@@ -10,7 +10,8 @@ import os
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import onnx
@@ -119,6 +120,12 @@ class FamilyContract:
     states: tuple[State, ...]   # in graph order: inputs[2:], outputs[1:]
     hidden_input: str = "token_embedding"
     position_input: str = "position_ids"
+    constant_roles: Mapping[str, str] = field(default_factory=dict)  # name -> "parameter" | "frequency" | "control"; checked before the op-pattern classifier
+
+    def __post_init__(self):
+        for name, role in self.constant_roles.items():
+            if role not in ("parameter", "frequency", "control"):
+                raise ValueError(f"invalid constant role {role!r} for {name!r}; expected parameter, frequency or control")
 
 
 def decoder_states(model, *, read_only):
@@ -136,7 +143,7 @@ def decoder_states(model, *, read_only):
     return tuple(states)
 
 
-def _constant_roles(model):
+def _constant_roles(model, overrides=None):
     """Classify the supported exporter ops by use, never by a byte threshold.
 
     Projection/kernel RHS and normalization gains are resource parameters.
@@ -144,8 +151,13 @@ def _constant_roles(model):
     their position-only computation can execute outside the family dispatch.
     Scalar arithmetic, Pow exponents and Where fills are controls. Reject
     unrecognized and mixed sites instead of guessing.
+
+    ``overrides`` maps a constant name to its role and skips pattern matching
+    for that constant: a new model declares what the classifier can't decide
+    in its contract instead of growing new patterns here.
     """
     constants = {i.name: i for i in model.graph.initializer}
+    overrides = overrides or {}
     for node in model.graph.node:
         if node.op_type == "Constant":
             attrs = {a.name: a for a in node.attribute}
@@ -185,6 +197,9 @@ def _constant_roles(model):
             if name not in constants:
                 continue
             tensor = constants[name]
+            if name in overrides:
+                uses[name].add(overrides[name])
+                continue
             if node.op_type == "DequantizeLinear":
                 uses[name].add("parameter")
                 continue
@@ -361,7 +376,7 @@ def import_native_family(paths: dict[int, Path], output: Path, contract: FamilyC
             if any(size > inp["shape"][state.seq_axis] for state, inp in zip(contract.states, inputs[2:])
                    if state.seq_axis is not None):
                 raise ValueError(f"native chunk exceeds cache capacity in {path}")
-            current = _constant_roles(model)
+            current = _constant_roles(model, contract.constant_roles)
             if parameters is None:
                 parameters = current
             elif current != parameters:

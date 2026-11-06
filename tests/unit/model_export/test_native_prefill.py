@@ -541,6 +541,27 @@ def test_validate_rejects_state_count_mismatch(tmp_path):
         validate_native_onnx(paths, contract=contract)
 
 
+def test_constant_role_override_controls_unclassified_constant(tmp_path):
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1, 4)}
+    for b, path in paths.items():
+        model = _family_graph(b)
+        model.graph.initializer.append(numpy_helper.from_array(np.ones((1, 1, 4), np.float32), "fill"))
+        model.graph.node.append(h.make_node("Concat", ["fill", "projected"], ["fill_out"], axis=1))
+        onnx.save(model, path)
+    contract = _contract(paths[1], read_only=False)
+    with pytest.raises(ValueError, match="unclassified native float constant"):
+        import_native_family(paths, tmp_path / "family.mlirbc", contract)
+    overridden = FamilyContract(states=contract.states, constant_roles={"fill": "control"})
+    metadata = import_native_family(paths, tmp_path / "family2.mlirbc", overridden)
+    assert set(metadata["entries"]) == {"main", "main_4"}
+
+
+def test_constant_roles_reject_invalid_overrides():
+    with pytest.raises(ValueError, match="invalid constant role"):
+        FamilyContract(states=(), constant_roles={"fill": "weight"})
+
+
 def test_renamed_state_contract_imports_and_validates(tmp_path):
     pytest.importorskip("iree.compiler.extras.onnx_importer")
     paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1, 4)}
