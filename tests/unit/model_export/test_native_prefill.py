@@ -448,8 +448,14 @@ def test_liquid_vision_inherits_ordinary_gqa_configuration(tmp_path):
     assert exporter._native_batch_prefill == ()
     attention=exporter.graph_edit_blocks()["source.convert (attention)"][0]
     assert attention.args[-1] is True
-    with pytest.raises(ValueError,match="vision"):
+    # Without --split-lm-head the base gate names the missing prerequisite.
+    with pytest.raises(ValueError,match="--split-lm-head"):
         LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7))
+    # With split-lm-head on, a vision build option is rejected for the vision
+    # reason (not the split reason).
+    with pytest.raises(ValueError,match="vision"):
+        LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7),
+                              split_lm_head=True, compile_vision=True)
 
 
 def test_liquid_vision_constructor_preserves_pre_super_options(tmp_path):
@@ -1403,3 +1409,99 @@ def test_native_validation_tolerance_defaults_and_override():
         calls.clear()
         stub._settle_native_family(validate=True)
     assert calls == [(1e-3, 1e-4)]
+
+
+# --- LFM2-VL text decoder (patch-25) ----------------------------------------
+
+def _vl_config_dir(tmp_path):
+    import json
+    config = dict(hidden_size=8, vocab_size=16, num_attention_heads=2, num_key_value_heads=1,
+                  head_dim=4, conv_dim=8, conv_L_cache=3, num_hidden_layers=2,
+                  layer_types=["conv", "full_attention"])
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return tmp_path
+
+
+def test_liquid_vl_native_gating_and_family_keying(tmp_path):
+    from torq.models.liquid.export_vl import DECODER, LiquidVLModelExporter
+
+    _vl_config_dir(tmp_path)
+
+    def construct(**overrides):
+        options = dict(onnx_source_dir=tmp_path, models_dir=tmp_path,
+                       split_lm_head=True, native_batch_prefill=True,
+                       batch_prefill_sizes=(4, 12))
+        options.update(overrides)
+        return LiquidVLModelExporter(**options)
+
+    exporter = construct()
+    assert exporter._native_batch_prefill == (4, 12)
+    assert exporter._native_prefill_enabled is True
+    # The attribute stays False for the VL LUT flow; only the base validation
+    # saw the parameter.
+    assert exporter._extract_embeddings is False
+
+    for override in (dict(compile_vision=True), dict(vision_res=256),
+                     dict(image_decoder_parts=3), dict(keep_conv1d=True),
+                     dict(simulate_bf16=True), dict(chunk_lm_head=True),
+                     dict(dynamic_quantize=True), dict(convert_dtypes=True),
+                     dict(split_lm_head=False), dict(keep_individual_kv_io=True),
+                     dict(batch_prefill_sizes=None)):
+        with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+            construct(**override)
+
+    exporter._export_paths = {DECODER: "d", "model_prefill_4": "c4", "model_prefill_12": "c12"}
+    assert exporter._native_family_paths() == {1: "d", 4: "c4", 12: "c12"}
+
+
+def test_liquid_vl_native_contract_sources_the_decoder_member(tmp_path):
+    import onnx as onnx_mod
+    from torq.models.liquid.export_vl import DECODER, LiquidVLModelExporter
+
+    _vl_config_dir(tmp_path)
+    exporter = LiquidVLModelExporter(onnx_source_dir=tmp_path, models_dir=tmp_path,
+                                     split_lm_head=True, native_batch_prefill=True,
+                                     batch_prefill_sizes=(4,))
+    decode_path = tmp_path / f"{DECODER}.onnx"
+    onnx_mod.save(_family_graph(1), str(decode_path))
+    exporter._export_paths = {DECODER: decode_path}
+    contract = exporter._native_family_contract()
+    assert len(contract.states) == 1
+    assert contract.states[0].input == "past_key_values.0.key_value"
+    assert contract.states[0].rows_only is False
+    assert contract.states[0].seq_axis == 2
+    # The inherited liquid 350M mask role is present but inert on this graph.
+    assert "control" in set(contract.constant_roles.values())
+    explicit = exporter._native_family_contract(path=decode_path)
+    assert explicit.states == contract.states
+
+
+def test_liquid_vl_cli_forwards_native_options(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    import torq.models.liquid.export_vl as vl
+    from torq.models.liquid import add_liquid_vl_export_args
+
+    constructed = []
+    def fake_ctor(**kwargs):
+        constructed.append(kwargs)
+        mock = Mock()
+        return mock
+    monkeypatch.setattr(vl, "LiquidVLModelExporter", fake_ctor)
+    from torq.model_export import prefill
+    monkeypatch.setattr(prefill, "check_native_compiler", Mock())
+
+    parser = argparse.ArgumentParser()
+    add_liquid_vl_export_args(parser)
+    args = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,12",
+                              "--skip-torq", "--split-lm-head"])
+    vl.export_liquid_vl_from_args(args)
+    kwargs = constructed[0]
+    assert kwargs["native_batch_prefill"] is True
+    assert kwargs["batch_prefill_sizes"] == (4, 12)
+    assert kwargs["batch_prefill"] is None
+    assert kwargs["split_lm_head"] is True
+    constructed.clear()
+    args = parser.parse_args(["--skip-torq"])
+    vl.export_liquid_vl_from_args(args)
+    assert constructed[0]["native_batch_prefill"] is False
+    assert constructed[0]["batch_prefill"] == 64

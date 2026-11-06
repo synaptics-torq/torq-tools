@@ -16,7 +16,7 @@ An exporter that already produces correct fixed-size prefill graphs can usually 
 
 Reuse the shared helpers and existing chunk-aware graph edits before adding a model-specific rewrite. Native hardware execution belongs in `torq-examples`; adding an exporter does not require adding native VMFB dispatch to the torq-tools inference runners.
 
-The current supported scope is Gemma3/FunctionGemma 270M, LFM2.5 230M/350M, Qwen3-0.6B / Qwen2.5-0.5B-Instruct and SmolLM2 135M/360M. The supported configuration checks are deliberate. Extending them to another model requires validating its graph and state contract, and may require extending the shared ABI or constant classifier. Merely removing an unsupported-model check does not establish support.
+The current supported scope is Gemma3/FunctionGemma 270M, LFM2.5 230M/350M, Qwen3-0.6B / Qwen2.5-0.5B-Instruct, SmolLM2 135M/360M and the LFM2-VL 450M text decoder. The supported configuration checks are deliberate. Extending them to another model requires validating its graph and state contract, and may require extending the shared ABI or constant classifier. Merely removing an unsupported-model check does not establish support.
 
 ## Semantic requirements
 
@@ -71,7 +71,7 @@ The importer checks a narrow contract in addition to model configuration gates:
 
 The decoder entries are `main` for B=1 and `main_B` for chunks. The head is compiled separately. A separate `attention_mask` input and arbitrary extra state names are outside this ABI; the graph builds its mask from the position and static dimensions. The names above are the convention `decoder_states()` follows; an exporter declares its actual interface and state layout as a `FamilyContract` (built with `decoder_states()`, or hand-written when the naming differs) and the shared helpers check each graph against it instead of recognising models.
 
-Static dimensions, combined KV I/O, extracted embeddings and a split head are required by this path. Dynamic shapes, vision, arbitrary topology splitting and sliding-window execution beyond the exported context need separate support. The base exporter runs `validate_native_options()` before source preparation; each model passes its minimum context, read-only support, unsupported-condition flag and supported-configuration error text.
+Static dimensions, combined KV I/O, extracted embeddings and a split head are required by this path. Dynamic shapes, vision, arbitrary topology splitting and sliding-window execution beyond the exported context need separate support (the LFM2-VL text decoder is native-supported; its vision build options are not). The base exporter runs `validate_native_options()` before source preparation; each model passes its minimum context, read-only support, unsupported-condition flag and supported-configuration error text.
 
 ## Wiring a new exporter
 

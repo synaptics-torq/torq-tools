@@ -337,6 +337,28 @@ the **same caption** as the host ORT reference — *"two cats sleeping on a pink
 blanket … two remote controls"* — at ~0.54 s/decoder-call (TTFT ≈ 140 s for the
 259-token image prompt, decode ≈ 1.8 tok/s).
 
+## Experimental native batch prefill
+
+The LFM2-VL text decoder joins the opt-in native static families with
+`--native-batch-prefill`. Omitting `--batch-prefill-sizes ...` is not
+supported for VL (the automatic size probe is text-model-only); pass explicit
+ascending sizes (at least 4, fitting the context).
+
+The supported configuration is the 450M text decoder with `--split-lm-head`
+(the native ABI needs the hidden-state output) and the full-state cache (the
+VL demo engine writes whole caches back and the image-prefill chain shares
+them). FP32 only. The vision build options (`--compile-vision`,
+`--vision-res`, `--image-decoder-parts`) and the `--keep-conv1d` /
+`--chunk-lm-head` / `--simulate-bf16` options are not yet validated with
+native families and are rejected together with `--native-batch-prefill`.
+Chunks reuse the LFM2.5 native convolution rewrite, so the family carries
+conv state (`present_conv.{i}`) alongside the KV state.
+
+See the shared [native batch-prefill guide](../../model_export/doc/batch_prefill.md)
+for export commands, compiler/runtime requirements, artifact layout, chunk
+selection and state handling. The `torq-examples` hardware runner carries
+convolution and KV state across entry changes.
+
 ## What this exporter does *not* do (yet)
 
 - **Image/text merge in the runner.** Running the full VL model end-to-end

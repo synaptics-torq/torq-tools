@@ -91,6 +91,8 @@ class LiquidVLModelExporter(LiquidModelExporter):
         *,
         max_gen_tokens: int = 256,
         batch_prefill: int | None = None,
+        native_batch_prefill: bool = False,
+        batch_prefill_sizes: tuple[int, ...] | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
@@ -102,13 +104,10 @@ class LiquidVLModelExporter(LiquidModelExporter):
         static_models: bool = True,
         **edit_args,
     ):
-        if edit_args.get("native_batch_prefill") or edit_args.get("batch_prefill_sizes") is not None:
-            raise ValueError("native batch prefill is not supported for vision models")
         # --- LFM2.5 exporter knobs (mirror LiquidModelExporter.__init__) ----
         # The VL decoder takes inputs_embeds directly; there is no Gather to
         # extract.  The token-embedding LUT lives in embed_tokens.onnx and is
         # handled separately (see _extract_embed_lut).
-        self._native_prefill_enabled = False
         self._extract_embeddings = False
         self._keep_individual_kv_io = keep_individual_kv_io
         # The VL demo engine writes whole caches back, and the image prefill chain shares them.
@@ -185,6 +184,39 @@ class LiquidVLModelExporter(LiquidModelExporter):
             convert_dtypes=convert_dtypes,
             split_weights=split_weights,
             opt_configs={},  # LFM2 custom ops break the ORT bert optimizer
+            max_gen_tokens=max_gen_tokens,
+            extract_embeddings=True,
+            split_lm_head=self._split_lm_head,
+            read_only_kv_cache=False,
+            keep_individual_kv_io=keep_individual_kv_io,
+            batch_prefill=batch_prefill,
+            native_batch_prefill=native_batch_prefill,
+            batch_prefill_sizes=batch_prefill_sizes,
+            native_minimum=4,
+            native_supports_read_only=False,
+            native_unsupported=(
+                self._compile_vision
+                or bool(self._vision_res)
+                or bool(self._image_decoder_parts)
+                or dynamic_quantize
+                or convert_dtypes
+                or not self._replace_conv1d
+                or self._simulate_bf16
+                or self._chunk_lm_head
+                or not self._split_lm_head
+                or keep_individual_kv_io
+                or batch_prefill_sizes is None
+            ),
+            native_supported=(
+                "LFM2-VL 450M text decoder only, FP32 with --split-lm-head, "
+                "--batch-prefill-sizes and the full-state cache; the vision "
+                "build options (--compile-vision, --vision-res, "
+                "--image-decoder-parts) and the --keep-conv1d / --chunk-lm-head "
+                "/ --simulate-bf16 options are not yet validated with native "
+                "families; only the FP32 family is validated (dynamic "
+                "quantization and dtype conversion would quantize the "
+                "family without re-sharing it)"
+            ),
         )
 
     # ------------------------------------------------------------------ config
@@ -549,7 +581,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return component == VISION and not self._compile_vision
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
-        if component not in (DECODER, DECODER_PREFILL):
+        if component not in (DECODER, DECODER_PREFILL) and not component.startswith("model_prefill_"):
             return
         self._patch_static_model(model_path, component)
         if self._split_lm_head:
@@ -586,6 +618,31 @@ class LiquidVLModelExporter(LiquidModelExporter):
         del model.graph.input[:]
         model.graph.input.extend(front + rest)
         self._save_component_model(model, model_path)
+
+    # ------------------------------------------------------------- native family
+    def _make_native_prefill(self):
+        components = {}
+        for size in self._native_batch_prefill:
+            component = f"model_prefill_{size}"
+            self._logger.info(
+                "(%s) Making graph static with %d tokens...", component, size
+            )
+            source = self._convert_decoder(chunk_len=size, component=component)
+            components[component] = self._make_model_static(
+                self.check_model(source, skip_data_prop=True),
+                component=component,
+                chunk_len=size,
+            )
+        return components
+
+    def _native_family_paths(self, paths=None):
+        # The decode member is the VL decoder component, not 'model'.
+        paths = self._export_paths if paths is None else paths
+        return {size: paths[DECODER if size == 1 else f"model_prefill_{size}"]
+                for size in (1, *self._native_batch_prefill)}
+
+    def _native_family_contract(self, path=None):
+        return super()._native_family_contract(path or self._export_paths[DECODER])
 
     # ----------------------------------------------------------------- convert
     def convert_models(
@@ -877,7 +934,9 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
     exporter = LiquidVLModelExporter(
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=args.batch_prefill or None,
+        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
+        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill_sizes=args.batch_prefill_sizes,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
@@ -899,6 +958,8 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
+    from ...model_export.prefill import check_native_cli_args
+    check_native_cli_args(args)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(
