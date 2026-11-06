@@ -309,8 +309,6 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
         token_embeddings: np.ndarray | None = None,
         token_id_lut: np.ndarray | None = None,
         lm_head: InferenceRunner | None = None,
-        prefill_model: InferenceRunner | None = None,
-        prefill_size: int | None = None,
         hidden_states_name: str = "last_hidden_states",
         temperature: float = 0.0,
         top_p: float = 1.0,
@@ -319,12 +317,6 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
         self._token_embeddings = token_embeddings
         self._token_id_lut = token_id_lut
         self._lm_head = lm_head
-        if (prefill_model is None) != (prefill_size is None):
-            raise ValueError("prefill_model and prefill_size must be provided together")
-        if prefill_size is not None and prefill_size < 1:
-            raise ValueError(f"prefill_size must be positive, got {prefill_size}")
-        self._prefill_model = prefill_model
-        self._prefill_size = prefill_size
         self._hidden_states_name = hidden_states_name
         super().__init__(
             model,
@@ -396,31 +388,6 @@ class StaticDecoderOnlyRunner(DecoderOnlyRunner):
 
     def _llm_step(self, token: int, curr_seq_len: int) -> tuple[int, list[np.ndarray]]:
         return self._llm_tokens_step(self._model, [token], curr_seq_len)
-
-    def _prefill_prompt(self, prompt_tokens: list[int], start_seq_len: int = 0) -> tuple[int, int]:
-        if self._prefill_model is None or self._prefill_size is None:
-            return super()._prefill_prompt(prompt_tokens, start_seq_len)
-
-        curr_seq_len = start_seq_len
-        next_token: int | None = None
-        chunk_start = 0
-        while chunk_start + self._prefill_size <= len(prompt_tokens):
-            chunk = prompt_tokens[chunk_start:chunk_start + self._prefill_size]
-            next_token, cache = self._llm_tokens_step(
-                self._prefill_model,
-                chunk,
-                curr_seq_len,
-            )
-            self._update_cache(cache, curr_seq_len)
-            chunk_start += self._prefill_size
-            curr_seq_len += self._prefill_size
-
-        if chunk_start < len(prompt_tokens):
-            next_token, curr_seq_len = super()._prefill_prompt(
-                prompt_tokens[chunk_start:],
-                start_seq_len=curr_seq_len,
-            )
-        return next_token, curr_seq_len
 
     def _run(
         self,

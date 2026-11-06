@@ -38,8 +38,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         static_models: bool = True,
         *,
         max_gen_tokens: int = 64,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = None,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         split_lm_head: bool = False,
         models_dir: str | os.PathLike = "models",
@@ -93,7 +92,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             read_only_kv_cache=read_only_kv_cache,
             keep_individual_kv_io=keep_individual_kv_io,
             batch_prefill=batch_prefill,
-            native_batch_prefill=native_batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
             native_supports_read_only=True,
@@ -370,6 +368,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
+    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    resolve_batch_prefill_cli(args)
     exporter = SmolLM2ModelExporter(
         args.model_size,
         args.instruct_model,
@@ -377,9 +377,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
-        # SmolLM2 has no legacy prefill builder: the shared --batch-prefill
-        # flag is not registered for it, so there is nothing to forward.
-        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill=args.batch_prefill,
         batch_prefill_sizes=args.batch_prefill_sizes,
         split_lm_head=args.split_lm_head,
         models_dir=args.models_dir,
@@ -396,9 +394,9 @@ def export_smollm2_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    from ...model_export.prefill import check_native_cli_args
-    check_native_cli_args(args)
-    exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
+    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
+                     compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(
             skip=args.dynamic_quantization_skip_model,

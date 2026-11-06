@@ -509,7 +509,7 @@ class ProbeReport:
     def sizes_flag(self) -> Optional[str]:
         if not self.chosen:
             return None
-        return "--native-batch-prefill --batch-prefill-sizes " + ",".join(str(b) for b in self.chosen)
+        return "--batch-prefill --batch-prefill-sizes " + ",".join(str(b) for b in self.chosen)
 
     def log_lines(self) -> List[str]:
         lines = [
@@ -841,7 +841,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m torq.model_export.prefill_sizes",
         description="Probe the matmul tiler and print the recommended "
-        "--native-batch-prefill --batch-prefill-sizes options for the model exporter.",
+        "--batch-prefill --batch-prefill-sizes options for the model exporter.",
     )
     parser.add_argument("model", help="the .onnx or imported .mlir/.mlirbc source")
     parser.add_argument("--chip", help="HW chip identifier, passed to --torq-hw in torq-compile", 

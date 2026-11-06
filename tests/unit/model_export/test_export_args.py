@@ -54,8 +54,10 @@ def test_extract_embeddings_is_on_by_default(name, add_args):
 
 @pytest.mark.parametrize("name,add_args", SPLIT_PREFILL_EXPORTERS)
 def test_split_lm_head_on_and_batch_prefill_default(name, add_args):
+    # The argparse default is None: the shared CLI check resolves it (on for
+    # compile runs, off for --skip-torq) before the exporter is constructed.
     assert _parse(add_args).split_lm_head is True
-    assert _parse(add_args).batch_prefill == 64
-    off = _parse(add_args, "--no-split-lm-head", "--batch-prefill", "0")
+    assert _parse(add_args).batch_prefill is None
+    off = _parse(add_args, "--no-split-lm-head", "--no-batch-prefill")
     assert off.split_lm_head is False
-    assert off.batch_prefill == 0
+    assert off.batch_prefill is False

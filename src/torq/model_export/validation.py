@@ -46,8 +46,6 @@ def validate_decoder_only_onnx(
     n_iters: int = 5,
     n_threads: int | None = None,
     lm_head_path: str | os.PathLike | None = None,
-    prefill_model_path: str | os.PathLike | None = None,
-    prefill_size: int | None = None,
     prompts: tuple[str, ...] = VALIDATION_PROMPTS,
     max_inp_len: int | None = None,
     runner_kwargs: dict | None = None,
@@ -57,24 +55,17 @@ def validate_decoder_only_onnx(
     The reference is always `dynamic_cls` on the source `model.onnx`; the model
     under test is static or dynamic depending on how it was exported.
     `lm_head_path` chains a split LM head onto the model under test, whose own
-    first output is then hidden states rather than logits. `prefill_model_path`
-    uses the fixed-size prefill model for complete prompt chunks. `max_inp_len`
+    first output is then hidden states rather than logits. `max_inp_len`
     can allow a complete tool prompt larger than one chunk; `runner_kwargs`
     supplies the same tool definitions to both runners.
     """
     n_threads = n_threads or os.cpu_count()
-    max_inp_len = max_inp_len if max_inp_len is not None else prefill_size
     runner_kwargs = runner_kwargs or {}
     if static_models:
         # Only exporters that can split the model accept these component paths.
         split_model_kwargs = {}
         if lm_head_path:
             split_model_kwargs["lm_head_path"] = lm_head_path
-        if prefill_model_path:
-            split_model_kwargs.update({
-                "prefill_model_path": prefill_model_path,
-                "prefill_size": prefill_size,
-            })
         runner = static_cls.from_onnx(
             model_path,
             max_gen_tokens,

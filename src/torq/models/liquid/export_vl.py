@@ -53,7 +53,6 @@ from ...model_export.onnx import (
 # Component keys — match the source ONNX filenames so the base exporter writes
 # ``<comp>.onnx`` back out under the same names.
 DECODER = "decoder_model_merged"
-DECODER_PREFILL = "decoder_model_merged_prefill"
 VISION = "vision_encoder"
 EMBED_FILE = "embed_tokens.onnx"
 
@@ -90,8 +89,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self,
         *,
         max_gen_tokens: int = 256,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = None,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -124,18 +122,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
-        if batch_prefill is not None:
-            if batch_prefill < 1:
-                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
-            if batch_prefill > max_gen_tokens:
-                raise ValueError(
-                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
-                )
-            if not self._split_lm_head:
-                raise ValueError("`--batch-prefill` requires `--split-lm-head`")
-            if not static_models:
-                raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
-        self._batch_prefill = batch_prefill
         self._onnx_source_dir = onnx_source_dir
         self._model_size = "450m-vl"
         self._hf_repo = HF_REPO_VL
@@ -190,7 +176,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
             read_only_kv_cache=False,
             keep_individual_kv_io=keep_individual_kv_io,
             batch_prefill=batch_prefill,
-            native_batch_prefill=native_batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
             native_supports_read_only=False,
@@ -364,7 +349,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
             # transformer.onnx (not the fused decoder_model_merged.onnx).
             filenames = {
                 DECODER: "transformer.onnx",
-                DECODER_PREFILL: "transformer_prefill.onnx",
             }
             if component in filenames:
                 return self._export_dir / filenames[component]
@@ -545,22 +529,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
             import copy
             self._dynamic_decoder = copy.deepcopy(self._components[DECODER])
         self._components[DECODER] = self._make_model_static(self._components[DECODER])
-        if self._batch_prefill is not None:
-            self._logger.info(
-                "(%s) Making graph static with %d tokens...",
-                DECODER_PREFILL, self._batch_prefill,
-            )
-            prefill_model = self._convert_decoder(
-                chunk_len=self._batch_prefill, component=DECODER_PREFILL
-            )
-            self._components[DECODER_PREFILL] = self.check_model(
-                prefill_model, skip_data_prop=True
-            )
-            self._components[DECODER_PREFILL] = self._make_model_static(
-                self._components[DECODER_PREFILL],
-                component=DECODER_PREFILL,
-                chunk_len=self._batch_prefill,
-            )
 
     def _allows_dynamic_shapes(self, component: str) -> bool:
         """The SigLIP tower keeps its dynamic ``num_patches`` / ``spatial_shapes``.
@@ -581,7 +549,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         return component == VISION and not self._compile_vision
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
-        if component not in (DECODER, DECODER_PREFILL) and not component.startswith("model_prefill_"):
+        if component != DECODER and not component.startswith("model_prefill_"):
             return
         self._patch_static_model(model_path, component)
         if self._split_lm_head:
@@ -932,10 +900,11 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
 def export_liquid_vl_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
+    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    resolve_batch_prefill_cli(args)
     exporter = LiquidVLModelExporter(
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
-        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill=args.batch_prefill,
         batch_prefill_sizes=args.batch_prefill_sizes,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
@@ -958,8 +927,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    from ...model_export.prefill import check_native_cli_args
-    check_native_cli_args(args)
+    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(

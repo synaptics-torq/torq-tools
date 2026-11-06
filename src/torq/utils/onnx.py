@@ -232,10 +232,6 @@ def add_onnx_args(
         )
 
 
-# Default N for --batch-prefill (the LLM lower-TTFT prefill export).
-DEFAULT_BATCH_PREFILL = 64
-
-
 def add_decoder_args(
     parser: argparse.ArgumentParser,
     *,
@@ -244,11 +240,10 @@ def add_decoder_args(
     default_model_size: str | None = None,
     split_lm_head: bool = False,
     batch_prefill: bool = False,
-    native_batch_prefill: bool = False,
 ):
     """Args shared by exporters with a decoder component: the
     ``-s/--model-size`` selector (every model family) and, for LLM decoders,
-    the lower-TTFT ``--split-lm-head`` / ``--batch-prefill`` options.
+    the ``--split-lm-head`` / ``--batch-prefill`` options.
 
     Defined here (not in each model's ``__init__.py``) so their defaults
     change in one place, like the other shared export args.
@@ -269,33 +264,24 @@ def add_decoder_args(
             default=True,
             help="Split the final LM head into lm_head.onnx; the main model is then exported as transformer.onnx and outputs hidden states (default: %(default)s)"
         )
-    group = None
     if batch_prefill:
-        group = parser.add_mutually_exclusive_group()
-        group.add_argument(
+        # argparse default None: the shared CLI check resolves the default
+        # (on for compile runs, off + info line for --skip-torq) and the base
+        # constructor resolves it for unsupported configurations.
+        parser.add_argument(
             "--batch-prefill",
-            type=int,
-            # argparse otherwise treats an explicit interned default as absent
-            # from the mutually exclusive group. String defaults are type-converted.
-            default=str(DEFAULT_BATCH_PREFILL),
-            metavar="N",
-            help="Also export transformer_prefill.onnx with a fixed N-token prefill (default: %(default)s; pass 0 to disable)"
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Compile the shared decoder family (single-token decode plus "
+                "batched prefill chunks in one VMFB). Default: on for compile "
+                "runs; --skip-torq exports decode only"
+            ),
         )
-
-    if native_batch_prefill:
-        # Exporters without a legacy prefill builder (smollm2) expose the
-        # native flags only: the legacy --batch-prefill flag would be inert
-        # and its default-64 would fail the base's split-head check.
-        if group is None:
-            group = parser.add_mutually_exclusive_group()
         from ..model_export.prefill import parse_native_sizes
-        group.add_argument(
-            "--native-batch-prefill", action="store_true",
-            help="Opt in to an experimental shared decoder family (incompatible with --batch-prefill)",
-        )
         parser.add_argument(
             "--batch-prefill-sizes", type=parse_native_sizes, default=None, metavar="B1,B2,...",
-            help="Native prefill sizes in ascending order; requires --native-batch-prefill (default: probe automatically)",
+            help="Prefill sizes in ascending order; requires --batch-prefill (default: probe automatically)",
         )
 
 
@@ -309,7 +295,6 @@ def add_llm_args(
     instruct: bool = False,
     split_lm_head: bool = False,
     batch_prefill: bool = False,
-    native_batch_prefill: bool = False,
 ):
     """LLM export args: ``-t/--max-gen-tokens`` and optional
     ``--instruct-model`` on top of the shared decoder args."""
@@ -334,7 +319,6 @@ def add_llm_args(
         default_model_size=default_model_size,
         split_lm_head=split_lm_head,
         batch_prefill=batch_prefill,
-        native_batch_prefill=native_batch_prefill,
     )
 
 

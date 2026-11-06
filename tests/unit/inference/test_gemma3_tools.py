@@ -67,7 +67,7 @@ def test_validation_passes_tools_and_complete_prompt_limit(static_models):
     validate_decoder_only_onnx(
         logging.getLogger(__name__), static_cls, dynamic_cls, "model.onnx", "source.onnx",
         static_models=static_models, max_gen_tokens=256, instruct_model=True,
-        prefill_size=64, max_inp_len=224, prompts=("London",), n_iters=1,
+        max_inp_len=224, prompts=("London",), n_iters=1,
         runner_kwargs={"tools": tools},
     )
     for call in static_cls.from_onnx.call_args_list + dynamic_cls.from_onnx.call_args_list:

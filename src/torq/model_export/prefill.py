@@ -6,6 +6,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -33,33 +34,56 @@ def parse_native_sizes(value: str) -> tuple[int, ...]:
     return sizes
 
 
-def validate_native_options(sizes, *, enabled, batch_prefill, context, minimum, static,
+def validate_native_options(sizes, *, enabled, context, minimum, static,
                             embeddings, split_head, read_only, individual, unsupported,
                             supports_read_only=False, supported=""):
     if type(enabled) is not bool:
-        raise ValueError("native_batch_prefill must be a boolean; supply sizes via batch_prefill_sizes")
+        raise ValueError("batch_prefill must be a boolean; supply sizes via batch_prefill_sizes")
     if not enabled:
         if sizes is not None:
-            raise ValueError("--batch-prefill-sizes requires --native-batch-prefill")
+            raise ValueError("--batch-prefill-sizes requires --batch-prefill")
         return ()
     if context < minimum:
-        raise ValueError(f"native prefill requires a context of at least {minimum}")
+        raise ValueError(f"batch prefill requires a context of at least {minimum}")
     if sizes is not None and (not sizes or any(type(b) is not int or not minimum <= b <= context for b in sizes)
             or any(a >= b for a, b in zip(sizes, sizes[1:]))):
         raise ValueError(f"--batch-prefill-sizes requires unique ascending sizes in [{minimum}, {context}]")
-    if batch_prefill is not None:
-        raise ValueError("--native-batch-prefill and --batch-prefill are mutually exclusive")
     if not static or not embeddings or not split_head or (read_only and not supports_read_only) or individual or unsupported:
         raise ValueError(
-            "--native-batch-prefill requires static exports, --extract-embeddings, "
+            "--batch-prefill requires static exports, --extract-embeddings, "
             f"--split-lm-head and combined KV I/O; {supported}"
         )
     return tuple(sizes) if sizes is not None else ()
 
 
-def check_native_cli_args(args):
-    """Fail fast on the compiler and flag set before any destructive export work."""
-    if args.native_batch_prefill and (not args.skip_torq or args.batch_prefill_sizes is None):
+def resolve_batch_prefill_cli(args):
+    """Resolve the ``--skip-torq`` half of the ``--batch-prefill`` default
+    (rules 1/2 of the step-8 resolution) before the exporter is constructed.
+
+    Mutates ``args.batch_prefill``: an explicit ``--batch-prefill`` or
+    ``--batch-prefill-sizes`` together with ``--skip-torq`` fails, since batch
+    prefill always compiles; the default resolves to off (with an info line).
+    Compile runs keep the argparse default (None), which the base constructor
+    resolves against the model's supported configuration (rules 3/4).
+    """
+    if not args.skip_torq:
+        return
+    if args.batch_prefill is True or args.batch_prefill_sizes is not None:
+        raise ValueError(
+            "--batch-prefill requires compilation; drop --skip-torq or pass --no-batch-prefill"
+        )
+    if args.batch_prefill is None:
+        args.batch_prefill = False
+        logging.getLogger("torq.export").info(
+            "--batch-prefill is off for this --skip-torq export (decode only)"
+        )
+
+
+def check_native_cli_args(args, *, enabled):
+    """Fail fast on the compiler and flag set before any destructive export
+    work (after ``resolve_batch_prefill_cli`` and construction; ``enabled`` is
+    the exporter's resolved batch-prefill state)."""
+    if enabled:
         check_native_compiler(args.compiler_path)
         native_compile_flags(args.compile_flags or [])
 

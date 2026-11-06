@@ -44,7 +44,7 @@ torq-export-model gemma3 --functiongemma --onnx-source-dir ./functiongemma-onnx
 
 The default source is `google/functiongemma-270m-it` (`--instruct-model` is implied). A source override is optional. Google recommends fine-tuning FunctionGemma for your function-calling task for best accuracy; see the [model card](https://huggingface.co/google/functiongemma-270m-it). Local ONNX sources must include `config.json`, `tokenizer.json`, and the source tokenizer metadata and chat template (`tokenizer_config.json` with an embedded template or a separate `chat_template.jinja`).
 
-Export validation compares a tool-call prompt, including special function-call markers, against the original ONNX using the source checkpoint's chat template, a developer instruction, and a sample tool definition. It checks export equivalence, not task accuracy. The full prompt can span multiple prefill chunks; an insufficient context limit raises an error instead of truncating the tool definition. Runners honor every stop token in the source configuration, including FunctionGemma's start-of-function-response token. Tokenizer metadata and chat templates are preserved in exported, quantized, converted, and compiled directories. The read-only KV cache and other Gemma export defaults also apply.
+Export validation compares a tool-call prompt, including special function-call markers, against the original ONNX using the source checkpoint's chat template, a developer instruction, and a sample tool definition. It checks export equivalence, not task accuracy. The prompt is processed one token at a time; an insufficient context limit raises an error instead of truncating the tool definition. Runners honor every stop token in the source configuration, including FunctionGemma's start-of-function-response token. Tokenizer metadata and chat templates are preserved in exported, quantized, converted, and compiled directories. The read-only KV cache and other Gemma export defaults also apply.
 
 INT4 quantization uses round-to-nearest unless you supply `--gptq-checkpoint` for this checkpoint. The hosted ordinary Gemma GPTQ weights are never selected for FunctionGemma. Programmatic `Gemma3Static` and `Gemma3Dynamic` runners accept `tools=[...]` with Hugging Face tool schemas and use the local chat template. The existing text-only inference CLI does not accept tool definitions or execute function calls.
 
@@ -71,8 +71,9 @@ This is the model of the torq-examples `gemma3` demo
 (`Synaptics/gemma-3-270-GPTQ-int4-it-torq`). The command downloads the source
 and the GPTQ INT4 weights (the `gptq/` folder of that repository), builds the
 static model with a trimmed vocabulary and a separate LM head, quantizes the
-weights to INT4, and compiles `transformer.vmfb`, `transformer_prefill.vmfb`
-and `lm_head.vmfb.trim` (the trimmed-vocabulary LM head). Equivalent module form: `python -m torq.models.gemma3.export …`.
+weights to INT4, and compiles the decoder family `transformer.vmfb`
+(single-token decode plus prefill chunks) and `lm_head.vmfb.trim` (the
+trimmed-vocabulary LM head). Equivalent module form: `python -m torq.models.gemma3.export …`.
 
 The `.vmfb` files and the host files (`token_embeddings.npy` in bf16,
 `token_id_lut.npy` in int32, `tokenizer.json`, `config.json`) are in
@@ -90,7 +91,7 @@ torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization non
 torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization int8
 ```
 
-To compile the float variant, use `torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization none`. A run compiles only its selected variant: the default INT4 run regenerates the intermediate `fp32/static` ONNX files, but preserves any `fp32/static/compiled` files from earlier float runs. Those compiled files can therefore have older input shapes and KV layouts than the adjacent ONNX files. The selected variant emits separate `transformer.vmfb` and `transformer_prefill.vmfb` files for decoding and prefill.
+To compile the float variant, use `torq-export-model gemma3 --instruct-model --trim-vocab --weight-quantization none`. A run compiles only its selected variant: the default INT4 run regenerates the intermediate `fp32/static` ONNX files, but preserves any `fp32/static/compiled` files from earlier float runs. Those compiled files can therefore have older input shapes and KV layouts than the adjacent ONNX files. The selected variant compiles the decoder family (decode plus prefill chunks) into one `transformer.vmfb`.
 
 If the Torq compiler Python API is not installed in the venv, point the fallback
 at a `torq-compile` binary first:
@@ -112,13 +113,13 @@ export TORQ_COMPILER_PATH=/path/to/torq-compile
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
 | `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits. **On by default** — opt out with `--no-split-lm-head` |
-| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens (default: `64`; pass `0` to disable). Requires `--split-lm-head` (on by default) |
+| `--batch-prefill` / `--no-batch-prefill` | Compile the shared decoder family (single-token decode plus batched prefill chunks in one VMFB); default: on for compile runs, `--skip-torq` exports decode only. See [Batch prefill](#batch-prefill) |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--no-read-only-kv-cache` | Export the pre-2.4 KV caches (head-major, written back whole every step). By default the time-major caches are read-only inputs and the models output only the new rows; see the [Qwen README](../qwen/README.md#read-only-kv-cache) |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |
 | `--onnx-source-dir DIR` | Use a local source ONNX (skips download) |
 | `--models-dir DIR` | Base directory for source + export models (default: `models`) |
-| `--dynamic-models` | Export dynamic (CPU) models instead of static. The static-only options above are on by default, so a dynamic run also needs `--no-split-lm-head --batch-prefill 0` |
+| `--dynamic-models` | Export dynamic (CPU) models instead of static. The static-only options above are on by default, so a dynamic run also needs `--no-split-lm-head --no-batch-prefill` |
 | `--dynamic-quantize` | Dynamically quantize the model to 8-bit integer in-pipeline, before compiling. Turns off `--weight-quantization` |
 | `--weight-quantization {int4,int8,none}` | Quantize the MatMul weights (block size 32) in-pipeline to a DQL model, before compiling (default: `int4`). See [Weight quantization](#weight-quantization-int4--int8) |
 | `--gptq / --no-gptq` | With `int4` and the default 270m instruct source, take the INT4 weights from the hosted GPTQ checkpoint (default: on). Other sources use round-to-nearest |
@@ -162,14 +163,15 @@ above holds `transformer.onnx` (hidden-states output) plus `lm_head.onnx`
 ```
 models/<repo>/export/<full|trim>/split_lm_head/<dtype>/static/
     transformer.onnx                    ← the decoder, outputs last_hidden_states
-    transformer_prefill.onnx            ← with --batch-prefill; processes N tokens and outputs the last hidden state
+    transformer_prefill_<B>.onnx        ← with batch prefill, one chunk per probed or supplied size B
     lm_head.onnx                        ← standalone LM head
 ```
 
-Inference and export validation pick up both companion models automatically when
-they sit next to the transformer. Full `N`-token prompt chunks run through
-`transformer_prefill.onnx`; any remainder and generated tokens use
-`transformer.onnx`, with both paths sharing `lm_head.onnx`.
+Inference and export validation pick up the companion `lm_head.onnx`
+automatically when it sits next to the transformer. The local runners process
+prompts one token at a time through `transformer.onnx`; batched prompt chunks
+run through the compiled family on the board, with both sharing
+`lm_head.onnx` (see [Batch prefill](#batch-prefill)).
 
 ## Weight quantization (int4 / int8)
 
@@ -189,13 +191,14 @@ torq-export-model gemma3 --instruct-model --trim-vocab
 - For each model, the log shows a "Quantization summary" line: KL divergence,
   cosine similarity and max absolute error of the logits against the fp32 model.
 - Output: `models/<repo>/export/trim/split_lm_head/quantized/static/`
-  (`transformer.onnx`, `transformer_prefill.onnx`, `lm_head.onnx`) and
-  `compiled/` (the `.vmfb` files and the host files: `.npy` in the runtime
-  dtype, `tokenizer.json`, `config.json`).
-- The batch-prefill model (`transformer_prefill.vmfb`, `--batch-prefill 64` by
-  default) halves the time to the first token for long prompts. Its
-  "Quantization summary" line shows a high value: the check feeds it inputs that
-  do not match a prefill chunk, so it does not measure its accuracy.
+  (`transformer.onnx`, the `transformer_prefill_<B>.onnx` chunks,
+  `lm_head.onnx`) and `compiled/` (the family VMFB and host files: `.npy` in
+  the runtime dtype, `tokenizer.json`, `config.json`).
+- The batched prefill chunks in the compiled family (batch prefill is on by
+  default) halve the time to the first token for long prompts. Their
+  "Quantization summary" lines show high values: the check feeds them inputs
+  that do not match a prefill chunk, so they do not measure the chunks'
+  accuracy.
 
 To use your own GPTQ checkpoint (compressed-tensors `pack-quantized` safetensors,
 group size 32), pass `--gptq-checkpoint DIR`. Other sources (another `--hf-repo`,
@@ -228,7 +231,7 @@ torq-export-model gemma3 \
 ### 2. Quantize
 
 Quantize each model of the export directory (`transformer.onnx`,
-`transformer_prefill.onnx`, `lm_head.onnx`) the same way:
+`lm_head.onnx`) the same way:
 
 ```sh
 # int8 (ORT-matching asymmetric uint8, block_size 32) as a DQL model
@@ -321,9 +324,9 @@ bf16 ONNX cannot run through onnxruntime (no CPU bf16 MatMul kernel) — validat
 correctness on the **fp32** ONNX, and use the VMFB (or the DQL/dequantized model)
 on the board.
 
-### Experimental native batch prefill
+### Batch prefill
 
-Gemma3 270M and FunctionGemma support opt-in native static families with the `--native-batch-prefill` flag. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this native path; ordinary separate-prefill exports remain available.
+Gemma3 270M and FunctionGemma compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. INT8, dynamic quantization, explicit dtype conversion, dynamic shapes and layer splitting are unsupported in this path.
 
 See the shared [native batch-prefill guide](../../model_export/doc/batch_prefill.md) for export commands, compiler/runtime requirements, artifact layout, optional size probing, chunk selection and cache handling. FunctionGemma additionally needs checkpoint-specific validation.
 

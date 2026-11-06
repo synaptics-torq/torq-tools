@@ -95,8 +95,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         static_models: bool = True,
         *,
         max_gen_tokens: int = 256,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = None,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         model_dtype: str = "fp32",
         models_dir: str | os.PathLike = "models",
@@ -153,7 +152,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             read_only_kv_cache=read_only_kv_cache,
             keep_individual_kv_io=keep_individual_kv_io,
             batch_prefill=batch_prefill,
-            native_batch_prefill=native_batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
             native_unsupported=unsupported,
@@ -169,9 +167,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "`--read-only-kv-cache` needs the combined KV cache I/O; "
                 "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
             )
-        if self._batch_prefill is not None and not static_models:
-            raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
-
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
         cfg_path: Path | None = None
@@ -298,7 +293,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         if getattr(self, "_split_lm_head", False):
             filenames = {
                 "model": "transformer.onnx",
-                "model_prefill": "transformer_prefill.onnx",
             }
             if component in filenames:
                 return self._export_dir / filenames[component]
@@ -538,7 +532,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             )]
-        if self._batch_prefill is not None or self._native_prefill_enabled:
+        if self._native_prefill_enabled:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -1344,7 +1338,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
                     self._num_attention_heads,
                     self._num_key_value_heads,
                     self._head_dim,
-                    self._batch_prefill if component.endswith("_prefill") else 1,
                 )
 
         editor.reorder_graph_input("position_ids", 1)
@@ -1419,22 +1412,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._components["model"], skip_data_prop=True
         )
         self._components["model"] = self._make_model_static(self._components["model"])
-        if self._batch_prefill is not None:
-            self._logger.info(
-                "(model_prefill) Making graph static with %d tokens...",
-                self._batch_prefill,
-            )
-            prefill_model = self._convert_source_model(
-                chunk_len=self._batch_prefill, component="model_prefill"
-            )
-            self._components["model_prefill"] = self.check_model(
-                prefill_model, skip_data_prop=True
-            )
-            self._components["model_prefill"] = self._make_model_static(
-                self._components["model_prefill"],
-                component="model_prefill",
-                chunk_len=self._batch_prefill,
-            )
 
 
     def _native_family_contract(self, path=None):
@@ -1565,8 +1542,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 repo_id=self._hf_repo,
                 config_path=cfg_path,
                 tokenizer_path=tok_path,
-                prefill_model_path=self._export_paths.get("model_prefill"),
-                prefill_size=self._batch_prefill,
                 lm_head_path=self._export_paths.get("lm_head"),
             )
         else:
@@ -1805,14 +1780,16 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
 def export_liquid_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
+    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    resolve_batch_prefill_cli(args)
+
     exporter = LiquidModelExporter(
         args.model_size,
         args.extract_embeddings,
         args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
-        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill=args.batch_prefill,
         batch_prefill_sizes=args.batch_prefill_sizes,
         model_dtype=args.model_dtype,
         models_dir=args.models_dir,
@@ -1832,8 +1809,7 @@ def export_liquid_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    from ...model_export.prefill import check_native_cli_args
-    check_native_cli_args(args)
+    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

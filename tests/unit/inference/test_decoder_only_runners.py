@@ -118,8 +118,6 @@ class _DemoStatic(_DemoMixin, StaticDecoderOnlyRunner):
         token_embeddings: np.ndarray | None = None,
         token_id_lut: np.ndarray | None = None,
         lm_head: _FakeLMHead | None = None,
-        prefill_model: _FakeRunner | None = None,
-        prefill_size: int | None = None,
     ):
         StaticDecoderOnlyRunner.__init__(
             self,
@@ -133,8 +131,6 @@ class _DemoStatic(_DemoMixin, StaticDecoderOnlyRunner):
             token_embeddings=token_embeddings,
             token_id_lut=token_id_lut,
             lm_head=lm_head,
-            prefill_model=prefill_model,
-            prefill_size=prefill_size,
         )
 
 
@@ -245,28 +241,6 @@ def test_static_runner_split_lm_head_remaps_through_token_lut():
     next_token, _ = runner._llm_step(2, 0)
 
     assert next_token == 42
-
-
-def test_static_runner_uses_prefill_model_for_full_chunks_then_decode_for_remainder():
-    decode_model = _FakeRunner(tokens=[1])
-    prefill_model = _FakeRunner(tokens=[2])
-    lm_head = _FakeLMHead(token=6)
-    runner = _DemoStatic(
-        decode_model,
-        lm_head=lm_head,
-        prefill_model=prefill_model,
-        prefill_size=2,
-    )
-
-    next_token, curr_seq_len = runner._prefill_prompt([3, 4, 5], start_seq_len=1)
-
-    assert next_token == 6
-    assert curr_seq_len == 4
-    assert np.array_equal(prefill_model.calls[0]["input_ids"], np.array([[3, 4]]))
-    assert np.array_equal(prefill_model.calls[0]["position_ids"], np.array([[1]]))
-    assert np.array_equal(decode_model.calls[0]["input_ids"], np.array([[5]]))
-    assert np.array_equal(decode_model.calls[0]["position_ids"], np.array([[3]]))
-    assert len(lm_head.calls) == 2
 
 
 def test_gemma3_stop_rules_are_preserved():

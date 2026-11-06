@@ -10,7 +10,6 @@ from unittest.mock import Mock
 from torq.models.liquid.export import LiquidModelExporter
 from torq.models.liquid.export_vl import (
     DECODER,
-    DECODER_PREFILL,
     LiquidVLModelExporter,
 )
 
@@ -87,8 +86,8 @@ class LiquidExporterTests(unittest.TestCase):
         return LiquidModelExporter(onnx_source_dir=source_dir, **kwargs)
 
     def test_batch_prefill_block_present_only_when_enabled(self):
-        enabled = self._create_exporter(self.tmp, batch_prefill=8)
-        disabled = self._create_exporter(self.tmp)
+        enabled = self._create_exporter(self.tmp, batch_prefill=True, extract_embeddings=True, read_only_kv_cache=False)
+        disabled = self._create_exporter(self.tmp, batch_prefill=False)
 
         self.assertIn("model.patch (batch prefill)", enabled.graph_edit_blocks())
         self.assertNotIn("model.patch (batch prefill)", disabled.graph_edit_blocks())
@@ -209,7 +208,7 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            model_path = self._write_model(td, "transformer_prefill.onnx")
+            model_path = self._write_model(td, "transformer_prefill_4.onnx")
             exporter = self._make_exporter(model_path)
             exporter.make_lm_head_split(model_path, write_lm_head=False)
 
@@ -230,7 +229,7 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            model_path = td / "transformer_prefill.onnx"
+            model_path = td / "transformer_prefill_4.onnx"
             model = _build_tiny_liquid_decoder()
             model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 64
             model.graph.node.insert(1, helper.make_node(
@@ -271,7 +270,7 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
             source_dir = _write_config(td)
             (source_dir / "tokenizer.json").write_text("tokenizer")
             model_path = td / "transformer.onnx"
-            prefill_path = td / "transformer_prefill.onnx"
+            prefill_path = td / "transformer_prefill_4.onnx"
             onnx.save(_build_tiny_liquid_decoder(), str(model_path))
             onnx.save(_build_tiny_liquid_decoder(), str(prefill_path))
 
@@ -284,11 +283,11 @@ class LiquidSplitLMHeadTests(unittest.TestCase):
             exporter._split_lm_head = True
             exporter._simulate_bf16 = False
             exporter._onnx_dir = source_dir
-            exporter._export_paths = {"model": model_path, "model_prefill": prefill_path}
+            exporter._export_paths = {"model": model_path, "model_prefill_4": prefill_path}
             exporter._patch_static_model = Mock()
 
             exporter.apply_post_static_patches(model_path, "model")
-            exporter.apply_post_static_patches(prefill_path, "model_prefill")
+            exporter.apply_post_static_patches(prefill_path, "model_prefill_4")
 
             # Both bodies are split; a single lm_head.onnx (derived from the
             # decode model) is shared.
@@ -386,23 +385,6 @@ class LiquidVLSplitLMHeadTests(unittest.TestCase):
         self.assertEqual([i.name for i in lm_head.graph.input], ["last_hidden_states"])
         self.assertEqual([o.name for o in lm_head.graph.output], ["logits"])
 
-        # The prefill component is split too (gemma3-style); it reuses the
-        # lm_head.onnx derived from the decode model instead of re-writing it.
-        prefill_path = export_dir / "transformer_prefill.onnx"
-        onnx.save(_build_tiny_liquid_decoder(), str(prefill_path))
-        lm_head_before = (export_dir / "lm_head.onnx").read_bytes()
-        exporter._export_paths = {
-            DECODER: model_path,
-            DECODER_PREFILL: prefill_path,
-        }
-        exporter._patch_static_model = Mock()
-        exporter._reorder_decoder_inputs = Mock()
-        exporter._stage_runtime_assets = Mock()
-        exporter.apply_post_static_patches(prefill_path, DECODER_PREFILL)
-        prefill = onnx.load(str(prefill_path))
-        self.assertEqual(prefill.graph.output[0].name, "last_hidden_states")
-        self.assertNotIn("/model/lm_head/MatMul", {n.name for n in prefill.graph.node})
-        self.assertEqual((export_dir / "lm_head.onnx").read_bytes(), lm_head_before)
 
 class LiquidVLRuntimeAssetTests(unittest.TestCase):
     def setUp(self):

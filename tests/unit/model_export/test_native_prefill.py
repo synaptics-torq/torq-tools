@@ -25,31 +25,35 @@ def test_invalid_sizes(value):
 
 
 @pytest.mark.parametrize("add_args", [add_gemma3_export_args, add_liquid_export_args, add_qwen_export_args])
-def test_cli_sizes_replace_default_without_accepting_explicit_legacy(add_args):
+def test_cli_batch_prefill_flag_and_sizes(add_args):
     parser = argparse.ArgumentParser()
     add_args(parser)
+    # argparse default is None: the shared CLI check resolves it (on for
+    # compile runs, off for --skip-torq) and the base constructor resolves it
+    # for unsupported configurations.
     defaults = parser.parse_args([])
-    assert defaults.batch_prefill == 64
-    assert defaults.native_batch_prefill is False
+    assert defaults.batch_prefill is None
     assert defaults.batch_prefill_sizes is None
-    automatic = parser.parse_args(["--native-batch-prefill"])
-    assert automatic.native_batch_prefill is True
+    explicit_on = parser.parse_args(["--batch-prefill"])
+    assert explicit_on.batch_prefill is True
+    explicit_off = parser.parse_args(["--no-batch-prefill"])
+    assert explicit_off.batch_prefill is False
+    automatic = parser.parse_args(["--batch-prefill"])
     assert automatic.batch_prefill_sizes is None
-    explicit = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,7"])
-    assert explicit.native_batch_prefill is True
-    assert explicit.batch_prefill_sizes == (4, 7)
+    sized = parser.parse_args(["--batch-prefill", "--batch-prefill-sizes", "4,7"])
+    assert sized.batch_prefill is True
+    assert sized.batch_prefill_sizes == (4, 7)
+    # The legacy integer form is gone.
     for size in ("0", "64"):
-        for arguments in (["--batch-prefill", size, "--native-batch-prefill"],
-                          ["--native-batch-prefill", "--batch-prefill", size]):
-            with pytest.raises(SystemExit):
-                parser.parse_args(arguments)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--batch-prefill", size])
 
 
 @pytest.mark.parametrize("override", [dict(sizes=()), dict(sizes=(4,4)), dict(sizes=(7,4)), dict(sizes=(1,4)),
     dict(sizes=(4,17)), dict(sizes=(2,), minimum=4), dict(read_only=True), dict(static=False),
-    dict(embeddings=False), dict(split_head=False), dict(individual=True), dict(unsupported=True), dict(batch_prefill=64)])
+    dict(embeddings=False), dict(split_head=False), dict(individual=True), dict(unsupported=True)])
 def test_reject_unsupported_options(override):
-    options = dict(sizes=(4,7), enabled=True, batch_prefill=None, context=16, minimum=2, static=True,
+    options = dict(sizes=(4,7), enabled=True, context=16, minimum=2, static=True,
                    embeddings=True, split_head=True, read_only=False, individual=False, unsupported=False)
     options.update(override)
     with pytest.raises(ValueError):
@@ -230,6 +234,7 @@ def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, 
         exported.append(self)
         export_options.append(kwargs)
     monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_onnx", record_export)
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_torq", Mock())
     quantize = Mock()
     monkeypatch.setattr(gemma.Gemma3ModelExporter, "weight_quantize_models", quantize)
     parser = argparse.ArgumentParser()
@@ -237,7 +242,7 @@ def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, 
     from torq.model_export import prefill
     check_compiler = Mock()
     monkeypatch.setattr(prefill, "check_native_compiler", check_compiler)
-    arguments = ["--instruct-model", "--native-batch-prefill", "--skip-torq", "--compiler-path", "/selected/compiler"]
+    arguments = ["--instruct-model", "--batch-prefill", "--compiler-path", "/selected/compiler"]
     if sizes is not None:
         arguments += ["--batch-prefill-sizes", ",".join(map(str, sizes))]
     arguments += ["--compile-flags", "--torq-max-nss-programs-size=33554432"]
@@ -254,10 +259,107 @@ def test_gemma_native_cli_keeps_default_int4_gptq_and_read_only_cache(tmp_path, 
     assert export_options[0]["torq_compile_args"] == args.compile_flags
     assert exported[0]._native_prefill_enabled is True
     assert exported[0]._native_batch_prefill == (sizes or ())
-    if sizes is None:
-        check_compiler.assert_called_once_with(args.compiler_path)
+    # Compile runs always need the selected compiler: explicit sizes compile
+    # the family, omitted sizes probe first.
+    check_compiler.assert_called_once_with(args.compiler_path)
+
+
+@pytest.mark.parametrize("arguments,raise_match,enabled,sizes,compiler_calls", [
+    # Rule 1: explicit --batch-prefill (or sizes, which imply it) + --skip-torq fails.
+    (["--batch-prefill", "--skip-torq"], "requires compilation", None, None, 0),
+    (["--batch-prefill-sizes", "4,12", "--skip-torq"], "requires compilation", None, None, 0),
+    # Rule 2: the default with --skip-torq is a decode-only export (no compiler).
+    (["--skip-torq"], None, False, (), 0),
+    # Rule 3: the default on an unsupported configuration warns and exports decode-only.
+    (["--no-split-lm-head"], None, False, (), 0),
+    # Rule 3 (explicit): an explicit --batch-prefill on an unsupported configuration fails.
+    (["--batch-prefill", "--no-split-lm-head"], "requires static exports", None, None, 0),
+    # Explicit off on a supported configuration: off, no warning, no compiler.
+    (["--no-batch-prefill"], None, False, (), 0),
+    # Rule 4: otherwise on; omitted sizes probe automatically.
+    ([], None, True, (), 1),
+])
+def test_batch_prefill_cli_resolution_rules(tmp_path, monkeypatch, caplog,
+                                             arguments, raise_match, enabled, sizes, compiler_calls):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.gemma3 import export as gemma
+
+    monkeypatch.setattr(gemma.AutoConfig, "from_pretrained", Mock(return_value=SimpleNamespace(
+        hidden_size=8, vocab_size=16, num_attention_heads=2,
+    )))
+    monkeypatch.setattr(gemma, "_resolve_gptq_checkpoint", Mock(return_value=None))
+    # configure_logging clears the root handlers, which would drop caplog.
+    monkeypatch.setattr(gemma, "configure_logging", lambda *a, **k: None)
+    exported = []
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_onnx",
+                        lambda self, **kwargs: exported.append(self))
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "export_torq", Mock())
+    monkeypatch.setattr(gemma.Gemma3ModelExporter, "weight_quantize_models", Mock())
+    parser = argparse.ArgumentParser()
+    add_gemma3_export_args(parser)
+    from torq.model_export import prefill
+    check_compiler = Mock()
+    monkeypatch.setattr(prefill, "check_native_compiler", check_compiler)
+
+    args = parser.parse_args(arguments)
+    with caplog.at_level("WARNING"):
+        if raise_match:
+            with pytest.raises(ValueError, match=raise_match):
+                gemma.export_gemma3_from_args(args)
+        else:
+            gemma.export_gemma3_from_args(args)
+    if raise_match:
+        assert not exported
+        return
+    assert exported[0]._native_prefill_enabled is enabled
+    assert exported[0]._native_batch_prefill == sizes
+    assert check_compiler.call_count == compiler_calls
+    warned = "off for this export" in caplog.text
+    if arguments == ["--no-split-lm-head"]:
+        assert warned  # rule 3: the default on an unsupported configuration
     else:
-        check_compiler.assert_not_called()
+        assert not warned
+
+
+def test_non_batch_prefill_exporters_default_silently(tmp_path, caplog):
+    # Exporters without the batch-prefill option keep the base default:
+    # off, with no resolution warning.
+    from support.model_export import StubExporter
+
+    with caplog.at_level("WARNING"):
+        exporter = StubExporter(tmp_path, {"model": _family_graph(1)})
+    assert exporter._native_prefill_enabled is False
+    assert exporter._native_batch_prefill == ()
+    assert "batch-prefill" not in caplog.text
+
+
+def test_api_default_unsupported_warns_and_explicit_sizes_fail(tmp_path, monkeypatch, caplog):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.gemma3 import export as gemma
+
+    monkeypatch.setattr(gemma.AutoConfig, "from_pretrained", Mock(return_value=SimpleNamespace(
+        hidden_size=8, vocab_size=16, num_attention_heads=2,
+    )))
+    kwargs = dict(static_models=True, extract_embeddings=True, split_lm_head=True,
+                  read_only_kv_cache=False, keep_individual_kv_io=True, models_dir=tmp_path)
+    # Python-API default on an unsupported configuration: warn, export decode-only.
+    with caplog.at_level("WARNING"):
+        exporter = gemma.Gemma3ModelExporter(**kwargs)
+    assert exporter._native_prefill_enabled is False
+    assert exporter._native_batch_prefill == ()
+    assert "off for this export" in caplog.text
+    # Sizes imply an explicit request: invalid or off+sizes fails rather than
+    # silently dropping them.
+    for bad in (dict(batch_prefill_sizes=(1, 4)),
+                dict(batch_prefill=True, batch_prefill_sizes=(4, 4)),
+                dict(batch_prefill=False, batch_prefill_sizes=(4, 7))):
+        options = {key: value for key, value in kwargs.items()
+                   if key not in ("keep_individual_kv_io", "read_only_kv_cache")}
+        options.update(bad)
+        with pytest.raises(ValueError):
+            gemma.Gemma3ModelExporter(**options)
 
 
 @pytest.mark.parametrize("native,quantization,read_only,expected", [
@@ -450,11 +552,11 @@ def test_liquid_vision_inherits_ordinary_gqa_configuration(tmp_path):
     assert attention.args[-1] is True
     # Without --split-lm-head the base gate names the missing prerequisite.
     with pytest.raises(ValueError,match="--split-lm-head"):
-        LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7))
+        LiquidVLModelExporter(batch_prefill=True, batch_prefill_sizes=(4,7))
     # With split-lm-head on, a vision build option is rejected for the vision
     # reason (not the split reason).
     with pytest.raises(ValueError,match="vision"):
-        LiquidVLModelExporter(native_batch_prefill=True, batch_prefill_sizes=(4,7),
+        LiquidVLModelExporter(batch_prefill=True, batch_prefill_sizes=(4,7),
                               split_lm_head=True, compile_vision=True)
 
 
@@ -465,10 +567,9 @@ def test_liquid_vision_constructor_preserves_pre_super_options(tmp_path):
     config=dict(hidden_size=8,vocab_size=16,num_attention_heads=2,num_key_value_heads=1,
                 head_dim=4,conv_dim=8,conv_L_cache=3,num_hidden_layers=2,layer_types=["conv","full_attention"])
     (tmp_path/"config.json").write_text(json.dumps(config))
-    exporter=LiquidVLModelExporter(onnx_source_dir=tmp_path,models_dir=tmp_path,batch_prefill=16,
+    exporter=LiquidVLModelExporter(onnx_source_dir=tmp_path,models_dir=tmp_path,
                                    max_gen_tokens=32,keep_individual_kv_io=True,split_lm_head=True)
     # These attributes are assigned before the base __init__; the base must preserve them.
-    assert exporter._batch_prefill == 16
     assert exporter._max_gen_tokens == 32
     assert exporter._keep_individual_kv_io is True
     assert exporter._split_lm_head is True
@@ -745,7 +846,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_
     graph = _read_only_family_graph if read_only else _family_graph
     options = dict(models_dir=tmp_path / "models", onnx_source_dir=source, max_gen_tokens=16,
                    extract_embeddings=True, split_lm_head=True, read_only_kv_cache=read_only,
-                   native_batch_prefill=mode != "ordinary",
+                   batch_prefill=mode != "ordinary",
                    batch_prefill_sizes=(4, 7) if mode == "explicit" else None)
     if family.startswith("gemma3"):
         monkeypatch.setattr("torq.models.gemma3.export.AutoConfig.from_pretrained",
@@ -880,7 +981,7 @@ def test_automatic_probe_failure_keeps_exported_decoder(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("enabled,sizes,static,error", [
-    (False, (4, 7), True, "requires --native-batch-prefill"),
+    (False, (4, 7), True, "requires --batch-prefill"),
     (True, None, False, "requires static exports"),
     ((4, 7), None, True, "must be a boolean"),
 ])
@@ -890,7 +991,7 @@ def test_native_mode_validation_before_source_loading(enabled, sizes, static, er
 
     for cls in (Gemma3ModelExporter, LiquidModelExporter):
         with pytest.raises(ValueError, match=error):
-            cls(native_batch_prefill=enabled, batch_prefill_sizes=sizes, static_models=static,
+            cls(batch_prefill=enabled, batch_prefill_sizes=sizes, static_models=static,
                 extract_embeddings=True, split_lm_head=True, read_only_kv_cache=False)
 
 
@@ -1076,12 +1177,11 @@ def test_qwen_native_gates_supported_configs(quantization, convert, split_model,
             split_model=split_model,
             read_only_kv_cache=read_only,
             weight_quantization=None if quantization == "none" else quantization,
-            batch_prefill=None,
-            native_batch_prefill=True,
+            batch_prefill=True,
             batch_prefill_sizes=(4, 12),
         )
         if expected is ValueError:
-            with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+            with pytest.raises(ValueError, match="--batch-prefill requires"):
                 QwenModelExporter(**options)
         else:
             exporter = QwenModelExporter(**options)
@@ -1148,7 +1248,7 @@ def test_qwen_native_int4_auto_sizes_rejected(tmp_path, monkeypatch):
                 split_lm_head=True,
                 read_only_kv_cache=True,
                 weight_quantization="int4",
-                native_batch_prefill=True,
+                batch_prefill=True,
                 batch_prefill_sizes=None,
             )
 
@@ -1184,6 +1284,7 @@ def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypat
     def record_export(self, **kwargs):
         exported.append((self, kwargs))
     monkeypatch.setattr(qwen.QwenModelExporter, "export_onnx", record_export)
+    monkeypatch.setattr(qwen.QwenModelExporter, "export_torq", Mock())
     converted = []
     def record_convert(self, **kwargs):
         converted.append((self, kwargs))
@@ -1196,7 +1297,7 @@ def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypat
     monkeypatch.setattr(prefill, "check_native_compiler", check_compiler)
 
     arguments = [
-        "--native-batch-prefill", "--skip-torq", "--compiler-path", "/selected/compiler",
+        "--batch-prefill", "--compiler-path", "/selected/compiler",
         "--no-gptq", "--weight-quantization", weight,
     ]
     if sizes is not None:
@@ -1207,19 +1308,15 @@ def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypat
     exporter, options = exported[0]
     assert exporter._native_prefill_enabled is True
     assert exporter._native_batch_prefill == (sizes or ())
-    assert exporter._batch_prefill is None
     assert exporter._read_only_kv_cache is True
     assert exporter._split_lm_head is True
     assert exporter._convert_dtypes is convert_expected
     assert options["compiler_path"] == Path("/selected/compiler")
     assert options["torq_compile_args"] == (args.compile_flags or [])
     assert len(converted) == int(convert_expected)
-    # Explicit sizes skip the compiler preflight with --skip-torq; auto
-    # sizes probe, so the selected compiler is checked before any export.
-    if sizes is None:
-        check_compiler.assert_called_once_with(Path("/selected/compiler"))
-    else:
-        check_compiler.assert_not_called()
+    # Compile runs always need the selected compiler: explicit sizes compile
+    # the family, omitted sizes probe first.
+    check_compiler.assert_called_once_with(Path("/selected/compiler"))
 
 
 # --- SmolLM2 onboarding ------------------------------------------------------
@@ -1290,8 +1387,7 @@ def test_smollm2_native_gates_supported_configs():
             extract_embeddings=True,
             split_lm_head=True,
             read_only_kv_cache=True,
-            batch_prefill=None,
-            native_batch_prefill=True,
+            batch_prefill=True,
             batch_prefill_sizes=(4, 12),
         )
         options.update(overrides)
@@ -1306,11 +1402,11 @@ def test_smollm2_native_gates_supported_configs():
         for override in (dict(model_size="1.7B"), dict(dynamic_quantize=True),
                          dict(convert_dtypes=True), dict(split_weights=True),
                          dict(read_only_kv_cache=False)):
-            with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+            with pytest.raises(ValueError, match="--batch-prefill requires"):
                 construct(**override)
         # Sizes without the native flag fail before any source loading.
-        with pytest.raises(ValueError, match="requires --native-batch-prefill"):
-            construct(native_batch_prefill=False, batch_prefill_sizes=(4, 12))
+        with pytest.raises(ValueError, match="requires --batch-prefill"):
+            construct(batch_prefill=False, batch_prefill_sizes=(4, 12))
 
 
 def test_smollm2_split_lm_head_defaults_off():
@@ -1321,11 +1417,9 @@ def test_smollm2_split_lm_head_defaults_off():
     add_smollm2_export_args(parser)
     defaults = parser.parse_args([])
     assert defaults.split_lm_head is False
-    assert defaults.native_batch_prefill is False
-    # No legacy prefill builder: the inert --batch-prefill flag is not
-    # registered, so plain runs cannot trip the base's split-head check.
-    assert not hasattr(defaults, "batch_prefill")
-    gate = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,12", "--split-lm-head"])
+    assert defaults.batch_prefill is None
+    assert defaults.batch_prefill_sizes is None
+    gate = parser.parse_args(["--batch-prefill", "--batch-prefill-sizes", "4,12", "--split-lm-head"])
     assert gate.split_lm_head is True and gate.batch_prefill_sizes == (4, 12)
 
 
@@ -1429,7 +1523,7 @@ def test_liquid_vl_native_gating_and_family_keying(tmp_path):
 
     def construct(**overrides):
         options = dict(onnx_source_dir=tmp_path, models_dir=tmp_path,
-                       split_lm_head=True, native_batch_prefill=True,
+                       split_lm_head=True, batch_prefill=True,
                        batch_prefill_sizes=(4, 12))
         options.update(overrides)
         return LiquidVLModelExporter(**options)
@@ -1447,7 +1541,7 @@ def test_liquid_vl_native_gating_and_family_keying(tmp_path):
                      dict(dynamic_quantize=True), dict(convert_dtypes=True),
                      dict(split_lm_head=False), dict(keep_individual_kv_io=True),
                      dict(batch_prefill_sizes=None)):
-        with pytest.raises(ValueError, match="--native-batch-prefill requires"):
+        with pytest.raises(ValueError, match="--batch-prefill requires"):
             construct(**override)
 
     exporter._export_paths = {DECODER: "d", "model_prefill_4": "c4", "model_prefill_12": "c12"}
@@ -1460,7 +1554,7 @@ def test_liquid_vl_native_contract_sources_the_decoder_member(tmp_path):
 
     _vl_config_dir(tmp_path)
     exporter = LiquidVLModelExporter(onnx_source_dir=tmp_path, models_dir=tmp_path,
-                                     split_lm_head=True, native_batch_prefill=True,
+                                     split_lm_head=True, batch_prefill=True,
                                      batch_prefill_sizes=(4,))
     decode_path = tmp_path / f"{DECODER}.onnx"
     onnx_mod.save(_family_graph(1), str(decode_path))
@@ -1484,24 +1578,27 @@ def test_liquid_vl_cli_forwards_native_options(tmp_path, monkeypatch):
     constructed = []
     def fake_ctor(**kwargs):
         constructed.append(kwargs)
-        mock = Mock()
-        return mock
+        return Mock()
     monkeypatch.setattr(vl, "LiquidVLModelExporter", fake_ctor)
     from torq.model_export import prefill
     monkeypatch.setattr(prefill, "check_native_compiler", Mock())
 
     parser = argparse.ArgumentParser()
     add_liquid_vl_export_args(parser)
-    args = parser.parse_args(["--native-batch-prefill", "--batch-prefill-sizes", "4,12",
-                              "--skip-torq", "--split-lm-head"])
+    args = parser.parse_args(["--batch-prefill", "--batch-prefill-sizes", "4,12",
+                              "--split-lm-head"])
     vl.export_liquid_vl_from_args(args)
     kwargs = constructed[0]
-    assert kwargs["native_batch_prefill"] is True
+    assert kwargs["batch_prefill"] is True
     assert kwargs["batch_prefill_sizes"] == (4, 12)
-    assert kwargs["batch_prefill"] is None
     assert kwargs["split_lm_head"] is True
+    constructed.clear()
+    # Rule 1: explicit --batch-prefill with --skip-torq fails.
+    args = parser.parse_args(["--batch-prefill", "--skip-torq"])
+    with pytest.raises(ValueError, match="requires compilation"):
+        vl.export_liquid_vl_from_args(args)
+    # Rule 2: the default with --skip-torq resolves to decode-only.
     constructed.clear()
     args = parser.parse_args(["--skip-torq"])
     vl.export_liquid_vl_from_args(args)
-    assert constructed[0]["native_batch_prefill"] is False
-    assert constructed[0]["batch_prefill"] == 64
+    assert constructed[0]["batch_prefill"] is False

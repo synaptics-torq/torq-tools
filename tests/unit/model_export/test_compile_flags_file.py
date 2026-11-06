@@ -229,7 +229,9 @@ def test_get_iree_version_falls_back_to_pip_package(monkeypatch, tmp_path):
 def test_export_onnx_writes_variant_snapshot(tmp_path):
     exporter = _exporter(tmp_path)
     exporter._compile_flags_file = lambda: _flags_file(tmp_path, ["--a"], ["--b"])
-    exporter._batch_prefill = 64
+    exporter._native_prefill_enabled = True
+    exporter._native_batch_prefill = (64,)
+    exporter._complete_native_prefill = lambda **kwargs: None
     exporter.export_onnx(validate=False, cleanup=False)
 
     snapshot = json.loads((exporter.export_dir / COMPILE_FLAGS_FILE).read_text())

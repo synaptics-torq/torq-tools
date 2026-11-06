@@ -96,8 +96,7 @@ class OnnxModelExporterBase(ABC):
         split_lm_head: bool = False,
         read_only_kv_cache: bool = False,
         keep_individual_kv_io: bool = False,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = False,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         native_minimum: int = 2,
         native_supports_read_only: bool = False,
@@ -109,39 +108,41 @@ class OnnxModelExporterBase(ABC):
         self._logger = logging.getLogger(self.__class__.__name__)
         # The batch-prefill option handling lives here, before any subclass
         # source-loading, so invalid options fail without touching the disk.
-        # Each model passes its supported-configuration text (native_supported)
-        # and its unsupported-condition flag (native_unsupported).
+        # Family exporters forward their ``batch_prefill`` option; exporters
+        # without the option keep the base default (off) and never warn.
+        # A None ``batch_prefill`` is the default: on unless this
+        # configuration does not support batch prefill, which warns and
+        # exports decode-only (rules 3/4 of the step-8 resolution). Explicit
+        # sizes imply on; any other explicit request that is invalid fails.
         from .prefill import validate_native_options
-        self._native_prefill_enabled = native_batch_prefill
-        self._native_batch_prefill = validate_native_options(
-            batch_prefill_sizes, enabled=native_batch_prefill, batch_prefill=batch_prefill,
+        options = dict(
             context=max_gen_tokens, minimum=native_minimum, static=static_models,
             embeddings=extract_embeddings, split_head=split_lm_head,
             read_only=read_only_kv_cache, individual=keep_individual_kv_io,
             supports_read_only=native_supports_read_only, unsupported=native_unsupported,
             supported=native_supported,
         )
+        if batch_prefill is None and batch_prefill_sizes is None:
+            batch_prefill = True
+            try:
+                self._native_batch_prefill = validate_native_options(None, enabled=True, **options)
+            except ValueError as error:
+                self._logger.warning("--batch-prefill is off for this export: %s", error)
+                batch_prefill = False
+                self._native_batch_prefill = ()
+        else:
+            if batch_prefill is None:
+                batch_prefill = True
+            self._native_batch_prefill = validate_native_options(batch_prefill_sizes, enabled=batch_prefill, **options)
+        self._native_prefill_enabled = batch_prefill
         # Deeper stacks accumulate more FP32 reduction-order noise from the
         # read-only past/new attention split; a model may pass a wider
         # validation tolerance. The default is unchanged for every family.
         self._native_validation_rtol = native_validation_rtol
         self._native_validation_atol = native_validation_atol
-        if batch_prefill is not None:
-            if batch_prefill < 1:
-                raise ValueError(f"`--batch-prefill` must be positive, got {batch_prefill}")
-            if batch_prefill > max_gen_tokens:
-                raise ValueError(
-                    f"`--batch-prefill` ({batch_prefill}) cannot exceed `--max-gen-tokens` ({max_gen_tokens})"
-                )
-            if not split_lm_head:
-                raise ValueError(
-                    "`--batch-prefill` requires `--split-lm-head` "
-                    "(disable the prefill export with `--batch-prefill 0`)"
-                )
         # Siblings that predate the base owning these options (smollm2, qwen,
         # moonshine, VL) still assign them before super(); preserve those
         # values, otherwise take the parameters.
-        self._batch_prefill = getattr(self, "_batch_prefill", batch_prefill)
         self._extract_embeddings = getattr(self, "_extract_embeddings", extract_embeddings)
         self._keep_individual_kv_io = getattr(self, "_keep_individual_kv_io", keep_individual_kv_io)
         self._read_only_kv_cache = getattr(self, "_read_only_kv_cache", read_only_kv_cache)
@@ -276,11 +277,9 @@ class OnnxModelExporterBase(ABC):
 
     def _auto_torq_compile_extras(self) -> list[str]:
         """torq-compile flags derived from this run's export options."""
-        # The --batch-prefill exporters set _batch_prefill either through the
-        # base constructor or in their own __init__ before super() (VL), so
-        # getattr: the attribute may not exist on other exporters.
-        if (getattr(self, "_batch_prefill", None) is None
-                and not getattr(self, "_native_prefill_enabled", False)
+        # getattr: siblings that predate the base's batch-prefill bookkeeping
+        # may not have the attributes yet.
+        if (not getattr(self, "_native_prefill_enabled", False)
                 and not getattr(self, "_native_batch_prefill", ())):
             return []
         return ["--torq-max-nss-programs-size", TORQ_MAX_NSS_PROGRAMS_SIZE]

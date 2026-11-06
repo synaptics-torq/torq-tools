@@ -30,7 +30,6 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         max_gen_tokens=DEFAULT_GEN_TOKENS,
         split_lm_head=True,
         batch_prefill=True,
-        native_batch_prefill=True,
     )
     parser.add_argument(
         "--model-dtype",
@@ -91,7 +90,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         max_gen_tokens=DEFAULT_GEN_TOKENS,
         split_lm_head=True,
         batch_prefill=True,
-        native_batch_prefill=True,
     )
     add_onnx_args(
         parser,

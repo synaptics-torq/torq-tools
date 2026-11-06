@@ -125,8 +125,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         hf_repo: str = DEFAULT_HF_REPO,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = None,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -217,7 +216,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             read_only_kv_cache=read_only_kv_cache,
             keep_individual_kv_io=keep_individual_kv_io,
             batch_prefill=batch_prefill,
-            native_batch_prefill=native_batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=4,
             native_supports_read_only=True,
@@ -1642,6 +1640,7 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:
 
 def export_qwen_from_args(args: argparse.Namespace) -> None:
     configure_logging(args.logging)
+    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
 
     hf_repo = args.hf_repo or QWEN_MODELS[args.model_size]["hf_repo"]
     weight_quantization = (
@@ -1653,13 +1652,14 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
     # export always converts its dtypes.
     convert_dtypes = args.convert_dtypes or weight_quantization is not None
 
+    resolve_batch_prefill_cli(args)
+
     exporter = QwenModelExporter(
         static_models=not args.dynamic_models,
         hf_repo=hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
-        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill=args.batch_prefill,
         batch_prefill_sizes=args.batch_prefill_sizes,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
@@ -1673,8 +1673,7 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         gptq_checkpoint=_resolve_gptq_checkpoint(args),
     )
 
-    from ...model_export.prefill import check_native_cli_args
-    check_native_cli_args(args)
+    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
 
     # The generic ONNX cleanup serializes the whole model in memory. The Qwen
     # models have more than 2 GB of fp32 weights, so the cleanup cannot run.

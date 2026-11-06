@@ -95,7 +95,7 @@ torq-export-model liquid --models-dir models
 
 Like the other models (gemma3, smollm2), this single command **exports and
 compiles**: by default it produces the static split-lm-head ONNX set
-(embedding extraction and a 64-token batched prefill on) and then compiles it
+(embedding extraction and batch prefill on) and then compiles it
 to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Pass
 `--convert-dtypes` to compile the converted bf16 variant instead (the VMFB is
 dtype-converted by the compiler either way). Pass `--skip-torq` to stop at the
@@ -112,7 +112,7 @@ Flag breakdown:
 | `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
 | `--dynamic-quantize` | dynamically quantize every exported component to int8 weights; `--dynamic-quantization-skip-model COMPONENT…` exempts components (e.g. keep the `lm_head` fp32) |
 | `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. **On by default** — opt out with `--no-split-lm-head`. |
-| `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step (default: `64`; pass `0` to disable); requires `--split-lm-head` (on by default). See [Batched prefill](#3-batched-prefill). |
+| `--batch-prefill` / `--no-batch-prefill` | compile the shared decoder family (single-token decode plus batched prefill chunks in one VMFB); default: on for compile runs, `--skip-torq` exports decode only; requires `--split-lm-head` (on by default). See [Batch prefill](#batch-prefill). |
 | `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. **On by default** — opt out with `--no-extract-embeddings`. |
 | `--no-read-only-kv-cache` | export the pre-2.4 KV caches (head-major, written back whole every step). By default the time-major caches are read-only inputs and the decode and prefill models output only the new rows; see the [Qwen README](../qwen/README.md#read-only-kv-cache) |
 | `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
@@ -138,7 +138,7 @@ models/liquid-2p5-350m/
     │   ├── model.onnx                (~1.4 GB; unified export only)
     │   ├── transformer.onnx          (~1.4 GB; split export body with last_hidden_states output)
     │   ├── lm_head.onnx              (split export, on by default; ~268 MB fp32)
-    │   ├── transformer_prefill.onnx  (default: 64-token prefill; --batch-prefill 0 disables; stays fused)
+    │   ├── transformer_prefill_<B>.onnx  (with batch prefill, one chunk per probed or supplied size)
     │   ├── token_embeddings.npy      (~128 MB, fp32; for host inference)
     │   ├── config.json
     │   ├── tokenizer.json
@@ -199,39 +199,13 @@ lm_head, ~258 MB without FFN).
 
 ---
 
-## 3. Batched prefill
+## Batch prefill
 
-`--batch-prefill N` (default: `64`, `0` disables) requires `--split-lm-head`
-(on by default) and additionally emits
-`transformer_prefill.onnx`: the same static decoder with its token input pinned to
-exactly N positions. It takes `input_ids` / `token_embedding` of shape
-`[1, N]` / `[1, N, hidden]` plus a `position_ids [1, 1]` holding the chunk's
-*start* position, updates N consecutive KV-cache rows in one step, and emits
-the final position's logit (`logits [1, 1, vocab]`). The short-conv stack and
-the attention layers handle the chunk natively; RoPE rotates each sequence row
-by its own position, and the causal mask covers the N query rows. The decode
-model and the prefill model share KV-cache I/O shapes, so they can be driven
-alternately on the same cache state. The prefill component is converted to
-bf16 and compiled to the matching `*_prefill.vmfb` alongside the decode model by the
-same command.
-
-Inference (`LiquidStatic`) picks up the matching `*_prefill.onnx` /
-`*_prefill.vmfb` automatically when it sits next to the decode model, reading N from the
-prefill model's input metadata (pass `prefill_size=` explicitly for vmfb,
-which reports no shapes). Prompt processing then runs every complete N-token
-chunk through the prefill model and falls back to single-token decode for any
-remainder; generation always uses the decode model. Export validation compares
-the chunked runner against the unedited dynamic source ONNX.
-
----
-
-### Experimental native batch prefill
-
-LFM2.5 230M and 350M support opt-in native static families with `--native-batch-prefill`. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context.
-**NOTE:** Vision models are outside this native path; ordinary separate-prefill exports remain available.
+LFM2.5 230M and 350M compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context.
+**NOTE:** The LFM2-VL text decoder is covered by its own section in [README_VL.md](README_VL.md#batch-prefill).
 
 The supported depthwise convolution has kernel size three, stride/dilation one, no padding or bias, and channel-major three-token state. Native chunks retain token-major activations and use one broadcast MatMul per convolution block; the history ABI remains `[1,D,3]`, oldest first.
 
-See the shared [native batch-prefill guide](../../model_export/doc/batch_prefill.md) for compiler/runtime requirements, artifact layout, optional size probing, chunk selection and state handling. The `torq-examples` hardware runner carries both convolution and KV state across entry changes.
+See the shared [batch-prefill guide](../../model_export/doc/batch_prefill.md) for compiler/runtime requirements, artifact layout, optional size probing, chunk selection and state handling. The `torq-examples` hardware runner carries both convolution and KV state across entry changes.
 
 Earlier full-model checks cover B=4/7 at context 16, including FP32 hidden/state comparisons and byte-identical Torq payloads against frontend generation from the same imported source and flags. Full-model validation has not been repeated on the rebased compiler. Device accuracy and performance remain separate validation gates. Fixed RoPE frequencies remain verified literals because preserving them as weight globals can put position computation outside the family dispatch.

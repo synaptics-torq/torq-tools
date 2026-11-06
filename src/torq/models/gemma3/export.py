@@ -71,8 +71,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         hf_repo: str | None = None,
         hf_repo_subdir: str | os.PathLike | None = None,
         max_gen_tokens: int = 256,
-        batch_prefill: int | None = None,
-        native_batch_prefill: bool = False,
+        batch_prefill: bool | None = None,
         batch_prefill_sizes: tuple[int, ...] | None = None,
         models_dir: str | os.PathLike = "models",
         onnx_source_dir: str | os.PathLike | None = None,
@@ -107,7 +106,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             read_only_kv_cache=read_only_kv_cache,
             keep_individual_kv_io=keep_individual_kv_io,
             batch_prefill=batch_prefill,
-            native_batch_prefill=native_batch_prefill,
             batch_prefill_sizes=batch_prefill_sizes,
             native_minimum=2,
             native_supports_read_only=True,
@@ -177,7 +175,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             num_heads=self._config.num_attention_heads,
             hidden_size=self._config.hidden_size,
         )
-        self._opt_configs = {"model": opt_config, "model_prefill": opt_config}
+        self._opt_configs = {"model": opt_config}
 
 
     def _model_compile_flags(self, **kwargs) -> list[str]:
@@ -255,8 +253,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             return self._export_dir / self._export_model_filenames[0]
         if component.startswith("model_prefill_"):
             return self._export_dir / f"transformer_prefill_{component.removeprefix('model_prefill_')}.onnx"
-        if component == "model_prefill":
-            return self._export_dir / "transformer_prefill.onnx"
         return super()._export_path_for_component(component)
 
     def _resolve_source_asset_path(self, asset_name: str) -> Path:
@@ -389,7 +385,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch (split LM head)"] = [
                 EditSpec("SplitLMHead", (ctx("lm_head_path"), "logits", "last_hidden_states"))
             ]
-        if self._batch_prefill is not None or self._native_prefill_enabled:
+        if self._native_prefill_enabled:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -487,7 +483,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config.num_key_value_heads,
                     self._config.head_dim,
                     (int(component.removeprefix("model_prefill_")) if component.startswith("model_prefill_")
-                     else self._batch_prefill if component == "model_prefill" else 1),
+                     else 1),
                 )
 
         if self._trim_vocab:
@@ -504,7 +500,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
         editor.reorder_graph_input("position_ids", 1)
 
-        if component == "model_prefill" or component.startswith("model_prefill_"):
+        if component.startswith("model_prefill_"):
             editor.apply_specs(blocks["model.patch (batch prefill)"], self._harness)
 
         if self._split_lm_head:
@@ -554,15 +550,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         source_model = self.check_model(self._components["model"])
         self._logger.info("(model) Making graph static...")
         self._components["model"] = self._make_model_static(source_model)
-        if self._batch_prefill is not None:
-            self._logger.info(
-                "(model_prefill) Making graph static with %d tokens...", self._batch_prefill
-            )
-            self._components["model_prefill"] = self._make_model_static(
-                source_model,
-                component="model_prefill",
-                chunk_len=self._batch_prefill,
-            )
 
 
     def _make_native_prefill(self, source_model=None):
@@ -612,8 +599,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             repo_id=self._hf_repo,
             n_iters=n_iters,
             lm_head_path=self._export_paths.get("lm_head"),
-            prefill_model_path=self._export_paths.get("model_prefill"),
-            prefill_size=self._batch_prefill,
             **validation_kwargs,
         )
 
@@ -745,10 +730,7 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace, weight_quantization: str 
 
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    if args.batch_prefill_sizes is not None and not args.native_batch_prefill:
-        raise ValueError("--batch-prefill-sizes requires --native-batch-prefill")
-    if args.native_batch_prefill and (args.weight_quantization not in ("none", "int4") or args.dynamic_quantize or args.convert_dtypes):
-        raise ValueError("native prefill supports FP32 or INT4 weights without dynamic quantization or explicit dtype conversion")
+    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
     weight_quantization = None if args.weight_quantization == "none" else args.weight_quantization
     if weight_quantization and args.dynamic_quantize:
         logger.info("--dynamic-quantize: the weights are not quantized to %s", weight_quantization)
@@ -756,6 +738,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
     # The weight quantization writes a bf16 model, so it replaces --convert-dtypes.
     convert_dtypes = args.convert_dtypes and weight_quantization is None
     gptq_checkpoint = _resolve_gptq_checkpoint(args, weight_quantization)
+    resolve_batch_prefill_cli(args)
+
     exporter = Gemma3ModelExporter(
         args.model_size,
         args.instruct_model,
@@ -766,8 +750,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
         hf_repo=args.hf_repo,
         hf_repo_subdir=args.hf_repo_subdir,
         max_gen_tokens=args.max_gen_tokens,
-        batch_prefill=None if args.native_batch_prefill else args.batch_prefill or None,
-        native_batch_prefill=args.native_batch_prefill,
+        batch_prefill=args.batch_prefill,
         batch_prefill_sizes=args.batch_prefill_sizes,
         models_dir=args.models_dir,
         onnx_source_dir=args.onnx_source_dir,
@@ -789,8 +772,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    from ...model_export.prefill import check_native_cli_args
-    check_native_cli_args(args)
+    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

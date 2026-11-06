@@ -40,13 +40,19 @@ def _fake_compile(monkeypatch) -> list:
         calls.append(kwargs.get("compiler_args"))
 
     monkeypatch.setattr(me, "export_torq", fake_export_torq)
+    # Native runs check the selected compiler before compiling; these tests
+    # only exercise the flag assembly.
+    monkeypatch.setattr("torq.model_export.prefill.check_native_compiler", lambda *a: None)
     return calls
 
 
 def _exporter(tmp_path, batch_prefill=None):
     exporter = StubExporter(tmp_path, {"model": _tiny_model()})
     exporter.export_onnx(validate=False, cleanup=False)
-    exporter._batch_prefill = batch_prefill
+    if batch_prefill:
+        # Native enabled with sizes still unprobed: the flag assembly is what
+        # these tests exercise, not the family compile.
+        exporter._native_prefill_enabled = True
     return exporter
 
 

@@ -105,7 +105,7 @@ VL-specific flags (everything else matches `torq-export-model liquid`):
 | `--vision-res {128,256}` | build + compile the **static** SigLIP encoder (`vision_encoder_<res>.vmfb`); 256 → 64 image tokens, 128 → 16 |
 | `--split-lm-head` | gemma3-style split at ONNX-export time: the decoder becomes the body `transformer.onnx` (`last_hidden_states` output) + a first-class `lm_head.onnx` (hidden→logits). Lower-TTFT as the head runs only when sampling. Static exports only. **On by default** — opt out with `--no-split-lm-head` |
 | `--chunk-lm-head` | revert to the legacy 512-chunk lm_head MatMul split (default: a single `[1024, 65536]` MatMul; tile-and-fuse handles it) |
-| `--batch-prefill N` | also emit the fixed-shape `transformer_prefill.onnx` LLM decoder (N tokens per step, stays fused; default: `64`, `0` disables); requires `--split-lm-head` (on by default); static exports only; the vision encoder is unaffected |
+| `--batch-prefill` / `--no-batch-prefill` | compile the text decoder family (single-token decode plus batched prefill chunks in one VMFB); default: on for compile runs, `--skip-torq` exports decode only; requires `--split-lm-head` (on by default) and explicit `--batch-prefill-sizes` (no automatic probe for VL); static exports only; the vision encoder is unaffected. See [Batch prefill](#batch-prefill) |
 | `--dynamic-quantize` | int8 dynamic-quantize the exported chip components (decoder, prefill, head); `--dynamic-quantization-skip-model COMPONENT…` exempts more. The dynamic `vision_encoder` is skipped by default unless `--compile-vision` / `--vision-res` is set — it is a CPU/ORT component, and ORT's quantizer pre-processing crashes on its dynamic shapes |
 | `--image-decoder-parts [N]` | build + compile the one-shot image-prefill decoder, split into N layer parts (bare = 2) |
 | `--compile-vision` | compile the *dynamic* encoder as-is (experimental; dynamic shapes + exotic ops — prefer `--vision-res`) |
@@ -150,12 +150,12 @@ models/liquid-2p5-450M-VL/export/
     ├── fp32/static/
     │   ├── transformer.onnx               (~1.1 GB)   body (last_hidden_states output)
     │   ├── lm_head.onnx                   (~268 MB)   hidden -> logits
-    │   ├── transformer_prefill.onnx       (with --batch-prefill N; stays fused)
+    │   ├── transformer_prefill_<B>.onnx   (with --batch-prefill-sizes; one chunk per size)
     │   └── … (vision / LUT / config / tokenizer as above)
     └── bf16/static/compiled/
         ├── transformer.vmfb
         ├── lm_head.vmfb
-        └── transformer_prefill.vmfb       (with --batch-prefill N)
+        └── transformer.family.json        (with --batch-prefill-sizes)
 ```
 
 Compiled artifacts (`.vmfb` + `.mlir`) live in a `compiled/` subdirectory of
@@ -196,7 +196,7 @@ gemma3-style), so the fused decoder and the body/head pair come from two runs:
 |---|---|
 | `decoder_model_merged.vmfb` (a.k.a. `decoder_main.vmfb`) | default unified run (the merged decoder + lm_head) |
 | `transformer.vmfb` + `lm_head.vmfb` | `--split-lm-head` (lower-TTFT body/lm_head split; supersedes the legacy `decoder_nolm.vmfb` of `--split-decoder`) |
-| `transformer_prefill.vmfb` (N-token prefill) | `--split-lm-head --batch-prefill N` |
+| `transformer.vmfb` prefill entries + `transformer.family.json` | `--split-lm-head --batch-prefill --batch-prefill-sizes B1,B2,…` (VL needs explicit sizes) |
 | `vision_encoder_256.vmfb` (64 tokens) / `vision_encoder_128.vmfb` (16 tokens) | `--vision-res 256` / `--vision-res 128` (static SigLIP encoder; compile is heavy but succeeds). One res per run. The bundle ships the 128 build under the legacy name `vision_encoder.vmfb`; rename after export if the runner is pointed at that name. |
 | `decoder_image_2part_A/B.vmfb` (one-shot image prefill) | `--image-decoder-parts` (bare = 2-part, the shipping split; `3` / `5` are alternates) |
 | `token_embeddings.npy`, `config.json`, `tokenizer.json` | staged automatically (fp32 canonical in the export/convert dirs; bf16 copy in `compiled/` when the compile flags convert the vmfb I/O) |
@@ -337,12 +337,13 @@ the **same caption** as the host ORT reference — *"two cats sleeping on a pink
 blanket … two remote controls"* — at ~0.54 s/decoder-call (TTFT ≈ 140 s for the
 259-token image prompt, decode ≈ 1.8 tok/s).
 
-## Experimental native batch prefill
+## Batch prefill
 
-The LFM2-VL text decoder joins the opt-in native static families with
-`--native-batch-prefill`. Omitting `--batch-prefill-sizes ...` is not
-supported for VL (the automatic size probe is text-model-only); pass explicit
-ascending sizes (at least 4, fitting the context).
+The LFM2-VL text decoder compiles static families (single-token decode plus
+batched prefill chunks in one VMFB) on compile runs. Omitting
+`--batch-prefill-sizes ...` is not supported for VL (the automatic size probe
+is text-model-only); pass explicit ascending sizes (at least 4, fitting the
+context).
 
 The supported configuration is the 450M text decoder with `--split-lm-head`
 (the native ABI needs the hidden-state output) and the full-state cache (the
@@ -350,11 +351,11 @@ VL demo engine writes whole caches back and the image-prefill chain shares
 them). FP32 only. The vision build options (`--compile-vision`,
 `--vision-res`, `--image-decoder-parts`) and the `--keep-conv1d` /
 `--chunk-lm-head` / `--simulate-bf16` options are not yet validated with
-native families and are rejected together with `--native-batch-prefill`.
-Chunks reuse the LFM2.5 native convolution rewrite, so the family carries
-conv state (`present_conv.{i}`) alongside the KV state.
+batch-prefill families and are rejected together with `--batch-prefill`.
+Chunks reuse the LFM2.5 batch-prefill convolution rewrite, so the family
+carries conv state (`present_conv.{i}`) alongside the KV state.
 
-See the shared [native batch-prefill guide](../../model_export/doc/batch_prefill.md)
+See the shared [batch-prefill guide](../../model_export/doc/batch_prefill.md)
 for export commands, compiler/runtime requirements, artifact layout, chunk
 selection and state handling. The `torq-examples` hardware runner carries
 convolution and KV state across entry changes.

@@ -277,18 +277,12 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
-        prefill_model: InferenceRunner | None = None,
-        prefill_size: int | None = None,
         lm_head: InferenceRunner | None = None,
     ):
         if config_path is None:
             config_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "config.json")
         if tokenizer_path is None:
             tokenizer_path = _download_asset(repo_id or self.DEFAULT_REPO_ID, "tokenizer.json")
-        if (prefill_model is None) != (prefill_size is None):
-            raise ValueError("prefill_model and prefill_size must be provided together")
-        if prefill_size is not None and prefill_size < 1:
-            raise ValueError(f"prefill_size must be positive, got {prefill_size}")
         config = ModelConfig.from_json_config(config_path, instruct_model)
         self._set_liquid_config(config)
         # When `--extract-embeddings` was used at export time the model's
@@ -311,17 +305,9 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             token_embeddings=token_embeddings,
             lm_head=lm_head,
-            prefill_model=prefill_model,
-            prefill_size=prefill_size,
         )
         if self._lm_head is not None:
             self._logger.info("Loaded split LM head '%s'", str(self._lm_head.model_path))
-        if self._prefill_model is not None:
-            self._logger.info(
-                "Loaded %d-token prefill model '%s'",
-                self._prefill_size,
-                str(self._prefill_model.model_path),
-            )
 
     @staticmethod
     def _find_token_embeddings(
@@ -336,30 +322,12 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
         return np.load(paths[0])
 
     @staticmethod
-    def _find_prefill_model(
-        model_path: str | os.PathLike,
-        prefill_pattern: str,
-    ) -> Path | None:
-        """Locate the batched prefill model exported alongside the transformer."""
-        return find_single_data_file(model_path, prefill_pattern, "prefill model")
-
-    @staticmethod
     def _find_lm_head(
         model_path: str | os.PathLike,
         lm_head_pattern: str,
     ) -> Path | None:
         """Locate the split LM head exported alongside the decode model."""
         return find_single_data_file(model_path, lm_head_pattern, "split LM head")
-
-    @staticmethod
-    def _infer_prefill_size(prefill_model: InferenceRunner) -> int:
-        for input_name in ("token_embedding", "input_ids"):
-            shape = prefill_model.input_shapes.get(input_name)
-            if shape is not None and len(shape) >= 2 and isinstance(shape[1], int):
-                return shape[1]
-        raise ValueError(
-            f"Could not determine fixed prefill size from '{prefill_model.model_path}'"
-        )
 
     @classmethod
     def from_onnx(
@@ -373,19 +341,8 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
-        prefill_model_path: str | os.PathLike | None = None,
-        prefill_size: int | None = None,
         lm_head_path: str | os.PathLike | None = None,
     ) -> "LiquidStatic":
-        prefill_model_path = prefill_model_path or cls._find_prefill_model(
-            model_path, f"{Path(model_path).stem}_prefill.onnx"
-        )
-        prefill_model = (
-            ORTInferenceRunner(prefill_model_path, n_threads=n_threads)
-            if prefill_model_path else None
-        )
-        if prefill_model is not None and prefill_size is None:
-            prefill_size = cls._infer_prefill_size(prefill_model)
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.onnx")
         return cls(
             ORTInferenceRunner(model_path, n_threads=n_threads),
@@ -396,8 +353,6 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
-            prefill_model=prefill_model,
-            prefill_size=prefill_size,
             lm_head=(
                 ORTInferenceRunner(lm_head_path, n_threads=n_threads)
                 if lm_head_path else None
@@ -416,13 +371,8 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
         combined_kv_io: bool = True,
         config_path: str | os.PathLike | None = None,
         tokenizer_path: str | os.PathLike | None = None,
-        prefill_model_path: str | os.PathLike | None = None,
-        prefill_size: int | None = None,
         lm_head_path: str | os.PathLike | None = None,
     ) -> "LiquidStatic":
-        prefill_model_path = prefill_model_path or cls._find_prefill_model(
-            model_path, f"{Path(model_path).stem}_prefill.vmfb"
-        )
         lm_head_path = lm_head_path or cls._find_lm_head(model_path, "lm_head.vmfb*")
         return cls(
             VMFBInferenceRunner(model_path, n_threads=n_threads),
@@ -433,11 +383,6 @@ class LiquidStatic(LiquidBase, StaticDecoderOnlyRunner):
             combined_kv_io=combined_kv_io,
             config_path=config_path,
             tokenizer_path=tokenizer_path,
-            prefill_model=(
-                VMFBInferenceRunner(prefill_model_path, n_threads=n_threads)
-                if prefill_model_path else None
-            ),
-            prefill_size=prefill_size,
             lm_head=(
                 VMFBInferenceRunner(lm_head_path, n_threads=n_threads)
                 if lm_head_path else None

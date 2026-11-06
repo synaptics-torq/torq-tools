@@ -30,7 +30,6 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         instruct=True,
         split_lm_head=True,
         batch_prefill=True,
-        native_batch_prefill=True,
     )
     parser.add_argument(
         "--functiongemma",

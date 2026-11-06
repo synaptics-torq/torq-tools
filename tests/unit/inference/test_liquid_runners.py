@@ -92,8 +92,6 @@ class _DemoStatic(LiquidStatic):
     def __init__(
         self,
         model: _FakeRunner,
-        prefill_model: _FakeRunner | None = None,
-        prefill_size: int | None = None,
         lm_head: _FakeRunner | None = None,
     ):
         self._set_liquid_config(_CONFIG)
@@ -108,8 +106,6 @@ class _DemoStatic(LiquidStatic):
             sys_prompt=None,
             combined_kv_io=True,
             lm_head=lm_head,
-            prefill_model=prefill_model,
-            prefill_size=prefill_size,
         )
 
 
@@ -158,72 +154,16 @@ def test_static_feeds_attention_mask_only_when_declared():
     assert "attention_mask" not in unknown.calls[0]
 
 
-def test_static_runs_split_lm_head_for_decode_and_prefill_bodies():
+def test_static_runs_split_lm_head_for_the_decode_body():
     decode_model = _FakeRunner(input_names=["input_ids", "position_ids"])
-    prefill_model = _FakeRunner(input_names=["input_ids", "position_ids"])
     lm_head = _FakeRunner(input_names=["last_hidden_states"])
-    runner = _DemoStatic(
-        decode_model,
-        prefill_model=prefill_model,
-        prefill_size=2,
-        lm_head=lm_head,
-    )
+    runner = _DemoStatic(decode_model, lm_head=lm_head)
 
-    runner._llm_tokens_step(prefill_model, [1, 2], 0)
-    runner._llm_tokens_step(decode_model, [3], 2)
+    runner._llm_tokens_step(decode_model, [3], 0)
 
-    # Both bodies emit the hidden state as their first output, so the
-    # standalone head runs for each (gemma3-style).
-    assert len(lm_head.calls) == 2
+    # The body emits the hidden state as its first output, so the standalone
+    # head runs (gemma3-style).
+    assert len(lm_head.calls) == 1
     hidden = np.zeros((1, 1, 4), dtype=np.float32)
     hidden[0, 0, 3] = 1.0  # the fake body's first output
-    for call in lm_head.calls:
-        assert np.array_equal(call["last_hidden_states"], hidden)
-
-
-def test_static_prefill_chunks_repeatedly_advance_cache_and_position():
-    decode_model = _FakeRunner(input_names=["input_ids", "position_ids"])
-    prefill_model = _FakeRunner(input_names=["input_ids", "position_ids"])
-    runner = _DemoStatic(decode_model, prefill_model=prefill_model, prefill_size=2)
-
-    runner._prefill_prompt([1, 2, 3, 4, 5, 6], start_seq_len=0)
-
-    assert len(prefill_model.calls) == 3
-    assert decode_model.calls == []
-    assert [c["position_ids"].item() for c in prefill_model.calls] == [0, 2, 4]
-    assert np.array_equal(prefill_model.calls[-1]["input_ids"], np.array([[5, 6]]))
-
-
-def test_static_prefill_feeds_token_embeddings_for_chunks():
-    decode_model = _FakeRunner(input_names=["token_embedding", "position_ids"])
-    prefill_model = _FakeRunner(input_names=["token_embedding", "position_ids"])
-    runner = _DemoStatic(decode_model, prefill_model=prefill_model, prefill_size=2)
-    runner._token_embeddings = np.arange(30, dtype=np.float32).reshape(10, 3)
-
-    runner._prefill_prompt([3, 4], start_seq_len=0)
-
-    fed = prefill_model.calls[0]["token_embedding"]
-    assert fed.shape == (1, 2, 3)
-    assert np.array_equal(fed[0, 0], runner._token_embeddings[3])
-    assert np.array_equal(fed[0, 1], runner._token_embeddings[4])
-
-
-def test_static_infer_prefill_size_from_input_shapes():
-    class _ShapedRunner:
-        model_path = Path("model_prefill.onnx")
-        input_shapes = {"input_ids": [1, 8]}
-
-    assert LiquidStatic._infer_prefill_size(_ShapedRunner()) == 8
-
-    class _EmbShapedRunner:
-        model_path = Path("model_prefill.onnx")
-        input_shapes = {"token_embedding": [1, 16, 4]}
-
-    assert LiquidStatic._infer_prefill_size(_EmbShapedRunner()) == 16
-
-    class _OpaqueRunner:
-        model_path = Path("model_prefill.onnx")
-        input_shapes = {}
-
-    with pytest.raises(ValueError, match="fixed prefill size"):
-        LiquidStatic._infer_prefill_size(_OpaqueRunner())
+    assert np.array_equal(lm_head.calls[0]["last_hidden_states"], hidden)

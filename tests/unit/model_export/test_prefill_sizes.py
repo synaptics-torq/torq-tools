@@ -59,7 +59,7 @@ def test_probe_drops_restream_and_no_fit(monkeypatch, tmp_path):
 def test_recommendation_uses_exporter_option():
     from torq.model_export.prefill_sizes import ProbeReport
 
-    assert ProbeReport([4, 7, 12], [], 12, 16).sizes_flag() == "--native-batch-prefill --batch-prefill-sizes 4,7,12"
+    assert ProbeReport([4, 7, 12], [], 12, 16).sizes_flag() == "--batch-prefill --batch-prefill-sizes 4,7,12"
 
 
 def _model(tmp_path, dtype=None, *, quantized=False):
