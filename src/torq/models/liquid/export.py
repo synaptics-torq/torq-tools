@@ -1386,7 +1386,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         except Exception as e:
             self._logger.warning("(lm-head) shape inference after split: %s", e)
 
-        if component.endswith("_prefill") or component.startswith("model_prefill_"):
+        if component.startswith("model_prefill_"):
             # The prefill model's LM head only needs the final position's
             # logit; slice its input before the head.  No-op when the head
             # isn't a direct MatMul (chunked --chunk-lm-head or a
