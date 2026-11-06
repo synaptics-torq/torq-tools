@@ -355,6 +355,18 @@ class OnnxModelExporterBase(ABC):
         return {size: paths["model" if size == 1 else f"model_prefill_{size}"]
                 for size in (1, *self._native_batch_prefill)}
 
+    def _native_family_contract(self, path=None):
+        """Family contract for a decode graph.
+
+        Defaults to the exported decode ONNX; pass the family's decode member
+        explicitly when the variant file differs. The default follows the
+        past_key_values/past_conv naming convention; exporters with other
+        names or state behaviour override this.
+        """
+        from .prefill import FamilyContract, decoder_states
+        model = load_onnx_lazy(path or self._export_paths["model"])
+        return FamilyContract(states=decoder_states(model, read_only=getattr(self, "_read_only_kv_cache", False)))
+
     def _complete_native_prefill(self, *, validate=True, cleanup=True,
                                  compiler_path=None, torq_compile_args=None):
         if not self._native_prefill_enabled:
@@ -382,7 +394,7 @@ class OnnxModelExporterBase(ABC):
             key: self._export_path_for_component(key) for key in self._export_paths
         })
         if validate:
-            validate_native_onnx(base_paths)
+            validate_native_onnx(base_paths, contract=self._native_family_contract(base_paths[1]))
         share_native_weights(base_paths.values())
         return components
 
@@ -497,7 +509,7 @@ class OnnxModelExporterBase(ABC):
             sizes = getattr(self, "_native_batch_prefill", ())
             if sizes and all(f"model_prefill_{b}" in self._export_paths for b in sizes):
                 from .prefill import validate_native_onnx
-                validate_native_onnx(self._native_family_paths())
+                validate_native_onnx(self._native_family_paths(), contract=self._native_family_contract())
             if self._skip_export:
                 self._logger.warning("Skipping validation as components %s have not been exported", str(self._skip_export))
             else:
@@ -744,7 +756,8 @@ class OnnxModelExporterBase(ABC):
         self._torq_dir.mkdir(parents=True, exist_ok=True)
         if native_sizes:
             family_paths = self._native_family_paths()
-            compile_native_family(family_paths, self._torq_dir, compiler_args=family_flags,
+            compile_native_family(family_paths, self._torq_dir, self._native_family_contract(),
+                                  compiler_args=family_flags,
                                   compiler_path=compiler_path, local_compile=local_compile)
         for comp, onnx_path in self._export_paths.items():
             if native_sizes and onnx_path in family_paths.values():

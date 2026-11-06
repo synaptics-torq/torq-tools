@@ -10,8 +10,8 @@ import pytest
 from onnx import TensorProto as T, helper as h, numpy_helper
 
 from torq.model_export.prefill import (
-    _constant_roles, import_native_family, parse_native_sizes, validate_native_options,
-    validate_native_onnx,
+    _constant_roles, FamilyContract, State, decoder_states, import_native_family,
+    parse_native_sizes, validate_native_options, validate_native_onnx,
 )
 from torq.models.gemma3 import add_gemma3_export_args
 from torq.models.liquid import add_liquid_export_args
@@ -103,13 +103,17 @@ def _family_graph(size, weight=1., width=4):
     ],"main",inputs,outputs,initializers),opset_imports=[h.make_opsetid("",18)],ir_version=10)
 
 
+def _contract(path, *, read_only):
+    return FamilyContract(states=decoder_states(onnx.load(path), read_only=read_only))
+
+
 def test_family_import_and_numerical_gate(tmp_path):
     pytest.importorskip("iree.compiler.extras.onnx_importer")
     paths = {b: tmp_path/f"decoder_{b}.onnx" for b in (1,4,7)}
     for b,path in paths.items():
         onnx.save(_family_graph(b),path)
     output = tmp_path/"family.mlirbc"
-    metadata = import_native_family(paths,output)
+    metadata = import_native_family(paths,output,_contract(paths[1],read_only=False))
     assert output.read_bytes().startswith(b"ML\xefR")
     assert set(metadata["entries"]) == {"main","main_4","main_7"}
     from iree.compiler import ir
@@ -117,16 +121,16 @@ def test_family_import_and_numerical_gate(tmp_path):
     with ir.Context():
         assembly = str(ir.Module.parse(output.read_bytes()))
     assert set(re.findall(r"dense_resource<(weight[^>]*)>", assembly)) == {"weight"}
-    validate_native_onnx(paths)
+    validate_native_onnx(paths,contract=_contract(paths[1],read_only=False))
     onnx.save(_family_graph(7,weight=2.),paths[7])
     with pytest.raises(ValueError,match="parameters differ"):
-        import_native_family(paths,output)
+        import_native_family(paths,output,_contract(paths[1],read_only=False))
 
 
-def _read_only_family_graph(size):
-    model = _family_graph(size)
-    model.graph.input[2].CopyFrom(h.make_tensor_value_info("past_key_values.0.key_value", T.FLOAT, [1,16,2,4]))
-    model.graph.output[1].CopyFrom(h.make_tensor_value_info("present.0.key_value", T.FLOAT, [1,size,2,4]))
+def _read_only_family_graph(size, width=4):
+    model = _family_graph(size, width=width)
+    model.graph.input[2].CopyFrom(h.make_tensor_value_info("past_key_values.0.key_value", T.FLOAT, [1,16,2,width]))
+    model.graph.output[1].CopyFrom(h.make_tensor_value_info("present.0.key_value", T.FLOAT, [1,size,2,width]))
     del model.graph.node[-1]
     model.graph.initializer.append(numpy_helper.from_array(np.array([2], np.int64), "rows_axis"))
     model.graph.node.extend([
@@ -141,17 +145,17 @@ def test_read_only_family_import_and_sequential_rows(tmp_path):
     paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1,4,7)}
     for size, path in paths.items():
         onnx.save(_read_only_family_graph(size), path)
-    metadata = import_native_family(paths, tmp_path / "family.mlirbc")
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc", _contract(paths[1], read_only=True))
     assert metadata["kv_cache_sequence_axis"] == 1
     assert metadata["entries"]["main_7"]["outputs"][1]["shape"] == [1,7,2,4]
-    validate_native_onnx(paths)
+    validate_native_onnx(paths, contract=_contract(paths[1], read_only=True))
     # A chunk returning the wrong rows must fail the populated-cache gate.
     model = _read_only_family_graph(7)
     model.graph.node.insert(len(model.graph.node) - 1, h.make_node("Neg", ["rows"], ["negated"]))
     model.graph.node[-1].input[1] = "negated"
     onnx.save(model, paths[7])
     with pytest.raises(AssertionError):
-        validate_native_onnx(paths)
+        validate_native_onnx(paths, contract=_contract(paths[1], read_only=True))
 
 
 def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
@@ -186,7 +190,7 @@ def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
                            for tensor in stored.graph.initializer if tensor.name.startswith("weight_")})
     assert references[0] == references[1]
     assert all(references[0].values())
-    metadata = import_native_family(paths, tmp_path / "family.mlirbc")
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc", _contract(paths[1], read_only=True))
     assert metadata["entries"]["main"]["inputs"][0]["dtype"] == T.BFLOAT16
     assert metadata["entries"]["main_4"]["inputs"][1]["dtype"] == T.INT32
     from iree.compiler import ir
@@ -202,7 +206,7 @@ def test_int4_family_fingerprints_all_dql_parameters(tmp_path):
         tensor.raw_data = bytes([original[0] ^ 1]) + original[1:]
         onnx.save(model, paths[4])
         with pytest.raises(ValueError, match="parameters differ"):
-            import_native_family(paths, tmp_path / "family.mlirbc")
+            import_native_family(paths, tmp_path / "family.mlirbc", _contract(paths[1], read_only=True))
         # Restore for the next parameter mutation.
         tensor.raw_data = original
         onnx.save(model, paths[4])
@@ -385,10 +389,11 @@ def test_export_compiles_family_once_and_keeps_family_flags_off_head(tmp_path, m
     exporter.export_onnx(validate=False,cleanup=False)
     calls=[]
     monkeypatch.setattr(prefill,"check_native_compiler",lambda path:None)
-    monkeypatch.setattr(prefill,"compile_native_family",lambda paths,folder,**kwargs:calls.append(("family",paths,kwargs)))
+    monkeypatch.setattr(prefill,"compile_native_family",lambda paths,folder,contract=None,**kwargs:calls.append(("family",paths,kwargs,contract)))
     monkeypatch.setattr(me,"export_torq",lambda path,folder,**kwargs:calls.append(("head",path,kwargs)))
     exporter.export_torq(compiler_path=tmp_path/"compiler", torq_compile_args=["--torq-max-nss-programs-size=33554432"])
     assert [c[0] for c in calls] == ["family","head"]
+    assert isinstance(calls[0][3], prefill.FamilyContract)
     assert list(calls[0][1]) == [1,4,7]
     assert "--torq-enable-multi-graph" in calls[0][2]["compiler_args"]
     assert "--torq-enable-multi-graph" not in calls[1][2]["compiler_args"]
@@ -496,9 +501,9 @@ def test_native_export_shares_weights_and_keeps_controls_inline(tmp_path, split_
     assert (directory / "lm_head.onnx.data").exists() == split_weights
     # Re-saving one member must not damage the shared file or its siblings.
     save_onnx(load_onnx_lazy(paths[4]), paths[4])
-    validate_native_onnx(paths)
+    validate_native_onnx(paths, contract=_contract(paths[1], read_only=False))
     pytest.importorskip("iree.compiler.extras.onnx_importer")
-    assert set(import_native_family(paths, directory / "family.mlirbc")["entries"]) == {"main", "main_4", "main_7"}
+    assert set(import_native_family(paths, directory / "family.mlirbc", _contract(paths[1], read_only=False))["entries"]) == {"main", "main_4", "main_7"}
 
 
 def test_shared_weights_preserve_distinct_parameters(tmp_path):
@@ -514,7 +519,43 @@ def test_shared_weights_preserve_distinct_parameters(tmp_path):
         np.testing.assert_array_equal(numpy_helper.to_array(onnx.load(path).graph.initializer[0]), np.eye(16) * size)
     pytest.importorskip("iree.compiler.extras.onnx_importer")
     with pytest.raises(ValueError, match="parameters differ"):
-        import_native_family(paths, tmp_path / "family.mlirbc")
+        import_native_family(paths, tmp_path / "family.mlirbc", _contract(paths[1], read_only=False))
+
+
+def test_decoder_states_rejects_unknown_state_names():
+    model = _family_graph(4)
+    model.graph.input[2].name = "cache.0"
+    with pytest.raises(ValueError, match="unknown native decoder state"):
+        decoder_states(model, read_only=False)
+
+
+def test_validate_rejects_state_count_mismatch(tmp_path):
+    paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1, 4)}
+    for b, path in paths.items():
+        onnx.save(_family_graph(b), path)
+    contract = FamilyContract(states=(
+        State(input="past_key_values.0.key_value", output="present.0.key_value", seq_axis=2),
+        State(input="past_key_values.1.key_value", output="present.1.key_value", seq_axis=2),
+    ))
+    with pytest.raises(ValueError, match="state count mismatch"):
+        validate_native_onnx(paths, contract=contract)
+
+
+def test_renamed_state_contract_imports_and_validates(tmp_path):
+    pytest.importorskip("iree.compiler.extras.onnx_importer")
+    paths = {b: tmp_path / f"decoder_{b}.onnx" for b in (1, 4)}
+    for b, path in paths.items():
+        model = _family_graph(b)
+        model.graph.input[2].name = "cache.0"
+        model.graph.output[1].name = "cache_out.0"
+        model.graph.node[-1].input[0] = "cache.0"
+        model.graph.node[-1].output[0] = "cache_out.0"
+        onnx.save(model, path)
+    contract = FamilyContract(states=(State(input="cache.0", output="cache_out.0", seq_axis=2),))
+    metadata = import_native_family(paths, tmp_path / "family.mlirbc", contract)
+    assert metadata["kv_cache_sequence_axis"] == 2
+    assert metadata["entries"]["main_4"]["inputs"][2]["name"] == "cache.0"
+    validate_native_onnx(paths, contract=contract)
 
 
 def test_shared_weights_failed_write_preserves_original_graphs(tmp_path, monkeypatch):
@@ -616,6 +657,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_
     (source / "config.json").write_text(json.dumps(config))
     (source / "tokenizer.json").write_text("{}")
     onnx.save(_family_graph(1, width=32), source / "model.onnx")
+    graph = _read_only_family_graph if read_only else _family_graph
     options = dict(models_dir=tmp_path / "models", onnx_source_dir=source, max_gen_tokens=16,
                    extract_embeddings=True, split_lm_head=True, read_only_kv_cache=read_only,
                    native_batch_prefill=mode != "ordinary",
@@ -629,13 +671,13 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_
     monkeypatch.setattr("torq.model_export.prefill.check_native_compiler", lambda *a: None)
     cls = type(exporter)
     monkeypatch.setattr(cls, "_model_compile_flags", lambda self, **kwargs: ["--torq-prefetch-algorithm=constant-loads"])
-    monkeypatch.setattr(cls, "_load_onnx", lambda self: {"model": _family_graph(1, width=32)})
+    monkeypatch.setattr(cls, "_load_onnx", lambda self: {"model": graph(1, width=32)})
     def make_chunks(self, source_model=None):
-        return {f"model_prefill_{size}": _family_graph(size, width=32)
+        return {f"model_prefill_{size}": graph(size, width=32)
                 for size in self._native_batch_prefill}
     monkeypatch.setattr(cls, "_make_native_prefill", make_chunks)
     def make_static(self):
-        self._components = {"model": _family_graph(1, width=32)}
+        self._components = {"model": graph(1, width=32)}
     monkeypatch.setattr(cls, "make_static", make_static)
     monkeypatch.setattr(cls, "optimize_model", lambda *args: None)
     exports = []

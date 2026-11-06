@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
@@ -103,6 +104,36 @@ def _signature(values):
         signature.append({"name": value.name, "dtype": tensor.elem_type,
                           "shape": [d.dim_value for d in tensor.shape.dim]})
     return signature
+
+
+@dataclass(frozen=True)
+class State:
+    input: str                  # graph input, e.g. "past_key_values.0.key_value"
+    output: str                 # graph output, e.g. "present.0.key_value"
+    seq_axis: int | None = None # KV states: axis indexed by position; None for recurrent state (conv, SSM)
+    rows_only: bool = False     # chunk returns only its B new rows along seq_axis (read-only KV cache)
+
+
+@dataclass(frozen=True)
+class FamilyContract:
+    states: tuple[State, ...]   # in graph order: inputs[2:], outputs[1:]
+    hidden_input: str = "token_embedding"
+    position_input: str = "position_ids"
+
+
+def decoder_states(model, *, read_only):
+    """States for exporters using the past_key_values.N.key_value / past_conv.N convention."""
+    states = []
+    for inp in model.graph.input[2:]:
+        if inp.name.startswith("past_key_values."):
+            states.append(State(input=inp.name, output=inp.name.replace("past_key_values.", "present."),
+                                seq_axis=1 if read_only else 2, rows_only=read_only))
+        elif inp.name.startswith("past_conv."):
+            states.append(State(input=inp.name, output=inp.name.replace("past_conv.", "present_conv."),
+                                seq_axis=None))
+        else:
+            raise ValueError(f"unknown native decoder state: {inp.name}")
+    return tuple(states)
 
 
 def _constant_roles(model):
@@ -262,7 +293,7 @@ def _tensor_context_cache():
     return TensorContextCache
 
 
-def import_native_family(paths: dict[int, Path], output: Path):
+def import_native_family(paths: dict[int, Path], output: Path, contract: FamilyContract):
     """Import decode (key 1) and static chunks into one verified bytecode module."""
     from iree.compiler import ir
     from iree.compiler.extras import onnx_importer
@@ -270,10 +301,15 @@ def import_native_family(paths: dict[int, Path], output: Path):
 
     if not paths or next(iter(paths)) != 1 or len(paths) < 2:
         raise ValueError("native family needs decode followed by prefill entries")
+    kv_axes = {state.seq_axis for state in contract.states if state.seq_axis is not None}
+    if len(kv_axes) > 1:
+        raise ValueError(f"native family KV states disagree on sequence axis: {sorted(kv_axes)}")
+    if any(state.rows_only and state.seq_axis is None for state in contract.states):
+        raise ValueError("rows-only native states need a sequence axis")
+    kv_axis = kv_axes.pop() if kv_axes else 2
     entries = {}
     parameters = None
     decode_inputs = decode_outputs = None
-    read_only = False
     shared_parameters = {}
 
     class FamilyContextCache(_tensor_context_cache()):
@@ -292,39 +328,38 @@ def import_native_family(paths: dict[int, Path], output: Path):
             args = parse_arguments([str(path), "--data-prop", "--large-model"])
             model = load_onnx_model(args)
             inputs, outputs = _signature(model.graph.input), _signature(model.graph.output)
-            if (len(inputs) < 3 or inputs[0]["name"] != "token_embedding"
+            hidden = inputs[0]["dtype"] if inputs else None
+            if (not inputs or len(inputs) != 2 + len(contract.states)
+                    or inputs[0]["name"] != contract.hidden_input
                     or inputs[0]["shape"][:2] != [1, size]
-                    or inputs[0]["dtype"] not in (onnx.TensorProto.FLOAT, onnx.TensorProto.BFLOAT16)
-                    or inputs[1] != {"name": "position_ids", "dtype": (onnx.TensorProto.INT64 if inputs[0]["dtype"] == onnx.TensorProto.FLOAT else onnx.TensorProto.INT32), "shape": [1, 1]}
-                    or not outputs or outputs[0]["dtype"] != inputs[0]["dtype"]
+                    or hidden not in (onnx.TensorProto.FLOAT, onnx.TensorProto.BFLOAT16)
+                    or inputs[1] != {"name": contract.position_input, "dtype": (onnx.TensorProto.INT64 if hidden == onnx.TensorProto.FLOAT else onnx.TensorProto.INT32), "shape": [1, 1]}
+                    or not outputs or outputs[0]["dtype"] != hidden
                     or outputs[0]["shape"] != [1, 1, inputs[0]["shape"][-1]]
                     or len(outputs) != len(inputs) - 1):
                 raise ValueError(f"unsupported native decoder ABI in {path}")
             if size == 1:
                 decode_inputs, decode_outputs = inputs, outputs
-                read_only = (inputs[2]["name"].startswith("past_key_values.")
-                             and inputs[2]["shape"] != outputs[1]["shape"])
-                for index, (inp, out) in enumerate(zip(inputs[2:], outputs[1:])):
-                    expected = inp["name"].replace("past_key_values.", "present.").replace("past_conv.", "present_conv.")
+                for state, inp, out in zip(contract.states, inputs[2:], outputs[1:]):
                     shape = inp["shape"]
-                    if read_only and inp["name"].startswith("past_key_values."):
-                        if len(shape) != 4 or shape[1] <= 1:
-                            raise ValueError(f"invalid time-major native cache: {inp['name']}")
+                    if state.rows_only:
+                        if len(shape) != 4 or shape[state.seq_axis] <= 1:
+                            raise ValueError(f"invalid time-major native cache: {state.input}")
                         shape = [1, 1, *shape[2:]]
-                    if (inp["name"] not in (f"past_key_values.{index}.key_value", f"past_conv.{index}")
-                            or out["name"] != expected or inp["dtype"] != inputs[0]["dtype"]
+                    if (inp["name"] != state.input or out["name"] != state.output
+                            or inp["dtype"] != hidden
                             or (shape, inp["dtype"]) != (out["shape"], out["dtype"])):
-                        raise ValueError(f"native state input/output name, order or shape mismatch: {inp['name']}")
+                        raise ValueError(f"native state input/output name, order or shape mismatch: {state.input}")
             else:
-                expected_outputs = [
+                expected_outputs = [decode_outputs[0]] + [
                     {**out, "shape": [1, size, *out["shape"][2:]]}
-                    if read_only and out["name"].startswith("present.") else out
-                    for out in decode_outputs
+                    if state.rows_only else out
+                    for state, out in zip(contract.states, decode_outputs[1:])
                 ]
                 if inputs[1:] != decode_inputs[1:] or outputs != expected_outputs or inputs[0]["shape"][2:] != decode_inputs[0]["shape"][2:]:
                     raise ValueError(f"native family state ABI differs in {path}")
-            if any(size > inp["shape"][1 if read_only else 2] for inp in inputs[2:]
-                   if inp["name"].startswith("past_key_values.")):
+            if any(size > inp["shape"][state.seq_axis] for state, inp in zip(contract.states, inputs[2:])
+                   if state.seq_axis is not None):
                 raise ValueError(f"native chunk exceeds cache capacity in {path}")
             current = _constant_roles(model)
             if parameters is None:
@@ -344,7 +379,7 @@ def import_native_family(paths: dict[int, Path], output: Path):
         module.operation.verify()
         with output.open("wb") as stream:
             module.operation.write_bytecode(stream)
-    return {"version": 1, "entries": entries, "kv_cache_sequence_axis": 1 if read_only else 2}
+    return {"version": 1, "entries": entries, "kv_cache_sequence_axis": kv_axis}
 
 
 def native_compile_flags(flags):
@@ -367,10 +402,10 @@ def native_compile_flags(flags):
     return result + ["--torq-enable-multi-graph"]
 
 
-def compile_native_family(paths, output_dir, *, compiler_args, compiler_path=None, local_compile=False):
+def compile_native_family(paths, output_dir, contract, *, compiler_args, compiler_path=None, local_compile=False):
     output_dir = Path(output_dir)
     mlir = output_dir / "transformer.mlirbc"
-    metadata = import_native_family(paths, mlir)
+    metadata = import_native_family(paths, mlir, contract)
     flags = list(compiler_args)
     compile_mlir_for_vm(mlir, output_dir / "transformer.vmfb", compiler_args=flags,
                         compiler_path=compiler_path, use_binary=True, local_compile=local_compile)
@@ -379,7 +414,7 @@ def compile_native_family(paths, output_dir, *, compiler_args, compiler_path=Non
     (output_dir / "transformer.family.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
-def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
+def validate_native_onnx(paths, *, contract, rtol=1e-4, atol=1e-4):
     """Compare every hidden/state output to sequential decode at cache boundaries."""
     import numpy as np
     import onnxruntime as ort
@@ -389,9 +424,11 @@ def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
     decode = ort.InferenceSession(str(paths[1]), opts, providers=["CPUExecutionProvider"])
     specs = decode.get_inputs()
     state_specs = specs[2:]
-    read_only = state_specs[0].shape != decode.get_outputs()[1].shape
-    axis = 1 if read_only else 2
-    context = next(s.shape[axis] for s in state_specs if s.name.startswith("past_key_values."))
+    if len(state_specs) != len(contract.states):
+        raise ValueError(f"native family state count mismatch in {paths[1]}")
+    read_only = any(state.rows_only for state in contract.states)
+    context = next(s.shape[state.seq_axis] for s, state in zip(state_specs, contract.states)
+                   if state.seq_axis is not None)
     rng = np.random.default_rng(0)
     for size, path in paths.items():
         if size == 1:
@@ -401,20 +438,20 @@ def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
             embeddings = rng.normal(0, 0.1, chunk.get_inputs()[0].shape).astype(np.float32)
             state = {s.name: (np.zeros(s.shape, dtype=np.float32) if position == 0 else
                              rng.normal(0, 0.1, s.shape).astype(np.float32)) for s in state_specs}
-            actual = chunk.run(None, {"token_embedding": embeddings,
-                                     "position_ids": np.array([[position]], dtype=np.int64), **state})
+            actual = chunk.run(None, {contract.hidden_input: embeddings,
+                                     contract.position_input: np.array([[position]], dtype=np.int64), **state})
             current = {name: value.copy() for name, value in state.items()}
             for offset in range(size):
-                expected = decode.run(None, {"token_embedding": embeddings[:, offset:offset + 1],
-                                            "position_ids": np.array([[position + offset]], dtype=np.int64), **current})
-                for spec, value in zip(state_specs, expected[1:]):
-                    if read_only and spec.name.startswith("past_key_values."):
+                expected = decode.run(None, {contract.hidden_input: embeddings[:, offset:offset + 1],
+                                            contract.position_input: np.array([[position + offset]], dtype=np.int64), **current})
+                for spec, value, st in zip(state_specs, expected[1:], contract.states):
+                    if st.rows_only:
                         current[spec.name][:, position + offset:position + offset + 1] = value
                     else:
                         current[spec.name] = value
             expected = [expected[0], *[
-                current[s.name][:, position:position + size] if read_only and s.name.startswith("past_key_values.")
-                else current[s.name] for s in state_specs
+                current[s.name][:, position:position + size] if st.rows_only
+                else current[s.name] for s, st in zip(state_specs, contract.states)
             ]]
             for spec, result, reference in zip(chunk.get_outputs(), actual, expected):
                 message = f"B={size}, p={position}, output={spec.name}"
@@ -427,7 +464,7 @@ def validate_native_onnx(paths, *, rtol=1e-4, atol=1e-4):
                     np.testing.assert_allclose(np.linalg.norm(result - reference), 0, rtol=0,
                                                atol=atol + rtol * np.linalg.norm(reference), err_msg=message)
                 np.testing.assert_allclose(result, reference, rtol=rtol, atol=tolerance, err_msg=message)
-            for spec, result in zip(state_specs, actual[1:]):
-                if spec.name.startswith("past_key_values.") and not read_only:
+            for spec, result, st in zip(state_specs, actual[1:], contract.states):
+                if st.seq_axis is not None and not st.rows_only:
                     np.testing.assert_array_equal(result[:, :, :position], state[spec.name][:, :, :position])
                     np.testing.assert_array_equal(result[:, :, position + size:], state[spec.name][:, :, position + size:])
