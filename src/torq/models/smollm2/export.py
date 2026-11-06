@@ -318,7 +318,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
     def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
         components = {}
         source_model = self._load_onnx()["model"]
-        for size in self._native_batch_prefill:
+        for size in self._batch_prefill_sizes:
             self._logger.info(
                 "(model_prefill_%d) Making graph static with %d tokens...",
                 size,
@@ -368,7 +368,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
 
 def export_smollm2_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    from ...model_export.prefill import check_batch_prefill_cli_args, resolve_batch_prefill_cli
     resolve_batch_prefill_cli(args)
     exporter = SmolLM2ModelExporter(
         args.model_size,
@@ -394,7 +394,7 @@ def export_smollm2_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    check_batch_prefill_cli_args(args, enabled=exporter._batch_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                      compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

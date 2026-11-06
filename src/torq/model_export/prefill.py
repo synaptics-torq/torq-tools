@@ -34,7 +34,7 @@ def parse_native_sizes(value: str) -> tuple[int, ...]:
     return sizes
 
 
-def validate_native_options(sizes, *, enabled, context, minimum, static,
+def validate_batch_prefill_options(sizes, *, enabled, context, minimum, static,
                             embeddings, split_head, read_only, individual, unsupported,
                             supports_read_only=False, supported=""):
     if type(enabled) is not bool:
@@ -79,13 +79,13 @@ def resolve_batch_prefill_cli(args):
         )
 
 
-def check_native_cli_args(args, *, enabled):
+def check_batch_prefill_cli_args(args, *, enabled):
     """Fail fast on the compiler and flag set before any destructive export
     work (after ``resolve_batch_prefill_cli`` and construction; ``enabled`` is
     the exporter's resolved batch-prefill state)."""
     if enabled:
-        check_native_compiler(args.compiler_path)
-        native_compile_flags(args.compile_flags or [])
+        check_batch_prefill_compiler(args.compiler_path)
+        batch_prefill_compile_flags(args.compile_flags or [])
 
 
 def probe_native_sizes(model_path, *, context, minimum, compiler_args, compiler_path, work_dir):
@@ -104,7 +104,7 @@ def probe_native_sizes(model_path, *, context, minimum, compiler_args, compiler_
     return sizes
 
 
-def check_native_compiler(compiler_path=None):
+def check_batch_prefill_compiler(compiler_path=None):
     """Check the selected executable and the installed importer before destructive work."""
     try:
         from iree.compiler import ir
@@ -428,7 +428,7 @@ def import_native_family(paths: dict[int, Path], output: Path, contract: FamilyC
     return {"version": 1, "entries": entries, "kv_cache_sequence_axis": kv_axis}
 
 
-def native_compile_flags(flags):
+def batch_prefill_compile_flags(flags):
     if any(flag.startswith("--torq-enable-multi-graph") for flag in flags):
         raise ValueError("native exporter sets multi-graph compilation; do not pass compiler family options")
     required = ["--iree-input-type=onnx-torq", "--iree-hal-target-backends=torq", "--torq-hw=SL2610",

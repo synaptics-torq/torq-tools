@@ -234,8 +234,8 @@ class QwenModelExporter(OnnxModelExporterBase):
         )
 
         if (
-            self._native_prefill_enabled
-            and not self._native_batch_prefill
+            self._batch_prefill_enabled
+            and not self._batch_prefill_sizes
             and self._weight_quantization is not None
         ):
             # Qwen quantizes in convert_models, which never probes; without
@@ -927,7 +927,7 @@ class QwenModelExporter(OnnxModelExporterBase):
     def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
         components = {}
         source_model = self._load_onnx()["model"]
-        for size in self._native_batch_prefill:
+        for size in self._batch_prefill_sizes:
             self._logger.info(
                 "(model_prefill_%d) Making Qwen graph static with %d tokens...",
                 size,
@@ -998,9 +998,9 @@ class QwenModelExporter(OnnxModelExporterBase):
         # Qwen's large-model saves use <stem>.onnx_data sidecars, which
         # share_native_weights does not remove; once the family points at the
         # shared transformer.weights.data they are orphans.
-        if not (self._native_batch_prefill and all(
+        if not (self._batch_prefill_sizes and all(
             f"model_prefill_{size}" in self._export_paths
-            for size in self._native_batch_prefill
+            for size in self._batch_prefill_sizes
         )):
             return
         for path in self._native_family_paths().values():
@@ -1247,7 +1247,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             if not self._split_model:
                 quantized_components.add("model.onnx")
             quantized_components.update(
-                f"model_prefill_{size}.onnx" for size in self._native_batch_prefill
+                f"model_prefill_{size}.onnx" for size in self._batch_prefill_sizes
             )
 
             if (
@@ -1479,10 +1479,10 @@ class QwenModelExporter(OnnxModelExporterBase):
         if self._split_model:
             skip = list(skip) + ["model"]
 
-        if self._native_batch_prefill:
-            from ...model_export.prefill import check_native_compiler
+        if self._batch_prefill_sizes:
+            from ...model_export.prefill import check_batch_prefill_compiler
 
-            check_native_compiler(compiler_path)
+            check_batch_prefill_compiler(compiler_path)
             if any(c == "model" or c.startswith("model_prefill_") for c in skip):
                 raise ValueError("cannot skip individual members of a native decoder family")
 
@@ -1504,10 +1504,10 @@ class QwenModelExporter(OnnxModelExporterBase):
         common_flags = list(flags_entry.get("common") or [])
 
         family_paths: dict[int, Path] = {}
-        if self._native_batch_prefill:
+        if self._batch_prefill_sizes:
             from ...model_export.prefill import (
                 compile_native_family,
-                native_compile_flags,
+                batch_prefill_compile_flags,
             )
 
             family_paths = self._native_family_paths()
@@ -1523,7 +1523,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 family_paths,
                 self._torq_dir,
                 self._native_family_contract(),
-                compiler_args=native_compile_flags(family_args),
+                compiler_args=batch_prefill_compile_flags(family_args),
                 compiler_path=compiler_path,
                 local_compile=local_compile,
             )
@@ -1640,7 +1640,7 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace) -> Path | None:
 
 def export_qwen_from_args(args: argparse.Namespace) -> None:
     configure_logging(args.logging)
-    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    from ...model_export.prefill import check_batch_prefill_cli_args, resolve_batch_prefill_cli
 
     hf_repo = args.hf_repo or QWEN_MODELS[args.model_size]["hf_repo"]
     weight_quantization = (
@@ -1673,7 +1673,7 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         gptq_checkpoint=_resolve_gptq_checkpoint(args),
     )
 
-    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    check_batch_prefill_cli_args(args, enabled=exporter._batch_prefill_enabled)
 
     # The generic ONNX cleanup serializes the whole model in memory. The Qwen
     # models have more than 2 GB of fp32 weights, so the cleanup cannot run.

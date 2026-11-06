@@ -157,7 +157,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config = AutoConfig.from_pretrained(self._hf_repo, local_files_only=True)
                 except OSError:
                     self._config = AutoConfig.from_pretrained(self._hf_repo)
-        if self._native_prefill_enabled and max_gen_tokens > (getattr(self._config, "sliding_window", None) or max_gen_tokens):
+        if self._batch_prefill_enabled and max_gen_tokens > (getattr(self._config, "sliding_window", None) or max_gen_tokens):
             raise ValueError("native prefill context must fit within the sliding attention window")
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
@@ -180,7 +180,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _model_compile_flags(self, **kwargs) -> list[str]:
         flags = super()._model_compile_flags(**kwargs)
-        if self._native_prefill_enabled and self._weight_quantization is None and not self._read_only_kv_cache:
+        if self._batch_prefill_enabled and self._weight_quantization is None and not self._read_only_kv_cache:
             # Stream prefetch shrinks the shared legacy-cache weight tiles.
             flags = [flag for flag in flags if not flag.startswith("--torq-prefetch-algorithm=")]
             flags.append("--torq-prefetch-algorithm=constant-loads")
@@ -361,7 +361,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("CollapseGQABroadcast"),
-            EditSpec("FoldScalarMatMul", (True,) if self._native_prefill_enabled else ()),
+            EditSpec("FoldScalarMatMul", (True,) if self._batch_prefill_enabled else ()),
         ]
         if self._broadcast_ops is not None:
             patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
@@ -385,7 +385,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             blocks["model.patch (split LM head)"] = [
                 EditSpec("SplitLMHead", (ctx("lm_head_path"), "logits", "last_hidden_states"))
             ]
-        if self._native_prefill_enabled:
+        if self._batch_prefill_enabled:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -508,16 +508,16 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             editor.apply_specs(
                 blocks["model.patch (split LM head)"],
                 self._harness,
-                {"lm_head_path": lm_head_path if component == "model" or not self._native_prefill_enabled else None},
+                {"lm_head_path": lm_head_path if component == "model" or not self._batch_prefill_enabled else None},
             )
-            if component == "model" or not self._native_prefill_enabled:
+            if component == "model" or not self._batch_prefill_enabled:
                 lm_head_model = load_onnx_lazy(lm_head_path)
                 lm_head_model.ir_version = model.ir_version
                 self._save_component_model(self.check_model(lm_head_model), lm_head_path)
                 self._export_paths["lm_head"] = lm_head_path
                 self._logger.info("(lm_head) Saved split LM head to '%s'", str(lm_head_path))
 
-        if self._native_prefill_enabled and component.startswith("model_prefill_"):
+        if self._batch_prefill_enabled and component.startswith("model_prefill_"):
             self._native_rope_layout(editor.graph)
         new_model = editor.to_onnx(override_ir=model.ir_version)
         self._save_component_model(new_model, model_path)
@@ -553,12 +553,12 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
 
     def _make_native_prefill(self, source_model=None):
-        if not self._native_batch_prefill:
+        if not self._batch_prefill_sizes:
             return {}
         if source_model is None:
             source_model = self.check_model(self._load_onnx()["model"])
         components = {}
-        for size in self._native_batch_prefill:
+        for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
             components[component] = self._make_model_static(
                 source_model, component=component, chunk_len=size,
@@ -730,7 +730,7 @@ def _resolve_gptq_checkpoint(args: argparse.Namespace, weight_quantization: str 
 
 def export_gemma3_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    from ...model_export.prefill import check_batch_prefill_cli_args, resolve_batch_prefill_cli
     weight_quantization = None if args.weight_quantization == "none" else args.weight_quantization
     if weight_quantization and args.dynamic_quantize:
         logger.info("--dynamic-quantize: the weights are not quantized to %s", weight_quantization)
@@ -772,7 +772,7 @@ def export_gemma3_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    check_batch_prefill_cli_args(args, enabled=exporter._batch_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

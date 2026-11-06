@@ -187,7 +187,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self._head_dim = int(self._config_dict.get("head_dim") or (self._hidden_size // self._num_attention_heads))
         self._conv_dim = int(self._config_dict.get("conv_dim", self._hidden_size))
         self._conv_L_cache = int(self._config_dict.get("conv_L_cache", 3))
-        if self._native_prefill_enabled and self._conv_L_cache != 3:
+        if self._batch_prefill_enabled and self._conv_L_cache != 3:
             raise ValueError("native LFM prefill requires a three-token convolution state")
         self._layer_types = tuple(self._config_dict["layer_types"])
         self._num_hidden_layers = int(self._config_dict["num_hidden_layers"])
@@ -500,7 +500,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             "source.convert (attention)": [
                 EditSpec("ReplaceGroupQueryAttention", (
                     self._num_attention_heads, self._num_key_value_heads, self._head_dim,
-                    ctx("chunk_len"), not self._native_prefill_enabled,
+                    ctx("chunk_len"), not self._batch_prefill_enabled,
                 )),
             ],
             "model.static": [
@@ -522,7 +522,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
             EditSpec("CollapseReshapeChain"),
             EditSpec("FoldScalarMatMul"),
         ]
-        if not self._native_prefill_enabled:
+        if not self._batch_prefill_enabled:
             patch.insert(2, EditSpec("CollapseGQABroadcast"))
         if self._broadcast_ops is not None:
             patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
@@ -532,7 +532,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 "ExtractConstantLUT",
                 ((self._vocab_size, self._hidden_size), ctx("save_embeddings_path"), "token_embedding"),
             )]
-        if self._native_prefill_enabled:
+        if self._batch_prefill_enabled:
             blocks["model.patch (batch prefill)"] = [EditSpec("TakeLastToken")]
         return blocks
 
@@ -1351,7 +1351,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # SL2610's depthwise-conv path asserts out of torq-compile on this
         # kernel.  Disabled by --keep-conv1d.
         if self._replace_conv1d:
-            if self._native_prefill_enabled and component.startswith("model_prefill_"):
+            if self._batch_prefill_enabled and component.startswith("model_prefill_"):
                 new_model, n_conv = self._replace_native_conv1d(new_model)
             else:
                 new_model, n_conv = self._replace_conv1d_with_matmul(new_model)
@@ -1426,7 +1426,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
     def _make_native_prefill(self):
         components = {}
-        for size in self._native_batch_prefill:
+        for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
             source = self._convert_source_model(chunk_len=size, component=component)
             components[component] = self._make_model_static(
@@ -1780,7 +1780,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
 
 def export_liquid_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    from ...model_export.prefill import check_batch_prefill_cli_args, resolve_batch_prefill_cli
     resolve_batch_prefill_cli(args)
 
     exporter = LiquidModelExporter(
@@ -1809,7 +1809,7 @@ def export_liquid_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    check_batch_prefill_cli_args(args, enabled=exporter._batch_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup,
                          compiler_path=args.compiler_path, torq_compile_args=args.compile_flags or [])
     if args.dynamic_quantize:

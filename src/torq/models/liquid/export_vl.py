@@ -590,7 +590,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
     # ------------------------------------------------------------- native family
     def _make_native_prefill(self):
         components = {}
-        for size in self._native_batch_prefill:
+        for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
             self._logger.info(
                 "(%s) Making graph static with %d tokens...", component, size
@@ -607,7 +607,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # The decode member is the VL decoder component, not 'model'.
         paths = self._export_paths if paths is None else paths
         return {size: paths[DECODER if size == 1 else f"model_prefill_{size}"]
-                for size in (1, *self._native_batch_prefill)}
+                for size in (1, *self._batch_prefill_sizes)}
 
     def _native_family_contract(self, path=None):
         return super()._native_family_contract(path or self._export_paths[DECODER])
@@ -900,7 +900,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
 def export_liquid_vl_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
-    from ...model_export.prefill import check_native_cli_args, resolve_batch_prefill_cli
+    from ...model_export.prefill import check_batch_prefill_cli_args, resolve_batch_prefill_cli
     resolve_batch_prefill_cli(args)
     exporter = LiquidVLModelExporter(
         max_gen_tokens=args.max_gen_tokens,
@@ -927,7 +927,7 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
     if args.view_graph_edits:
         print(render_graph_edit_plan(exporter.describe_graph_edits()))
         return
-    check_native_cli_args(args, enabled=exporter._native_prefill_enabled)
+    check_batch_prefill_cli_args(args, enabled=exporter._batch_prefill_enabled)
     exporter.export_onnx(validate=not args.skip_validation, cleanup=not args.no_onnx_cleanup)
     if args.dynamic_quantize:
         exporter.dynamic_quantize_models(
