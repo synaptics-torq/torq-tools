@@ -1263,7 +1263,7 @@ def test_qwen_native_contract_declares_undecidable_constants():
     assert QwenModelExporter._native_contract_roles(direct) == {}
 
 
-def test_qwen_native_int4_auto_sizes_rejected(tmp_path, monkeypatch):
+def test_qwen_native_int4_auto_sizes_allowed(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import patch
     from torq.models.qwen import export as qwen_export
@@ -1271,16 +1271,17 @@ def test_qwen_native_int4_auto_sizes_rejected(tmp_path, monkeypatch):
 
     config = SimpleNamespace(hidden_size=1024, vocab_size=16384, num_attention_heads=16, num_key_value_heads=8)
     with patch.object(qwen_export.AutoConfig, "from_pretrained", return_value=config):
-        with pytest.raises(ValueError, match="requires explicit --batch-prefill-sizes"):
-            QwenModelExporter(
-                static_models=True,
-                max_gen_tokens=256,
-                split_lm_head=True,
-                read_only_kv_cache=True,
-                weight_quantization="int4",
-                batch_prefill=True,
-                batch_prefill_sizes=None,
-            )
+        exporter = QwenModelExporter(
+            static_models=True,
+            max_gen_tokens=256,
+            split_lm_head=True,
+            read_only_kv_cache=True,
+            weight_quantization="int4",
+            batch_prefill=True,
+            batch_prefill_sizes=None,
+        )
+        assert exporter._batch_prefill_enabled
+        assert exporter._batch_prefill_sizes == ()
 
 
 def test_qwen_native_quantized_chunk_names_must_match_decode():
@@ -1301,6 +1302,7 @@ def test_qwen_native_quantized_chunk_names_must_match_decode():
     ((4, 12), "none", False),
     ((4, 12), "int4", True),
     (None, "none", False),
+    (None, "int4", True),
 ])
 def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypatch, sizes, weight, convert_expected):
     from pathlib import Path
@@ -1319,6 +1321,7 @@ def test_qwen_native_cli_forwards_options_and_compiler_check(tmp_path, monkeypat
     def record_convert(self, **kwargs):
         converted.append((self, kwargs))
     monkeypatch.setattr(qwen.QwenModelExporter, "convert_models", record_convert)
+    monkeypatch.setattr(qwen.QwenModelExporter, "weight_quantize_models", record_convert)
 
     parser = argparse.ArgumentParser()
     add_qwen_export_args(parser)
@@ -1632,3 +1635,104 @@ def test_liquid_vl_cli_forwards_native_options(tmp_path, monkeypatch):
     args = parser.parse_args(["--skip-torq"])
     vl.export_liquid_vl_from_args(args)
     assert constructed[0]["batch_prefill"] is False
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_qwen_int4_probes_converted_decode_then_processes_only_new_chunks(tmp_path, automatic):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.qwen.export import QwenModelExporter
+
+    events = []
+    paths = {"model": tmp_path / "fp32" / "model.onnx"}
+    if not automatic:
+        paths["model_prefill_4"] = tmp_path / "fp32" / "model_prefill_4.onnx"
+    exporter = SimpleNamespace(
+        _export_paths=paths, _export_dir=tmp_path / "fp32",
+        _quantize_dir=tmp_path / "quantized", _prepare=Mock(),
+        _write_compile_flags_snapshot=Mock(), _copy_runtime_assets=Mock(),
+        _settle_native_family=Mock(),
+    )
+
+    def quantize(components):
+        events.append(("quantize", tuple(components)))
+        for key in components:
+            paths[key] = exporter._quantize_dir / paths[key].name
+
+    def convert(*, preserve_io, components=None):
+        keys = tuple(paths if components is None else components)
+        events.append(("convert", keys))
+        assert preserve_io
+        for key in keys:
+            assert paths[key].parent == exporter._quantize_dir
+            paths[key] = tmp_path / "converted" / paths[key].name
+
+    def complete(**kwargs):
+        events.append(("complete",))
+        assert paths["model"].parent == tmp_path / "converted"
+        assert kwargs == dict(validate=False, cleanup=False, compiler_path="compiler", torq_compile_args=["flag"])
+        if automatic:
+            paths["model_prefill_4"] = tmp_path / "fp32" / "model_prefill_4.onnx"
+            return {"model_prefill_4": object()}
+        return {}
+
+    exporter._quantize_components = quantize
+    exporter.convert_models = convert
+    exporter._complete_native_prefill = complete
+    QwenModelExporter.weight_quantize_models(
+        exporter, validate=False, compiler_path="compiler", torq_compile_args=["flag"], preserve_io=True,
+    )
+    initial = ("model",) if automatic else ("model", "model_prefill_4")
+    assert events == [("quantize", initial), ("convert", initial), ("complete",)] + (
+        [("quantize", ("model_prefill_4",)), ("convert", ("model_prefill_4",))] if automatic else []
+    )
+    assert all(path.parent == tmp_path / "converted" for path in paths.values())
+    exporter._settle_native_family.assert_not_called()
+
+
+def test_qwen_chunk_conversion_preserves_already_converted_runtime_tables(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from torq.models.qwen.export import QwenModelExporter
+
+    converted = tmp_path / "converted"
+    converted.mkdir()
+    # BF16 NumPy files load as void arrays; casting them again fails.
+    embeddings = converted / "token_embeddings.npy"
+    np.save(embeddings, np.zeros((2, 4), dtype="V2"))
+    original = embeddings.read_bytes()
+    exporter = SimpleNamespace(
+        _convert_dtypes=True, _convert_dir=converted,
+        _export_paths={"model": converted / "model.onnx"},
+        _split_lm_head=True, _export_dir=tmp_path / "fp32",
+        _copy_runtime_assets=Mock(), _settle_native_family=Mock(),
+    )
+    QwenModelExporter.convert_models(exporter, components={})
+    assert embeddings.read_bytes() == original
+    exporter._settle_native_family.assert_called_once_with(validate=False)
+
+
+def test_qwen_cleanup_keeps_sidecars_still_referenced_by_mixed_stage_family(tmp_path):
+    from types import SimpleNamespace
+    from torq.models.qwen.export import QwenModelExporter
+
+    converted = tmp_path / "converted"
+    converted.mkdir()
+    decode = converted / "model.onnx"
+    tensor = numpy_helper.from_array(np.ones((1024,), dtype=np.float32), "weight")
+    model = onnx.helper.make_model(onnx.helper.make_graph([], "main", [], [], [tensor]))
+    onnx.save_model(model, decode, save_as_external_data=True, all_tensors_to_one_file=True,
+                    location="model.onnx_data", size_threshold=0)
+    chunk = tmp_path / "model_prefill_4.onnx"
+    orphan = tmp_path / "model_prefill_4.onnx_data"
+    orphan.write_bytes(b"obsolete")
+    onnx.save(onnx.helper.make_model(onnx.helper.make_graph([], "main", [], [])), chunk)
+    paths = {1: decode, 4: chunk}
+    exporter = SimpleNamespace(
+        _batch_prefill_sizes=(4,), _export_paths={"model": decode, "model_prefill_4": chunk},
+        _native_family_paths=lambda: paths,
+    )
+    QwenModelExporter._drop_family_sidecars(exporter)
+    onnx.load(decode)  # Still readable before converted-family weight sharing.
+    assert (converted / "model.onnx_data").exists()
+    assert not orphan.exists()

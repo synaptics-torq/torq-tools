@@ -16,7 +16,7 @@ torq-export-model qwen -s qwen3-0.6b --batch-prefill --batch-prefill-sizes 4,12
 torq-export-model qwen -s qwen2.5-0.5b-instruct --batch-prefill --batch-prefill-sizes 4,12
 ```
 
-These commands explicitly request batch prefill with example chunk sizes 4 and 12. INT4 requires explicit sizes; for automatic selection use `--weight-quantization none` and omit `--batch-prefill-sizes`. See the [shared quick start](../../model_export/doc/batch_prefill.md#qwen) for both recipes.
+These commands explicitly request batch prefill with example chunk sizes 4 and 12. For automatic selection with FP32 or INT4 weights, omit `--batch-prefill-sizes`. See the [shared quick start](../../model_export/doc/batch_prefill.md#qwen) for both recipes.
 
 The command does these steps:
 
@@ -104,7 +104,7 @@ Qwen3-0.6B on an SL2610 board at 1 GHz (torq-runtime 2.3.0, torq-examples chat d
 
 Qwen3-0.6B and Qwen2.5-0.5B-Instruct compile static families (single-token decode plus batched prefill chunks in one VMFB) by default on compile runs; `--batch-prefill`/`--no-batch-prefill` select it and `--skip-torq` exports decode only. Omitting `--batch-prefill-sizes ...` (default behavior) automatically probes the final transformed decoder for optimal batch sizes. Sizes must be unique, ascending, at least four, and fit the context.
 
-The supported configurations are static exports with `--split-lm-head` (token-embedding extraction is implicit) and the default read-only time-major KV caches, with FP32 or INT4 (GPTQ or round-to-nearest) weights. INT8, explicit `--convert-dtypes`, `--split-model`, `--keep-individual-kv-io` and `--no-read-only-kv-cache` are unsupported (a default run on such a configuration switches batch prefill off with a warning; an explicit `--batch-prefill` fails). INT4 exports always use explicit `--batch-prefill-sizes`: Qwen quantizes in the convert stage, which never probes. ONNX-only families are built through the Python API (`batch_prefill=True` with explicit `batch_prefill_sizes`, then `export_onnx()`).
+The supported configurations are static exports with `--split-lm-head` (token-embedding extraction is implicit) and the default read-only time-major KV caches, with FP32 or INT4 (GPTQ or round-to-nearest) weights. INT8, explicit `--convert-dtypes`, `--split-model`, `--keep-individual-kv-io` and `--no-read-only-kv-cache` are unsupported (a default run on such a configuration switches batch prefill off with a warning; an explicit `--batch-prefill` fails). INT4 quantization runs in `weight_quantize_models()`, before automatic probing of the BF16/i32 decoder. Selected prefill graphs are then built, quantized and converted without reprocessing decode. `convert_models()` only converts dtypes. ONNX-only families are built through the Python API (`batch_prefill=True` with explicit `batch_prefill_sizes`, then `export_onnx()`).
 
 See the shared [batch-prefill guide](../../model_export/doc/batch_prefill.md) for export commands, compiler/runtime requirements, artifact layout, optional size probing, chunk selection and state handling. The `torq-examples` hardware runner carries the KV state across entry changes.
 

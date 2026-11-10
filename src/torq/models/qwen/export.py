@@ -233,18 +233,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             ),
         )
 
-        if (
-            self._batch_prefill_enabled
-            and not self._batch_prefill_sizes
-            and self._weight_quantization is not None
-        ):
-            # Qwen quantizes in convert_models, which never probes; without
-            # explicit sizes an INT4 run would silently export decode-only.
-            raise ValueError(
-                "Qwen INT4 native prefill requires explicit --batch-prefill-sizes; "
-                "automatic size probing is only supported for the FP32 family"
-            )
-
     def _setup_dirs(self) -> list[Path]:
         if (
             self._onnx_source_dir
@@ -314,7 +302,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             / ("static" if self._static_models else "dynamic")
         )
 
-        return onnx_dir, export_dir, None, convert_dir, torq_dir
+        return onnx_dir, export_dir, export_dir.parent.parent / "quantized" / export_dir.name, convert_dir, torq_dir
 
     def _load_onnx(self) -> dict[str, onnx.ModelProto]:
         model_path = self._onnx_dir / "model.onnx"
@@ -1006,6 +994,11 @@ class QwenModelExporter(OnnxModelExporterBase):
         for path in self._native_family_paths().values():
             orphan = path.with_name(path.stem + ".onnx_data")
             if orphan.exists():
+                model = onnx.load(path, load_external_data=False)
+                if any(entry.key == "location" and entry.value == orphan.name
+                       for tensor in onnx.external_data_helper._get_all_tensors(model)
+                       for entry in tensor.external_data):
+                    continue
                 orphan.unlink()
 
     def _complete_native_prefill(self, *, validate=True, cleanup=True,
@@ -1155,87 +1148,40 @@ class QwenModelExporter(OnnxModelExporterBase):
                     "GPTQ weights bind per node name"
                 )
 
-    def convert_models(
-        self,
-        convert_dir: str | os.PathLike | None = None,
-        preserve_io: bool = False,
-    ):
-        """
-        Convert Qwen fp32 -> bf16 and int64 -> int32 without using
-        in-memory ONNX shape inference.
-
-        Qwen3-0.6B uses multi-gigabyte external tensor data, which exceeds
-        protobuf serialization limits in the shared converter's shape-
-        inference path.
-        """
-
-        if not self._convert_dtypes:
-            self._logger.warning(
-                "Skipping conversion as convert_dtypes==False"
-            )
-            return
-
-        self._convert_dir = Path(
-            convert_dir or self._convert_dir
+    def weight_quantize_models(self, *, validate=True, cleanup=False,
+                               compiler_path=None, torq_compile_args=None,
+                               preserve_io=False):
+        """Quantize and convert decode before probing, then process new chunks."""
+        self._prepare()
+        if self._quantize_dir.exists():
+            shutil.rmtree(self._quantize_dir)
+        self._quantize_dir.mkdir(parents=True, exist_ok=True)
+        self._write_compile_flags_snapshot(self._quantize_dir)
+        self._quantize_components(dict(self._export_paths))
+        self._copy_runtime_assets(self._quantize_dir, self._export_dir)
+        self.convert_models(preserve_io=preserve_io)
+        chunks = self._complete_native_prefill(
+            validate=validate, cleanup=cleanup, compiler_path=compiler_path,
+            torq_compile_args=torq_compile_args,
         )
+        if chunks:
+            self._quantize_components(chunks)
+            self.convert_models(preserve_io=preserve_io, components=chunks)
 
-        if self._convert_dir.exists():
-            shutil.rmtree(
-                self._convert_dir,
-                ignore_errors=True,
-            )
-
-        self._convert_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        source_dir = self._export_paths["model"].parent
-
-        for comp, model_path in self._export_paths.items():
-            converted_model_path = (
-                self._convert_dir / model_path.name
-            )
-
-            self._logger.info(
-                "(ONNX-convert) Converting model '%s' to dtype bf16...",
-                str(model_path),
-            )
-
-            # Populate intermediate tensor dtype metadata before BF16 conversion.
-            # Qwen3-0.6B is too large for in-memory shape inference, so use
-            # ONNX's path-based inference on a temporary FP32 model.
-            inferred_fp32_path = (
-                Path(model_path).with_name(
-                    f"{Path(model_path).stem}_fp32_inferred.onnx"
-                )
-            )
-
+    def _quantize_components(self, components):
+        source_dir = self._export_dir
+        for comp in components:
+            model_path = self._export_paths[comp]
+            quantized_model_path = self._quantize_dir / model_path.name
+            # Upgrade structure before loading multi-gigabyte external weights.
+            inferred_path = model_path.with_name(f"{model_path.stem}_fp32_inferred.onnx")
             try:
-                onnx.shape_inference.infer_shapes_path(
-                    model_path,
-                    inferred_fp32_path,
-                    data_prop=True,
-                )
-
-                if self._weight_quantization is not None:
-                    # Block-wise DequantizeLinear needs opset 21. Upgrade the
-                    # graph structure only; weights stay in external data.
-                    fp32_model = onnx.load(
-                        inferred_fp32_path,
-                        load_external_data=False,
-                    )
-                    fp32_model = self._upgrade_opset(fp32_model, 21)
-                    load_external_data_for_model(
-                        fp32_model,
-                        str(Path(model_path).parent),
-                    )
-                else:
-                    fp32_model = onnx.load(inferred_fp32_path)
+                onnx.shape_inference.infer_shapes_path(model_path, inferred_path, data_prop=True)
+                fp32_model = onnx.load(inferred_path, load_external_data=False)
+                fp32_model = self._upgrade_opset(fp32_model, 21)
+                load_external_data_for_model(fp32_model, str(model_path.parent))
             finally:
-                if inferred_fp32_path.exists():
-                    inferred_fp32_path.unlink()
-
+                inferred_path.unlink(missing_ok=True)
             # Quantize supported split-component MatMul weights to INT8/INT4
             # DQL before the Qwen-specific BF16/int32 conversion pipeline.
             # Without the A/B split, model.onnx is the whole transformer.
@@ -1265,14 +1211,12 @@ class QwenModelExporter(OnnxModelExporterBase):
                 )
 
                 quantizer = _QwenDQLOnlyQuantizer(
-                    model_path=inferred_fp32_path,
-                    output_path=converted_model_path,
+                    model_path=model_path,
+                    output_path=quantized_model_path,
                     # One-hot rotary table lookups are not weight MatMuls.
                     skip_layers=["rotary_emb_cache_"],
                 )
 
-                # Reuse the already shape-inferred model instead of loading
-                # the original uninferred graph again.
                 quantizer._model = fp32_model
 
                 quant_config = QuantizationConfig.uniform(
@@ -1306,6 +1250,80 @@ class QwenModelExporter(OnnxModelExporterBase):
                     len(matmul_info),
                     model_path.name,
                 )
+
+            self._save_large_external_model(fp32_model, quantized_model_path)
+            self._export_paths[comp] = quantized_model_path
+
+    def convert_models(
+        self,
+        convert_dir: str | os.PathLike | None = None,
+        preserve_io: bool = False,
+        *, components=None,
+    ):
+        """
+        Convert Qwen fp32 -> bf16 and int64 -> int32 without using
+        in-memory ONNX shape inference.
+
+        Qwen3-0.6B uses multi-gigabyte external tensor data, which exceeds
+        protobuf serialization limits in the shared converter's shape-
+        inference path.
+        """
+
+        if not self._convert_dtypes:
+            self._logger.warning(
+                "Skipping conversion as convert_dtypes==False"
+            )
+            return
+
+        self._convert_dir = Path(
+            convert_dir or self._convert_dir
+        )
+
+        if components is None and self._convert_dir.exists():
+            shutil.rmtree(
+                self._convert_dir,
+                ignore_errors=True,
+            )
+
+        self._convert_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        source_dir = self._export_paths["model"].parent
+
+        for comp, model_path in list(self._export_paths.items()):
+            if components is not None and comp not in components:
+                continue
+            converted_model_path = (
+                self._convert_dir / model_path.name
+            )
+
+            self._logger.info(
+                "(ONNX-convert) Converting model '%s' to dtype bf16...",
+                str(model_path),
+            )
+
+            # Populate intermediate tensor dtype metadata before BF16 conversion.
+            # Qwen3-0.6B is too large for in-memory shape inference, so use
+            # ONNX's path-based inference on a temporary FP32 model.
+            inferred_fp32_path = (
+                Path(model_path).with_name(
+                    f"{Path(model_path).stem}_fp32_inferred.onnx"
+                )
+            )
+
+            try:
+                onnx.shape_inference.infer_shapes_path(
+                    model_path,
+                    inferred_fp32_path,
+                    data_prop=True,
+                )
+
+                fp32_model = onnx.load(inferred_fp32_path)
+            finally:
+                if inferred_fp32_path.exists():
+                    inferred_fp32_path.unlink()
 
             bf16_converter = _QwenFP32Converter(
                 "bf16",
@@ -1385,7 +1403,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 converted_model_path
             )
 
-        if self._split_lm_head:
+        if self._split_lm_head and components is None:
             embeddings_src = source_dir / "token_embeddings.npy"
             embeddings_dst = self._convert_dir / "token_embeddings.npy"
 
@@ -1684,7 +1702,14 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         torq_compile_args=args.compile_flags or [],
     )
 
-    if convert_dtypes:
+    if weight_quantization is not None:
+        exporter.weight_quantize_models(
+            validate=not args.skip_validation, cleanup=False,
+            compiler_path=args.compiler_path,
+            torq_compile_args=args.compile_flags or [],
+            preserve_io=args.preserve_io_dtypes,
+        )
+    elif convert_dtypes:
         exporter.convert_models(
             preserve_io=args.preserve_io_dtypes,
         )
