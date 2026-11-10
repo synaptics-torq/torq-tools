@@ -18,7 +18,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -51,7 +51,7 @@ MAX_PROBE_JOBS = max(1, min(16, os.cpu_count() or 16))  # the probes are torq-co
 
 # Bumped when the probe template or the parse changes: stale work-dir caches
 # must not serve results produced by different probe behavior.
-PROBE_CACHE_VERSION = 3
+PROBE_CACHE_VERSION = 4
 
 
 class ProbeError(RuntimeError):
@@ -68,6 +68,16 @@ class ProbeResult:
     m_outer: bool  # M loop outside the N loop: the weight strip is reloaded
     # per M pass (re-streamed)
     snap_grid: bool = True  # only direct BF16 weights use the BF16 family grid
+
+    m_step: Optional[int] = None
+
+    @property
+    def weight_passes(self):
+        if self.restreams_weight:
+            if self.m_step is None or self.m_step <= 0:
+                raise ProbeError("DMA estimate needs a positive token-tile step")
+            return (self.m + self.m_step - 1) // self.m_step
+        return 1
 
     def signature(self):
         return (self.width, self.m_tiled, self.m_outer)
@@ -115,6 +125,8 @@ class _Projection:
     k: int
     n: int
     template: bytes
+    weight_bytes: int = 0
+    occurrences: int = 1
 
     @cached_property
     def key(self):
@@ -196,7 +208,7 @@ def _projections_onnx(model, data_dir, exclude_lm_head=False):
         return constant[name]
 
     projections = []
-    seen = set()
+    seen = {}
     for node in model.graph.node:
         if exclude_lm_head and 'logits' in node.output:
             continue  # Native families compile the language model head separately.
@@ -235,15 +247,19 @@ def _projections_onnx(model, data_dir, exclude_lm_head=False):
             value.name = rename(value.name)
         key = signature.graph.SerializeToString()
         if key in seen:
+            index = seen[key]
+            projections[index] = replace(projections[index], occurrences=projections[index].occurrences + 1)
             continue
-        seen.add(key)
         info = onnx_importer.ModelInfo(sub)
         module = info.create_module()
         cache = _tensor_context_cache()(module.context)
         importer = onnx_importer.NodeImporter.define_function(info.main_graph, module.operation, context_cache=cache)
         importer.import_all()
         with module.context, ir.Location.unknown():
-            projections.extend(_projections_mlir(module))
+            extracted = _projections_mlir(module)
+            if extracted:
+                seen[key] = len(projections)
+                projections.extend(extracted)
     return projections
 
 
@@ -252,7 +268,7 @@ def _projections_mlir(module):
     from iree.compiler.dialects import func
 
     projections = []
-    seen = set()
+    seen = {}
     for source in module.body.operations:
         if source.operation.name != 'func.func' or not source.regions[0].blocks:
             continue
@@ -311,8 +327,10 @@ def _projections_mlir(module):
                                         for a in producer.attributes)))
             structure = tuple(structure)
             if structure in seen:
+                index = seen[structure]
+                projections[index] = replace(projections[index], occurrences=projections[index].occurrences + 1)
                 continue
-            seen.add(structure)
+            seen[structure] = len(projections)
             result = ir.Module.create()
             attrs = {a: source.attributes[a] for a in source.attributes if a.startswith('torch.onnx_meta.')}
             with ir.InsertionPoint(result.body):
@@ -331,7 +349,18 @@ def _projections_mlir(module):
             result.operation.verify()
             stream = io.BytesIO()
             result.operation.write_bytecode(stream)
-            projections.append(_Projection(k, n, stream.getvalue()))
+            weight_bytes = 0
+            for producer in chain:
+                for name in producer.attributes:
+                    attr = producer.attributes[name]
+                    if not isinstance(attr.type, ir.RankedTensorType):
+                        continue
+                    typ = ir.ShapedType(attr.type)
+                    bits = re.fullmatch(r'(?:bf|f|[su]?i)(\d+)', str(typ.element_type))
+                    if bits is None or any(d < 0 for d in typ.shape):
+                        raise ProbeError(f'unsupported constant storage type: {typ}')
+                    weight_bytes += (math.prod(typ.shape) * int(bits[1]) + 7) // 8
+            projections.append(_Projection(k, n, stream.getvalue(), weight_bytes))
     return projections
 
 
@@ -419,6 +448,7 @@ def _parse_tile_and_fuse(stderr: str, m: int, k: int, n: int) -> ProbeResult:
     return ProbeResult(
         m, weight_loop['step'], m_loop is not None,
         m_loop is not None and m_loop['indent'] < weight_loop['indent'], snap_grid,
+        m_loop['step'] if m_loop is not None else None,
     )
 
 
@@ -505,6 +535,7 @@ class ProbeReport:
     candidates: List[Dict] = field(default_factory=list)  # b, kept, reason
     warnings: List[str] = field(default_factory=list)
     elapsed: float = 0.0
+    heuristic: str = "reuse"
 
     def sizes_flag(self) -> Optional[str]:
         if not self.chosen:
@@ -536,12 +567,15 @@ class ProbeReport:
             "chip": chip,
             "tool": str(tool),
             "flags": flags,
+            "heuristic": self.heuristic,
             "cap": self.cap,
             "context": self.context,
             "elapsed_s": round(self.elapsed, 1),
             "shapes": [
                 {
                     "projection": s.projection,
+                    "weight_bytes": s.weight_bytes,
+                    "occurrences": s.occurrences,
                     "snap_grid": s.snap_grid,
                     "k": s.k,
                     "n": s.n,
@@ -594,7 +628,7 @@ class _ProbeCache:
         e = self.entries.get(self._key(projection, m))
         if e is None:
             return None
-        return ProbeResult(e["m"], e["width"], e["m_tiled"], e["m_outer"], e["snap_grid"])
+        return ProbeResult(e["m"], e["width"], e["m_tiled"], e["m_outer"], e["snap_grid"], e["m_step"])
 
     def put(self, projection: str, result: ProbeResult) -> None:
         self.entries[self._key(projection, result.m)] = {
@@ -603,6 +637,7 @@ class _ProbeCache:
             "m_tiled": result.m_tiled,
             "m_outer": result.m_outer,
             "snap_grid": result.snap_grid,
+            "m_step": result.m_step,
         }
 
     def save(self) -> None:
@@ -638,6 +673,7 @@ def recommend(
     context_length: Optional[int] = None,
     tool: Optional[str] = None,
     exclude_lm_head: bool = False,
+    heuristic: str = "reuse",
 ) -> Optional[ProbeReport]:
     """Probe the tiler and recommend sizes.
 
@@ -648,6 +684,8 @@ def recommend(
     a sweep ran.
     """
     started = time.perf_counter()
+    if heuristic not in ("reuse", "dma"):
+        raise ProbeError(f"unknown size heuristic: {heuristic}")
 
     model_path = Path(model_path)
     work_dir = Path(work_dir)
@@ -672,7 +710,7 @@ def recommend(
             context_length = _context_length_from_onnx(onnx_model)
 
     projections = extract_projections(model_path, onnx_model, exclude_lm_head)
-    report = ProbeReport([], [], cap, context_length, warnings=warnings)
+    report = ProbeReport([], [], cap, context_length, warnings=warnings, heuristic=heuristic)
     if not projections:
         warnings.append(f"no matmul weight shapes found in {model_path.name}; choose explicit sizes")
         _finish(report, started, work_dir, model_path, chip, tool, flags)
@@ -705,7 +743,7 @@ def recommend(
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PROBE_JOBS) as pool:
             decode = list(pool.map(lambda p: make_probe(p, 1), projections))
             jobs = [(p, b) for p, result in zip(projections, decode)
-                    if result.width is not None for b in range(4, cap + 1)]
+                    if result.width is not None or heuristic == "dma" for b in range(4, cap + 1)]
             results = list(pool.map(lambda job: make_probe(*job), jobs))
         points = {p.key: {1: result} for p, result in zip(projections, decode)}
         for (p, b), result in zip(jobs, results):
@@ -713,6 +751,8 @@ def recommend(
         for p in projections:
             scan = _scan_shape((p.k, p.n), points[p.key])
             scan.projection = p.key
+            scan.weight_bytes = p.weight_bytes
+            scan.occurrences = p.occurrences
             scans.append(scan)
 
         constrained = [s for s in scans if s.constrained]
@@ -736,6 +776,10 @@ def recommend(
         for scan in constrained:
             candidate_set.update(p["b_end"] for p in scan.plateaus if p["width"] is not None and p["b_end"] <= limit)
         # Four is the minimum supported by every native decoder exporter.
+        if heuristic == "dma":
+            for scan in scans:
+                candidate_set.update(b - 1 for b in range(5, limit + 1)
+                                     if scan.points[b].weight_passes != scan.points[b - 1].weight_passes)
         candidates = sorted(b for b in candidate_set if b >= 4)
 
     except (ProbeError, OSError):
@@ -745,6 +789,10 @@ def recommend(
         cache.save()
     except OSError as exc:
         logger.warning("prefill probe: could not save cache: %s", exc)
+
+    if heuristic == "dma":
+        _select_dma(report, candidates)
+        return _finish(report, started, work_dir, model_path, chip, tool, flags)
 
     if not constrained:
         warnings.append(
@@ -809,6 +857,30 @@ def recommend(
     return _finish(report, started, work_dir, model_path, chip, tool, flags)
 
 
+def _select_dma(report, candidates):
+    """Keep increasing sizes that set a new low for decoder weight DMA/token."""
+    if any(s.weight_bytes <= 0 or s.occurrences <= 0 for s in report.shapes):
+        raise ProbeError("DMA estimate needs stored constant bytes and occurrence counts")
+    best = math.inf
+    for b in candidates:
+        no_fit = any(s.constrained and s.points[b].width is None for s in report.shapes)
+        traffic = sum(s.weight_bytes * s.occurrences * s.points[b].weight_passes
+                      for s in report.shapes)
+        cost = traffic / b
+        kept = not no_fit and cost <= best
+        report.candidates.append(dict(
+            b=b, kept=kept, weight_bytes=traffic, weight_bytes_per_token=cost,
+            reason="no tile fit" if no_fit else "lower DMA bytes/token" if kept else "no DMA improvement",
+        ))
+        if kept:
+            if cost == best and report.chosen[-1] != 4:
+                previous = report.chosen.pop()
+                entry = next(c for c in report.candidates if c['b'] == previous)
+                entry.update(kept=False, reason="same DMA bytes/token; prefer larger chunk")
+            report.chosen.append(b)
+            best = cost
+
+
 def _finish(report, started, work_dir, model, chip, tool, flags):
     """Log and persist the completed report."""
     report.elapsed = time.perf_counter() - started
@@ -853,6 +925,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--work-dir", default=None,
                         help="where prefill_sizes.json and the probe cache go "
                         "(default: <cwd>/<model-stem>-prefill-probes)")
+    parser.add_argument("--heuristic", choices=["reuse", "dma"], default="reuse",
+                        help="size selection: conservative reuse (default) or estimated DMA bytes/token")
     parser.add_argument("--tool", default=None, help="path to torq-compile")
     args = parser.parse_args(argv)
     model = Path(args.model)
@@ -863,7 +937,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = recommend(
             model, args.chip, list(user_flags), work_dir,
-            cap=args.max_batch_size, context_length=args.context_length, tool=args.tool,
+            cap=args.max_batch_size, context_length=args.context_length, tool=args.tool, heuristic=args.heuristic,
         )
     except Exception as exc:
         print(f"probe failed: {exc}", file=sys.stderr)

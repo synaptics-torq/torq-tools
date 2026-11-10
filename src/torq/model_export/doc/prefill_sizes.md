@@ -2,6 +2,14 @@
 
 [`prefill_sizes.py`](prefill_sizes.py) recommends a family of chunk sizes that help reuse projection weights across tokens. It extracts representative projections from the sequential, unbatched transformer graph, then probes how the compiler's tile-and-fuse algorithm divides those projections into tiles at different chunk sizes. The LM head is currently excluded as it isn't extensively used during prefill. The [batch-prefill user guide](batch_prefill.md#optional-size-probe) covers the CLI and compiler workflow.
 
+## Experimental DMA selector
+
+The standalone probe accepts `--heuristic dma`; `--heuristic reuse` remains the default and native exporter automatic probing keeps that default. Run the DMA probe on the final decoder weight format with the same compiler flags, then pass its printed `--batch-prefill --batch-prefill-sizes ...` options to an export in a separate destination for comparison.
+
+The DMA selector estimates bytes per token as the sum of each representative projection's packed constant bytes times its graph occurrence count times its weight-pass count, divided by the chunk length. Constant storage includes packed INT4 weights, scales, zero points and constant biases. Weight passes are `ceil(chunk length / token-tile step)` when the token loop surrounds the weight-strip loop, otherwise one. Structural deduplication retains occurrence counts; probe cache identity still uses the representative's real constants. This is a projection-weight traffic estimate: it does not model attention, activation/state transfers, transfer padding, compiler constant folding or DMA/computation overlap.
+
+Candidates include the existing tiling-plateau boundaries, the last size before each weight-pass count changes, the minimum size four and the sweep cap. Keep increasing sizes that lower estimated DMA bytes per token; equal-cost candidates prefer the larger chunk while retaining four for tails. Sizes without a tile fit are excluded. Repeated weight loads are allowed when their total bytes per token improve. `prefill_sizes.json` records the heuristic, projection byte sizes and occurrence counts, and each candidate's total bytes, bytes per token and decision. The cache records token-tile steps and invalidates results from the older parser.
+
 ## Probe flow
 
 <details>

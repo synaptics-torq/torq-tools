@@ -181,7 +181,7 @@ def test_parser_reads_typed_and_blocked_weight_strips(dtype, shape, snap_grid, m
         '      %activation = tensor.extract_slice %x[0, %i, 0]',
         '    }', '  }', '}',
     ])
-    assert probe._parse_tile_and_fuse(dump, 12, 8, 16) == probe.ProbeResult(12, 8, True, m_outer, snap_grid)
+    assert probe._parse_tile_and_fuse(dump, 12, 8, 16) == probe.ProbeResult(12, 8, True, m_outer, snap_grid, 4)
 
 
 def test_quantized_widths_do_not_use_bf16_snap(tmp_path, monkeypatch):
@@ -285,6 +285,8 @@ def test_lfm_channelwise_convolution_does_not_block_projection_sweep(tmp_path, m
     model.graph.input.append(h.make_tensor_value_info('window', T.FLOAT, [1024, 1, 3]))
     model.graph.node.append(h.make_node('MatMul', ['window', 'kernel'], ['conv']))
     model.graph.output.append(h.make_tensor_value_info('conv', T.FLOAT, [1024, 1, 1]))
+    model.graph.node.append(h.make_node('MatMul', ['window', 'kernel'], ['conv_again']))
+    model.graph.output.append(h.make_tensor_value_info('conv_again', T.FLOAT, [1024, 1, 1]))
     if source_format == 'onnx':
         onnx.save(model, path)
     else:
@@ -334,3 +336,63 @@ def test_other_batched_matmuls_still_require_explicit_sizes(tmp_path, weight_sha
     onnx.save(model, path)
     with pytest.raises(probe.ProbeError, match='unsupported projection weight shape'):
         probe.extract_projections(path)
+
+
+@pytest.mark.parametrize('dtype,quantized,expected', [(1, False, 512), (16, False, 256), (22, True, 144)])
+def test_dma_counts_packed_constants_and_repeated_projections(tmp_path, dtype, quantized, expected):
+    import onnx
+    from torq.model_export import prefill_sizes as probe
+
+    path = _model(tmp_path, dtype, quantized=quantized)
+    model = onnx.load(path)
+    model.graph.node.append(onnx.helper.make_node('MatMul', ['x', 'weight'], ['second']))
+    model.graph.output.append(onnx.helper.make_tensor_value_info('second', model.graph.output[0].type.tensor_type.elem_type, [1, 1, 16]))
+    onnx.save(model, path)
+    projection, = probe.extract_projections(path)
+    assert projection.occurrences == 2
+    assert projection.weight_bytes == expected  # INT4: 64 weight + 64 scale + 16 zero-point bytes.
+    mlir = tmp_path / 'projection.mlirbc'
+    projection.write(mlir, 1)
+    reloaded, = probe.extract_projections(mlir)
+    assert reloaded.weight_bytes == expected
+
+
+def test_dma_keeps_restreaming_when_total_bytes_per_token_improves(monkeypatch, tmp_path):
+    from torq.model_export import prefill_sizes as probe
+
+    path = _model(tmp_path)
+    monkeypatch.setattr(probe, 'run_probe', lambda *args: '')
+    monkeypatch.setattr(probe, '_parse_tile_and_fuse', lambda _, m, k, n: probe.ProbeResult(
+        m, 8, m > 5, m > 5, True, 5 if m > 5 else None))
+    kwargs = dict(cap=16, tool=sys.executable, heuristic='dma')
+    report = probe.recommend(path, 'SL2610', [], tmp_path, **kwargs)
+    # Each repeated load serves another five tokens. Cost ties prefer the larger chunk.
+    assert report.chosen == [4, 15]
+    costs = {c['b']: c for c in report.candidates}
+    assert costs[15]['weight_bytes'] == 512 * 3
+    assert costs[15]['weight_bytes_per_token'] == 512 / 5
+    assert not costs[16]['kept']
+    cached = probe.recommend(path, 'SL2610', [], tmp_path, **kwargs)
+    assert cached.chosen == report.chosen
+
+
+def test_dma_weights_projection_occurrences_and_filters_no_fit():
+    from types import SimpleNamespace
+    from torq.model_export import prefill_sizes as probe
+
+    # A small projection reloads, while the dominant repeated projection amortizes better.
+    scans = [SimpleNamespace(weight_bytes=100, occurrences=10, constrained=True,
+              points={4: probe.ProbeResult(4, 8, False, False),
+                      8: probe.ProbeResult(8, 8, False, False),
+                      12: probe.ProbeResult(12, None, False, False)}),
+             SimpleNamespace(weight_bytes=100, occurrences=1, constrained=True,
+              points={4: probe.ProbeResult(4, 8, False, False),
+                      8: probe.ProbeResult(8, 8, True, True, True, 4),
+                      12: probe.ProbeResult(12, 8, True, True, True, 4)})]
+    report = probe.ProbeReport([], scans, 12, 256, heuristic='dma')
+    probe._select_dma(report, [4, 8, 12])
+    assert report.chosen == [4, 8]
+    assert report.candidates[1]['weight_bytes_per_token'] == 150
+    assert report.candidates[2]['reason'] == 'no tile fit'
+    with pytest.raises(probe.ProbeError, match='token-tile step'):
+        probe.ProbeResult(8, 8, True, True).weight_passes

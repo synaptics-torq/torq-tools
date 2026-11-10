@@ -172,3 +172,5 @@ The optional size probe is `python -m torq.model_export.prefill_sizes transforme
 Production readiness still requires checkpoint-specific accuracy, simulator/device numerics, entry-switch state, repeated sequences, TTFT, decode latency and memory measurements. Dynamic shapes, sliding-window execution and vision exports remain separate work.
 
 The [batch-prefill size probe README](src/torq/model_export/doc/prefill_sizes.md) explains projection extraction, the recommendation flow, loop-order weight reuse, plateau selection, split-constant snapping and caching with Mermaid diagrams.
+
+The standalone prefill probe keeps `--heuristic reuse` as its default. Experimental `--heuristic dma` ranks whole-decoder projection constant bytes per token using packed storage, structural occurrence counts and compiler token-loop steps. Preserve occurrence counts when deduplicating representatives, and bump the cache version when parser metadata changes. Validate new selectors with separate exports and hardware comparisons before changing native exporter defaults.
