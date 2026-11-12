@@ -79,6 +79,10 @@ warning. Flags after `--compile-flags` come last and take precedence.
 - `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
   over the slice compute, so that most of the compute is hidden under the
   weight loads. Decode is DMA-bound, so this sets the token rate.
+- `--torq-dma-in-mtu=6 --torq-dma-out-mtu=6`: DMA burst length of 64 beats
+  (default MTU 4, 16 beats). Longer bursts increase the DDR throughput. On
+  the SL2610 board, Qwen3-0.6B decodes at 8.7 tok/s, against 8.3 tok/s with
+  the default MTU.
 - `--torq-max-nss-programs-size=12582912` (transformer only): the NSS
   programs need about 11 MB.
 
