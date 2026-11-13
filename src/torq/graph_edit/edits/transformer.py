@@ -12,6 +12,15 @@ import onnx_graphsurgeon as gs
 from ..onnx import OnnxGraphEdit, rewire_consumers
 
 
+def _is_sliding_layer(node: gs.Node, window: int | None, layers: frozenset[int]) -> bool:
+    if window is None:
+        return False
+    match = re.search(r"/layers\.(\d+)/self_attn/", node.name)
+    if match is None:
+        raise ValueError(f"Cannot determine attention layer from {node.name!r}")
+    return int(match[1]) in layers
+
+
 @dataclass
 class ReplaceDynamicKVCache(OnnxGraphEdit):
     """
@@ -215,8 +224,12 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
     export_dtype: onnx.TensorProto.DataType
     match_shape_fallback: bool = False
     chunk_len: int = 1
+    sliding_window: int | None = None
+    sliding_layers: frozenset[int] = frozenset()
 
     def __post_init__(self):
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive")
         if self.export_dtype not in onnx.TensorProto.DataType.values():
             raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
         if not 1 <= self.chunk_len <= self.max_tokens:
@@ -240,6 +253,8 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
             raise RuntimeError("ONNX export dtype is requried for this graph edit, provide via `export_dtype`")
 
         self._check_node_op(node, "Softmax")
+
+        sliding = _is_sliding_layer(node, self.sliding_window, self.sliding_layers)
 
         # create bool mask where positions > cur_len are effectively blocked
         # by being set to a large negative value
@@ -289,16 +304,38 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
                 )
             ],
         )[0]
-        mask = self.graph.layer(
-            name=node.name + "_mask_attn",
-            op="Where",
-            inputs=[mask_lte, attn_mask_keep, attn_mask_block],
-            outputs=[
-                gs.Variable(node.name + "_where",
-                            dtype=node.inputs[0].dtype or self.export_dtype,
-                            shape=mask_shape)
-            ],
-        )[0]
+        if sliding:
+            tensors = self.graph.tensors()
+            mask = tensors.get("attn_mask_sliding")
+            if mask is None:
+                lower = self.graph.layer(
+                    name="attn_window_lower", op="Sub",
+                    inputs=[query_positions, gs.Constant("attn_window", np.array(self.sliding_window, dtype=np.int64))],
+                    outputs=[gs.Variable("attn_window_lower", dtype=np.int64, shape=query_positions.shape)],
+                )[0]
+                recent = self.graph.layer(
+                    name="attn_window_recent", op="Greater", inputs=[time_axis, lower],
+                    outputs=[gs.Variable("attn_window_recent", dtype=np.bool_, shape=mask_shape)],
+                )[0]
+                within = self.graph.layer(
+                    name="attn_window_causal", op="And", inputs=[mask_lte, recent],
+                    outputs=[gs.Variable("attn_window_causal", dtype=np.bool_, shape=mask_shape)],
+                )[0]
+                mask = self.graph.layer(
+                    name="attn_mask_sliding", op="Where", inputs=[within, attn_mask_keep, attn_mask_block],
+                    outputs=[gs.Variable("attn_mask_sliding", dtype=node.inputs[0].dtype or self.export_dtype, shape=mask_shape)],
+                )[0]
+        else:
+            mask = self.graph.layer(
+                name=node.name + "_mask_attn",
+                op="Where",
+                inputs=[mask_lte, attn_mask_keep, attn_mask_block],
+                outputs=[
+                    gs.Variable(node.name + "_where",
+                                dtype=node.inputs[0].dtype or self.export_dtype,
+                                shape=mask_shape)
+                ],
+            )[0]
 
         # rewire producer node to use mask
         producer_node: gs.Node = node.i()
@@ -832,6 +869,14 @@ class ReadOnlyKVCache(OnnxGraphEdit):
     num_kv_heads: int
     head_dim: int
     chunk_len: int = 1
+    sliding_window: int | None = None
+    sliding_layers: frozenset[int] = frozenset()
+
+    def __post_init__(self):
+        if self.sliding_window is not None and not 1 <= self.chunk_len < self.sliding_window:
+            raise ValueError("chunk_len must be positive and less than sliding_window")
+        return super().__post_init__()
+
 
     @staticmethod
     def _cache_blend(tensor: gs.Tensor, chunk_len: int):
@@ -898,7 +943,7 @@ class ReadOnlyKVCache(OnnxGraphEdit):
             node = node.inputs[0].inputs[0]
         return node.inputs[1]
 
-    def _masks(self, position: gs.Tensor, max_len: int, rows: int, dtype) -> tuple[gs.Tensor, gs.Tensor | None]:
+    def _masks(self, position: gs.Tensor, max_len: int, rows: int, dtype, sliding: bool = False) -> tuple[gs.Tensor, gs.Tensor | None]:
         """Past-row mask ``[1, 1, 1, L]`` and causal new-row mask ``[1, 1, rows, T]``, shared by all layers."""
         tensors = self.graph.tensors()
         keep = tensors.get("attn_mask_keep") or gs.Constant("attn_mask_keep", np.asarray(0.0, dtype=np.float32))
@@ -927,10 +972,36 @@ class ReadOnlyKVCache(OnnxGraphEdit):
                 np.where(causal, keep.values, block.values).astype(np.float32).reshape(1, 1, rows, t),
                 export_dtype=getattr(block, "export_dtype", None),
             )
+        if sliding:
+            sliding_mask = tensors.get("kv_past_mask_sliding")
+            if sliding_mask is None:
+                shape = [1, 1, rows if self.chunk_len > 1 else 1, max_len]
+                offsets = (np.arange(shape[2]) % self.chunk_len).reshape(1, 1, -1, 1)
+                lower_shape = [1, 1, shape[2], 1]
+                if self.chunk_len == 1:
+                    # Keep scalar arithmetic at the position's rank: compiler
+                    # 2.3.0 cannot lower a rank-changing scalar Add.
+                    offsets = offsets.reshape(position.shape)
+                    lower_shape = position.shape
+                lower = self.graph.layer(
+                    name="kv_window_lower", op="Add",
+                    inputs=[position, gs.Constant("kv_window_offsets", (offsets - self.sliding_window).astype(np.dtype(position.dtype or np.int64)))],
+                    outputs=[gs.Variable("kv_window_lower", dtype=position.dtype, shape=lower_shape)],
+                )[0]
+                recent = self.graph.layer(
+                    name="kv_window_recent", op="Greater", inputs=[self.graph.tensors()["kv_time_axis"], lower],
+                    outputs=[gs.Variable("kv_window_recent", dtype=np.bool_, shape=shape)],
+                )[0]
+                sliding_mask = self.graph.layer(
+                    name="kv_past_mask_sliding", op="Where", inputs=[recent, past_mask, block],
+                    outputs=[gs.Variable("kv_past_mask_sliding", dtype=dtype, shape=shape)],
+                )[0]
+            past_mask = sliding_mask
         return past_mask, new_mask
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Softmax")
+        sliding = _is_sliding_layer(node, self.sliding_window, self.sliding_layers)
         q, k_scale, k_blend, v_blend, cache, present, context = self._pattern(node)
         base = node.name.rsplit("/", 1)[0] + "/ReadOnlyKV/"
         heads, kv, d, t = self.num_heads, self.num_kv_heads, self.head_dim, self.chunk_len
@@ -959,7 +1030,7 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         cache.shape = [1, max_len, 2 * kv, d]
         k_heads = [head(cache, 2, k_offset + i, [1, max_len, d], f"k{i}") for i in range(kv)]
         v_heads = [head(cache, 2, v_offset + i, [1, max_len, d], f"v{i}") for i in range(kv)]
-        past_mask, new_mask = self._masks(self._position(k_blend[0]), max_len, rows, dtype)
+        past_mask, new_mask = self._masks(self._position(k_blend[0]), max_len, rows, dtype, sliding)
 
         if k_scale != 1.0:
             q = layer("Mul", "q_scaled", [q, np.array(k_scale, dtype=np.float32)], None)

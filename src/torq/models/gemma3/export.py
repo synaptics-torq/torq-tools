@@ -333,6 +333,18 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if not updated:
             raise ValueError("Could not find logits output metadata for trimmed-vocab export")
 
+    def _sliding_attention(self) -> tuple[int | None, frozenset[int]]:
+        window = getattr(self._config, "sliding_window", None)
+        if window is None or self._max_gen_tokens <= window:
+            return None, frozenset()
+        types = getattr(self._config, "layer_types", None)
+        if types is not None:
+            layers = frozenset(i for i, kind in enumerate(types) if kind == "sliding_attention")
+        else:
+            pattern = self._config.sliding_window_pattern
+            layers = frozenset(i for i in range(self._config.num_hidden_layers) if (i + 1) % pattern)
+        return window, layers
+
     def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
         blocks: dict[str, list[EditSpec]] = {}
         blocks["model.static"] = [
@@ -343,7 +355,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
             EditSpec(
                 "MaskFutureAttentionScores",
-                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len"), *self._sliding_attention()),
             ),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
             EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
@@ -480,6 +492,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config.num_key_value_heads,
                     self._config.head_dim,
                     self._batch_prefill if component == "model_prefill" else 1,
+                    *self._sliding_attention(),
                 )
 
         if self._trim_vocab:
@@ -565,6 +578,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_path=self._export_paths.get("lm_head"),
             prefill_model_path=self._export_paths.get("model_prefill"),
             prefill_size=self._batch_prefill,
+            sliding_window=self._sliding_attention()[0],
             **validation_kwargs,
         )
 
