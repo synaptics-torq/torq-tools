@@ -207,8 +207,9 @@ def _attention_layer(style: str, heads: int, kv_heads: int, max_len: int, head_d
     [("hf", 4, 2, 1), ("grouped", 6, 2, 1), ("grouped", 6, 2, 2), ("broadcast", 4, 1, 1), ("broadcast", 4, 1, 3)],
 )
 @pytest.mark.parametrize("window", [None, 4])
-def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk, window):
-    max_len, head_dim = 6, 4
+@pytest.mark.parametrize("ring", [False, True])
+def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk, window, ring):
+    max_len, head_dim = 16, 4
     if style == "hf":
         editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
     else:
@@ -231,7 +232,7 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk,
             onnx.TensorProto.FLOAT, chunk_len=chunk, sliding_window=window, sliding_layers=frozenset({0}),
         ))
     blended = clone_graph(editor.graph)
-    editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk, window, frozenset({0}))
+    editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk, window, frozenset({0}), ring_buffer=ring)
     read_only = editor.to_onnx()
     assert not [n for n in editor.graph.nodes if n.op == "Where" and n.outputs[0].name.startswith("present")]
     # torq-compile 2.3.0 miscompiles a Where over a constant condition, so the causal mask is a float constant.
@@ -239,7 +240,8 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk,
 
     rng = np.random.default_rng(0)
     blended_cache = rng.standard_normal((1, 2 * kv_heads, max_len, head_dim)).astype(np.float32)  # stale rows must not leak in
-    read_only_cache = blended_cache.transpose(0, 2, 1, 3).copy()
+    length = window - 1 if ring and window else max_len
+    read_only_cache = blended_cache[:, :, :length].transpose(0, 2, 1, 3).copy()
     for pos in range(0, max_len - chunk + 1, chunk):
         feeds = {
             "q": rng.standard_normal((1, heads, chunk, head_dim)).astype(np.float32),
@@ -252,8 +254,10 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk,
         np.testing.assert_allclose(actual["attn"], expected["attn"], rtol=1e-5, atol=1e-6)
         assert actual["present.0.key_value"].shape == (1, chunk, 2 * kv_heads, head_dim)
         blended_cache = expected["present.0.key_value"]
-        read_only_cache[:, pos:pos + chunk] = actual["present.0.key_value"]
-    np.testing.assert_array_equal(read_only_cache, blended_cache.transpose(0, 2, 1, 3))
+        for row in range(chunk):
+            read_only_cache[:, (pos + row) % length] = actual["present.0.key_value"][:, row]
+    if not (ring and window):
+        np.testing.assert_array_equal(read_only_cache, blended_cache.transpose(0, 2, 1, 3))
 
 
 @pytest.mark.parametrize("chunk", [1, 3])

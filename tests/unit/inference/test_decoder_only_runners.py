@@ -320,3 +320,16 @@ def test_smollm2_stop_rules_are_preserved():
 
     runner._instruct_model = True
     assert runner._stop_decoding(7, [7]) is None
+
+
+def test_static_runner_wraps_each_ring_independently():
+    runner = _DemoStatic(_FakeRunner())
+    runner._kv_cache = {
+        "ring": np.zeros((1, 3, 6, 5), np.float32),
+        "global": np.zeros((1, 7, 6, 5), np.float32),
+    }
+    values = np.arange(3, dtype=np.float32).reshape(1, 3, 1, 1) + 1
+    rows = np.broadcast_to(values, (1, 3, 6, 5)).copy()
+    runner._update_cache([rows, rows], 2)
+    np.testing.assert_array_equal(runner._kv_cache["ring"][0, :, 0, 0], [2, 3, 1])
+    np.testing.assert_array_equal(runner._kv_cache["global"][0, :, 0, 0], [0, 0, 1, 2, 3, 0, 0])

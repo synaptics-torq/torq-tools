@@ -863,6 +863,7 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         num_kv_heads (int): Number of key/value heads
         head_dim (int): Head dimension
         chunk_len (int): Number of new rows per step
+        ring_buffer (bool): Store only W-1 past rows for selected sliding layers.
     """
 
     num_heads: int
@@ -871,8 +872,11 @@ class ReadOnlyKVCache(OnnxGraphEdit):
     chunk_len: int = 1
     sliding_window: int | None = None
     sliding_layers: frozenset[int] = frozenset()
+    ring_buffer: bool = False
 
     def __post_init__(self):
+        if self.ring_buffer and self.sliding_window is not None and self.sliding_window < 2:
+            raise ValueError("ring buffers require sliding_window >= 2")
         if self.sliding_window is not None and not 1 <= self.chunk_len < self.sliding_window:
             raise ValueError("chunk_len must be positive and less than sliding_window")
         return super().__post_init__()
@@ -999,6 +1003,48 @@ class ReadOnlyKVCache(OnnxGraphEdit):
             past_mask = sliding_mask
         return past_mask, new_mask
 
+    def _ring_mask(self, position, rows, dtype):
+        """Mask physical slots using the absolute positions they held before this step."""
+        tensors = self.graph.tensors()
+        if (mask := tensors.get("kv_ring_mask")) is not None:
+            return mask
+        length = self.sliding_window - 1
+        # The accelerator compiler cannot lower this arithmetic in int64.
+        position = self.graph.layer(name="kv_ring_position", op="Cast", inputs=[position],
+            attrs={"to": onnx.TensorProto.INT32},
+            outputs=[gs.Variable("kv_ring_position", dtype=np.int32, shape=position.shape)])[0]
+        itype = np.dtype(position.dtype or np.int64)
+        shape = [1, 1, rows if self.chunk_len > 1 else 1, length]
+
+        def op(name, kind, inputs, out_shape):
+            return self.graph.layer(name=name, op=kind, inputs=inputs,
+                outputs=[gs.Variable(name, dtype=np.bool_ if kind in ("Less", "Greater", "GreaterOrEqual") else position.dtype, shape=out_shape)])[0]
+
+        period = gs.Constant("kv_ring_period", np.full(position.shape, length, dtype=itype))
+        turn = op("kv_ring_turn", "Div", [position, period], position.shape)
+        cycle = op("kv_ring_cycle", "Mul", [turn, period], position.shape)
+        start = op("kv_ring_start", "Sub", [position, cycle], position.shape)
+        slots = gs.Constant("kv_ring_slots", np.arange(length, dtype=itype).reshape(1, 1, 1, length))
+        current = op("kv_ring_current", "Add", [cycle, slots], [1, 1, 1, length])
+        previous = op("kv_ring_previous", "Sub", [current, period], [1, 1, 1, length])
+        before = op("kv_ring_before", "Less", [slots, start], [1, 1, 1, length])
+        offsets = (np.arange(shape[2]) % self.chunk_len - self.sliding_window).astype(itype)
+        offsets = offsets.reshape(1, 1, -1, 1) if self.chunk_len > 1 else offsets.reshape(position.shape)
+        lower = op("kv_ring_lower", "Add", [position, gs.Constant("kv_ring_offsets", offsets)], [1, 1, shape[2], 1] if self.chunk_len > 1 else position.shape)
+        keep, block = tensors["attn_mask_keep"], tensors["attn_mask_block"]
+
+        def mask(name, condition, yes, no, out_shape):
+            return self.graph.layer(name=name, op="Where", inputs=[condition, yes, no],
+                outputs=[gs.Variable(name, dtype=dtype, shape=out_shape)])[0]
+
+        masks = []
+        for label, absolute in (("current", current), ("previous", previous)):
+            valid = op(f"kv_ring_{label}_valid", "GreaterOrEqual", [absolute, gs.Constant(f"kv_ring_{label}_zero", np.asarray(0, dtype=itype))], [1, 1, 1, length])
+            recent = op(f"kv_ring_{label}_recent", "Greater", [absolute, lower], shape)
+            warmup = mask(f"kv_ring_{label}_warmup", valid, keep, block, [1, 1, 1, length])
+            masks.append(mask(f"kv_ring_{label}_mask", recent, warmup, block, shape))
+        return mask("kv_ring_mask", before, masks[0], masks[1], shape)
+
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Softmax")
         sliding = _is_sliding_layer(node, self.sliding_window, self.sliding_layers)
@@ -1006,7 +1052,8 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         base = node.name.rsplit("/", 1)[0] + "/ReadOnlyKV/"
         heads, kv, d, t = self.num_heads, self.num_kv_heads, self.head_dim, self.chunk_len
         rows = heads // kv * t
-        max_len = cache.shape[2]
+        linear_length = cache.shape[2]
+        max_len = self.sliding_window - 1 if sliding and self.ring_buffer else cache.shape[2]
         dtype = q.dtype or np.float32
         k_new, v_new = k_blend[1], v_blend[1]
         k_offset = int(k_blend[2].inputs[1].values.ravel()[0])
@@ -1030,7 +1077,12 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         cache.shape = [1, max_len, 2 * kv, d]
         k_heads = [head(cache, 2, k_offset + i, [1, max_len, d], f"k{i}") for i in range(kv)]
         v_heads = [head(cache, 2, v_offset + i, [1, max_len, d], f"v{i}") for i in range(kv)]
-        past_mask, new_mask = self._masks(self._position(k_blend[0]), max_len, rows, dtype, sliding)
+        position = self._position(k_blend[0])
+        ring = sliding and self.ring_buffer
+        # The linear masks share the global length; rings have a separate slot axis.
+        past_mask, new_mask = self._masks(position, linear_length, rows, dtype, sliding and not ring)
+        if ring:
+            past_mask = self._ring_mask(position, rows, dtype)
 
         if k_scale != 1.0:
             q = layer("Mul", "q_scaled", [q, np.array(k_scale, dtype=np.float32)], None)

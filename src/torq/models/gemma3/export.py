@@ -493,6 +493,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config.head_dim,
                     self._batch_prefill if component == "model_prefill" else 1,
                     *self._sliding_attention(),
+                    ring_buffer=True,
                 )
 
         if self._trim_vocab:
