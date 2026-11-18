@@ -57,7 +57,8 @@ Use the `-s` value with the same architecture as `<hf-repo>`. Without `--gptq-ch
 
 - `--torq-disable-slicing`: the models are compiled without LinalgSlicing.
 - `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers over the slice compute, so that most of the compute is hidden under the weight loads. Decode is DMA-bound, so this sets the token rate.
-- `--torq-max-nss-programs-size=12582912` (transformer only): the NSS programs need about 11 MB.
+
+The flag sets carry no `--torq-max-nss-programs-size` cap: batch-prefill family exports auto-size the NSS program budget in the exporter (384 MiB default), and an explicit cap in the flags suppresses that auto-sizing — a 12 MiB cap validated for single-graph compiles makes the weight-reuse family compile fail its target translation. Single-graph compiles use the compiler's default budget.
 
 ## Key export flags
 
