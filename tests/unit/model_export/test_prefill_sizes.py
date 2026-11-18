@@ -34,24 +34,27 @@ def test_probe_sweeps_narrow_nonmonotone_plateaus(monkeypatch, tmp_path):
     report = probe.recommend(path, "SL2610", [], tmp_path, **kwargs)
     assert sorted(calls) == [1, *range(4, 13)]
     assert [(p["b_start"], p["b_end"]) for p in report.shapes[0].plateaus] == [(4, 6), (7, 7), (8, 12)]
-    assert report.chosen == [4, 7, 12]
+    assert report.chosen == [4, 6, 7, 12]
     calls.clear()
     cached = probe.recommend(path, "SL2610", [], tmp_path, **kwargs)
     assert cached.chosen == report.chosen
     assert calls == []
 
 
-def test_probe_drops_restream_and_no_fit(monkeypatch, tmp_path):
+def test_probe_drops_no_fit(monkeypatch, tmp_path):
     from torq.model_export import prefill_sizes as probe
 
     path = _model(tmp_path)
     monkeypatch.setattr(probe, "run_probe", lambda *args: "")
     monkeypatch.setattr(probe, "_parse_tile_and_fuse", lambda _, m, k, n: probe.ProbeResult(
-        m, None if m == 8 else 8 if m < 6 else 4, m == 6, m == 6))
+        m, None if m == 8 else 8, False, False))
     report = probe.recommend(path, "SL2610", [], tmp_path, cap=8, tool=sys.executable)
-    assert report.chosen == [4, 5, 7]
+    assert report.chosen == [4, 7]
     dropped = {c["b"]: c["reason"] for c in report.candidates if not c["kept"]}
-    assert "re-streamed" in dropped[6] and "no tile fit" in dropped[8] and len(dropped) == 2
+    assert dropped == {8: "no tile fit"}
+    monkeypatch.setattr(probe, "_parse_tile_and_fuse", lambda _, m, k, n: probe.ProbeResult(
+        m, 8 if m == 1 else None, False, False))
+    assert probe.recommend(path, "SL2610", [], tmp_path / "nofit", cap=8, tool=sys.executable) is None
     with pytest.raises(probe.ProbeError, match="max batch size"):
         probe.recommend(path, "SL2610", [], tmp_path, cap=3, tool=sys.executable)
 
@@ -158,12 +161,11 @@ def test_probe_cache_tracks_actual_projection_contents(tmp_path, monkeypatch):
     assert sorted(calls) == [1, 4]
 
 
-@pytest.mark.parametrize('dtype,shape,snap_grid', [
-    ('i4', '2x4x16', False), ('f16', '8x16', False),
-    ('f32', '8x16', False), ('bf16', '1x8x16', True),
+@pytest.mark.parametrize('dtype,shape', [
+    ('i4', '2x4x16'), ('f16', '8x16'), ('f32', '8x16'), ('bf16', '1x8x16'),
 ])
 @pytest.mark.parametrize('m_outer', [False, True])
-def test_parser_reads_typed_and_blocked_weight_strips(dtype, shape, snap_grid, m_outer):
+def test_parser_reads_typed_and_blocked_weight_strips(dtype, shape, m_outer):
     from torq.model_export import prefill_sizes as probe
 
     n_loop = '%n = scf.for %j = %c0 to %c16 step %c8 iter_args(%out = %empty) -> (tensor<1x12x16xbf16>) {'
@@ -181,20 +183,7 @@ def test_parser_reads_typed_and_blocked_weight_strips(dtype, shape, snap_grid, m
         '      %activation = tensor.extract_slice %x[0, %i, 0]',
         '    }', '  }', '}',
     ])
-    assert probe._parse_tile_and_fuse(dump, 12, 8, 16) == probe.ProbeResult(12, 8, True, m_outer, snap_grid, 4)
-
-
-def test_quantized_widths_do_not_use_bf16_snap(tmp_path, monkeypatch):
-    from torq.model_export import prefill_sizes as probe
-
-    path = _model(tmp_path, 22, quantized=True)
-    monkeypatch.setattr(probe, 'run_probe', lambda *args: '')
-    monkeypatch.setattr(probe, '_parse_tile_and_fuse', lambda _, m, k, n:
-        probe.ProbeResult(m, 96 if m == 1 else 64 if m < 6 else 48, False, False, False))
-    monkeypatch.setattr(probe, 'snap', lambda *args: pytest.fail('BF16 snap used for INT4'))
-    report = probe.recommend(path, 'SL2610', ['--torq-enable-split-constants-optimization'],
-                             tmp_path, cap=8, tool=sys.executable)
-    assert report.chosen == [4, 5, 8]
+    assert probe._parse_tile_and_fuse(dump, 12, 8, 16) == probe.ProbeResult(12, 8, True, m_outer, 4)
 
 
 @pytest.mark.parametrize('read_only', [False, True])
@@ -363,8 +352,8 @@ def test_dma_keeps_restreaming_when_total_bytes_per_token_improves(monkeypatch, 
     path = _model(tmp_path)
     monkeypatch.setattr(probe, 'run_probe', lambda *args: '')
     monkeypatch.setattr(probe, '_parse_tile_and_fuse', lambda _, m, k, n: probe.ProbeResult(
-        m, 8, m > 5, m > 5, True, 5 if m > 5 else None))
-    kwargs = dict(cap=16, tool=sys.executable, heuristic='dma')
+        m, 8, m > 5, m > 5, 5 if m > 5 else None))
+    kwargs = dict(cap=16, tool=sys.executable)
     report = probe.recommend(path, 'SL2610', [], tmp_path, **kwargs)
     # Each repeated load serves another five tokens. Cost ties prefer the larger chunk.
     assert report.chosen == [4, 15]
@@ -387,9 +376,9 @@ def test_dma_weights_projection_occurrences_and_filters_no_fit():
                       12: probe.ProbeResult(12, None, False, False)}),
              SimpleNamespace(weight_bytes=100, occurrences=1, constrained=True,
               points={4: probe.ProbeResult(4, 8, False, False),
-                      8: probe.ProbeResult(8, 8, True, True, True, 4),
-                      12: probe.ProbeResult(12, 8, True, True, True, 4)})]
-    report = probe.ProbeReport([], scans, 12, 256, heuristic='dma')
+                      8: probe.ProbeResult(8, 8, True, True, 4),
+                      12: probe.ProbeResult(12, 8, True, True, 4)})]
+    report = probe.ProbeReport([], scans, 12, 256)
     probe._select_dma(report, [4, 8, 12])
     assert report.chosen == [4, 8]
     assert report.candidates[1]['weight_bytes_per_token'] == 150

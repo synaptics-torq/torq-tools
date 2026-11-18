@@ -955,7 +955,7 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_
         final = onnx.load(exporter._export_paths["model"])
         assert probed_weights == [[(i.name, i.data_type, tuple(i.dims), i.raw_data)
                                    for i in final.graph.initializer]]
-    expected = (4, 7, 16) if mode == "automatic" else (4, 7) if mode == "explicit" else ()
+    expected = (4, 6, 7, 16) if mode == "automatic" else (4, 7) if mode == "explicit" else ()
     assert exporter._batch_prefill_sizes == expected
     assert set(exporter._export_paths) == {"model", *(f"model_prefill_{size}" for size in expected)}
     assert bool(calls) == (mode == "automatic")

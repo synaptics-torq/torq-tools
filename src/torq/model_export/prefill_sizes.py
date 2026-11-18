@@ -67,8 +67,6 @@ class ProbeResult:
     m_tiled: bool
     m_outer: bool  # M loop outside the N loop: the weight strip is reloaded
     # per M pass (re-streamed)
-    snap_grid: bool = True  # only direct BF16 weights use the BF16 family grid
-
     m_step: Optional[int] = None
 
     @property
@@ -85,27 +83,6 @@ class ProbeResult:
     @property
     def restreams_weight(self) -> bool:
         return self.m_tiled and self.m_outer
-
-
-def snap(width: int, decode_width: int) -> int:
-    """Mirror the bf16 family grid and aligned divisor choice in TileAndFuse."""
-    vector = 32
-    grid = 0
-    unit = vector
-    while unit <= decode_width:
-        grid = max(grid, unit, 3 * unit if 3 * unit <= decode_width else 0)
-        unit *= 2
-    step = grid or decode_width
-    alignment = vector if step % vector == 0 and width >= vector else 1
-    cap = min(width, step) // alignment
-    best = 1
-    for d in range(1, math.isqrt(step // alignment) + 1):
-        if (step // alignment) % d == 0:
-            for divisor in (d, step // alignment // d):
-                if divisor <= cap:
-                    best = max(best, divisor)
-    snapped = best * alignment
-    return width if snapped == 1 or snapped * 2 < width else snapped
 
 
 def filter_probe_flags(compiler_options: List[str]) -> List[str]:
@@ -405,7 +382,6 @@ def _parse_tile_and_fuse(stderr: str, m: int, k: int, n: int) -> ProbeResult:
             if dims[-1] == n and math.prod(dims[:-1]) == k:
                 weight = wd['name']
                 rank = len(dims)
-                snap_grid = wd['elt'] == 'bf16'
                 break
         if weight is not None:
             break
@@ -444,10 +420,10 @@ def _parse_tile_and_fuse(stderr: str, m: int, k: int, n: int) -> ProbeResult:
                   and all(o == '0' for o in offsets[:-2])):
                 m_loop = loop
     if weight_loop is None:
-        return ProbeResult(m, None, m_loop is not None, False, snap_grid)
+        return ProbeResult(m, None, m_loop is not None, False)
     return ProbeResult(
         m, weight_loop['step'], m_loop is not None,
-        m_loop is not None and m_loop['indent'] < weight_loop['indent'], snap_grid,
+        m_loop is not None and m_loop['indent'] < weight_loop['indent'],
         m_loop['step'] if m_loop is not None else None,
     )
 
@@ -482,9 +458,8 @@ class _ShapeScan:
     k: int
     n: int
     decode_width: Optional[int]
-    plateaus: List[Dict] = field(default_factory=list)  # b_start, b_end, width, snapped, m_tiled, m_outer
+    plateaus: List[Dict] = field(default_factory=list)  # b_start, b_end, width, m_tiled, m_outer
     points: Dict[int, ProbeResult] = field(default_factory=dict)
-    snap_grid: bool = True
     projection: str = ""
 
     @property
@@ -498,7 +473,6 @@ def _plateau(b_start: int, b_end: int, sig) -> Dict:
         "b_start": b_start,
         "b_end": b_end,
         "width": width,
-        "snapped": None,  # filled in by recommend() when split constants are on
         "m_tiled": m_tiled,
         "m_outer": m_outer,
     }
@@ -508,7 +482,7 @@ def _scan_shape(shape, points: Dict[int, ProbeResult]) -> _ShapeScan:
     """Record every supported batch size, including narrow dips and returns."""
     k, n = shape
     decode = points[1]
-    scan = _ShapeScan(k, n, decode.width, snap_grid=decode.snap_grid)
+    scan = _ShapeScan(k, n, decode.width)
     scan.points = points
     if not scan.constrained:
         return scan
@@ -535,7 +509,6 @@ class ProbeReport:
     candidates: List[Dict] = field(default_factory=list)  # b, kept, reason
     warnings: List[str] = field(default_factory=list)
     elapsed: float = 0.0
-    heuristic: str = "reuse"
 
     def sizes_flag(self) -> Optional[str]:
         if not self.chosen:
@@ -552,7 +525,6 @@ class ProbeReport:
                 continue
             parts = [
                 f"B {p['b_start']}-{p['b_end']}: width {p['width']}"
-                + (f" (snapped {p['snapped']})" if p.get("snapped") is not None else "")
                 + (f", M tiled{' (M-outer)' if p['m_outer'] else ''}" if p["m_tiled"] else "")
                 for p in scan.plateaus
             ]
@@ -567,7 +539,6 @@ class ProbeReport:
             "chip": chip,
             "tool": str(tool),
             "flags": flags,
-            "heuristic": self.heuristic,
             "cap": self.cap,
             "context": self.context,
             "elapsed_s": round(self.elapsed, 1),
@@ -576,7 +547,6 @@ class ProbeReport:
                     "projection": s.projection,
                     "weight_bytes": s.weight_bytes,
                     "occurrences": s.occurrences,
-                    "snap_grid": s.snap_grid,
                     "k": s.k,
                     "n": s.n,
                     "decode_width": s.decode_width,
@@ -628,7 +598,7 @@ class _ProbeCache:
         e = self.entries.get(self._key(projection, m))
         if e is None:
             return None
-        return ProbeResult(e["m"], e["width"], e["m_tiled"], e["m_outer"], e["snap_grid"], e["m_step"])
+        return ProbeResult(e["m"], e["width"], e["m_tiled"], e["m_outer"], e["m_step"])
 
     def put(self, projection: str, result: ProbeResult) -> None:
         self.entries[self._key(projection, result.m)] = {
@@ -636,7 +606,6 @@ class _ProbeCache:
             "width": result.width,
             "m_tiled": result.m_tiled,
             "m_outer": result.m_outer,
-            "snap_grid": result.snap_grid,
             "m_step": result.m_step,
         }
 
@@ -673,19 +642,16 @@ def recommend(
     context_length: Optional[int] = None,
     tool: Optional[str] = None,
     exclude_lm_head: bool = False,
-    heuristic: str = "reuse",
 ) -> Optional[ProbeReport]:
     """Probe the tiler and recommend sizes.
 
     Returns a report with a non-empty ``chosen`` list, or None when the
     probe warns and the caller should keep the exporter's explicit sizes
-    (no shapes, nothing constrained, every candidate dropped, or any
+    (no shapes, no size fits the tiler, or any
     probe failure). Writes ``prefill_sizes.json`` to ``work_dir`` whenever
     a sweep ran.
     """
     started = time.perf_counter()
-    if heuristic not in ("reuse", "dma"):
-        raise ProbeError(f"unknown size heuristic: {heuristic}")
 
     model_path = Path(model_path)
     work_dir = Path(work_dir)
@@ -710,7 +676,7 @@ def recommend(
             context_length = _context_length_from_onnx(onnx_model)
 
     projections = extract_projections(model_path, onnx_model, exclude_lm_head)
-    report = ProbeReport([], [], cap, context_length, warnings=warnings, heuristic=heuristic)
+    report = ProbeReport([], [], cap, context_length, warnings=warnings)
     if not projections:
         warnings.append(f"no matmul weight shapes found in {model_path.name}; choose explicit sizes")
         _finish(report, started, work_dir, model_path, chip, tool, flags)
@@ -742,8 +708,7 @@ def recommend(
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PROBE_JOBS) as pool:
             decode = list(pool.map(lambda p: make_probe(p, 1), projections))
-            jobs = [(p, b) for p, result in zip(projections, decode)
-                    if result.width is not None or heuristic == "dma" for b in range(4, cap + 1)]
+            jobs = [(p, b) for p in projections for b in range(4, cap + 1)]
             results = list(pool.map(lambda job: make_probe(*job), jobs))
         points = {p.key: {1: result} for p, result in zip(projections, decode)}
         for (p, b), result in zip(jobs, results):
@@ -757,17 +722,6 @@ def recommend(
 
         constrained = [s for s in scans if s.constrained]
 
-        split_requested = any(
-            o.partition("=")[0] == "--torq-enable-split-constants-optimization"
-            and o.partition("=")[2] not in ("false", "0") for o in flags
-        )
-        for scan in constrained:
-            for plateau in scan.plateaus:
-                if plateau["width"] is not None:
-                    plateau["snapped"] = (
-                        snap(plateau["width"], scan.decode_width) if split_requested and scan.snap_grid else plateau["width"]
-                    )
-
         # Candidates: the largest B of each joint plateau = every constrained
         # shape's plateau end, plus the limit (cap bounded by the context when
         # known). Use the sweep results to keep or drop each candidate.
@@ -776,10 +730,9 @@ def recommend(
         for scan in constrained:
             candidate_set.update(p["b_end"] for p in scan.plateaus if p["width"] is not None and p["b_end"] <= limit)
         # Four is the minimum supported by every native decoder exporter.
-        if heuristic == "dma":
-            for scan in scans:
-                candidate_set.update(b - 1 for b in range(5, limit + 1)
-                                     if scan.points[b].weight_passes != scan.points[b - 1].weight_passes)
+        for scan in scans:
+            candidate_set.update(b - 1 for b in range(5, limit + 1)
+                                 if scan.points[b].weight_passes != scan.points[b - 1].weight_passes)
         candidates = sorted(b for b in candidate_set if b >= 4)
 
     except (ProbeError, OSError):
@@ -790,68 +743,9 @@ def recommend(
     except OSError as exc:
         logger.warning("prefill probe: could not save cache: %s", exc)
 
-    if heuristic == "dma":
-        _select_dma(report, candidates)
-        return _finish(report, started, work_dir, model_path, chip, tool, flags)
-
-    if not constrained:
-        warnings.append(
-            "no weight is tiled along N at decode; the sizes are unconstrained, choose explicit sizes"
-        )
-        _finish(report, started, work_dir, model_path, chip, tool, flags)
-        return None
-
-    chosen = report.chosen
-    for b in candidates:
-        reason = "kept"
-        for scan in constrained:
-            r = scan.points[b]
-            if r.width is None:
-                reason = f"[{scan.k},{scan.n}] no tile fit (skipped by the tiler)"
-                break
-            if r.restreams_weight:
-                reason = f"[{scan.k},{scan.n}] M-tiled with M-outer loop order (weight re-streamed)"
-                break
-        report.candidates.append({"b": b, "kept": reason == "kept", "reason": reason})
-        if reason == "kept":
-            chosen.append(b)
-
-    # Domination: with split constants the effective tile count is the SNAPPED
-    # width; a smaller B whose per-shape (snapped width, M tiling, loop order)
-    # equals a larger kept B does strictly fewer tokens per weight pass and is
-    # dropped.
-    def effective_sig(b):
-        return tuple(
-            (
-                snap(scan.points[b].width, scan.decode_width)
-                if split_requested and scan.snap_grid and scan.points[b].width is not None
-                else scan.points[b].width,
-                scan.points[b].m_tiled,
-                scan.points[b].m_outer,
-            )
-            for scan in constrained
-        )
-
-    sigs = {b: effective_sig(b) for b in chosen}
-    for c in report.candidates:
-        b = c["b"]
-        if not c["kept"] or b == 4:
-            continue
-        dominator = next(
-            (b2 for b2 in chosen if b2 > b and sigs[b2] == sigs[b]), None
-        )
-        if dominator is not None:
-            c["kept"] = False
-            c["reason"] = (
-                f"identical effective tile counts as {dominator} after the "
-                "split-constants snap (fewer tokens per weight pass)"
-            )
-            chosen.remove(b)
-    if not chosen:
-        warnings.append(
-            "no probe candidates (cap too small)" if not candidates
-            else "every probed candidate was dropped; choose explicit sizes"
-        )
+    _select_dma(report, candidates)
+    if not report.chosen:
+        warnings.append("no probed size fits the tiler; choose explicit sizes")
         _finish(report, started, work_dir, model_path, chip, tool, flags)
         return None
     return _finish(report, started, work_dir, model_path, chip, tool, flags)
@@ -925,8 +819,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--work-dir", default=None,
                         help="where prefill_sizes.json and the probe cache go "
                         "(default: <cwd>/<model-stem>-prefill-probes)")
-    parser.add_argument("--heuristic", choices=["reuse", "dma"], default="reuse",
-                        help="size selection: conservative reuse (default) or estimated DMA bytes/token")
     parser.add_argument("--tool", default=None, help="path to torq-compile")
     args = parser.parse_args(argv)
     model = Path(args.model)
@@ -937,7 +829,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = recommend(
             model, args.chip, list(user_flags), work_dir,
-            cap=args.max_batch_size, context_length=args.context_length, tool=args.tool, heuristic=args.heuristic,
+            cap=args.max_batch_size, context_length=args.context_length, tool=args.tool,
         )
     except Exception as exc:
         print(f"probe failed: {exc}", file=sys.stderr)

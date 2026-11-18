@@ -1,14 +1,12 @@
 # Batch-prefill size probe
 
-[`prefill_sizes.py`](prefill_sizes.py) recommends a family of chunk sizes that help reuse projection weights across tokens. It extracts representative projections from the sequential, unbatched transformer graph, then probes how the compiler's tile-and-fuse algorithm divides those projections into tiles at different chunk sizes. The LM head is currently excluded as it isn't extensively used during prefill. The [batch-prefill user guide](batch_prefill.md#optional-size-probe) covers the CLI and compiler workflow.
+[`prefill_sizes.py`](prefill_sizes.py) recommends a family of chunk sizes that lower the estimated projection-weight DMA traffic per prompt token. It extracts representative projections from the sequential, unbatched transformer graph, then probes how the compiler's tile-and-fuse algorithm divides those projections into tiles at different chunk sizes. The LM head is currently excluded as it isn't extensively used during prefill. The [batch-prefill user guide](batch_prefill.md#optional-size-probe) covers the CLI and compiler workflow.
 
-## Experimental DMA selector
+## DMA cost
 
-The standalone probe accepts `--heuristic dma`; `--heuristic reuse` remains the default and native exporter automatic probing keeps that default. Run the DMA probe on the final decoder weight format with the same compiler flags, then pass its printed `--batch-prefill --batch-prefill-sizes ...` options to an export in a separate destination for comparison.
+The selector estimates bytes per token as the sum of each representative projection's packed constant bytes times its graph occurrence count times its weight-pass count, divided by the chunk length. Constant storage includes packed INT4 weights, scales, zero points and constant biases. Weight passes are `ceil(chunk length / token-tile step)` when the token loop surrounds the weight-strip loop, otherwise one. Structural deduplication retains occurrence counts; probe cache identity still uses the representative's real constants. This is a projection-weight traffic estimate: it does not model attention, activation/state transfers, transfer padding, compiler constant folding or DMA/computation overlap.
 
-The DMA selector estimates bytes per token as the sum of each representative projection's packed constant bytes times its graph occurrence count times its weight-pass count, divided by the chunk length. Constant storage includes packed INT4 weights, scales, zero points and constant biases. Weight passes are `ceil(chunk length / token-tile step)` when the token loop surrounds the weight-strip loop, otherwise one. Structural deduplication retains occurrence counts; probe cache identity still uses the representative's real constants. This is a projection-weight traffic estimate: it does not model attention, activation/state transfers, transfer padding, compiler constant folding or DMA/computation overlap.
-
-Candidates include the existing tiling-plateau boundaries, the last size before each weight-pass count changes, the minimum size four and the sweep cap. Keep increasing sizes that lower estimated DMA bytes per token; equal-cost candidates prefer the larger chunk while retaining four for tails. Sizes without a tile fit are excluded. Repeated weight loads are allowed when their total bytes per token improve. `prefill_sizes.json` records the heuristic, projection byte sizes and occurrence counts, and each candidate's total bytes, bytes per token and decision. The cache records token-tile steps and invalidates results from the older parser.
+Candidates include the tiling-plateau boundaries, the last size before each weight-pass count changes, the minimum size four and the sweep limit. Keep increasing sizes that lower estimated DMA bytes per token; equal-cost candidates prefer the larger chunk while retaining four for tails. Sizes without a tile fit are excluded. Repeated weight loads are allowed when their total bytes per token improve, so large models still get several chunk sizes where a strict no-reload rule would leave only small ones. `prefill_sizes.json` records projection byte sizes and occurrence counts, and each candidate's total bytes, bytes per token and decision.
 
 ## Probe flow
 
@@ -24,9 +22,8 @@ Candidates include the existing tiling-plateau boundaries, the last size before 
 | Work | The projection's matrix multiplication for a chunk of tokens. This probe does not measure the whole prefill computation. |
 | Work layout / tiling | How the compiler divides that multiplication into smaller pieces and orders their processing. |
 | Weight strip / tile | A piece of the weight matrix loaded for computation. Strip width is the number of output features it covers. |
-| Weight reuse / re-streaming | Reuse means computing for multiple tokens with an already loaded weight strip. Re-streaming means loading it again for each token group. |
+| Weight pass / re-streaming | One load of every weight strip. Re-streaming loads the strips again for each token group, adding weight passes. |
 | Range / plateau | Consecutive chunk sizes with the same work layout. A signature records the layout details used to compare them. |
-| Weight splitting / split constants | A compiler option that splits stored weights into pieces. Its alignment rules can affect which layouts count as equivalent. |
 | Family | The final set of recommended chunk sizes. |
 </details>
 
@@ -37,17 +34,14 @@ flowchart TD
     Extract --> Found{"Any projections?"}
     Found -->|No| Explicit["No recommendation: choose explicit sizes"]
     Found -->|Yes| Decode["Probe <b>B=1</b> for every projection"]
-    Decode --> Constrained{"Any projection tiled along N?"}
-    Constrained -->|No| Explicit
-    Constrained -->|Yes| Sweep["Probe every <b>B=4..limit</b>"]
+    Decode --> Sweep["Probe every <b>B=4..limit</b>"]
     Sweep --> Plateaus["Find ranges with the same <b>work layout</b>"]
-    Plateaus --> Candidates["Collect the largest size in each range"]
-    Candidates --> Reject["Remove sizes that cannot <b>reuse weights</b>"]
-    Reject --> Survive{"Any sizes left?"}
+    Plateaus --> Candidates["Collect range ends, weight-pass changes, <b>B=4</b> and the limit"]
+    Candidates --> Cost["Estimate <b>weight DMA bytes per token</b>"]
+    Cost --> Keep["Keep each size that lowers the cost"]
+    Keep --> Survive{"Any sizes left?"}
     Survive -->|No| Explicit
-    Survive -->|Yes| Snap["Account for <b>weight splitting</b>, if enabled"]
-    Snap --> Prune["Remove redundant smaller sizes"]
-    Prune --> Recommend["Recommend sizes and save a report"]
+    Survive -->|Yes| Recommend["Recommend sizes and save a report"]
     Stop["Stop the sweep"] --> Explicit
     Decode -.->|Compile or parse failure| Stop
     Sweep -.->|Compile or parse failure| Stop
@@ -60,13 +54,10 @@ A **weight strip** is a piece of the weight matrix loaded for computation. The s
 
 - A work layout describes the weight-strip width, whether tokens are split into smaller groups, and the order those groups and weight strips are processed.
 - Consecutive chunk sizes with the same layout form a range (called a “plateau” in the report).
-- Each range's largest size becomes a candidate when its weight-strip width is recognized.
-- Combine candidates from all constrained projections, then add size 4 and the sweep limit.
-- Only projections whose weights are split along the output dimension (N) at decode are constrained and swept.
-- Remove a candidate if any constrained projection has no recognized weight tile or reloads weights for each token group.
-- When split constants is enabled, account for its alignment rules before comparing layouts.
-- Remove a smaller candidate if a larger retained size has the same layout across all constrained projections; retain size 4 if valid.
-- No projections, no constrained projections or no surviving candidates means no recommendation.
+- Candidates are the largest size of each range with a recognized weight-strip width, the last size before any projection's weight-pass count changes, size 4 and the sweep limit.
+- Walk the candidates in ascending order and keep each one whose estimated weight DMA bytes per token is no higher than the best so far; on a tie the larger size replaces the smaller, except size 4.
+- Drop a candidate if any projection tiled along N at decode has no recognized weight tile at that size.
+- No projections or no surviving candidates means no recommendation.
 - Compile/parse failures also stop the sweep.
 - Empty recommendations and failures require explicit sizes; this is not a fallback to a known optimal family.
 
@@ -87,7 +78,7 @@ flowchart TD
     Request["Projection and chunk size"] --> Cache{"Matching cached result?"}
     Cache -->|Yes| Result["How the compiler divides the work"]
     Cache -->|No| Compile["Compile at this chunk size"]
-    Compile --> Parse["Check how weights are loaded and reused"]
+    Compile --> Parse["Check how weights are loaded"]
     Parse --> Save["Cache the result"]
     Save --> Result
     Compile -.->|Failure| Stop["Stop the sweep"]
@@ -95,7 +86,7 @@ flowchart TD
 ```
 
 <details>
-<summary>What the probe records and why weight reuse matters</summary>
+<summary>What the probe records and how weight passes are counted</summary>
 
 The cache matches the graph contents, chunk size, target, flags and compiler. On a cache miss, inspect the final `torq-tile-and-fuse` IR after compilation. Successful probe results remain cached even if a later probe fails.
 
@@ -122,13 +113,13 @@ sequenceDiagram
     end
 ```
 
-M tiling alone is allowed. Reject a candidate if any constrained projection has no recognized weight tile or has M tiling with an outer M loop.
+M tiling alone costs one weight pass. With an outer M loop, each M tile is another pass: `ceil(B / M step)` passes in total.
 
 </details>
 
 ## Decode baseline and exhaustive sweep
 
-Probe B=1 for every projection to establish its decode strip width. For constrained projections, probe every integer B from 4 through the cap, bounded by context length when known. The default cap is 128. Tiling is nonmonotonic: widths can shrink, jump up and shrink again, so binary search would miss transitions.
+Probe B=1 for every projection to establish its decode strip width, then probe every integer B from 4 through the cap, bounded by context length when known. The default cap is 128. Tiling is nonmonotonic: widths can shrink, jump up and shrink again, so binary search would miss transitions.
 
 ## Choose candidate sizes
 
@@ -145,28 +136,15 @@ flowchart LR
 <details>
 <summary>How ranges and candidates are defined</summary>
 
-Group consecutive sizes with the same `(strip width, M tiled, M outer)` signature into plateaus. Candidate sizes are the union of all constrained projections' plateau endpoints with a recognized strip width, plus 4 and the sweep limit. For example, an earlier Gemma3 `[640, 1024]` BF16 probe under stream scheduling used width 128 for B=4..25, making 25 a candidate.
+Group consecutive sizes with the same `(strip width, M tiled, M outer)` signature into plateaus. Candidate sizes are the union of the plateau endpoints with a recognized strip width of every projection tiled along N at decode, the last size before any projection's weight-pass count changes, 4 and the sweep limit. For example, an earlier Gemma3 `[640, 1024]` BF16 probe under stream scheduling used width 128 for B=4..25, making 25 a candidate.
 
-In the diagram, each layout represents one signature. Returning to layout A starts a new range. Combine these endpoints across projections before filtering; an endpoint valid for one projection can fail another.
-
-</details>
-
-## Adjust and narrow the choices
-
-Account for how the compiler splits weights, then remove smaller sizes that offer the same weight reuse as a larger choice. Keep size 4 if it passed the earlier checks.
-
-<details>
-<summary>Weight alignment and comparison rules</summary>
-
-When split-constants optimization is enabled for direct BF16 weights, snap raw strip widths to the compiler's decode-based aligned strip grid. Other types and fused dequantization use their observed widths; the BF16 grid does not apply to their constant producers.
-
-Compare the resulting `(effective width, M tiled, M outer)` signatures across all constrained projections. Drop a smaller candidate when a larger retained candidate has the same signatures: the smaller one processes fewer tokens per weight pass. B=4 is exempt from this pruning if it passed the rejection checks.
+In the diagram, each layout represents one signature. Returning to layout A starts a new range. Combine these endpoints across projections before costing; an endpoint valid for one projection can fail another.
 
 </details>
 
 ## Reports, cache and limits
 
-Report choices, plateaus and candidate rejection reasons in `prefill_sizes.json`. Cache individual probe results by extracted graph content (including weights), batch size, target, filtered flags, compiler path/mtime and probe version. Changing the representative's constants or graph invalidates its cached results.
+Report choices, plateaus and per-candidate costs and decisions in `prefill_sizes.json`. Cache individual probe results by extracted graph content (including weights), batch size, target, filtered flags, compiler path/mtime and probe version. Changing the representative's constants or graph invalidates its cached results.
 
 LFM2.5 automatic sizing excludes the single-window channel-wise convolution rewrite, `[C,1,K] @ [C,K,1]` for C > 1. These MatMuls use independent kernels per channel rather than a shared projection across tokens. The exclusion applies to ONNX and imported MLIR sources; other unsupported batched weight shapes still fail the probe. Recommendations use the remaining shared projections and do not estimate convolution tiling or performance.
 
