@@ -589,19 +589,18 @@ class LiquidVLModelExporter(LiquidModelExporter):
 
     # ------------------------------------------------------------- native family
     def _make_native_prefill(self):
-        components = {}
+        """Yield one chunk graph at a time (key, model)."""
         for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
             self._logger.info(
                 "(%s) Making graph static with %d tokens...", component, size
             )
             source = self._convert_decoder(chunk_len=size, component=component)
-            components[component] = self._make_model_static(
+            yield component, self._make_model_static(
                 self.check_model(source, skip_data_prop=True),
                 component=component,
                 chunk_len=size,
             )
-        return components
 
     def _native_family_paths(self, paths=None):
         # The decode member is the VL decoder component, not 'model'.

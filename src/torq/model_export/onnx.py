@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import gc
 import inspect
 import json
 import logging
@@ -435,11 +436,21 @@ class OnnxModelExporterBase(ABC):
             self._opt_configs.update({f"model_prefill_{size}": self._opt_configs["model"]
                                       for size in self._batch_prefill_sizes})
         if all(f"model_prefill_{size}" in self._export_paths for size in self._batch_prefill_sizes):
-            return {}
-        components = {key: model for key, model in self._make_native_prefill().items()
-                      if key not in self._export_paths}
-        self._components.update(components)
-        self._export_components(components, cleanup=cleanup)
+            return []
+        # Build, export and free one family member at a time: every member is a
+        # full copy of the transformer graph, so keeping them all live made peak
+        # RAM scale with the number of probed sizes.
+        exported = []
+        for key, model in self._make_native_prefill():
+            if key not in self._export_paths:
+                self._export_components({key: model}, cleanup=cleanup)
+                exported.append(key)
+            # Drop the member before the generator builds the next one, and collect
+            # the graphsurgeon graphs left by cleanup and the static patches: their
+            # Node/Tensor reference cycles keep the member's weights alive until a
+            # full collection, which CPython defers in a process this large.
+            del model
+            gc.collect()
         base_paths = self._native_family_paths({
             key: self._export_path_for_component(key) for key in self._export_paths
         })
@@ -447,7 +458,7 @@ class OnnxModelExporterBase(ABC):
             validate_native_onnx(base_paths, contract=self._native_family_contract(base_paths[1]),
                                  rtol=self._native_validation_rtol, atol=self._native_validation_atol)
         share_native_weights(base_paths.values())
-        return components
+        return exported
 
     def _settle_native_family(self, *, validate=True):
         """Everything the export does only for a complete family: validate

@@ -552,18 +552,17 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._components["model"] = self._make_model_static(source_model)
 
 
-    def _make_native_prefill(self, source_model=None):
+    def _make_native_prefill(self):
+        """Yield one chunk graph at a time (key, model) so the base exporter
+        can export and free each member without holding the whole family live."""
         if not self._batch_prefill_sizes:
-            return {}
-        if source_model is None:
-            source_model = self.check_model(self._load_onnx()["model"])
-        components = {}
+            return
+        source_model = self.check_model(self._load_onnx()["model"])
         for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
-            components[component] = self._make_model_static(
+            yield component, self._make_model_static(
                 source_model, component=component, chunk_len=size,
             )
-        return components
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)

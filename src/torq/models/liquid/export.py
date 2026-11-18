@@ -1427,14 +1427,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
                        constant_roles={"/model/shared_conv/Mask_Unsqueeze_Last/output_0_folded": "control"})
 
     def _make_native_prefill(self):
-        components = {}
+        """Yield one chunk graph at a time (key, model)."""
         for size in self._batch_prefill_sizes:
             component = f"model_prefill_{size}"
             source = self._convert_source_model(chunk_len=size, component=component)
-            components[component] = self._make_model_static(
+            yield component, self._make_model_static(
                 self.check_model(source, skip_data_prop=True), component=component, chunk_len=size,
             )
-        return components
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)

@@ -888,9 +888,9 @@ def test_export_native_size_selection(tmp_path, monkeypatch, family, mode, read_
     cls = type(exporter)
     monkeypatch.setattr(cls, "_model_compile_flags", lambda self, **kwargs: ["--torq-prefetch-algorithm=constant-loads"])
     monkeypatch.setattr(cls, "_load_onnx", lambda self: {"model": graph(1, width=32)})
-    def make_chunks(self, source_model=None):
-        return {f"model_prefill_{size}": graph(size, width=32)
-                for size in self._batch_prefill_sizes}
+    def make_chunks(self):
+        for size in self._batch_prefill_sizes:
+            yield f"model_prefill_{size}", graph(size, width=32)
     monkeypatch.setattr(cls, "_make_native_prefill", make_chunks)
     def make_static(self):
         self._components = {"model": graph(1, width=32)}
@@ -1525,9 +1525,8 @@ def test_native_validation_tolerance_defaults_and_override():
         stub._export_dir = None
         stub._export_paths = {"model": "m"}
         stub._export_path_for_component = lambda key: f"{key}.onnx"
-        stub._components = {}
         stub._opt_configs = {}
-        stub._make_native_prefill = lambda: {"model_prefill_4": None}
+        stub._make_native_prefill = lambda: iter([("model_prefill_4", None)])
         stub._export_components = lambda comps, **kw: stub._export_paths.update(
             {k: f"{k}.onnx" for k in comps})
         stub._native_family_paths = lambda paths=None: {1: "m", 4: "model_prefill_4.onnx"}

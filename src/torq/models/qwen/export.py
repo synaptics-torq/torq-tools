@@ -912,8 +912,8 @@ class QwenModelExporter(OnnxModelExporterBase):
             self._components["model"]
         )
 
-    def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
-        components = {}
+    def _make_native_prefill(self):
+        """Yield one chunk graph at a time (key, model)."""
         source_model = self._load_onnx()["model"]
         for size in self._batch_prefill_sizes:
             self._logger.info(
@@ -921,11 +921,10 @@ class QwenModelExporter(OnnxModelExporterBase):
                 size,
                 size,
             )
-            components[f"model_prefill_{size}"] = self._make_model_static(
+            yield f"model_prefill_{size}", self._make_model_static(
                 source_model,
                 chunk_len=size,
             )
-        return components
 
     @staticmethod
     def _native_contract_roles(model: onnx.ModelProto) -> dict[str, str]:

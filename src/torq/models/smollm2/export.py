@@ -315,8 +315,8 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         self._components["model"] = self.check_model(self._components["model"])
         self._components["model"] = self._make_model_static(self._components["model"])
 
-    def _make_native_prefill(self) -> dict[str, onnx.ModelProto]:
-        components = {}
+    def _make_native_prefill(self):
+        """Yield one chunk graph at a time (key, model)."""
         source_model = self._load_onnx()["model"]
         for size in self._batch_prefill_sizes:
             self._logger.info(
@@ -324,11 +324,10 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 size,
                 size,
             )
-            components[f"model_prefill_{size}"] = self._make_model_static(
+            yield f"model_prefill_{size}", self._make_model_static(
                 source_model,
                 chunk_len=size,
             )
-        return components
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
         self._patch_static_model(model_path, component)
