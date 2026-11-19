@@ -112,7 +112,7 @@ export TORQ_COMPILER_PATH=/path/to/torq-compile
 | `--trim-vocab` | Trim the static-export vocab to selected token groups (+ safety tokens); emits `token_id_lut.npy` |
 | `--trim-vocab-groups {latin,punct,digits,digits-non-latin,other}` | Groups to keep with `--trim-vocab` (default: `latin punct digits`) |
 | `--split-lm-head` | Emit the LM head as a separate `lm_head.onnx`; the main model is then written as **`transformer.onnx`** and outputs hidden states instead of logits. **On by default** — opt out with `--no-split-lm-head` |
-| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens (default: `64`; pass `0` to disable). Requires `--split-lm-head` (on by default) |
+| `--batch-prefill N` | Also emit a fixed-shape `transformer_prefill.onnx` that processes N tokens (default: `64`; pass `0` to disable). Requires `--split-lm-head` (on by default). Skipped above 256 tokens of context (`--max-gen-tokens`), where prompts are prefilled one token at a time |
 | `--keep-individual-kv-io` | Keep separate key/value tensors instead of combining KV I/O |
 | `--no-read-only-kv-cache` | Export the pre-2.4 KV caches (head-major, written back whole every step). By default the time-major caches are read-only inputs and the models output only the new rows; see the [Qwen README](../qwen/README.md#read-only-kv-cache) |
 | `--hf-repo / --hf-repo-subdir` | Override the HuggingFace source repo |

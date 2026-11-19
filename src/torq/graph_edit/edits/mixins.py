@@ -31,6 +31,7 @@ from .transformer import (
     ConvertToStaticIndex,
     GroupQueryHeads,
     MaskFutureAttentionScores,
+    PrecomputeRotaryTables,
     ReadOnlyKVCache,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
@@ -147,6 +148,10 @@ class CommonGraphEditsMixin:
 
     def read_only_kv_cache(self, num_heads: int, num_kv_heads: int, head_dim: int, chunk_len: int = 1, sliding_window: int | None = None, sliding_layers: frozenset[int] = frozenset(), ring_buffer: bool = False):
         self.apply_edit(ReadOnlyKVCache(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim, chunk_len, sliding_window, sliding_layers, ring_buffer))
+        return self
+
+    def precompute_rotary_tables(self, max_positions: int):
+        self.apply_edit(PrecomputeRotaryTables(self._graph, self._graph_name, max_positions))
         return self
 
     def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):

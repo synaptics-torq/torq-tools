@@ -15,6 +15,7 @@ import argparse
 
 import pytest
 
+from torq.model_export.onnx import legacy_batch_prefill
 from torq.models.gemma3 import add_gemma3_export_args
 from torq.models.liquid import add_liquid_export_args, add_liquid_vl_export_args
 from torq.models.moonshine import add_moonshine_export_args
@@ -59,3 +60,8 @@ def test_split_lm_head_on_and_batch_prefill_default(name, add_args):
     off = _parse(add_args, "--no-split-lm-head", "--batch-prefill", "0")
     assert off.split_lm_head is False
     assert off.batch_prefill == 0
+
+
+@pytest.mark.parametrize(("batch_prefill", "capacity", "expected"), [(64, 256, 64), (64, 1024, None), (None, 1024, None)])
+def test_legacy_batch_prefill_needs_exact_bf16_positions(batch_prefill, capacity, expected):
+    assert legacy_batch_prefill(batch_prefill, capacity) == expected

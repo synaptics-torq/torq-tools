@@ -26,8 +26,9 @@ from ._trim_vocab import (
     build_trimmed_vocab_spec,
     load_json,
 )
+from ...graph_edit.edits import PrecomputeRotaryTables
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig, legacy_batch_prefill
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
 from ...utils.onnx import load_onnx_lazy, validate_onnx_source_dir
@@ -159,7 +160,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     "`--batch-prefill` requires `--split-lm-head` "
                     "(disable the prefill export with `--batch-prefill 0`)"
                 )
-        self._batch_prefill = batch_prefill
+        self._batch_prefill = legacy_batch_prefill(batch_prefill, max_gen_tokens)
 
         opt_config = ORTOptimizerConfig(
             num_heads=self._config.num_attention_heads,
@@ -362,6 +363,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         ]
 
         patch = [
+            EditSpec("PrecomputeRotaryTables", (self._max_gen_tokens,)),
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("CollapseGQABroadcast"),
@@ -627,7 +629,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 str(model_path), bits, " (GPTQ)" if self._gptq_checkpoint else "",
             )
             model = onnx.load(str(model_path), load_external_data=True)
-            quantizer = WeightQuantizer()
+            quantizer = WeightQuantizer(skip_layers=[PrecomputeRotaryTables.TABLE_NAME])
             matmul_info = quantizer._find_matmul_weights(model)
             precomputed = None
             if self._gptq_checkpoint is not None:

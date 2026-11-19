@@ -6,7 +6,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph
+from support.graph_edit import clone_graph, graph, run_model
 from torq.graph_edit import OnnxGraphEditor
 from torq.graph_edit.edits.transformer import (
     AddCurrLenInput,
@@ -14,6 +14,7 @@ from torq.graph_edit.edits.transformer import (
     CombineKVCacheMixin,
     ConvertToStaticIndex,
     MaskFutureAttentionScores,
+    PrecomputeRotaryTables,
     ReplaceDynamicKVCache,
     RetargetCrossAttnKeyLayout,
 )
@@ -227,3 +228,54 @@ def test_combine_kv_io_tensors_replaces_key_value_inputs_with_combined_input():
     assert key_use.inputs[0].name == "past_key_values.0.key_from_combined"
     assert value_use.inputs[0].name == "past_key_values.0.value_from_combined"
     assert [o.name for o in editor.graph.outputs] == ["present.0.key_value"]
+
+
+def _rotary_graph(chunk: int) -> gs.Graph:
+    """Two layers computing the same RoPE from shared int positions, plus a Sin of a float input."""
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, chunk])
+    pos3d = gs.Variable("pos3d", dtype=np.int64, shape=[1, 1, chunk])
+    x = gs.Variable("x", dtype=np.float32, shape=[1, chunk, 8])
+    inv_freq = np.array([1.0, 0.1, 0.01, 0.001], dtype=np.float32).reshape(1, 4, 1)
+    nodes = [gs.Node("Unsqueeze", "Unsqueeze", inputs=[positions, gs.Constant("axis", np.array([1]))], outputs=[pos3d])]
+    outputs = []
+    for layer in range(2):
+        p = f"/model/layers.{layer}/rope"
+        t = [gs.Variable(f"{p}/{name}") for name in ("posf", "angles", "angles_t", "full")]
+        nodes += [
+            gs.Node("Cast", f"{p}/Cast", attrs={"to": onnx.TensorProto.FLOAT}, inputs=[pos3d], outputs=[t[0]]),
+            gs.Node("MatMul", f"{p}/MatMul", inputs=[gs.Constant(f"{p}/inv_freq", inv_freq), t[0]], outputs=[t[1]]),
+            gs.Node("Transpose", f"{p}/Transpose", attrs={"perm": [0, 2, 1]}, inputs=[t[1]], outputs=[t[2]]),
+            gs.Node("Concat", f"{p}/Concat", attrs={"axis": -1}, inputs=[t[2], t[2]], outputs=[t[3]]),
+        ]
+        for op in ("Sin", "Cos"):
+            raw, out = gs.Variable(f"{p}/{op}_out", dtype=np.float32), gs.Variable(f"{p}/{op}_x", dtype=np.float32, shape=[1, chunk, 8])
+            nodes += [gs.Node(op, f"{p}/{op}", inputs=[t[3]], outputs=[raw]), gs.Node("Mul", f"{p}/{op}_mul", inputs=[raw, x], outputs=[out])]
+            outputs.append(out)
+    float_sin = gs.Variable("x_sin", dtype=np.float32, shape=[1, chunk, 8])
+    nodes.append(gs.Node("Sin", "x_sin", inputs=[x], outputs=[float_sin]))
+    return graph(nodes=nodes, inputs=[positions, x], outputs=outputs + [float_sin])
+
+
+@pytest.mark.parametrize("chunk", [1, 3])
+def test_precompute_rotary_tables_matches_computed_rope(chunk):
+    g = _rotary_graph(chunk)
+    before = clone_graph(g)
+    edit = PrecomputeRotaryTables(g, "unit", max_positions=1024)
+    for node in list(g.nodes):
+        edit(node)
+    g.cleanup().toposort()
+
+    assert [node.name for node in g.nodes if node.op in ("Sin", "Cos")] == ["x_sin"]
+    tables = [node.inputs[1].values for node in g.nodes if PrecomputeRotaryTables.TABLE_NAME in node.name]
+    assert [table.shape for table in tables] == [(32, 8)] * 4  # cos/sin of 32 high and 32 low digits, shared by both layers
+    x = np.random.default_rng(0).standard_normal((1, chunk, 8)).astype(np.float32)
+    for start in (0, 300, 1024 - chunk):
+        feeds = {"position_ids": np.arange(start, start + chunk).reshape(1, chunk), "x": x}
+        for expected, actual in zip(run_model(before, feeds).values(), run_model(g, feeds).values()):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_precompute_rotary_tables_keeps_exact_bf16_capacities():
+    g = _rotary_graph(1)
+    edit = PrecomputeRotaryTables(g, "unit", max_positions=PrecomputeRotaryTables.EXACT_BF16_POSITIONS)
+    assert not any(edit.match(node) for node in g.nodes)

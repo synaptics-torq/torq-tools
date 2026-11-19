@@ -25,6 +25,7 @@ from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
+from ...graph_edit.edits import PrecomputeRotaryTables
 from ...utils.compile import (
     export_torq as compile_torq_model,
     get_iree_version,
@@ -458,6 +459,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 str(embeddings_npy),
             )
 
+        editor.precompute_rotary_tables(self._max_gen_tokens)
         editor.eliminate_transposes()
         editor.collapse_reshape_chains()
         editor.fold_scalar_matmul()
@@ -1070,7 +1072,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                     model_path=inferred_fp32_path,
                     output_path=converted_model_path,
                     # One-hot rotary table lookups are not weight MatMuls.
-                    skip_layers=["rotary_emb_cache_"],
+                    skip_layers=["rotary_emb_cache_", PrecomputeRotaryTables.TABLE_NAME],
                 )
 
                 # Reuse the already shape-inferred model instead of loading

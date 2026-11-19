@@ -48,6 +48,7 @@ from ...graph_edit.harness import GraphEditHarness, render_graph_edit_plan
 from ...model_export.onnx import (
     OnnxModelExporterBase,
     TORQ_MAX_NSS_PROGRAMS_SIZE,
+    legacy_batch_prefill,
 )
 
 
@@ -134,7 +135,7 @@ class LiquidVLModelExporter(LiquidModelExporter):
                 raise ValueError("`--batch-prefill` requires `--split-lm-head`")
             if not static_models:
                 raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
-        self._batch_prefill = batch_prefill
+        self._batch_prefill = legacy_batch_prefill(batch_prefill, max_gen_tokens)
         self._onnx_source_dir = onnx_source_dir
         self._model_size = "450m-vl"
         self._hf_repo = HF_REPO_VL

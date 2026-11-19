@@ -131,6 +131,7 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
             EditSpec("ConvertToStaticIndex"),
         ]
         patch = [
+            EditSpec("PrecomputeRotaryTables", (self._max_gen_tokens,)),
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("FoldScalarMatMul"),

@@ -3,12 +3,14 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
+import math
 import re
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
+from ...utils.ort import make_cpu_session
 from ..onnx import OnnxGraphEdit, rewire_consumers
 
 
@@ -1146,6 +1148,173 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         node.outputs.clear()
 
         self._logger.debug("Made the KV cache '%s' read-only at '%s'", cache.name, node.name)
+
+
+@dataclass
+class PrecomputeRotaryTables(OnnxGraphEdit):
+    """
+    Replace rotary ``Sin``/``Cos`` of integer positions with exact table lookups.
+
+    Exports compute rotary angles as ``float(position) * inv_freq``. In bf16 the
+    position and the angle keep 8 mantissa bits, so positions above 256 lose their
+    phase. For each ``Sin``/``Cos`` whose angle is linear in one integer tensor, the
+    edit splits each position ``p < max_positions`` into ``p = B * h + l`` and
+    selects cos/sin of both partial angles from fp64 tables with one-hot MatMuls,
+    which are exact in any dtype (Torq has no NPU lowering for a data-dependent
+    Gather). The angle-addition identities combine the parts. The tables and one-hot
+    vectors have about ``sqrt(max_positions)`` rows, and equal angles share them.
+    Weight quantizers must skip the MatMuls whose names contain ``TABLE_NAME``.
+    Capacities up to ``EXACT_BF16_POSITIONS`` keep their graphs: bf16 holds those
+    positions exactly.
+
+    Args:
+        max_positions (int): Number of supported positions
+    """
+
+    TABLE_NAME = "/rotary_table"
+    EXACT_BF16_POSITIONS = 256
+
+    max_positions: int
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._base = math.isqrt(self.max_positions - 1) + 1
+        self._onehots: dict[str, tuple[gs.Variable, gs.Variable]] = {}
+        self._parts: dict[tuple[str, bytes, bytes], dict[str, gs.Variable]] = {}
+
+    def match(self, node: gs.Node) -> bool:
+        return self.max_positions > self.EXACT_BF16_POSITIONS and node.op in ("Sin", "Cos")
+
+    @staticmethod
+    def _np_dtype(tensor: gs.Variable) -> np.dtype | None:
+        if isinstance(tensor.dtype, int):
+            return onnx.helper.tensor_dtype_to_np_dtype(tensor.dtype)
+        return None if tensor.dtype is None else np.dtype(tensor.dtype)
+
+    @classmethod
+    def _position_subgraph(cls, node: gs.Node) -> tuple[gs.Variable, list[gs.Node]] | None:
+        nodes: dict[str, gs.Node] = {}
+        leaves: dict[str, gs.Variable] = {}
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.name in nodes:
+                continue
+            nodes[current.name] = current
+            for tensor in current.inputs:
+                if isinstance(tensor, gs.Constant) or not tensor.name:
+                    continue
+                if (dtype := cls._np_dtype(tensor)) is not None and np.issubdtype(dtype, np.integer):
+                    leaves[tensor.name] = tensor
+                elif not tensor.inputs:
+                    return None
+                else:
+                    stack.append(tensor.inputs[0])
+        positions = next(iter(leaves.values())) if len(leaves) == 1 else None
+        if positions is None or positions.shape is None or not all(isinstance(d, int) for d in positions.shape):
+            return None
+        return positions, list(nodes.values())
+
+    def _angles(self, positions: gs.Variable, nodes: list[gs.Node], angle: gs.Variable) -> tuple[np.ndarray, tuple[int, ...]]:
+        model = gs.export_onnx(gs.Graph(nodes=nodes, inputs=[positions], outputs=[angle], opset=self.graph.opset))
+        session = make_cpu_session(model.SerializeToString())
+        shape, count = positions.shape, int(np.prod(positions.shape))
+        run = lambda ids: session.run(None, {positions.name: ids.astype(self._np_dtype(positions)).reshape(shape)})[0]
+        out_shape = run(np.arange(count)).shape
+        rows = [run(np.arange(start, start + count)).reshape(count, -1) for start in range(0, self.max_positions, count)]
+        # Row i must depend only on flattened position i.
+        if not np.array_equal(run(np.arange(count)[::-1]).reshape(count, -1), rows[0][::-1]):
+            raise ValueError(f"{angle.name!r} is not position-major in {positions.name!r}")
+        return np.concatenate(rows)[:self.max_positions], out_shape
+
+    def _onehot(self, name: str, digits: gs.Variable, size: int, dtype: np.dtype) -> gs.Variable:
+        mask = self.graph.layer(
+            name=name + "/Equal", op="Equal", inputs=[digits, np.arange(size, dtype=digits.dtype)],
+            outputs=[gs.Variable(name + "/mask", dtype=np.bool_, shape=[digits.shape[0], size])],
+        )[0]
+        return self.graph.layer(
+            name=name + "/Cast", op="Cast", attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(dtype)},
+            inputs=[mask], outputs=[gs.Variable(name, dtype=dtype, shape=[digits.shape[0], size])],
+        )[0]
+
+    def _digit_onehots(self, positions: gs.Variable, count: int, dtype: np.dtype) -> tuple[gs.Variable, gs.Variable]:
+        if positions.name not in self._onehots:
+            base, int_dtype = f"{positions.name}/rotary_onehot", self._np_dtype(positions)
+            radix = np.array([self._base], dtype=int_dtype)
+            layer = lambda op, suffix, inputs: self.graph.layer(
+                name=base + suffix, op=op, inputs=inputs,
+                outputs=[gs.Variable(base + suffix + "_out", dtype=int_dtype, shape=[count, 1])],
+            )[0]
+            flat = layer("Reshape", "/positions", [positions, np.array([count, 1], dtype=np.int64)])
+            high = layer("Div", "/high", [flat, radix])
+            low = layer("Sub", "/low", [flat, layer("Mul", "/high_scaled", [high, radix])])
+            rows = -(-self.max_positions // self._base)
+            self._onehots[positions.name] = (
+                self._onehot(base + "/high_onehot", high, rows, dtype),
+                self._onehot(base + "/low_onehot", low, self._base, dtype),
+            )
+        return self._onehots[positions.name]
+
+    def _angle_parts(self, positions: gs.Variable, count: int, offset: np.ndarray, step: np.ndarray, dtype: np.dtype) -> dict[str, gs.Variable]:
+        key = (positions.name, offset.tobytes(), step.tobytes())
+        if key not in self._parts:
+            high, low = self._digit_onehots(positions, count, dtype)
+            rows = np.arange(high.shape[1])[:, None] * self._base
+            angles = {"high": offset + rows * step, "low": np.arange(self._base)[:, None] * step}
+            parts = {}
+            for part, onehot in (("high", high), ("low", low)):
+                for fn in ("cos", "sin"):
+                    name = f"{positions.name}{self.TABLE_NAME}_{len(self._parts)}/{fn}_{part}"
+                    table = getattr(np, fn)(angles[part]).astype(dtype)
+                    parts[f"{fn}_{part}"] = self.graph.layer(
+                        name=name, op="MatMul", inputs=[onehot, gs.Constant(name, table)],
+                        outputs=[gs.Variable(name + "_selected", dtype=dtype, shape=[count, table.shape[1]])],
+                    )[0]
+            self._parts[key] = parts
+        return self._parts[key]
+
+    def transform(self, node: gs.Node):
+        angle = node.inputs[0]
+        found = self._position_subgraph(angle.inputs[0]) if angle.inputs else None
+        if found is None:
+            self._logger.debug("'%s' does not depend on positions only, skipping", node.name)
+            return
+        positions, nodes = found
+        angle.dtype = angle.dtype or node.outputs[0].dtype
+        angles, shape = self._angles(positions, nodes, angle)
+        count, dtype = int(np.prod(positions.shape)), angles.dtype
+        angles = angles.astype(np.float64)
+        offset, step = angles[0], (angles[-1] - angles[0]) / (len(angles) - 1)
+        if not np.allclose(angles, offset + np.arange(len(angles))[:, None] * step, rtol=1e-5, atol=1e-5):
+            self._logger.warning("'%s' angle is not linear in '%s', skipping", node.name, positions.name)
+            return
+
+        p = self._angle_parts(positions, count, offset, step, dtype)
+        # cos(a + b) = cos a cos b - sin a sin b;  sin(a + b) = sin a cos b + cos a sin b
+        if node.op == "Cos":
+            pairs, combine = ((p["cos_high"], p["cos_low"]), (p["sin_high"], p["sin_low"])), "Sub"
+        else:
+            pairs, combine = ((p["sin_high"], p["cos_low"]), (p["cos_high"], p["sin_low"])), "Add"
+        terms = [
+            self.graph.layer(
+                name=f"{node.name}/rotary_term{i}", op="Mul", inputs=list(pair),
+                outputs=[gs.Variable(f"{node.name}/rotary_term{i}_out", dtype=dtype, shape=[count, angles.shape[1]])],
+            )[0]
+            for i, pair in enumerate(pairs)
+        ]
+        combined = self.graph.layer(
+            name=f"{node.name}/rotary_{combine.lower()}", op=combine, inputs=terms,
+            outputs=[gs.Variable(f"{node.name}/rotary_combined", dtype=dtype, shape=[count, angles.shape[1]])],
+        )[0]
+        out = node.outputs[0]
+        replacement = self.graph.layer(
+            name=node.name + "/rotary_reshape", op="Reshape", inputs=[combined, np.array(shape, dtype=np.int64)],
+            outputs=[gs.Variable(out.name + "_table", dtype=dtype, shape=list(shape))],
+        )[0]
+        rewire_consumers(out.outputs.copy(), out, replacement)
+        node.outputs.clear()
+        self._logger.debug("Replaced '%s' with %d-position rotary tables", node.name, self.max_positions)
+
 
 class CombineKVCacheMixin:
     """
