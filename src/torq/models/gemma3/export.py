@@ -28,7 +28,7 @@ from ._trim_vocab import (
 )
 from ...graph_edit.edits import PrecomputeRotaryTables
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig, legacy_batch_prefill
+from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
 from ...model_export.hf import optimum_export_onnx, hf_download_source_model
 from ...utils.onnx import load_onnx_lazy, validate_onnx_source_dir
@@ -160,7 +160,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     "`--batch-prefill` requires `--split-lm-head` "
                     "(disable the prefill export with `--batch-prefill 0`)"
                 )
-        self._batch_prefill = legacy_batch_prefill(batch_prefill, max_gen_tokens)
+        self._batch_prefill = batch_prefill
 
         opt_config = ORTOptimizerConfig(
             num_heads=self._config.num_attention_heads,

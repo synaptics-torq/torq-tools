@@ -45,7 +45,6 @@ from ..utils.onnx import (
     save_onnx,
 )
 from .cleanup import cleanup_onnx_model
-from ..graph_edit.edits import PrecomputeRotaryTables
 from ..graph_edit.harness import EditSpec, GraphEditHarness
 
 __all__ = [
@@ -66,23 +65,6 @@ FP_EXPORT_DTYPE_MAPPING: Final[dict] = {
     "fp16" : onnx.TensorProto.FLOAT16,
     "bf16" : onnx.TensorProto.BFLOAT16
 }
-
-
-def legacy_batch_prefill(batch_prefill: int | None, max_gen_tokens: int) -> int | None:
-    """
-    The ``--batch-prefill N`` chunk size, or ``None`` above the exact bf16 position range.
-
-    Above it, ``PrecomputeRotaryTables`` replaces the rotary subgraph, and torq-compiler
-    2.3.0 then miscompiles the chunked prefill attention. Prompts are prefilled one token
-    at a time instead.
-    """
-    if batch_prefill is not None and max_gen_tokens > PrecomputeRotaryTables.EXACT_BF16_POSITIONS:
-        logging.getLogger(__name__).warning(
-            "Skipping the %d-token prefill model: it is unsupported above %d tokens of context (`--max-gen-tokens` %d)",
-            batch_prefill, PrecomputeRotaryTables.EXACT_BF16_POSITIONS, max_gen_tokens,
-        )
-        return None
-    return batch_prefill
 
 
 @dataclass

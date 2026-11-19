@@ -49,7 +49,7 @@ from ._graph import LiquidOnnxGraphEditor
 from ._inference import LiquidDynamic, LiquidStatic
 from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig, legacy_batch_prefill
+from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...utils.onnx import external_data_cwd
 
 
@@ -153,7 +153,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 )
             if not static_models:
                 raise ValueError("`--batch-prefill` is currently supported only for static LFM exports")
-        self._batch_prefill = legacy_batch_prefill(batch_prefill, max_gen_tokens)
+        self._batch_prefill = batch_prefill
 
         # Read config so we know architecture params; do this directly from
         # the source dir if a config.json is present, otherwise from HF.
