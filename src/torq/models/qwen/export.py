@@ -387,7 +387,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             .convert_to_static_index()
         )
 
-        editor.resolve_static_shape_inputs()
+        editor.freeze_shape_seeds()
 
         static_model = editor.to_onnx(
             override_ir=model.ir_version,
@@ -565,7 +565,7 @@ class QwenModelExporter(OnnxModelExporterBase):
 
         editor.reorder_graph_input("position_ids", 1)
 
-        editor.resolve_static_shape_inputs()
+        editor.freeze_shape_seeds()
         editor.replace_current_len_squeeze()
 
         if self._split_model:
@@ -797,7 +797,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 self._onnx_export_dtype,
             )
 
-            editor.resolve_static_shape_inputs()
+            editor.freeze_shape_seeds()
 
             resolved_model = editor.to_onnx(
                 override_ir=inferred_model.ir_version,
@@ -1154,7 +1154,6 @@ class QwenModelExporter(OnnxModelExporterBase):
                     converted_model,
                     self._onnx_export_dtype,
                 )
-                converted_editor.convert_static_shape_params_to_int32()
 
                 if model_path.name != "lm_head.onnx":
                     converted_editor.split_rope_qk(
@@ -1163,7 +1162,10 @@ class QwenModelExporter(OnnxModelExporterBase):
                         // self._config.num_attention_heads
                     )
 
+                # Torq takes int32 shape parameters, which ONNX shape inference rejects.
                 converted_model = converted_editor.to_onnx(
+                    check_type=False,
+                    strict_mode=False,
                     override_ir=converted_model.ir_version,
                 )
 

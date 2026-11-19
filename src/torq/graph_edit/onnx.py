@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -16,9 +15,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
-from onnx import helper, numpy_helper, shape_inference, TensorProto
+from onnx import helper, numpy_helper, shape_inference
+from onnx.external_data_helper import uses_external_data
 
-from ..utils.onnx import drop_empty_name_value_info
+from ..utils.onnx import drop_empty_name_value_info, infer_shapes, strip_weights
 
 if TYPE_CHECKING:
     from .harness import EditSpec, GraphEditHarness
@@ -191,7 +191,7 @@ class OnnxGraphEditor:
         ).toposort()
         if self._is_rnn:
             self.restore_rnn_output_arity(self._graph)
-        onnx_model = onnx.shape_inference.infer_shapes(
+        onnx_model = infer_shapes(
             gs.export_onnx(self._graph),
             check_type=check_type,
             strict_mode=strict_mode,
@@ -254,7 +254,7 @@ class OnnxGraphEditor:
             return
         model = gs.export_onnx(self._graph)
         try:
-            model = onnx.shape_inference.infer_shapes(
+            model = infer_shapes(
                 model, check_type=False, strict_mode=False, data_prop=False
             )
             drop_empty_name_value_info(model)
@@ -324,7 +324,7 @@ class OnnxGraphEditor:
         return self
 
     def _infer_shapes(self):
-        model = onnx.shape_inference.infer_shapes(
+        model = infer_shapes(
             gs.export_onnx(self._graph),
             check_type=True,
             strict_mode=True,
@@ -423,60 +423,40 @@ class OnnxGraphEditor:
             )
         return self
 
-    def freeze_shape_seeds(
-        self,
-        input_shapes: Mapping[str, Sequence[int]]
-    ):
-        """Constant-fold shape-arithmetic subgraphs feeding Reshape/Expand/Slice/Pad.
+    def freeze_shape_seeds(self):
+        """Constant-fold the shape arithmetic feeding Reshape/Expand/Slice/Pad.
 
-        Evaluates each shape-control input under onnxruntime with zero-valued
-        feeds (only shape arithmetic matters), replaces consumers with frozen
-        initializers, and prunes the now-orphan shape-computation nodes.
+        An input is frozen when shape ops alone compute it from constants and
+        static tensor shapes (``Shape`` of a statically shaped tensor), so
+        anything that depends on graph input values stays dynamic. Only that
+        shape subgraph runs under onnxruntime, which keeps this cheap for
+        models of any size. Frozen inputs let shape inference resolve more
+        tensors, so this repeats until nothing more can be frozen.
         """
-        if not input_shapes:
-            self._logger.debug("no input_shapes given; freeze_shape_seeds is a no-op")
-            return self
-
+        # Only shapes and small constants matter: work on a weight-free copy.
         model = gs.export_onnx(self._graph)
-        try:
-            model = shape_inference.infer_shapes(model)
-        except Exception as exc:
-            self._logger.debug("pre-pass shape_inference skipped: %s", exc)
-
-        seeds = _find_shape_seed_tensors(model)
-        producer, initializers, graph_inputs = _build_value_maps(model)
-        seen: set[str] = set()
-        candidates: list[str] = []
-        for s in seeds:
-            if not s or s in seen or s in initializers or s in graph_inputs:
-                continue
-            seen.add(s)
-            p = producer.get(s)
-            if p is not None and p.op_type in _SHAPE_OPS:
-                candidates.append(s)
-        if not candidates:
+        strip_weights(model)
+        frozen: dict[str, np.ndarray] = {}
+        while True:
+            try:
+                model = shape_inference.infer_shapes(model)
+            except Exception as exc:
+                self._logger.debug("shape_inference skipped: %s", exc)
+            if not (newly_frozen := _freeze_shape_round(model)):
+                break
+            frozen.update(newly_frozen)
+        if not frozen:
             return self
 
-        feeds = {
-            name: np.zeros(tuple(shape), dtype=np.float32)
-            for name, shape in input_shapes.items()
-        }
-        for s in candidates:
-            p = producer[s]
-            self._logger.debug("freeze seed %s <- %s (%s)", s, p.name, p.op_type)
-
-        # _evaluate_shape_seed_tensors deepcopies internally, so it's safe to
-        # mutate `model` afterwards.
-        frozen = _evaluate_shape_seed_tensors(model, candidates, feeds)
-        _replace_consumers_with_frozen_initializers(model, frozen)
-        _prune_dead_shape_nodes(model)
-
-        try:
-            model = shape_inference.infer_shapes(model)
-        except Exception as exc:
-            self._logger.debug("post-pass shape_inference skipped: %s", exc)
-        self._logger.debug("froze %d shape seed(s)", len(frozen))
-        self._graph = gs.import_onnx(model)
+        tensors = self._graph.tensors()
+        for name, value in frozen.items():
+            rewire_consumers(list(tensors[name].outputs), tensors[name], gs.Constant(f"{name}__frozen", value))
+        # Carry the now-static shapes over to the graph.
+        annotated = gs.import_onnx(model).tensors()
+        for name, tensor in self._graph.cleanup().toposort().tensors().items():
+            if isinstance(tensor, gs.Variable) and isinstance(annotated.get(name), gs.Variable):
+                tensor.shape, tensor.dtype = annotated[name].shape, annotated[name].dtype
+        self._logger.info("Froze %d shape inputs", len(frozen))
         return self
 
 
@@ -524,7 +504,7 @@ def _build_value_maps(model: onnx.ModelProto):
         for out in node.output:
             if out:
                 producer[out] = node
-    initializers = {init.name for init in model.graph.initializer}
+    initializers = {init.name: init for init in model.graph.initializer}
     graph_inputs = {i.name for i in model.graph.input}
     return producer, initializers, graph_inputs
 
@@ -557,36 +537,77 @@ def _find_shape_seed_tensors(model: onnx.ModelProto) -> list[str]:
 _PROBE_MAX_IR_VERSION = 11
 
 
-def _evaluate_shape_seed_tensors(
-    model: onnx.ModelProto,
-    tensor_names: list[str],
-    feeds: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    """Run the model with the named tensors exposed via Identity probes."""
+def _freeze_shape_round(model: onnx.ModelProto) -> dict[str, np.ndarray]:
+    """Freeze the currently foldable shape inputs of ``model`` in place."""
+    producer, initializers, graph_inputs = _build_value_maps(model)
+    shapes = _static_shapes(model)
+    constants: list[onnx.NodeProto] = []
+    kept: set[str] = set()
+    used_initializers: set[str] = set()
+    memo: dict[str, bool] = {}
+
+    def foldable(name: str) -> bool:
+        if not name:
+            return True
+        if name not in memo:
+            memo[name] = False
+            memo[name] = _foldable(name)
+        return memo[name]
+
+    def _foldable(name: str) -> bool:
+        if name in initializers:
+            if uses_external_data(initializers[name]):
+                return False
+            used_initializers.add(name)
+            return True
+        node = producer.get(name)
+        if node is None or node.op_type not in _SHAPE_OPS:
+            return False
+        if node.op_type == "Shape" and node.input[0] in shapes:
+            attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+            dims = shapes[node.input[0]][attrs.get("start", 0):attrs.get("end")]
+            value = numpy_helper.from_array(np.array(dims, dtype=np.int64))
+            constants.append(helper.make_node("Constant", [], [name], value=value))
+            return True
+        if not all(foldable(i) for i in node.input):
+            return False
+        kept.add(name)
+        return True
+
+    candidates = [
+        s for s in dict.fromkeys(_find_shape_seed_tensors(model))
+        if s and s not in initializers and s not in graph_inputs and foldable(s)
+    ]
+    if not candidates:
+        return {}
+
+    probe = helper.make_model(
+        helper.make_graph(
+            constants + [n for n in model.graph.node if n.output[0] in kept],
+            "shape_probe",
+            [],
+            [onnx.ValueInfoProto(name=s) for s in candidates],
+            [t for t in model.graph.initializer if t.name in used_initializers],
+        ),
+        opset_imports=model.opset_import,
+        ir_version=min(model.ir_version, _PROBE_MAX_IR_VERSION),
+    )
     # Imported locally to avoid a hard dependency at module import time.
     from ..utils.ort import make_cpu_session  # noqa: PLC0415
 
-    probe = copy.deepcopy(model)
-    del probe.graph.output[:]
-    out_names: list[str] = []
-    for i, tname in enumerate(tensor_names):
-        out_name = f"__probe_out_{i}"
-        out_names.append(out_name)
-        probe.graph.node.append(
-            helper.make_node(
-                "Identity", inputs=[tname], outputs=[out_name],
-                name=f"_ProbeIdentity_{i}",
-            )
-        )
-        probe.graph.output.append(
-            helper.make_tensor_value_info(out_name, TensorProto.INT64, None)
-        )
-    probe = shape_inference.infer_shapes(probe)
-    if probe.ir_version > _PROBE_MAX_IR_VERSION:
-        probe.ir_version = _PROBE_MAX_IR_VERSION
-    sess = make_cpu_session(probe.SerializeToString())
-    vals = sess.run(out_names, feeds)
-    return dict(zip(tensor_names, vals))
+    frozen = dict(zip(candidates, make_cpu_session(probe.SerializeToString()).run(None, {})))
+    _replace_consumers_with_frozen_initializers(model, frozen)
+    _prune_dead_shape_nodes(model)
+    return frozen
+
+
+def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    shapes = {t.name: list(t.dims) for t in model.graph.initializer}
+    for vi in [*model.graph.input, *model.graph.value_info, *model.graph.output]:
+        tensor_type = vi.type.tensor_type
+        if tensor_type.HasField("shape") and all(d.HasField("dim_value") for d in tensor_type.shape.dim):
+            shapes[vi.name] = [d.dim_value for d in tensor_type.shape.dim]
+    return shapes
 
 
 def _replace_consumers_with_frozen_initializers(

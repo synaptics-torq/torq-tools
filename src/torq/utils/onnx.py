@@ -45,6 +45,7 @@ __all__ = [
     "load_onnx_lazy",
     "save_onnx",
     "external_data_cwd",
+    "infer_shapes",
     "finalize_torq_ready_onnx",
 ]
 
@@ -631,6 +632,56 @@ def external_data_cwd(model: onnx.ModelProto):
     finally:
         for tensor in lazy:
             tensor.external_data.add(key="basepath", value=basepath)
+
+
+def strip_weights(model: onnx.ModelProto) -> list[tuple]:
+    """Detach initializer data above 1 KiB from ``model``, in place.
+
+    The tensors keep their name, type and shape (marked as external data),
+    which is all shape inference needs. Returns what ``restore_weights``
+    needs to put the data back.
+    """
+    stripped = []
+    for tensor in model.graph.initializer:
+        if tensor.HasField("raw_data") and len(tensor.raw_data) >= _EXTERNAL_DATA_THRESHOLD:
+            entries = [(e.key, e.value) for e in tensor.external_data]
+            stripped.append((tensor, tensor.raw_data, tensor.data_location, entries))
+            tensor.ClearField("raw_data")
+            _set_external_data(tensor, location="__stripped__")
+    return stripped
+
+
+def restore_weights(stripped: list[tuple]) -> None:
+    while stripped:
+        tensor, raw_data, location, entries = stripped.pop()
+        tensor.raw_data = raw_data
+        tensor.data_location = location
+        del tensor.external_data[:]
+        for key, value in entries:
+            tensor.external_data.add(key=key, value=value)
+
+
+def infer_shapes(model: onnx.ModelProto, **kwargs) -> onnx.ModelProto:
+    """``onnx.shape_inference.infer_shapes`` that also works above 2 GiB.
+
+    Inference serializes the model, which protobuf refuses above 2 GiB. It
+    only reads small (shape-parameter) constants, so larger initializer data
+    is stripped while it runs. A model that had data stripped is annotated
+    in place and returned (top-level graph only), which avoids a second copy
+    of its weights.
+    """
+    stripped = strip_weights(model)
+    try:
+        inferred = shape_inference.infer_shapes(model, **kwargs)
+    finally:
+        had_weights = bool(stripped)
+        restore_weights(stripped)
+    if not had_weights:
+        return inferred
+    for field in ("input", "output", "value_info"):
+        model.graph.ClearField(field)
+        getattr(model.graph, field).extend(getattr(inferred.graph, field))
+    return model
 
 
 def _load_lazy_values(self: LazyValues) -> np.ndarray:

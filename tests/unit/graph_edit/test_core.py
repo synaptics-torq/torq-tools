@@ -247,3 +247,46 @@ def test_editor_dump_externalizes_and_discards_weights(tmp_path, split_weights):
         "offset": "0",
         "length": str(weight.nbytes),
     }
+
+
+def test_freeze_shape_seeds_folds_static_shapes_but_not_input_values():
+    x = gs.Variable("x", np.float32, [2, 3, 4])
+    pos = gs.Variable("pos", np.int64, [1])
+    weight = gs.Constant("weight", np.ones((2048,), np.float32))
+    g = gs.Graph(inputs=[x, pos], outputs=[], opset=17)
+    shape = g.layer(op="Shape", inputs=[x], outputs=[gs.Variable("shape", np.int64)], attrs={"start": 0, "end": 2})[0]
+    target = g.layer(op="Concat", inputs=[shape, np.array([-1], np.int64)], outputs=[gs.Variable("target", np.int64)], attrs={"axis": 0})[0]
+    reshaped = g.layer(op="Reshape", inputs=[x, target], outputs=[gs.Variable("reshaped", np.float32)])[0]
+    end = g.layer(op="Add", inputs=[pos, np.array([1], np.int64)], outputs=[gs.Variable("end", np.int64)])[0]
+    sliced = g.layer(op="Slice", inputs=[weight, pos, end], outputs=[gs.Variable("sliced", np.float32)])[0]
+    g.outputs = [reshaped, sliced]
+
+    editor = OnnxGraphEditor(g, "test")
+    editor.freeze_shape_seeds()
+
+    nodes = {node.op: node for node in editor.graph.nodes}
+    assert set(nodes) == {"Reshape", "Add", "Slice"}
+    assert np.array_equal(nodes["Reshape"].inputs[1].values, [2, 3, -1])
+    assert nodes["Slice"].inputs[1].name == "pos"
+    assert np.array_equal(nodes["Slice"].inputs[0].values, weight.values)
+
+
+def test_infer_shapes_detaches_and_restores_large_initializers():
+    from torq.utils.onnx import infer_shapes
+
+    weight = np.arange(1024, dtype=np.float32)
+    model = onnx.helper.make_model(onnx.helper.make_graph(
+        [onnx.helper.make_node("Add", ["x", "w"], ["y"])],
+        "g",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1024])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, None)],
+        [onnx.numpy_helper.from_array(weight, "w")],
+    ))
+
+    inferred = infer_shapes(model)
+
+    assert inferred.graph.output[0].type.tensor_type.shape.dim[0].dim_value == 1024
+    for m in (model, inferred):
+        init = m.graph.initializer[0]
+        assert init.data_location == onnx.TensorProto.DEFAULT and not init.external_data
+        assert np.array_equal(onnx.numpy_helper.to_array(init), weight)

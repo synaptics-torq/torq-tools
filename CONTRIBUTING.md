@@ -56,6 +56,7 @@ A few details make graph edits easier to review and safer to reuse:
 - Keep the changed subgraph as small as practical.
 - Preserve tensor names, shapes, dtypes, and `export_dtype` intentionally.
 - Use `requires_shape_inference = True` when later logic needs inferred shapes; shape inference reimports the graph, so it is worth being deliberate.
+- Use `torq.utils.onnx.infer_shapes` rather than `onnx.shape_inference.infer_shapes`: it also handles models above the 2 GB protobuf limit. To make shape arithmetic static after fixing I/O dimensions, call `OnnxGraphEditor.freeze_shape_seeds()` instead of writing a model-specific evaluator.
 - Let `OnnxGraphEditor` handle cleanup and topological sorting unless the edit creates an artifact that needs an immediate check.
 - Write generated ONNX or NumPy files to `tmp_path` in tests unless the fixture is intentionally stable and shared under `tests/data/graph_edit/`.
 
