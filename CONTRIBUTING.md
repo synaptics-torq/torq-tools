@@ -89,7 +89,7 @@ Model exporters live under `src/torq/models/<model>/` and usually extend `OnnxMo
 The existing model directories use this layout:
 
 - `export.py`: CLI argument handling and the exporter class.
-- `_graph.py`: model-specific `OnnxGraphEditor` subclass and IO-shape helpers. Decoder-only LLMs subclass `DecoderGraphEditor`, which names the graph `model` and includes the common and combined-KV edits; every editor gets `from_onnx` from `OnnxGraphEditor`.
+- `_graph.py`: optional model-specific `OnnxGraphEditor` subclass and IO-shape helpers. Decoder-only exporters using only shared behavior instantiate `DecoderGraphEditor` directly; keep a local subclass only when it adds behavior. `DecoderGraphEditor` names the graph `model` and includes the common and combined-KV edits; every editor gets `from_onnx` from `OnnxGraphEditor`.
 - `_inference.py`: runtime wrappers used for validation and demos.
 - `infer.py` or `validate.py`: user-facing inference and validation entry points.
 

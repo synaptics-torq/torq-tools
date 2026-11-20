@@ -23,9 +23,8 @@ from transformers import AutoConfig
 
 from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
-from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
-from ...graph_edit.edits import PrecomputeRotaryTables, ReplaceLegacyRotaryCache, SplitRotarySlices
+from ...graph_edit.edits import DecoderGraphEditor, PrecomputeRotaryTables, ReplaceLegacyRotaryCache, SplitRotarySlices
 from ...utils.compile import (
     export_torq as compile_torq_model,
     get_iree_version,
@@ -329,7 +328,7 @@ class QwenModelExporter(OnnxModelExporterBase):
 
         graph = gs.import_onnx(model)
 
-        editor = QwenOnnxGraphEditor(
+        editor = DecoderGraphEditor(
             graph,
             self._onnx_export_dtype,
         )
@@ -409,7 +408,7 @@ class QwenModelExporter(OnnxModelExporterBase):
     ) -> None:
         model = onnx.load(model_path)
 
-        editor = QwenOnnxGraphEditor.from_onnx(
+        editor = DecoderGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,
         )
@@ -791,7 +790,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 load_external_data=False,
             )
 
-            editor = QwenOnnxGraphEditor.from_onnx(
+            editor = DecoderGraphEditor.from_onnx(
                 inferred_model,
                 self._onnx_export_dtype,
             )
@@ -1149,7 +1148,7 @@ class QwenModelExporter(OnnxModelExporterBase):
             )
 
             if self._split_lm_head:
-                converted_editor = QwenOnnxGraphEditor.from_onnx(
+                converted_editor = DecoderGraphEditor.from_onnx(
                     converted_model,
                     self._onnx_export_dtype,
                 )

@@ -8,7 +8,7 @@ import pytest
 
 from support.graph_edit import clone_graph, graph, run_model
 from torq.graph_edit.edits.transformer import MaskFutureAttentionScores, ReplaceDynamicKVCache
-from torq.models.qwen._graph import QwenOnnxGraphEditor
+from torq.graph_edit.edits import DecoderGraphEditor
 
 
 pytestmark = [pytest.mark.transformer, pytest.mark.ort]
@@ -130,8 +130,8 @@ def _gqa_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) ->
     return graph(nodes=nodes, inputs=inputs, outputs=[attn, *(n.outputs[0] for n in nodes if n.op == "Concat")])
 
 
-def _static_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> QwenOnnxGraphEditor:
-    editor = QwenOnnxGraphEditor(_gqa_decode_layer(heads, kv_heads, max_len, head_dim), onnx.TensorProto.FLOAT)
+def _static_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> DecoderGraphEditor:
+    editor = DecoderGraphEditor(_gqa_decode_layer(heads, kv_heads, max_len, head_dim), onnx.TensorProto.FLOAT)
     cur_len = editor.graph.layer(
         name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
         outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],
@@ -213,7 +213,7 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk,
     if style == "hf":
         editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
     else:
-        editor = QwenOnnxGraphEditor(_attention_layer(style, heads, kv_heads, max_len, head_dim, chunk), onnx.TensorProto.FLOAT)
+        editor = DecoderGraphEditor(_attention_layer(style, heads, kv_heads, max_len, head_dim, chunk), onnx.TensorProto.FLOAT)
         cur_len = editor.graph.layer(
             name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
             outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],

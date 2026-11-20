@@ -19,14 +19,13 @@ from tokenizers import Tokenizer
 from transformers import AutoConfig
 
 from . import FUNCTIONGEMMA_HF_REPO, GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
-from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
 from ._trim_vocab import (
     TrimmedVocabSpec,
     build_trimmed_vocab_spec,
     load_json,
 )
-from ...graph_edit.edits import PrecomputeRotaryTables
+from ...graph_edit.edits import DecoderGraphEditor, PrecomputeRotaryTables
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
@@ -419,7 +418,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
-        editor = Gemma3OnnxGraphEditor(
+        editor = DecoderGraphEditor(
             graph,
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
@@ -461,7 +460,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _patch_static_model(self, model_path: str | os.PathLike, component: str):
         model = load_onnx_lazy(model_path)
-        editor = Gemma3OnnxGraphEditor.from_onnx(
+        editor = DecoderGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(Path(model_path)),
