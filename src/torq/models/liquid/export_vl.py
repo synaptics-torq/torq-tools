@@ -416,6 +416,10 @@ class LiquidVLModelExporter(LiquidModelExporter):
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
         )
+        self._gqa_seqlen_inputs = {
+            node.inputs[5].name for node in graph.nodes
+            if node.op == "GroupQueryAttention" and len(node.inputs) > 5 and node.inputs[5].name
+        }
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)

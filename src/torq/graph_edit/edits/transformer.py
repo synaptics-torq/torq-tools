@@ -12,15 +12,105 @@ import onnx_graphsurgeon as gs
 
 from ...utils.ort import make_cpu_session
 from ..onnx import OnnxGraphEdit, replace_node, rewire_consumers
+from ._helpers import _const_array, _const_int_list
 
 
-def _is_sliding_layer(node: gs.Node, window: int | None, layers: frozenset[int]) -> bool:
+def _cache_input(graph: gs.Graph, tensor: gs.Tensor) -> gs.Tensor | None:
+    """Unwrap a cache view to its graph input."""
+    while tensor.inputs and tensor.inputs[0].op in ("Slice", "Cast", "Identity"):
+        tensor = tensor.inputs[0].inputs[0]
+    return tensor if any(tensor is inp for inp in graph.inputs) else None
+
+
+def _attention_cache(graph: gs.Graph, softmax: gs.Node) -> gs.Tensor | None:
+    """Find the past input of the cache update read by an attention Softmax."""
+    def unscale(tensor):
+        producer = tensor.inputs[0] if tensor.inputs else None
+        if producer is not None and producer.op in ("Mul", "Div"):
+            for i in (1, 0) if producer.op == "Mul" else (1,):
+                scale = producer.inputs[i]
+                scalar = scale.shape is not None and all(d == 1 for d in scale.shape)
+                if scale.shape is None:
+                    values = _const_array(scale)
+                    scalar = values is not None and values.size == 1
+                if scalar:
+                    return producer.inputs[1 - i]
+        return None
+
+    tensor = softmax.inputs[0]
+    while tensor.inputs:
+        node = tensor.inputs[0]
+        if node.op in ("Add", "Reshape", "Cast"):
+            tensor = node.inputs[0]
+        elif (scaled := unscale(tensor)) is not None:
+            tensor = scaled
+        else:
+            break
+    scores = _producer(tensor, "MatMul")
+    if scores is None:
+        return None
+    # Optimized exports may transpose the score product, putting K first.
+    for tensor in reversed(scores.inputs):
+        while tensor.inputs:
+            node = tensor.inputs[0]
+            if node.op in ("Transpose", "Reshape", "Unsqueeze", "Squeeze", "Expand", "Cast"):
+                tensor = node.inputs[0]
+            elif (scaled := unscale(tensor)) is not None:
+                tensor = scaled
+            elif node.op in ("Where", "Concat"):
+                if node.op == "Concat" and node.attrs.get("axis") not in (-2, 2):
+                    break
+                # The update must also supply a graph cache output (possibly
+                # through the combined-KV Concat), excluding cross-attention.
+                output = node.outputs[0]
+                exposed = any(output is out for out in graph.outputs) or any(
+                    user.op == "Concat" and any(out is user.outputs[0] for out in graph.outputs)
+                    for user in output.outputs
+                )
+                if exposed:
+                    past = node.inputs[2 if node.op == "Where" else 0]
+                    if (cache := _cache_input(graph, past)) is not None:
+                        return cache
+                break
+            else:
+                break
+    return None
+
+
+def _is_sliding_layer(cache: gs.Tensor | None, window: int | None, layers: frozenset[int]) -> bool:
     if window is None:
         return False
-    match = re.search(r"/layers\.(\d+)/self_attn/", node.name)
+    match = re.fullmatch(r"past_key_values\.(\d+)\.(?:key|value|key_value)", cache.name if cache is not None else "")
     if match is None:
-        raise ValueError(f"Cannot determine attention layer from {node.name!r}")
+        raise ValueError(f"Cannot determine attention layer from cache {cache!r}")
     return int(match[1]) in layers
+
+
+def residual_layer_boundaries(graph: gs.Graph, num_layers: int) -> list[gs.Tensor]:
+    """Follow the two residual additions per decoder layer through IO casts."""
+    stream = next((inp for inp in graph.inputs if inp.name in ("token_embedding", "inputs_embeds")), None)
+    if stream is None:
+        embedding = next((node for node in graph.nodes if node.op == "Gather"
+                          and len(node.inputs) == 2 and node.inputs[1].name == "input_ids"), None)
+        stream = embedding.outputs[0] if embedding is not None else None
+    if stream is None:
+        raise ValueError("Cannot find decoder embedding input")
+    boundaries = []
+    for step in range(2 * num_layers):
+        views, additions = [stream], {}
+        for view in views:
+            for user in view.outputs:
+                if user.op in ("Cast", "Identity"):
+                    if not any(user.outputs[0] is seen for seen in views):
+                        views.append(user.outputs[0])
+                elif user.op == "Add" and sum(inp is view for inp in user.inputs) == 1:
+                    additions[id(user)] = user
+        if len(additions) != 1:
+            raise ValueError(f"Expected one residual Add at step {step}, found {len(additions)}")
+        stream = next(iter(additions.values())).outputs[0]
+        if step % 2:
+            boundaries.append(stream)
+    return boundaries
 
 
 @dataclass
@@ -212,19 +302,12 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         - Optimizers may CSE-deduplicate identical masks into one shared tensor
 
     Args (extra):
-        match_shape_fallback (bool): Also match self-attention Softmax nodes
-            whose name doesn't end in ``self_attn/Softmax`` (as in a dynamo
-            export where node names differ), by checking whether the input
-            shape's last dim is ``max_tokens``/``max_tokens + 1``. Off by
-            default to preserve exact matching for existing (non-dynamo)
-            exports.
         chunk_len (int): Number of consecutive query rows to mask
     """
 
     cur_len: gs.Variable
     max_tokens: int
     export_dtype: onnx.TensorProto.DataType
-    match_shape_fallback: bool = False
     chunk_len: int = 1
     sliding_window: int | None = None
     sliding_layers: frozenset[int] = frozenset()
@@ -239,16 +322,7 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Softmax":
-            is_self_attn = node.name.endswith("self_attn/Softmax")
-            if not is_self_attn and self.match_shape_fallback and node.inputs:
-                inp_shape = getattr(node.inputs[0], "shape", None)
-                if inp_shape and len(inp_shape) >= 1:
-                    # Accept max_tokens (after KV replacement) or max_tokens+1 (traced shape)
-                    is_self_attn = inp_shape[-1] in (self.max_tokens, self.max_tokens + 1)
-            if is_self_attn:
-                return isinstance(node.i(), gs.Node)
-        return False
+        return node.op == "Softmax" and bool(node.inputs) and _attention_cache(self.graph, node) is not None
 
     def transform(self, node: gs.Node):
         if not self.export_dtype:
@@ -256,7 +330,7 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
 
         self._check_node_op(node, "Softmax")
 
-        sliding = _is_sliding_layer(node, self.sliding_window, self.sliding_layers)
+        sliding = _is_sliding_layer(_attention_cache(self.graph, node), self.sliding_window, self.sliding_layers)
 
         # create bool mask where positions > cur_len are effectively blocked
         # by being set to a large negative value
@@ -378,26 +452,32 @@ class AddCurrLenInput(OnnxGraphEdit):
 
     cur_len: gs.Variable
 
+    def _gathers(self, node: gs.Node):
+        if node.op != "Shape" or not node.inputs or node.attrs.get("start", 0) != 0 or "end" in node.attrs:
+            return []
+        cache = node.inputs[0]
+        if cache.shape is None or len(cache.shape) != 4 or not any(cache is inp for inp in self.graph.inputs):
+            return []
+        updates = [user for user in cache.outputs if (
+            user.op == "Concat" and user.attrs.get("axis") in (-2, 2) and user.inputs[0] is cache
+        ) or (user.op == "Where" and len(user.inputs) == 3 and user.inputs[2] is cache)]
+        if not any(any(update.outputs[0] is out for out in self.graph.outputs) for update in updates):
+            return []
+        return [user for user in node.outputs[0].outputs
+                if user.op == "Gather" and user.attrs.get("axis", 0) == 0
+                and _const_int_list(user.inputs[1]) == [2]]
+
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
-            return isinstance(node.o(), gs.Node) and node.o().op == "Gather"
-        return False
+        return bool(self._gathers(node))
 
     def transform(self, node: gs.Node):
-        self._check_node_op(node, "Shape")
-        gather_node: gs.Node = node.o()
-        if not isinstance(gather_node, gs.Node) or gather_node.op != "Gather":
-            raise ValueError(f"Expected Gather node after Shape, got {gather_node}")
+        for gather in self._gathers(node):
+            output = gather.outputs[0]
+            rewire_consumers(list(output.outputs), output, self.cur_len)
+            self.graph.outputs = [self.cur_len if out is output else out for out in self.graph.outputs]
+            gather.outputs.clear()
+        self._logger.debug("Replaced dynamic sequence length at '%s'", node.name)
 
-        gather_out: gs.Variable = gather_node.outputs[0]
-        consumers: list[gs.Node] = list(gather_out.outputs)
-        rewire_consumers(consumers, gather_out, self.cur_len)
-
-        # disconnect Shape + Gather branch
-        node.inputs.clear()
-        gather_node.outputs.clear()
-
-        self._logger.debug("Replaced dynamic seq len getter at node '%s'", node.name)
 
 @dataclass
 class ConvertToStaticIndex(OnnxGraphEdit):
@@ -777,7 +857,7 @@ class GroupQueryHeads(OnnxGraphEdit):
         return q, k[1], k_cache, v_cache, mask_add, softmax, context
 
     def match(self, node: gs.Node) -> bool:
-        return node.op == "MatMul" and node.name.endswith("self_attn/MatMul") and self._pattern(node) is not None
+        return node.op == "MatMul" and self._pattern(node) is not None
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "MatMul")
@@ -1049,8 +1129,8 @@ class ReadOnlyKVCache(OnnxGraphEdit):
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Softmax")
-        sliding = _is_sliding_layer(node, self.sliding_window, self.sliding_layers)
         q, k_scale, k_blend, v_blend, cache, present, context = self._pattern(node)
+        sliding = _is_sliding_layer(cache, self.sliding_window, self.sliding_layers)
         base = node.name.rsplit("/", 1)[0] + "/ReadOnlyKV/"
         heads, kv, d, t = self.num_heads, self.num_kv_heads, self.head_dim, self.chunk_len
         rows = heads // kv * t
@@ -1718,7 +1798,7 @@ class CombineKVCacheMixin:
         """
         if not 0 < split_at < num_layers:
             raise ValueError(f"split_at must be between 1 and {num_layers - 1}, got {split_at}")
-        boundary_name = f"/model/layers.{split_at - 1}/Add_1_output_0"
+        boundary_name = residual_layer_boundaries(self._graph, num_layers)[split_at - 1].name
 
         def partition(first_input: str, layers: range, last_output: str) -> gs.Graph:
             # Each partition gets its own independent graph copy.

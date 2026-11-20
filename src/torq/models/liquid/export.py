@@ -47,9 +47,8 @@ _patch_gs_bf16_converter()
 from . import add_liquid_export_args
 from ._graph import LiquidOnnxGraphEditor
 from ._inference import LiquidDynamic, LiquidStatic
-from ...graph_edit import DimMatchType, FixedDimMapping
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
-from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
+from ...model_export.onnx import OnnxModelExporterBase
 from ...utils.onnx import external_data_cwd
 
 
@@ -329,6 +328,11 @@ class LiquidModelExporter(OnnxModelExporterBase):
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
         )
+        # Record the op-defined sequence-length inputs before decomposing GQA.
+        self._gqa_seqlen_inputs = {
+            node.inputs[5].name for node in graph.nodes
+            if node.op == "GroupQueryAttention" and len(node.inputs) > 5 and node.inputs[5].name
+        }
         blocks = self.graph_edit_blocks()
         self._logger.info("Replacing (Skip)SimplifiedLayerNormalization ops...")
         editor.apply_specs(blocks["source.convert (layer norm)"], self._harness)
@@ -512,7 +516,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
                 EditSpec(
                     "MaskFutureAttentionScores",
-                    (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+                    (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), ctx("chunk_len")),
                 ),
                 EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
                 EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
@@ -583,21 +587,16 @@ class LiquidModelExporter(OnnxModelExporterBase):
             outputs=[gs.Variable(cur_len.name + "_squeezed", dtype=np.int64, shape=[])],
         )[0]
 
-        # Rewire any `seqlen_k` chain produced by GQA replacement
-        seqlen_k_candidates = [
-            "/model/attn_mask_reformat/attn_mask_subgraph/Sub/Cast/output_0",
-            "/model/attn_mask_reformat/attn_mask_subgraph/Expand/Cast/output_0",
-        ]
         tensors = graph.tensors()
-        for name in seqlen_k_candidates:
-            if name in tensors:
-                seqlen_k_var = tensors[name]
-                rewire_consumers(list(seqlen_k_var.outputs), seqlen_k_var, cur_len_scalar)
-                self._logger.info("Replaced seqlen_k chain '%s' with position_ids", name)
-                break
-        for name, t in list(tensors.items()):
-            if name.endswith("/seqlen_k_squeezed") and hasattr(t, "outputs"):
-                rewire_consumers(list(t.outputs), t, cur_len_scalar)
+        for name in self._gqa_seqlen_inputs:
+            if (seqlen := tensors.get(name)) is None:
+                continue
+            for user in list(seqlen.outputs):
+                if user.op == "Squeeze":
+                    output = user.outputs[0]
+                    rewire_consumers(list(output.outputs), output, cur_len_scalar)
+                else:
+                    rewire_consumers([user], seqlen, cur_len_scalar)
 
         editor.apply_specs(
             self.graph_edit_blocks()["model.static (KV cache)"],

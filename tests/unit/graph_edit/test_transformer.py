@@ -60,45 +60,55 @@ def test_replace_dynamic_kv_cache_uses_fixed_shape_chunk_placement():
     assert placed.shape == [1, 1, 4, 2]
 
 
-def test_mask_future_attention_scores_inserts_bias_add_when_producer_is_not_add():
+def _cached_attention():
+    q = gs.Variable("query", dtype=np.float32, shape=[1, 1, 1, 2])
+    past = gs.Variable("cache", dtype=np.float32, shape=[1, 1, 3, 2])
+    new = gs.Variable("new", dtype=np.float32, shape=[1, 1, 1, 2])
+    present = gs.Variable("updated", dtype=np.float32, shape=[1, 1, 4, 2])
+    kt = gs.Variable("kt", dtype=np.float32, shape=[1, 1, 2, 4])
     scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
-    pre_softmax = gs.Variable("pre_softmax", dtype=np.float32, shape=[1, 1, 1, 4])
-    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 1, 4])
-    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[pre_softmax])
-    softmax = gs.Node("Softmax", "layer/self_attn/Softmax", inputs=[pre_softmax], outputs=[probs])
-    g = graph(nodes=[identity, softmax], inputs=[scores], outputs=[probs])
+    probs = gs.Variable("probs", dtype=np.float32, shape=scores.shape)
+    nodes = [
+        gs.Node("Concat", "update", inputs=[past, new], outputs=[present], attrs={"axis": -2}),
+        gs.Node("Transpose", "transpose", inputs=[present], outputs=[kt], attrs={"perm": [0, 1, 3, 2]}),
+        gs.Node("MatMul", "scores", inputs=[q, kt], outputs=[scores]),
+        gs.Node("Softmax", "arbitrary_softmax", inputs=[scores], outputs=[probs]),
+    ]
+    return graph(nodes=nodes, inputs=[q, past, new], outputs=[present, probs]), nodes[-1]
 
-    edit = MaskFutureAttentionScores(
-        g,
-        "unit",
-        cur_len=gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1]),
-        max_tokens=4,
-        export_dtype=onnx.TensorProto.FLOAT,
-    )
+
+@pytest.mark.parametrize("static", [False, True])
+def test_mask_future_attention_scores_matches_cache_structure(static):
+    g, softmax = _cached_attention()
+    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1])
+    if static:
+        ReplaceDynamicKVCache(g, "unit", cur_len, 4).transform(g.nodes[0])
+    edit = MaskFutureAttentionScores(g, "unit", cur_len, 4, onnx.TensorProto.FLOAT)
     assert edit.match(softmax)
     edit.transform(softmax)
-
-    assert softmax.inputs[0].name == "layer/self_attn/Softmax_biased"
+    assert softmax.inputs[0].name == "arbitrary_softmax_biased"
     assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
 
 
-def test_mask_future_attention_scores_shape_fallback_requires_opt_in():
-    scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
-    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 1, 4])
-    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[gs.Variable("pre", dtype=np.float32, shape=[1, 1, 1, 4])])
-    softmax = gs.Node("Softmax", "decoder/layer0/Softmax_5", inputs=[identity.outputs[0]], outputs=[probs])
-    g = graph(nodes=[identity, softmax], inputs=[scores], outputs=[probs])
-    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1])
+def test_mask_future_attention_scores_recognizes_unannotated_constant_scale():
+    g, softmax = _cached_attention()
+    scores = softmax.inputs[0]
+    scale, scaled = gs.Variable("scale"), gs.Variable("scaled")
+    g.nodes.extend([
+        gs.Node("Constant", "constant", attrs={"value": gs.Constant("value", np.array(0.5, np.float32))}, outputs=[scale]),
+        gs.Node("Mul", "scale_scores", inputs=[scores, scale], outputs=[scaled]),
+    ])
+    softmax.inputs = [scaled]
+    assert MaskFutureAttentionScores(g, "unit", gs.Variable("position"), 4, onnx.TensorProto.FLOAT).match(softmax)
 
-    default_edit = MaskFutureAttentionScores(g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT)
-    assert not default_edit.match(softmax)
 
-    opted_in_edit = MaskFutureAttentionScores(
-        g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT, match_shape_fallback=True,
-    )
-    assert opted_in_edit.match(softmax)
-    opted_in_edit.transform(softmax)
-    assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
+def test_mask_future_attention_scores_rejects_cross_attention_even_with_legacy_name():
+    g, softmax = _cached_attention()
+    softmax.name = "layer/self_attn/Softmax"
+    transpose = g.nodes[1]
+    transpose.inputs[0] = g.inputs[1]  # Encoder K goes straight to attention.
+    edit = MaskFutureAttentionScores(g, "unit", gs.Variable("position"), 4, onnx.TensorProto.FLOAT)
+    assert not edit.match(softmax)
 
 
 def test_add_curr_len_input_rewires_shape_gather_consumers():
@@ -110,14 +120,16 @@ def test_add_curr_len_input_rewires_shape_gather_consumers():
     gather_node = gs.Node("Gather", "gather", inputs=[shape_out, gs.Constant("axis", np.array(2, dtype=np.int64))], outputs=[gathered])
     add = gs.Node("Add", "use", inputs=[gathered, gs.Constant("zero", np.array(0, dtype=np.int64))], outputs=[out])
     cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[])
-    g = graph(nodes=[shape, gather_node, add], inputs=[pkv, cur_len], outputs=[out])
+    present = gs.Variable("updated_cache", dtype=np.float32)
+    update = gs.Node("Concat", "update", inputs=[pkv, gs.Variable("new")], outputs=[present], attrs={"axis": -2})
+    g = graph(nodes=[shape, gather_node, add, update], inputs=[pkv, cur_len], outputs=[out, present])
 
     edit = AddCurrLenInput(g, "unit", cur_len=cur_len)
     assert edit.match(shape)
     edit.transform(shape)
 
     assert add.inputs[0] is cur_len
-    assert shape.inputs == []
+    assert shape.inputs == [pkv]  # Other Shape consumers remain valid.
     assert gather_node.outputs == []
 
 
@@ -241,11 +253,11 @@ def test_split_transformer_layers_chains_to_full_model():
     for i in range(layers):
         past = gs.Variable(f"past_key_values.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
         present = gs.Variable(f"present.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
-        mixed, out = gs.Variable(f"/model/layers.{i}/Add_output_0"), gs.Variable(f"/model/layers.{i}/Add_1_output_0")
+        mixed, out = gs.Variable(f"mixed_{i}"), gs.Variable(f"boundary_{i}")
         nodes += [
             gs.Node("Add", f"/model/layers.{i}/Add", inputs=[residual, position], outputs=[mixed]),
             gs.Node("Add", f"/model/layers.{i}/Add_1", inputs=[mixed, gs.Constant(f"bias_{i}", np.full(hidden, i, np.float32))], outputs=[out]),
-            gs.Node("Add", f"/model/layers.{i}/cache_update", inputs=[past, out], outputs=[present]),
+            gs.Node("Mul", f"/model/layers.{i}/cache_update", inputs=[past, out], outputs=[present]),
         ]
         caches.append(past)
         presents.append(present)
@@ -262,7 +274,7 @@ def test_split_transformer_layers_chains_to_full_model():
     full = run_model(editor.graph, feeds)
     a = run_model(part_a, {name: feeds[name] for name in ("token_embedding", "position_ids", "past_key_values.0.key_value")})
     b = run_model(part_b, {
-        "/model/layers.0/Add_1_output_0": a["/model/layers.0/Add_1_output_0"],
+        "boundary_0": a["boundary_0"],
         "position_ids": feeds["position_ids"],
         **{f"past_key_values.{i}.key_value": feeds[f"past_key_values.{i}.key_value"] for i in range(1, layers)},
     })

@@ -53,6 +53,7 @@ If the edit should be part of the public graph-edit API, export it from `src/tor
 
 A few details make graph edits easier to review and safer to reuse:
 
+- Match operators, connections, constant parameters and graph interfaces rather than exporter-generated internal names. Keep generated names stable when changing only selection. Attention edits trace the cache update to distinguish self-attention from cross-attention; sliding layers use the cache input index.
 - Keep the changed subgraph as small as practical.
 - Preserve tensor names, shapes, dtypes, and `export_dtype` intentionally.
 - Use `requires_shape_inference = True` when later logic needs inferred shapes; shape inference reimports the graph, so it is worth being deliberate.
@@ -61,6 +62,8 @@ A few details make graph edits easier to review and safer to reuse:
 - Write generated ONNX or NumPy files to `tmp_path` in tests unless the fixture is intentionally stable and shared under `tests/data/graph_edit/`.
 
 ### Graph Edit Tests
+
+For a matching-only change, run A/B edits on the same real model input with `--dump-after-edit` (or the editor’s `dump_path` and `dump_after_edit` arguments). Compare serialized `GraphProto` values exactly, including node order, names, shapes and attributes, and check that each edit matches the expected nonzero node count. Dumps omit weight payloads, so compare initializer values separately in the final models. Include renamed-node and unrelated-pattern cases in unit tests.
 
 Every graph edit should have unit coverage under `tests/unit/graph_edit/test_<domain>.py`. The existing tests build tiny synthetic graphs with `onnx_graphsurgeon` and helpers from `tests/support/graph_edit.py`; that pattern is usually easier to understand than using a full exported model. Good unit tests cover the expected rewrite, no-match behavior, metadata, constants, and useful error paths without requiring ONNX Runtime.
 

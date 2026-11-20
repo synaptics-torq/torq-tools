@@ -25,7 +25,7 @@ from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
-from ...graph_edit.edits import PrecomputeRotaryTables, ReplaceLegacyRotaryCache
+from ...graph_edit.edits import PrecomputeRotaryTables, ReplaceLegacyRotaryCache, SplitRotarySlices
 from ...utils.compile import (
     export_torq as compile_torq_model,
     get_iree_version,
@@ -1155,11 +1155,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 )
 
                 if model_path.name != "lm_head.onnx":
-                    converted_editor.split_rope_qk(
-                        getattr(self._config, "head_dim", None)
-                        or self._config.hidden_size
-                        // self._config.num_attention_heads
-                    )
+                    converted_editor.apply_edit(SplitRotarySlices(converted_editor.graph, "qwen"))
 
                 # Torq takes int32 shape parameters, which ONNX shape inference rejects.
                 converted_model = converted_editor.to_onnx(

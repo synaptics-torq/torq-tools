@@ -356,7 +356,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
             EditSpec(
                 "MaskFutureAttentionScores",
-                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len"), *self._sliding_attention()),
+                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), ctx("chunk_len"), *self._sliding_attention()),
             ),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
             EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),

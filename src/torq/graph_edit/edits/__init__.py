@@ -24,6 +24,7 @@ from .shape import (
     EliminateRank0Gather,
     EliminateSingletonGatherUnsqueeze,
     EliminateTranspose,
+    SplitRotarySlices,
 )
 from .transformer import (
     AddCurrLenInput,
@@ -66,6 +67,7 @@ __all__ = [
     "ComputeDequantizedLUT",
     "EliminateExpand",
     "EliminateTranspose",
+    "SplitRotarySlices",
     "RetargetCrossAttnKeyLayout",
     "CollapseReshapeChain",
     "CollapseUnrolledConcat",

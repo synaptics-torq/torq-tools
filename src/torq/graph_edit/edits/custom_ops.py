@@ -10,7 +10,6 @@ standard ONNX ops the Torq compiler can lower.  Split out of the monolithic
 ``edits.py`` when it was refactored into the ``graph_edit.edits`` package.
 """
 
-import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -296,17 +295,9 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
             and node.inputs[10].name
         ) else None
 
-        # Identify outputs by name pattern rather than fixed index
-        out_attn = None
-        out_present_k = None
-        out_present_v = None
-        for out in node.outputs:
-            if "present" in out.name and "key" in out.name:
-                out_present_k = out
-            elif "present" in out.name and "value" in out.name:
-                out_present_v = out
-            else:
-                out_attn = out
+        out_attn = node.outputs[0]
+        out_present_k = node.outputs[1] if len(node.outputs) > 1 and node.outputs[1].name else None
+        out_present_v = node.outputs[2] if len(node.outputs) > 2 and node.outputs[2].name else None
 
         scale = node.attrs.get("scale", 1.0 / (self.head_dim ** 0.5))
         prefix = node.name
@@ -674,8 +665,7 @@ class ReplaceGroupQueryAttention(OnnxGraphEdit):
         else:
             softmax_input = attn_scores
 
-        # Softmax — name must end with "self_attn/Softmax" so
-        # MaskFutureAttentionScores can find it later.
+        # Keep generated names stable for existing graph consumers.
         softmax_name = prefix.rsplit("/", 1)[0] + "/self_attn/Softmax"
         attn_weights = self.graph.layer(
             name=softmax_name, op="Softmax",

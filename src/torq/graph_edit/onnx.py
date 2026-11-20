@@ -186,6 +186,16 @@ class OnnxGraphEditor:
 
         DecomposeBidirectionalRnn.restore_output_arity(graph)
 
+    def _cleanup(self):
+        # GQA's optional output slots carry meaning even when one is unused.
+        outputs = [(node, list(node.outputs)) for node in self._graph.nodes
+                   if node.op == "GroupQueryAttention"]
+        self._graph.cleanup(remove_unused_graph_inputs=True, remove_unused_node_outputs=True).toposort()
+        for node, original in outputs:
+            if node.outputs:
+                node.outputs = original
+        return self._graph
+
     def to_onnx(
         self,
         check_type: bool = True,
@@ -193,10 +203,7 @@ class OnnxGraphEditor:
         data_prop: bool = True,
         override_ir: int | None = None
     ) -> onnx.ModelProto:
-        self._graph = self._graph.cleanup(
-            remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
-        ).toposort()
+        self._graph = self._cleanup()
         if self._is_rnn:
             self.restore_rnn_output_arity(self._graph)
         onnx_model = infer_shapes(
@@ -239,10 +246,7 @@ class OnnxGraphEditor:
         edit.graph = self._graph
         for node in self._graph.nodes:
             edit(node)
-        self._graph = self._graph.cleanup(
-            remove_unused_graph_inputs=True,
-            remove_unused_node_outputs=True
-        ).toposort()
+        self._graph = self._cleanup()
         if self._is_rnn:
             self.restore_rnn_output_arity(self._graph)
         if edit.requires_shape_inference:

@@ -224,6 +224,8 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk,
             export_dtype=onnx.TensorProto.FLOAT, chunk_len=chunk,
         ))
     editor.combine_kv_io_tensors([1, kv_heads, max_len, head_dim])
+    for index, node in enumerate(editor.graph.nodes):
+        node.name = f"anonymous_{index}"
     if style == "hf":
         editor.group_query_heads(heads, kv_heads, head_dim)
     if window is not None:
@@ -269,20 +271,28 @@ def test_sliding_attention_mask(chunk, position, window):
     position_input = gs.Variable("position", dtype=np.int64, shape=[1])
     nodes, outputs = [], []
     for index in range(3):
-        identity = gs.Variable(f"identity{index}", dtype=np.float32, shape=scores.shape)
+        past = gs.Variable(f"past_key_values.{index}.key", dtype=np.float32, shape=[1, 1, length - 1, length])
+        present = gs.Variable(f"present.{index}.key", dtype=np.float32, shape=[1, 1, length, length])
+        kt = gs.Variable(f"kt{index}", dtype=np.float32, shape=[1, 1, length, length])
+        product = gs.Variable(f"product{index}", dtype=np.float32, shape=scores.shape)
         output = gs.Variable(f"output{index}", dtype=np.float32, shape=scores.shape)
         nodes.extend([
-            gs.Node("Identity", f"identity{index}", inputs=[scores], outputs=[identity]),
-            gs.Node("Softmax", f"/model/layers.{index}/self_attn/Softmax", inputs=[identity], outputs=[output], attrs={"axis": -1}),
+            gs.Node("Concat", f"update{index}", inputs=[past, gs.Constant(f"new{index}", np.eye(length, dtype=np.float32)[-1:].reshape(1, 1, 1, length))], outputs=[present], attrs={"axis": -2}),
+            gs.Node("Transpose", f"transpose{index}", inputs=[present], outputs=[kt], attrs={"perm": [0, 1, 3, 2]}),
+            gs.Node("MatMul", f"matmul{index}", inputs=[scores, kt], outputs=[product]),
+            gs.Node("Softmax", f"anonymous{index}", inputs=[product], outputs=[output], attrs={"axis": -1}),
         ])
-        outputs.append(output)
-    g = graph(nodes=nodes, inputs=[scores, position_input], outputs=outputs)
+        outputs.extend([output, present])
+    caches = [node.inputs[0] for node in nodes if node.op == "Concat"]
+    g = graph(nodes=nodes, inputs=[scores, position_input, *caches], outputs=outputs)
     edit = MaskFutureAttentionScores(g, "test", position_input, length, onnx.TensorProto.FLOAT,
                                      chunk_len=chunk, sliding_window=window, sliding_layers=frozenset({0, 2}))
-    for node in nodes[1::2]:
+    for node in [n for n in nodes if n.op == "Softmax"]:
+        assert edit.match(node)
         edit.transform(node)
     values = np.random.default_rng(0).normal(size=scores.shape).astype(np.float32)
-    result = run_model(g, {"scores": values, "position": np.array([position], dtype=np.int64)})
+    result = run_model(g, {"scores": values, "position": np.array([position], dtype=np.int64),
+                           **{cache.name: np.eye(length, dtype=np.float32)[:-1].reshape(1, 1, length - 1, length) for cache in caches}})
     q = position + np.arange(chunk)[:, None]
     for index in range(3):
         keep = np.arange(length) <= q
