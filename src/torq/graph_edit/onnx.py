@@ -121,8 +121,9 @@ class OnnxGraphEditor:
         self,
         graph: gs.Graph,
         graph_name: str,
-        edits: Iterable[OnnxGraphEdit] | None = None,
         export_dtype: onnx.TensorProto.DataType | None = None,
+        *,
+        edits: Iterable[OnnxGraphEdit] | None = None,
         is_rnn: bool = False,
         dump_path: str | os.PathLike | None = None,
         dump_after_edit: str | None = None,
@@ -148,6 +149,13 @@ class OnnxGraphEditor:
         self._is_rnn = bool(is_rnn)
         if isinstance(edits, Iterable):
             self.register_edits(edits)
+
+    @classmethod
+    def from_onnx(cls, onnx_model: str | os.PathLike | onnx.ModelProto, *args, **kwargs):
+        """Create an editor from an ONNX path or model; other arguments go to the constructor."""
+        if not isinstance(onnx_model, onnx.ModelProto):
+            onnx_model = onnx.load(onnx_model)
+        return cls(gs.import_onnx(onnx_model), *args, **kwargs)
 
     @property
     def edits(self) -> list[str]:

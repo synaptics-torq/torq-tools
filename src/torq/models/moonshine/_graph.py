@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 
-import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
@@ -95,38 +93,6 @@ class MoveOutputFromConcat(OnnxGraphEdit):
 
 
 class MoonshineOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
-
-    def __init__(
-        self,
-        graph: gs.Graph,
-        component: str,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ):
-        super().__init__(
-            graph,
-            component,
-            export_dtype=export_dtype,
-            **editor_kwargs,
-        )
-
-    @classmethod
-    def from_onnx(
-        cls,
-        onnx_model: str | os.PathLike | onnx.ModelProto,
-        component: str,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ) -> "MoonshineOnnxGraphEditor":
-        if not isinstance(onnx_model, onnx.ModelProto):
-            onnx_model = onnx.load(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        return cls(
-            graph,
-            component,
-            export_dtype,
-            **editor_kwargs,
-        )
 
     def fix_encoder_io(
         self,

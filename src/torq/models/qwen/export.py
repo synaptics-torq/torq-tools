@@ -25,7 +25,7 @@ from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
 from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
-from ...graph_edit.edits import PrecomputeRotaryTables
+from ...graph_edit.edits import PrecomputeRotaryTables, ReplaceLegacyRotaryCache
 from ...utils.compile import (
     export_torq as compile_torq_model,
     get_iree_version,
@@ -337,8 +337,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         editor.fix_io(self._max_gen_tokens)
         editor.remove_redundant_casts()
         # No-op for Qwen3; required for legacy Qwen2/Qwen2.5 exports.
-        if editor.fold_legacy_rotary_cache(self._max_gen_tokens):
-            editor.rotary_gather_to_onehot_matmul()
+        editor.replace_legacy_rotary_cache(self._max_gen_tokens)
 
         position_ids = next(
             (
@@ -360,10 +359,11 @@ class QwenModelExporter(OnnxModelExporterBase):
             position_ids.dtype = np.int64
             position_ids.shape = [1, 1]
 
+        # Reshape, not Squeeze: Torch-MLIR crashes folding this Squeeze after int32 conversion.
         current_length = graph.layer(
             name="current_len_to_1d",
-            op="Squeeze",
-            inputs=[position_ids, [0]],
+            op="Reshape",
+            inputs=[position_ids, np.array([1], dtype=np.int64)],
             outputs=[
                 gs.Variable(
                     "position_ids_squeezed",
@@ -566,7 +566,6 @@ class QwenModelExporter(OnnxModelExporterBase):
         editor.reorder_graph_input("position_ids", 1)
 
         editor.freeze_shape_seeds()
-        editor.replace_current_len_squeeze()
 
         if self._split_model:
             split_dir = Path(model_path).parent
@@ -1072,7 +1071,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                     model_path=inferred_fp32_path,
                     output_path=converted_model_path,
                     # One-hot rotary table lookups are not weight MatMuls.
-                    skip_layers=["rotary_emb_cache_", PrecomputeRotaryTables.TABLE_NAME],
+                    skip_layers=[ReplaceLegacyRotaryCache.TABLE_NAME, PrecomputeRotaryTables.TABLE_NAME],
                 )
 
                 # Reuse the already shape-inferred model instead of loading

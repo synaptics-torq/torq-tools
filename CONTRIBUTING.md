@@ -49,7 +49,7 @@ Most edits subclass `OnnxGraphEdit` from `src/torq/graph_edit/onnx.py` and imple
 If the edit should be part of the public graph-edit API, export it from `src/torq/graph_edit/edits/__init__.py`. Add a convenience method to `CommonGraphEditsMixin` when model exporters should call the edit through the fluent editor API.
 
 > [!TIP]
-> If a graph edit is only useful for one model exporter, keep it close to that model in `src/torq/models/<model>/_graph.py` instead of promoting it to the shared `torq.graph_edit.edits` package. See [Model Export Pipelines](#model-export-pipelines) for how model-specific graph editors fit into the exporter flow.
+> Put graph edits that do not depend on one model's node names in the shared `torq.graph_edit.edits` package (with a `CommonGraphEditsMixin` method, or in `CombineKVCacheMixin` when they work on its combined caches), even when only one exporter uses them. Keep only edits tied to one model's node names in `src/torq/models/<model>/_graph.py`. See [Model Export Pipelines](#model-export-pipelines) for how model-specific graph editors fit into the exporter flow.
 
 A few details make graph edits easier to review and safer to reuse:
 
@@ -86,7 +86,7 @@ Model exporters live under `src/torq/models/<model>/` and usually extend `OnnxMo
 The existing model directories use this layout:
 
 - `export.py`: CLI argument handling and the exporter class.
-- `_graph.py`: model-specific `OnnxGraphEditor` subclass and IO-shape helpers.
+- `_graph.py`: model-specific `OnnxGraphEditor` subclass and IO-shape helpers. Decoder-only LLMs subclass `DecoderGraphEditor`, which names the graph `model` and includes the common and combined-KV edits; every editor gets `from_onnx` from `OnnxGraphEditor`.
 - `_inference.py`: runtime wrappers used for validation and demos.
 - `infer.py` or `validate.py`: user-facing inference and validation entry points.
 
@@ -98,7 +98,7 @@ Architecture-compatible checkpoints should share an exporter. FunctionGemma uses
 
 Each exported variant must carry its runtime sidecars so its directory can be staged independently. The shared ONNX exporter copies JSON metadata, Jinja templates, tokenizer model/vocabulary files, and NumPy tables through export, quantization, conversion, and compilation with `_copy_runtime_assets()`. Keep stage-specific `compile_flags.json` snapshots separate. Copy tables before dtype conversion so converted tables win; compilation preserves their dtype unless `--torq-convert-io-dtype` requests runtime dtype conversion.
 
-Rotary decoders must apply `PrecomputeRotaryTables` (with the static capacity) in their post-static patches, before dtype conversion. bf16 holds integers exactly only up to 256 and rounds the rotary angle, so `Sin`/`Cos` computed from `position_ids` lose their phase at longer contexts. The edit splits each position into high and low digits, selects cos/sin of both partial angles from small fp64 tables with one-hot MatMuls (exact in bf16), and combines them with the angle-addition identities. Weight quantizers must skip the table MatMuls (`PrecomputeRotaryTables.TABLE_NAME`). Capacities up to 256 keep their original graphs.
+Rotary decoders must apply `PrecomputeRotaryTables` (with the static capacity) in their post-static patches, before dtype conversion. bf16 holds integers exactly only up to 256 and rounds the rotary angle, so `Sin`/`Cos` computed from `position_ids` lose their phase at longer contexts. The edit splits each position into high and low digits, selects cos/sin of both partial angles from small fp64 tables with one-hot MatMuls (exact in bf16), and combines them with the angle-addition identities. Weight quantizers must skip the table MatMuls (`PrecomputeRotaryTables.TABLE_NAME`). Capacities up to 256 keep their original graphs. Exports from transformers older than 4.45 instead gather rows of a per-layer cos/sin cache; `ReplaceLegacyRotaryCache` turns those into one-hot MatMuls over a static table, and quantizers skip them by `ReplaceLegacyRotaryCache.TABLE_NAME`.
 
 Static decoders read their KV caches without writing them: after `combine_kv_io_tensors` (and, for Hugging Face GQA exports, `group_query_heads`), call `read_only_kv_cache` with the step's chunk length. Each cache becomes a time-major `[1, L, 2 * kv, D]` input and each `present.*` output holds only the step's new rows, so exporters that support it register `--read-only-kv-cache` (on by default) through `add_onnx_args(read_only_kv_cache=True)`. `DecoderOnlyRunner._update_cache` writes a cache output that is shorter than its input into the cache at the step's position, and replaces the cache with any other output; static runners take cache shapes from the model's inputs (`_kv_cache_zeros`).
 

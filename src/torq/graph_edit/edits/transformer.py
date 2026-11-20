@@ -11,7 +11,7 @@ import onnx
 import onnx_graphsurgeon as gs
 
 from ...utils.ort import make_cpu_session
-from ..onnx import OnnxGraphEdit, rewire_consumers
+from ..onnx import OnnxGraphEdit, replace_node, rewire_consumers
 
 
 def _is_sliding_layer(node: gs.Node, window: int | None, layers: frozenset[int]) -> bool:
@@ -1316,6 +1316,93 @@ class PrecomputeRotaryTables(OnnxGraphEdit):
         self._logger.debug("Replaced '%s' with %d-position rotary tables", node.name, self.max_positions)
 
 
+@dataclass
+class ReplaceLegacyRotaryCache(OnnxGraphEdit):
+    """
+    Replace legacy per-layer ``rotary_emb`` cos/sin cache lookups with one-hot MatMuls.
+
+    Exports from transformers <4.45 (e.g. Qwen2/Qwen2.5, Llama) keep a
+    ``[max_position_embeddings, head_dim]`` cos/sin cache in every layer, slice it to
+    ``Min(max_pos, past_len + seq_len)`` and gather rows by position. In the static
+    graph positions are below ``max_len``, so the slice is the constant
+    ``table[:max_len]``. Torq has no NPU lowering for a data-dependent Gather, so each
+    row Gather becomes ``onehot(positions) @ table``, which is exact (one non-zero
+    product). Identical tables are shared across layers, and each (table, positions)
+    pair shares one MatMul. Weight quantizers must skip the MatMuls whose names
+    contain ``TABLE_NAME``.
+
+    Args:
+        max_len (int): Number of supported positions
+    """
+
+    TABLE_NAME = "rotary_emb_cache_"
+
+    max_len: int
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._tables: dict[bytes, gs.Constant] = {}
+        self._onehots: dict[str, gs.Variable] = {}
+        self._selected: dict[tuple[str, str], gs.Variable] = {}
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Slice" or "/rotary_emb/" not in node.name or len(node.inputs) < 2:
+            return False
+        table, starts = node.inputs[:2]
+        return (
+            isinstance(table, gs.Constant) and table.values.ndim == 2
+            and isinstance(starts, gs.Constant) and not np.any(starts.values)
+        )
+
+    def _onehot(self, positions: gs.Variable, size: int, dtype: np.dtype) -> gs.Variable:
+        if positions.name not in self._onehots:
+            base = f"{positions.name}/rotary_cache_onehot"
+            shape = None if positions.shape is None else [*positions.shape, size]
+            unsqueezed = self.graph.layer(
+                name=base + "/Unsqueeze", op="Unsqueeze", inputs=[positions, np.array([-1], dtype=np.int64)],
+                outputs=[gs.Variable(base + "/positions", dtype=positions.dtype)],
+            )[0]
+            mask = self.graph.layer(
+                name=base + "/Equal", op="Equal",
+                inputs=[unsqueezed, gs.Constant(base + "/arange", np.arange(size, dtype=positions.dtype or np.int64))],
+                outputs=[gs.Variable(base + "/mask", dtype=np.bool_, shape=shape)],
+            )[0]
+            self._onehots[positions.name] = self.graph.layer(
+                name=base + "/Cast", op="Cast", attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(dtype)},
+                inputs=[mask], outputs=[gs.Variable(base, dtype=dtype, shape=shape)],
+            )[0]
+        return self._onehots[positions.name]
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Slice")
+        source = node.inputs[0]
+        if source.values.shape[0] < self.max_len:
+            raise ValueError(
+                f"Rotary cache '{source.name}' has {source.values.shape[0]} positions, fewer than max_len={self.max_len}"
+            )
+        values = np.ascontiguousarray(source.values[:self.max_len])
+        if (key := values.tobytes()) not in self._tables:
+            self._tables[key] = gs.Constant(f"{self.TABLE_NAME}{len(self._tables)}", values)
+        table = self._tables[key]
+
+        out = node.outputs[0]
+        for consumer in list(out.outputs):
+            if consumer.op != "Gather" or consumer.inputs[0] is not out or consumer.attrs.get("axis", 0) != 0:
+                rewire_consumers([consumer], out, table)
+                continue
+            positions = consumer.inputs[1]
+            if (pair := (table.name, positions.name)) not in self._selected:
+                name = f"{table.name}/{positions.name}/OneHotMatMul"
+                shape = None if positions.shape is None else [*positions.shape, values.shape[1]]
+                self._selected[pair] = self.graph.layer(
+                    name=name, op="MatMul", inputs=[self._onehot(positions, self.max_len, values.dtype), table],
+                    outputs=[gs.Variable(name + "_out", dtype=values.dtype, shape=shape)],
+                )[0]
+            replace_node(consumer, [self._selected[pair]])
+        node.outputs.clear()
+        self._logger.debug("Replaced legacy rotary cache '%s' with %d-position one-hot lookups", node.name, self.max_len)
+
+
 class CombineKVCacheMixin:
     """
     Mixin for combining separate key/value cache I/O tensors along the heads axis.
@@ -1544,3 +1631,119 @@ class CombineKVCacheMixin:
             remove_unused_node_outputs=True,
         ).toposort()
         return self
+
+    def blend_combined_kv_in_place(self):
+        """
+        Update each combined ``key_value`` cache with one Where per layer.
+
+        ``combine_kv_io_tensors`` splits each ``[1, 2 * kv, S, D]`` cache input into K
+        and V, blends the new token into each with a Where, and concatenates the
+        results back into the cache output. Every step this copies the whole cache
+        three times. This rewrites each layer to::
+
+            present = Where(mask, Concat(new_k, new_v), past)   # one cache write
+            K, V    = Slice(present, heads [0, kv)), Slice(present, heads [kv, 2 kv))
+
+        Only the new ``[1, 2 * kv, 1, D]`` rows are concatenated. K and V are
+        contiguous head ranges of the cache, so the slices need no reshuffle.
+        """
+
+        tensors = self._graph.tensors()
+        layer = 0
+        while (combined_out := tensors.get(f"present.{layer}.key_value")) is not None:
+            concat = combined_out.inputs[0] if combined_out.inputs else None
+            past = tensors.get(f"past_key_values.{layer}.key_value")
+            key, value = tensors.get(f"present.{layer}.key"), tensors.get(f"present.{layer}.value")
+            if concat is None or concat.op != "Concat" or past is None or key is None or value is None:
+                raise ValueError(f"Layer {layer} does not have the combined KV pattern")
+
+            key_blend, value_blend = key.inputs[0], value.inputs[0]
+            if key_blend.op != "Where" or value_blend.op != "Where":
+                raise ValueError(f"Layer {layer} KV update is not a Where")
+            mask, new_key = key_blend.inputs[0], key_blend.inputs[1]
+            new_value = value_blend.inputs[1]
+
+            kv_heads = key.shape[1]
+            new_rows = self._graph.layer(
+                name=f"present.{layer}_new_kv_concat",
+                op="Concat",
+                attrs={"axis": 1},
+                inputs=[new_key, new_value],
+                outputs=[gs.Variable(f"present.{layer}.new_key_value", dtype=past.dtype,
+                                     shape=[1, 2 * kv_heads, 1, key.shape[3]])],
+            )[0]
+
+            # The combined Where writes the cache output directly.
+            concat.outputs.clear()
+            self._graph.layer(
+                name=f"present.{layer}_blend_kv",
+                op="Where",
+                inputs=[mask, new_rows, past],
+                outputs=[combined_out],
+            )
+
+            # Attention reads K and V as head ranges of the updated cache.
+            for tensor, blend, start in ((key, key_blend, 0), (value, value_blend, kv_heads)):
+                blend.outputs.clear()
+                self._graph.layer(
+                    name=f"{tensor.name}_from_present",
+                    op="Slice",
+                    inputs=[
+                        combined_out,
+                        np.array([start], dtype=np.int64),
+                        np.array([start + kv_heads], dtype=np.int64),
+                        np.array([1], dtype=np.int64),
+                    ],
+                    outputs=[tensor],
+                )
+            layer += 1
+
+        self._graph.cleanup().toposort()
+        self._logger.info("Blended %d combined KV caches in place", layer)
+        return self
+
+    def split_transformer_layers(
+        self,
+        split_at: int,
+        num_layers: int,
+        hidden_size: int,
+    ) -> tuple[gs.Graph, gs.Graph]:
+        """
+        Split a combined-KV decoder into two graphs between layers ``split_at - 1`` and ``split_at``.
+
+        Part A maps ``token_embedding``, ``position_ids`` and the caches of layers
+        ``[0, split_at)`` to their updated caches and the residual stream after layer
+        ``split_at - 1``. Part B maps that residual, ``position_ids`` and the remaining
+        caches to their updated caches and ``last_hidden_states``.
+        """
+        if not 0 < split_at < num_layers:
+            raise ValueError(f"split_at must be between 1 and {num_layers - 1}, got {split_at}")
+        boundary_name = f"/model/layers.{split_at - 1}/Add_1_output_0"
+
+        def partition(first_input: str, layers: range, last_output: str) -> gs.Graph:
+            # Each partition gets its own independent graph copy.
+            graph = self._graph.copy()
+            tensors = graph.tensors()
+            position_ids, boundary = tensors["position_ids"], tensors[boundary_name]
+            position_ids.inputs.clear()
+            position_ids.shape = [1, 1]
+            boundary.shape, boundary.dtype = [1, 1, hidden_size], np.float32
+            if first_input == boundary_name:
+                boundary.inputs.clear()
+            graph.inputs = [
+                tensors[first_input],
+                position_ids,
+                *(tensors[f"past_key_values.{i}.key_value"] for i in layers),
+            ]
+            graph.outputs = [*(tensors[f"present.{i}.key_value"] for i in layers), tensors[last_output]]
+            return graph.cleanup(remove_unused_graph_inputs=True, remove_unused_node_outputs=False).toposort()
+
+        parts = (
+            partition("token_embedding", range(split_at), boundary_name),
+            partition(boundary_name, range(split_at, num_layers), "last_hidden_states"),
+        )
+        self._logger.info(
+            "Split transformer at layer %d: part A layers 0-%d, part B layers %d-%d",
+            split_at, split_at - 1, split_at, num_layers - 1,
+        )
+        return parts

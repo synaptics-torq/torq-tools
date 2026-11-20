@@ -16,6 +16,7 @@ from torq.graph_edit.edits.transformer import (
     MaskFutureAttentionScores,
     PrecomputeRotaryTables,
     ReplaceDynamicKVCache,
+    ReplaceLegacyRotaryCache,
     RetargetCrossAttnKeyLayout,
 )
 
@@ -230,6 +231,47 @@ def test_combine_kv_io_tensors_replaces_key_value_inputs_with_combined_input():
     assert [o.name for o in editor.graph.outputs] == ["present.0.key_value"]
 
 
+def test_split_transformer_layers_chains_to_full_model():
+    hidden, layers = 2, 3
+    token = gs.Variable("token_embedding", dtype=np.float32, shape=[1, 1, hidden])
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    position = gs.Variable("position_f", dtype=np.float32)
+    nodes = [gs.Node("Cast", "position_cast", attrs={"to": onnx.TensorProto.FLOAT}, inputs=[positions], outputs=[position])]
+    caches, presents, residual = [], [], token
+    for i in range(layers):
+        past = gs.Variable(f"past_key_values.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
+        present = gs.Variable(f"present.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
+        mixed, out = gs.Variable(f"/model/layers.{i}/Add_output_0"), gs.Variable(f"/model/layers.{i}/Add_1_output_0")
+        nodes += [
+            gs.Node("Add", f"/model/layers.{i}/Add", inputs=[residual, position], outputs=[mixed]),
+            gs.Node("Add", f"/model/layers.{i}/Add_1", inputs=[mixed, gs.Constant(f"bias_{i}", np.full(hidden, i, np.float32))], outputs=[out]),
+            gs.Node("Add", f"/model/layers.{i}/cache_update", inputs=[past, out], outputs=[present]),
+        ]
+        caches.append(past)
+        presents.append(present)
+        residual = out
+    last = gs.Variable("last_hidden_states", dtype=np.float32, shape=[1, 1, hidden])
+    nodes.append(gs.Node("Identity", "final", inputs=[residual], outputs=[last]))
+    editor = KVEditor(graph(nodes=nodes, inputs=[token, positions, *caches], outputs=[*presents, last]), "unit")
+
+    part_a, part_b = editor.split_transformer_layers(split_at=1, num_layers=layers, hidden_size=hidden)
+
+    rng = np.random.default_rng(0)
+    feeds = {t.name: rng.standard_normal(t.shape).astype(np.float32) for t in [token, *caches]}
+    feeds["position_ids"] = np.array([[5]], dtype=np.int64)
+    full = run_model(editor.graph, feeds)
+    a = run_model(part_a, {name: feeds[name] for name in ("token_embedding", "position_ids", "past_key_values.0.key_value")})
+    b = run_model(part_b, {
+        "/model/layers.0/Add_1_output_0": a["/model/layers.0/Add_1_output_0"],
+        "position_ids": feeds["position_ids"],
+        **{f"past_key_values.{i}.key_value": feeds[f"past_key_values.{i}.key_value"] for i in range(1, layers)},
+    })
+    for name, value in {**a, **b}.items():
+        if name in full:
+            np.testing.assert_allclose(value, full[name])
+    assert set(full) <= set(a) | set(b)
+
+
 def _rotary_graph(chunk: int) -> gs.Graph:
     """Two layers computing the same RoPE from shared int positions, plus a Sin of a float input."""
     positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, chunk])
@@ -279,3 +321,17 @@ def test_precompute_rotary_tables_keeps_exact_bf16_capacities():
     g = _rotary_graph(1)
     edit = PrecomputeRotaryTables(g, "unit", max_positions=PrecomputeRotaryTables.EXACT_BF16_POSITIONS)
     assert not any(edit.match(node) for node in g.nodes)
+
+
+def test_replace_legacy_rotary_cache_rejects_short_table():
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    sliced, out = gs.Variable("sliced", dtype=np.float32), gs.Variable("cos", dtype=np.float32)
+    slice_node = gs.Node("Slice", "/rotary_emb/Slice", inputs=[
+        gs.Constant("cos_cached", np.zeros((4, 2), np.float32)), gs.Constant("starts", np.array([0])), gs.Constant("ends", np.array([4])),
+    ], outputs=[sliced])
+    g = graph(nodes=[slice_node, gs.Node("Gather", "gather", inputs=[sliced, positions], outputs=[out])], inputs=[positions], outputs=[out])
+
+    edit = ReplaceLegacyRotaryCache(g, "unit", max_len=8)
+    assert edit.match(slice_node)
+    with pytest.raises(ValueError, match="fewer than max_len=8"):
+        edit.transform(slice_node)

@@ -270,6 +270,39 @@ class ComputeDequantizedLUT(OnnxGraphEdit):
         )
 
 @dataclass
+class MaterializeTiedLMHead(OnnxGraphEdit):
+    """
+    Replace a ``Transpose(embedding)`` LM head weight with a constant ``[hidden, vocab]`` weight.
+
+    Tied-embedding exports (e.g. Qwen2.5-0.5B) feed the LM head MatMul from a runtime
+    Transpose of the embedding table. Vocabulary trimming, LM head splitting and weight
+    quantization expect a constant weight.
+
+    Args:
+        output_name (str): Name of the LM head MatMul output (default: "logits").
+    """
+
+    output_name: str = "logits"
+
+    def match(self, node: gs.Node) -> bool:
+        return (
+            node.op == "MatMul" and len(node.inputs) == 2 and bool(node.outputs)
+            and node.outputs[0].name == self.output_name and not isinstance(node.inputs[1], gs.Constant)
+        )
+
+    def transform(self, node: gs.Node):
+        transpose = _producer(node.inputs[1], "Transpose")
+        if (
+            transpose is None
+            or not isinstance(source := transpose.inputs[0], gs.Constant)
+            or list(transpose.attrs.get("perm", [1, 0])) != [1, 0]
+        ):
+            raise ValueError(f"LM head '{node.name}' weight is neither a constant nor Transpose(constant)")
+        node.inputs[1] = gs.Constant("lm_head.weight", np.ascontiguousarray(source.values.T))
+        self._logger.info("Materialized tied LM head weight from '%s' %s", source.name, list(node.inputs[1].shape))
+
+
+@dataclass
 class TrimLMHeadVocab(OnnxGraphEdit):
     """
     Trim an LM head to a subset of tokens.

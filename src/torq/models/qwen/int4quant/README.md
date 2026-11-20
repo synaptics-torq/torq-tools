@@ -86,7 +86,8 @@ On an SL2610 board at 1 GHz:
 
 * Qwen2.5 ONNX exports from transformers older than 4.45 slice a per-layer
   `[32768, 64]` rotary cache. The exporter folds this into one static
-  `[max_gen_tokens, 64]` table (`fold_legacy_rotary_cache`).
+  `[max_gen_tokens, 64]` table read with a one-hot MatMul
+  (`replace_legacy_rotary_cache`).
 * Tied embeddings: the LM head is `Transpose(embed_tokens)` in the source
   graph. It is materialized as a constant before trimming
   (`materialize_tied_lm_head`). The host embedding table stays full-precision

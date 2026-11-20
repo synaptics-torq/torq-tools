@@ -3,20 +3,13 @@
 
 from __future__ import annotations
 
-import os
-
-import onnx
 import onnx_graphsurgeon as gs
 
-from ...graph_edit import (
-    DimMatchType,
-    FixedDimMapping,
-    OnnxGraphEditor,
-)
-from ...graph_edit.edits import *
+from ...graph_edit import DimMatchType, FixedDimMapping
+from ...graph_edit.edits import DecoderGraphEditor
 
 
-class LiquidOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
+class LiquidOnnxGraphEditor(DecoderGraphEditor):
     """
     Graph editor for the LiquidAI LFM2.5 hybrid (conv + attention) model.
 
@@ -26,35 +19,6 @@ class LiquidOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCac
     (already static).  Attention layers expose standard dynamic KV cache
     tensors `past_key_values.X.{key,value}` that need static replacement.
     """
-
-    def __init__(
-        self,
-        graph: gs.Graph,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ):
-        super().__init__(
-            graph,
-            "model",
-            export_dtype=export_dtype,
-            **editor_kwargs,
-        )
-
-    @classmethod
-    def from_onnx(
-        cls,
-        onnx_model: str | os.PathLike | onnx.ModelProto,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ) -> "LiquidOnnxGraphEditor":
-        if not isinstance(onnx_model, onnx.ModelProto):
-            onnx_model = onnx.load(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        return cls(
-            graph,
-            export_dtype,
-            **editor_kwargs,
-        )
 
     def fix_io(
         self,

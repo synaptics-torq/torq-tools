@@ -10,9 +10,9 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TakeLastToken, TrimLMHeadVocab
+from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, MaterializeTiedLMHead, SplitLMHead, TakeLastToken, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
-from .mixins import CommonGraphEditsMixin
+from .mixins import CommonGraphEditsMixin, DecoderGraphEditor
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
 from .shape import (
@@ -35,6 +35,7 @@ from .transformer import (
     PrecomputeRotaryTables,
     ReadOnlyKVCache,
     ReplaceDynamicKVCache,
+    ReplaceLegacyRotaryCache,
     RetargetCrossAttnKeyLayout,
 )
 from .custom_ops import (
@@ -51,6 +52,7 @@ __all__ = [
     "GroupQueryHeads",
     "ReadOnlyKVCache",
     "PrecomputeRotaryTables",
+    "ReplaceLegacyRotaryCache",
     "DequantizeProjectionsMatMul",
     "DecomposeLayerNormalization",
     "RemoveIsNaN",
@@ -68,6 +70,7 @@ __all__ = [
     "CollapseReshapeChain",
     "CollapseUnrolledConcat",
     "CollapseGQABroadcast",
+    "MaterializeTiedLMHead",
     "TrimLMHeadVocab",
     "SplitLMHead",
     "TakeLastToken",
@@ -82,6 +85,7 @@ __all__ = [
     "DecomposeBidirectionalRnn",
     "CombineKVCacheMixin",
     "CommonGraphEditsMixin",
+    "DecoderGraphEditor",
     "ReplaceSimplifiedLayerNorm",
     "ReplaceSkipSimplifiedLayerNorm",
     "ReplaceGroupQueryAttention",
