@@ -110,11 +110,10 @@ For pipeline-level changes, please run a manual end-to-end export when the depen
 
 ```bash
 python -m torq.models.<model>.export --skip-torq
-python -m torq.models.<model>.export --convert-dtype bf16 --skip-torq
 torq-export-model <model> --skip-torq
 ```
 
-If the change affects Torq compilation, also run the exporter without `--skip-torq` with `torq-compiler` installed, or point the run at a compiler with `TORQ_COMPILER_PATH` / `--compiler-path`.
+The compiler converts dtypes for the standard exports: each model's validated flags in `compile_flags.json` include `--torq-convert-dtypes`, so exporter-side `--convert-dtypes` is not needed. If the change affects Torq compilation, also run the exporter without `--skip-torq` with `torq-compiler` installed, or point the run at a compiler with `TORQ_COMPILER_PATH` / `--compiler-path`.
 
 ### Graph Edit Harness
 
