@@ -1,6 +1,7 @@
 import argparse
 from typing import Final
 
+from ...graph_edit.harness import add_graph_edit_harness_args
 from ...utils.compile import add_torq_args
 from ...utils.demo import add_common_args
 from ...utils.logging import add_logging_args
@@ -55,6 +56,7 @@ def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
         keep_individual_kv_io=True,
         read_only_kv_cache=True,
     )
+    add_graph_edit_harness_args(parser)
 
     parser.add_argument(
         "--split-model",

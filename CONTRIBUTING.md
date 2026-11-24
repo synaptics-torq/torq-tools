@@ -122,7 +122,7 @@ The compiler converts dtypes for the standard exports: each model's validated fl
 
 Exporters declare their default graph edits *declaratively* rather than calling editor methods imperatively. Each exporter overrides `graph_edit_blocks()` (on `OnnxModelExporterBase`) to return an ordered `dict[str, list[EditSpec]]`, where each block is a contiguous run of edits applied to one component/graph. An `EditSpec` is just an edit's registered name (its `OnnxGraphEdit` class name) plus positional constructor args. Args that are only known at export time (e.g. a `cur_len` tensor) are written as `ctx("name")` placeholders and resolved from a context mapping passed to `OnnxGraphEditor.apply_specs(specs, harness, context)`.
 
-Inside `make_static` / post-static patches, replace imperative edit calls with `editor.apply_specs(self.graph_edit_blocks()[block], self._harness, context)`. Non-edit editor operations (IO fixing, KV combining, input reordering, `to_onnx`) stay imperative and simply bracket the `apply_specs` calls.
+Inside `make_static` / post-static patches, replace imperative edit calls with `editor.apply_specs(self.graph_edit_blocks()[block], self._harness, context)`. Non-edit editor operations (IO fixing, KV combining, input reordering, `to_onnx`) stay imperative and simply bracket the `apply_specs` calls. Include edits applied after dtype conversion as well; Qwen declares its rotary Slice-to-Split rewrite in a separate conversion block. Use context placeholders for output paths and vocabulary arrays so viewing the plan does not require loading the graph or generating runtime assets.
 
 This wires up the shared CLI flags automatically once you call `add_graph_edit_harness_args(parser)` and, in `export_<model>_from_args`, `exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))` plus the `--view-graph-edits` short-circuit:
 
@@ -132,6 +132,8 @@ if args.view_graph_edits:
     print(render_graph_edit_plan(exporter.describe_graph_edits()))
     return
 ```
+
+The view path must return before export, dtype conversion, compilation, or quantization-checkpoint downloads. When migrating an imperative exporter, compare before/after per-edit dumps on the same source and compare final initializer values and runtime tables separately.
 
 Users then get `--apply-graph-edit NAME[:ARGS]` (repeatable, YAML args), `--apply-graph-edits-from-file FILE`, their `--exclude-graph-edit` / `--exclude-graph-edits-from-file` counterparts, and `--view-graph-edits`. Precedence when merging is flags > file > defaults: an overriding edit keeps the default's position, brand-new edits are appended (once per editor instance), and excluded edits are removed last.
 

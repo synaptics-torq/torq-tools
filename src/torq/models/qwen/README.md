@@ -96,6 +96,9 @@ warning. Flags after `--compile-flags` come last and take precedence.
 | `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings, so this fails for Qwen3-0.6B |
 | `--no-read-only-kv-cache` | Export the pre-2.4 caches: head-major, written back whole every step (see [Read-only KV cache](#read-only-kv-cache)) |
 | `--hf-repo`, `--onnx-source-dir` | Override the source model |
+| `--view-graph-edits` | Print the graph-edit plan with apply/exclude overrides and exit before export or GPTQ download |
+| `--apply-graph-edit NAME[:ARGS]` / `--exclude-graph-edit NAME` | Override or exclude edits by registered class name (repeatable); YAML files are supported through `--apply-graph-edits-from-file` / `--exclude-graph-edits-from-file` |
+| `--dump-after-edit[=EDITS]` | Save structural ONNX snapshots after all edits or a comma-separated edit-name list |
 | `--skip-torq` | Stop after the ONNX export |
 | `--compile-flags …` | Extra `torq-compile` flags (must be last) |
 
