@@ -84,6 +84,8 @@ For bug fixes, it is helpful to add the failing test first. A small graph that r
 
 ## Model Export Pipelines
 
+Common user-facing flags, compiler setup, cache conventions and standalone quantization recipes live in the [shared model export guide](src/torq/models/README.md). Keep model READMEs focused on model-specific defaults, recipes and limitations; link to shared instructions instead of duplicating them. Public READMEs should explain supported workflows and actionable limitations; keep implementation history, experiment logs and speculative debugging notes out of them.
+
 Model exporters live under `src/torq/models/<model>/` and usually extend `OnnxModelExporterBase` from `src/torq/model_export/onnx.py`. A complete exporter normally handles source model loading, static conversion, post-static graph patches, validation, dtype conversion, and optional Torq export.
 
 The existing model directories use this layout:

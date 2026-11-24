@@ -119,6 +119,9 @@ python -m src.torq.utils.benchmark compare -a results_int8.json -b results_mixed
 ```
 See `src/torq/utils/benchmark/README.md` for options.
 #### Export supported ONNX models to static graphs
+
+See the [model export guide](src/torq/models/README.md) for common flags, compiler setup, output variants, cache behavior and model-specific recipes.
+
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
