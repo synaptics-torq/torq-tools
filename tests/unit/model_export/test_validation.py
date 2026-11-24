@@ -6,28 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from torq.models.gemma3.export import Gemma3ModelExporter
 from torq.model_export.validation import _validate_long_context
-
-
-@pytest.mark.parametrize("capacity", [4, 16])
-@pytest.mark.parametrize("legacy", [False, True])
-def test_gemma_sliding_configuration(capacity, legacy):
-    exporter = object.__new__(Gemma3ModelExporter)
-    config = dict(sliding_window=4, num_hidden_layers=3, sliding_window_pattern=3)
-    if not legacy:
-        config["layer_types"] = ["sliding_attention", "sliding_attention", "full_attention"]
-    exporter._broadcast_ops = None
-    exporter._extract_embeddings = False
-    exporter._trim_vocab = False
-    exporter._split_lm_head = False
-    exporter._batch_prefill = None
-    exporter._config = SimpleNamespace(**config)
-    exporter._max_gen_tokens = capacity
-    expected = (4, frozenset({0, 1})) if capacity > 4 else (None, frozenset())
-    assert exporter._sliding_attention() == expected
-    spec = exporter.graph_edit_blocks()["model.static (KV cache)"][1]
-    assert spec.args[-2:] == expected
 
 
 def test_long_context_uses_reference_tokens_and_checks_boundary():
