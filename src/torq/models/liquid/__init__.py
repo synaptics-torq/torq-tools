@@ -44,8 +44,6 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
         allow_no_opt=False,
         extract_embeddings=True,
         dynamic_models=True,
-        keep_individual_kv_io=True,
-        read_only_kv_cache=True,
     )
     parser.add_argument(
         "--simulate-bf16",
@@ -61,15 +59,6 @@ def add_liquid_export_args(parser: argparse.ArgumentParser):
             "Keep the original depthwise Conv1D nodes (default: replace with a "
             "bit-exact batched-MatMul chain). The SL2610's depthwise-conv path "
             "crashes torq-compile; use only for CPU/ORT targets."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-lm-head",
-        action="store_true",
-        default=False,
-        help=(
-            "Split the lm_head MatMul into 512 chunks of [1024, 128] (default: "
-            "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
     add_graph_edit_harness_args(parser)
@@ -96,7 +85,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
         convert_dtypes=["bf16", "fp16"],
         allow_no_opt=False,
         dynamic_models=True,
-        keep_individual_kv_io=True,
     )
     parser.add_argument(
         "--compile-vision",
@@ -147,15 +135,6 @@ def add_liquid_vl_export_args(parser: argparse.ArgumentParser):
             "Keep the original depthwise Conv1D nodes (default: replace with a "
             "bit-exact batched-MatMul chain). The SL2610's depthwise-conv path "
             "crashes torq-compile; use only for CPU/ORT targets."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-lm-head",
-        action="store_true",
-        default=False,
-        help=(
-            "Split the lm_head MatMul into 512 chunks of [1024, 128] (default: "
-            "a single [1024, 65536] MatMul; tile-and-fuse handles it)."
         ),
     )
     add_graph_edit_harness_args(parser)

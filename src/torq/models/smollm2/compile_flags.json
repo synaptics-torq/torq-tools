@@ -22,5 +22,15 @@
       "--torq-convert-io-dtype",
       "--torq-disable-slicing"
     ]
+  },
+  "2.3.1": {
+    "common": [
+      "--torq-enable-annotate-tied-operands",
+      "--torq-enable-split-constants-optimization",
+      "--iree-flow-inline-constants-max-byte-length=300000000",
+      "--torq-convert-dtypes",
+      "--torq-convert-io-dtype",
+      "--torq-disable-slicing"
+    ]
   }
 }

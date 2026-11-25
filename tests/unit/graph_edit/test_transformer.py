@@ -6,7 +6,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import pytest
 
-from support.graph_edit import graph
+from support.graph_edit import clone_graph, graph, run_model
 from torq.graph_edit import OnnxGraphEditor
 from torq.graph_edit.edits.transformer import (
     AddCurrLenInput,
@@ -14,7 +14,9 @@ from torq.graph_edit.edits.transformer import (
     CombineKVCacheMixin,
     ConvertToStaticIndex,
     MaskFutureAttentionScores,
+    PrecomputeRotaryTables,
     ReplaceDynamicKVCache,
+    ReplaceLegacyRotaryCache,
     RetargetCrossAttnKeyLayout,
 )
 
@@ -58,45 +60,55 @@ def test_replace_dynamic_kv_cache_uses_fixed_shape_chunk_placement():
     assert placed.shape == [1, 1, 4, 2]
 
 
-def test_mask_future_attention_scores_inserts_bias_add_when_producer_is_not_add():
+def _cached_attention():
+    q = gs.Variable("query", dtype=np.float32, shape=[1, 1, 1, 2])
+    past = gs.Variable("cache", dtype=np.float32, shape=[1, 1, 3, 2])
+    new = gs.Variable("new", dtype=np.float32, shape=[1, 1, 1, 2])
+    present = gs.Variable("updated", dtype=np.float32, shape=[1, 1, 4, 2])
+    kt = gs.Variable("kt", dtype=np.float32, shape=[1, 1, 2, 4])
     scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
-    pre_softmax = gs.Variable("pre_softmax", dtype=np.float32, shape=[1, 1, 1, 4])
-    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 1, 4])
-    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[pre_softmax])
-    softmax = gs.Node("Softmax", "layer/self_attn/Softmax", inputs=[pre_softmax], outputs=[probs])
-    g = graph(nodes=[identity, softmax], inputs=[scores], outputs=[probs])
+    probs = gs.Variable("probs", dtype=np.float32, shape=scores.shape)
+    nodes = [
+        gs.Node("Concat", "update", inputs=[past, new], outputs=[present], attrs={"axis": -2}),
+        gs.Node("Transpose", "transpose", inputs=[present], outputs=[kt], attrs={"perm": [0, 1, 3, 2]}),
+        gs.Node("MatMul", "scores", inputs=[q, kt], outputs=[scores]),
+        gs.Node("Softmax", "arbitrary_softmax", inputs=[scores], outputs=[probs]),
+    ]
+    return graph(nodes=nodes, inputs=[q, past, new], outputs=[present, probs]), nodes[-1]
 
-    edit = MaskFutureAttentionScores(
-        g,
-        "unit",
-        cur_len=gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1]),
-        max_tokens=4,
-        export_dtype=onnx.TensorProto.FLOAT,
-    )
+
+@pytest.mark.parametrize("static", [False, True])
+def test_mask_future_attention_scores_matches_cache_structure(static):
+    g, softmax = _cached_attention()
+    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1])
+    if static:
+        ReplaceDynamicKVCache(g, "unit", cur_len, 4).transform(g.nodes[0])
+    edit = MaskFutureAttentionScores(g, "unit", cur_len, 4, onnx.TensorProto.FLOAT)
     assert edit.match(softmax)
     edit.transform(softmax)
-
-    assert softmax.inputs[0].name == "layer/self_attn/Softmax_biased"
+    assert softmax.inputs[0].name == "arbitrary_softmax_biased"
     assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
 
 
-def test_mask_future_attention_scores_shape_fallback_requires_opt_in():
-    scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, 1, 4])
-    probs = gs.Variable("probs", dtype=np.float32, shape=[1, 1, 1, 4])
-    identity = gs.Node("Identity", "scores_id", inputs=[scores], outputs=[gs.Variable("pre", dtype=np.float32, shape=[1, 1, 1, 4])])
-    softmax = gs.Node("Softmax", "decoder/layer0/Softmax_5", inputs=[identity.outputs[0]], outputs=[probs])
-    g = graph(nodes=[identity, softmax], inputs=[scores], outputs=[probs])
-    cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[1, 1, 1, 1])
+def test_mask_future_attention_scores_recognizes_unannotated_constant_scale():
+    g, softmax = _cached_attention()
+    scores = softmax.inputs[0]
+    scale, scaled = gs.Variable("scale"), gs.Variable("scaled")
+    g.nodes.extend([
+        gs.Node("Constant", "constant", attrs={"value": gs.Constant("value", np.array(0.5, np.float32))}, outputs=[scale]),
+        gs.Node("Mul", "scale_scores", inputs=[scores, scale], outputs=[scaled]),
+    ])
+    softmax.inputs = [scaled]
+    assert MaskFutureAttentionScores(g, "unit", gs.Variable("position"), 4, onnx.TensorProto.FLOAT).match(softmax)
 
-    default_edit = MaskFutureAttentionScores(g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT)
-    assert not default_edit.match(softmax)
 
-    opted_in_edit = MaskFutureAttentionScores(
-        g, "unit", cur_len=cur_len, max_tokens=4, export_dtype=onnx.TensorProto.FLOAT, match_shape_fallback=True,
-    )
-    assert opted_in_edit.match(softmax)
-    opted_in_edit.transform(softmax)
-    assert {"LessOrEqual", "Where", "Add"}.issubset({node.op for node in g.nodes if node.outputs})
+def test_mask_future_attention_scores_rejects_cross_attention_even_with_legacy_name():
+    g, softmax = _cached_attention()
+    softmax.name = "layer/self_attn/Softmax"
+    transpose = g.nodes[1]
+    transpose.inputs[0] = g.inputs[1]  # Encoder K goes straight to attention.
+    edit = MaskFutureAttentionScores(g, "unit", gs.Variable("position"), 4, onnx.TensorProto.FLOAT)
+    assert not edit.match(softmax)
 
 
 def test_add_curr_len_input_rewires_shape_gather_consumers():
@@ -108,14 +120,16 @@ def test_add_curr_len_input_rewires_shape_gather_consumers():
     gather_node = gs.Node("Gather", "gather", inputs=[shape_out, gs.Constant("axis", np.array(2, dtype=np.int64))], outputs=[gathered])
     add = gs.Node("Add", "use", inputs=[gathered, gs.Constant("zero", np.array(0, dtype=np.int64))], outputs=[out])
     cur_len = gs.Variable("cur_len", dtype=np.int64, shape=[])
-    g = graph(nodes=[shape, gather_node, add], inputs=[pkv, cur_len], outputs=[out])
+    present = gs.Variable("updated_cache", dtype=np.float32)
+    update = gs.Node("Concat", "update", inputs=[pkv, gs.Variable("new")], outputs=[present], attrs={"axis": -2})
+    g = graph(nodes=[shape, gather_node, add, update], inputs=[pkv, cur_len], outputs=[out, present])
 
     edit = AddCurrLenInput(g, "unit", cur_len=cur_len)
     assert edit.match(shape)
     edit.transform(shape)
 
     assert add.inputs[0] is cur_len
-    assert shape.inputs == []
+    assert shape.inputs == [pkv]  # Other Shape consumers remain valid.
     assert gather_node.outputs == []
 
 
@@ -227,3 +241,109 @@ def test_combine_kv_io_tensors_replaces_key_value_inputs_with_combined_input():
     assert key_use.inputs[0].name == "past_key_values.0.key_from_combined"
     assert value_use.inputs[0].name == "past_key_values.0.value_from_combined"
     assert [o.name for o in editor.graph.outputs] == ["present.0.key_value"]
+
+
+def test_split_transformer_layers_chains_to_full_model():
+    hidden, layers = 2, 3
+    token = gs.Variable("token_embedding", dtype=np.float32, shape=[1, 1, hidden])
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    position = gs.Variable("position_f", dtype=np.float32)
+    nodes = [gs.Node("Cast", "position_cast", attrs={"to": onnx.TensorProto.FLOAT}, inputs=[positions], outputs=[position])]
+    caches, presents, residual = [], [], token
+    for i in range(layers):
+        past = gs.Variable(f"past_key_values.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
+        present = gs.Variable(f"present.{i}.key_value", dtype=np.float32, shape=[1, 2, 4, hidden])
+        mixed, out = gs.Variable(f"mixed_{i}"), gs.Variable(f"boundary_{i}")
+        nodes += [
+            gs.Node("Add", f"/model/layers.{i}/Add", inputs=[residual, position], outputs=[mixed]),
+            gs.Node("Add", f"/model/layers.{i}/Add_1", inputs=[mixed, gs.Constant(f"bias_{i}", np.full(hidden, i, np.float32))], outputs=[out]),
+            gs.Node("Mul", f"/model/layers.{i}/cache_update", inputs=[past, out], outputs=[present]),
+        ]
+        caches.append(past)
+        presents.append(present)
+        residual = out
+    last = gs.Variable("last_hidden_states", dtype=np.float32, shape=[1, 1, hidden])
+    nodes.append(gs.Node("Identity", "final", inputs=[residual], outputs=[last]))
+    editor = KVEditor(graph(nodes=nodes, inputs=[token, positions, *caches], outputs=[*presents, last]), "unit")
+
+    part_a, part_b = editor.split_transformer_layers(split_at=1, num_layers=layers, hidden_size=hidden)
+
+    rng = np.random.default_rng(0)
+    feeds = {t.name: rng.standard_normal(t.shape).astype(np.float32) for t in [token, *caches]}
+    feeds["position_ids"] = np.array([[5]], dtype=np.int64)
+    full = run_model(editor.graph, feeds)
+    a = run_model(part_a, {name: feeds[name] for name in ("token_embedding", "position_ids", "past_key_values.0.key_value")})
+    b = run_model(part_b, {
+        "boundary_0": a["boundary_0"],
+        "position_ids": feeds["position_ids"],
+        **{f"past_key_values.{i}.key_value": feeds[f"past_key_values.{i}.key_value"] for i in range(1, layers)},
+    })
+    for name, value in {**a, **b}.items():
+        if name in full:
+            np.testing.assert_allclose(value, full[name])
+    assert set(full) <= set(a) | set(b)
+
+
+def _rotary_graph(chunk: int) -> gs.Graph:
+    """Two layers computing the same RoPE from shared int positions, plus a Sin of a float input."""
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, chunk])
+    pos3d = gs.Variable("pos3d", dtype=np.int64, shape=[1, 1, chunk])
+    x = gs.Variable("x", dtype=np.float32, shape=[1, chunk, 8])
+    inv_freq = np.array([1.0, 0.1, 0.01, 0.001], dtype=np.float32).reshape(1, 4, 1)
+    nodes = [gs.Node("Unsqueeze", "Unsqueeze", inputs=[positions, gs.Constant("axis", np.array([1]))], outputs=[pos3d])]
+    outputs = []
+    for layer in range(2):
+        p = f"/model/layers.{layer}/rope"
+        t = [gs.Variable(f"{p}/{name}") for name in ("posf", "angles", "angles_t", "full")]
+        nodes += [
+            gs.Node("Cast", f"{p}/Cast", attrs={"to": onnx.TensorProto.FLOAT}, inputs=[pos3d], outputs=[t[0]]),
+            gs.Node("MatMul", f"{p}/MatMul", inputs=[gs.Constant(f"{p}/inv_freq", inv_freq), t[0]], outputs=[t[1]]),
+            gs.Node("Transpose", f"{p}/Transpose", attrs={"perm": [0, 2, 1]}, inputs=[t[1]], outputs=[t[2]]),
+            gs.Node("Concat", f"{p}/Concat", attrs={"axis": -1}, inputs=[t[2], t[2]], outputs=[t[3]]),
+        ]
+        for op in ("Sin", "Cos"):
+            raw, out = gs.Variable(f"{p}/{op}_out", dtype=np.float32), gs.Variable(f"{p}/{op}_x", dtype=np.float32, shape=[1, chunk, 8])
+            nodes += [gs.Node(op, f"{p}/{op}", inputs=[t[3]], outputs=[raw]), gs.Node("Mul", f"{p}/{op}_mul", inputs=[raw, x], outputs=[out])]
+            outputs.append(out)
+    float_sin = gs.Variable("x_sin", dtype=np.float32, shape=[1, chunk, 8])
+    nodes.append(gs.Node("Sin", "x_sin", inputs=[x], outputs=[float_sin]))
+    return graph(nodes=nodes, inputs=[positions, x], outputs=outputs + [float_sin])
+
+
+@pytest.mark.parametrize("chunk", [1, 3])
+def test_precompute_rotary_tables_matches_computed_rope(chunk):
+    g = _rotary_graph(chunk)
+    before = clone_graph(g)
+    edit = PrecomputeRotaryTables(g, "unit", max_positions=1024)
+    for node in list(g.nodes):
+        edit(node)
+    g.cleanup().toposort()
+
+    assert [node.name for node in g.nodes if node.op in ("Sin", "Cos")] == ["x_sin"]
+    tables = [node.inputs[1].values for node in g.nodes if PrecomputeRotaryTables.TABLE_NAME in node.name]
+    assert [table.shape for table in tables] == [(32, 8)] * 4  # cos/sin of 32 high and 32 low digits, shared by both layers
+    x = np.random.default_rng(0).standard_normal((1, chunk, 8)).astype(np.float32)
+    for start in (0, 300, 1024 - chunk):
+        feeds = {"position_ids": np.arange(start, start + chunk).reshape(1, chunk), "x": x}
+        for expected, actual in zip(run_model(before, feeds).values(), run_model(g, feeds).values()):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_precompute_rotary_tables_keeps_exact_bf16_capacities():
+    g = _rotary_graph(1)
+    edit = PrecomputeRotaryTables(g, "unit", max_positions=PrecomputeRotaryTables.EXACT_BF16_POSITIONS)
+    assert not any(edit.match(node) for node in g.nodes)
+
+
+def test_replace_legacy_rotary_cache_rejects_short_table():
+    positions = gs.Variable("position_ids", dtype=np.int64, shape=[1, 1])
+    sliced, out = gs.Variable("sliced", dtype=np.float32), gs.Variable("cos", dtype=np.float32)
+    slice_node = gs.Node("Slice", "/rotary_emb/Slice", inputs=[
+        gs.Constant("cos_cached", np.zeros((4, 2), np.float32)), gs.Constant("starts", np.array([0])), gs.Constant("ends", np.array([4])),
+    ], outputs=[sliced])
+    g = graph(nodes=[slice_node, gs.Node("Gather", "gather", inputs=[sliced, positions], outputs=[out])], inputs=[positions], outputs=[out])
+
+    edit = ReplaceLegacyRotaryCache(g, "unit", max_len=8)
+    assert edit.match(slice_node)
+    with pytest.raises(ValueError, match="fewer than max_len=8"):
+        edit.transform(slice_node)

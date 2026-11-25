@@ -36,8 +36,13 @@ class DequantizeProjectionsMatMul(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node):
-        if node.op == "MatMul" and node.outputs[0].name == "logits":
-            return isinstance(node.i(1), gs.Node) and node.i(1).op == "DequantizeLinear"
+        return (
+            node.op == "MatMul" and len(node.inputs) == 2 and bool(node.outputs)
+            and bool(node.outputs[0].shape)
+            and node.outputs[0].shape[-1] == self.vocab_size
+            and bool(node.inputs[1].inputs)
+            and node.inputs[1].inputs[0].op == "DequantizeLinear"
+        )
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "MatMul")

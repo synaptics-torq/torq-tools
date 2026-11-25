@@ -45,6 +45,7 @@ __all__ = [
     "load_onnx_lazy",
     "save_onnx",
     "external_data_cwd",
+    "infer_shapes",
     "finalize_torq_ready_onnx",
 ]
 
@@ -60,11 +61,9 @@ def add_onnx_args(
     dynamic_quantize: bool = True,
     convert_dtypes: bool = False,
     allow_no_opt: bool = True,
+    allow_no_cleanup: bool = True,
     extract_embeddings: bool = False,
     dynamic_models: bool = False,
-    keep_individual_kv_io: bool = False,
-    read_only_kv_cache: bool = False,
-    replace_int_bf16_cast: bool = False,
 ):
     """Shared export-pipeline args for every model exporter.
 
@@ -108,14 +107,15 @@ def add_onnx_args(
         default=False,
         help="Skip validation for edited ONNX models"
     )
-    group.add_argument(
-        "--no-onnx-cleanup",
-        action="store_true",
-        default=False,
-        help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
-             "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
-             "exported component before dtype conversion",
-    )
+    if allow_no_cleanup:
+        group.add_argument(
+            "--no-onnx-cleanup",
+            action="store_true",
+            default=False,
+            help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
+                 "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
+                 "exported component before dtype conversion",
+        )
     group.add_argument(
         "--split-weights",
         action="store_true",
@@ -127,14 +127,6 @@ def add_onnx_args(
             "constants stay inline so onnxruntime can still resolve shape-op "
             "inputs (Squeeze/Reshape axes, Slice/Pad parameters) at load time."
         ),
-    )
-    group.add_argument(
-        "--broadcast-ops",
-        type=str,
-        metavar="OP",
-        nargs="*",
-        default=None,
-        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
     if allow_no_opt:
         group.add_argument(
@@ -205,30 +197,6 @@ def add_onnx_args(
             action="store_true",
             default=False,
             help="Export dynamic models for CPU"
-        )
-    if keep_individual_kv_io:
-        group.add_argument(
-            "--keep-individual-kv-io",
-            action="store_true",
-            default=False,
-            help="Keep KV I/O as separate key, value tensors instead of combining"
-        )
-    if read_only_kv_cache:
-        group.add_argument(
-            "--read-only-kv-cache",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help=(
-                "Read the time-major KV caches without writing them and output only the new rows, "
-                "which the runtime writes into the caches at position_ids (default: %(default)s)"
-            ),
-        )
-    if replace_int_bf16_cast:
-        group.add_argument(
-            "--replace-int-bf16-cast",
-            action="store_true",
-            default=False,
-            help="Replace int64 -> bf16 casts with a look-up table"
         )
 
 
@@ -631,6 +599,56 @@ def external_data_cwd(model: onnx.ModelProto):
     finally:
         for tensor in lazy:
             tensor.external_data.add(key="basepath", value=basepath)
+
+
+def strip_weights(model: onnx.ModelProto) -> list[tuple]:
+    """Detach initializer data above 1 KiB from ``model``, in place.
+
+    The tensors keep their name, type and shape (marked as external data),
+    which is all shape inference needs. Returns what ``restore_weights``
+    needs to put the data back.
+    """
+    stripped = []
+    for tensor in model.graph.initializer:
+        if tensor.HasField("raw_data") and len(tensor.raw_data) >= _EXTERNAL_DATA_THRESHOLD:
+            entries = [(e.key, e.value) for e in tensor.external_data]
+            stripped.append((tensor, tensor.raw_data, tensor.data_location, entries))
+            tensor.ClearField("raw_data")
+            _set_external_data(tensor, location="__stripped__")
+    return stripped
+
+
+def restore_weights(stripped: list[tuple]) -> None:
+    while stripped:
+        tensor, raw_data, location, entries = stripped.pop()
+        tensor.raw_data = raw_data
+        tensor.data_location = location
+        del tensor.external_data[:]
+        for key, value in entries:
+            tensor.external_data.add(key=key, value=value)
+
+
+def infer_shapes(model: onnx.ModelProto, **kwargs) -> onnx.ModelProto:
+    """``onnx.shape_inference.infer_shapes`` that also works above 2 GiB.
+
+    Inference serializes the model, which protobuf refuses above 2 GiB. It
+    only reads small (shape-parameter) constants, so larger initializer data
+    is stripped while it runs. A model that had data stripped is annotated
+    in place and returned (top-level graph only), which avoids a second copy
+    of its weights.
+    """
+    stripped = strip_weights(model)
+    try:
+        inferred = shape_inference.infer_shapes(model, **kwargs)
+    finally:
+        had_weights = bool(stripped)
+        restore_weights(stripped)
+    if not had_weights:
+        return inferred
+    for field in ("input", "output", "value_info"):
+        model.graph.ClearField(field)
+        getattr(model.graph, field).extend(getattr(inferred.graph, field))
+    return model
 
 
 def _load_lazy_values(self: LazyValues) -> np.ndarray:

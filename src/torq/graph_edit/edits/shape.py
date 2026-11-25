@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 import hashlib
 
@@ -16,6 +16,81 @@ from ._helpers import (
     _consumers_in_graph,
     _static_int_shape,
 )
+
+
+@dataclass
+class SplitRotarySlices(OnnxGraphEdit):
+    """Replace complementary rotary half-slices with one Split, on any axis."""
+
+    def _pattern(self, first):
+        if first.op != "Slice" or len(first.inputs) < 3 or not first.outputs:
+            return None
+        data = first.inputs[0]
+        shape = data.shape
+        if shape is None:
+            return None
+
+        def bounds(node):
+            if len(node.inputs) < 3:
+                return None
+            starts, ends = (_const_int_list(inp) for inp in node.inputs[1:3])
+            axes = _const_int_list(node.inputs[3]) if len(node.inputs) > 3 else [0]
+            steps = _const_int_list(node.inputs[4]) if len(node.inputs) > 4 else [1]
+            if starts is None or ends is None or axes is None or len(axes) != 1 or steps != [1]:
+                return None
+            if len(starts) != 1 or len(ends) != 1 or not -len(shape) <= axes[0] < len(shape):
+                return None
+            axis = axes[0] % len(shape)
+            size = shape[axis]
+            if not isinstance(size, int) or size <= 0:
+                return None
+            start, end, _ = slice(starts[0], ends[0], 1).indices(size)
+            return axis, start, end
+
+        left = bounds(first)
+        if left is None or left[1] != 0:
+            return None
+        axis, _, half = left
+        if half * 2 != shape[axis]:
+            return None
+        for second in data.outputs:
+            if second is first or second.op != "Slice" or not second.outputs:
+                continue
+            if bounds(second) != (axis, half, shape[axis]):
+                continue
+            # The rotate-half use distinguishes these from combined KV slices.
+            for neg in second.outputs[0].outputs:
+                if neg.op != "Neg":
+                    continue
+                for concat in neg.outputs[0].outputs:
+                    if (concat.op == "Concat" and len(concat.inputs) == 2
+                            and concat.inputs[0] is neg.outputs[0] and concat.inputs[1] is first.outputs[0]
+                            and concat.attrs.get("axis", 0) % len(shape) == axis):
+                        return second, axis, half
+        return None
+
+    def match(self, node: gs.Node) -> bool:
+        return self._pattern(node) is not None
+
+    def transform(self, node: gs.Node):
+        second, axis, half = self._pattern(node)
+        # Preserve legacy output names; names play no part in selecting slices.
+        if node.name.endswith("/Slice"):
+            name = node.name.removesuffix("Slice") + "RoPE_Q_Split"
+        elif node.name.endswith("/Slice_2"):
+            name = node.name.removesuffix("Slice_2") + "RoPE_K_Split"
+        else:
+            name = node.name + "_split"
+        size_name = f"qwen_rope_split_sizes_{half}_{half}"
+        sizes = self.graph.tensors().get(size_name)
+        if sizes is None:
+            sizes = gs.Constant(size_name, np.array([half, half], dtype=np.int64))
+        self.graph.nodes.append(gs.Node(
+            "Split", name, inputs=[node.inputs[0], sizes],
+            outputs=[node.outputs[0], second.outputs[0]], attrs={"axis": axis},
+        ))
+        node.outputs.clear()
+        second.outputs.clear()
 
 
 @dataclass

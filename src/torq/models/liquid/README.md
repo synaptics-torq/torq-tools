@@ -1,35 +1,18 @@
 # LFM2.5 (Liquid) export and compile
 
-End-to-end recipe to take an `LiquidAI/LFM2.5-*-ONNX` source model — **350M**
-(default) or **230M** — from HuggingFace, produce a Torq-ready bf16 ONNX, and
-compile it to a vmfb for the SL2610. Pass `--model-size 230m` for the smaller
-model; everything else is identical (the exporter reads the architecture —
-layer count, hidden size, layer types — from the model's `config.json`).
+See the [model export guide](../README.md) for setup, common flags, compiler configuration, output variants and cache behavior.
 
-This page covers **export** and **compile**, plus deploying the resulting vmfb
-to the board and a basic on-board run (see the end).
+End-to-end recipe to take an `LiquidAI/LFM2.5-*-ONNX` source model — **350M** (default) or **230M** — from HuggingFace, produce a Torq-ready bf16 ONNX, and compile it to a vmfb for the SL2610. Pass `--model-size 230m` for the smaller model.
 
-> For the vision-language model **LFM2-VL-450M** (three ONNX components:
-> decoder + vision encoder + embed_tokens), see [`README_VL.md`](README_VL.md).
-> Its `torq-export-model liquid-vl` subcommand reuses this decoder pipeline.
+> For the vision-language model **LFM2-VL-450M** (three ONNX components: decoder + vision encoder + embed_tokens), see [`README_VL.md`](README_VL.md). Its `torq-export-model liquid-vl` subcommand reuses this decoder pipeline.
 
 ---
 
 ## 0. Source model
 
-The source is the LFM2.5-350M ONNX export. The exporter downloads it
-automatically on first run, so you do not normally need to fetch it yourself.
-It tries the Synaptics-hosted mirror
-[`Synaptics/LiquidAI-LFM2p5-350M-LLM`](https://huggingface.co/Synaptics/LiquidAI-LFM2p5-350M-LLM)
-first — so the pipeline does not break if the upstream repo is renamed or
-removed — then falls back to the upstream `LiquidAI/LFM2.5-350M-ONNX`. The
-Synaptics repo is **private**, so set `HF_TOKEN` (or run `huggingface-cli
-login`) to use it; without a token the exporter falls through to the public
-upstream repo.
+The source is the LFM2.5-350M ONNX export. The exporter downloads it automatically on first run, so you do not normally need to fetch it yourself. It tries the Synaptics-hosted mirror [`Synaptics/LiquidAI-LFM2p5-350M-LLM`](https://huggingface.co/Synaptics/LiquidAI-LFM2p5-350M-LLM) first, then falls back to the upstream `LiquidAI/LFM2.5-350M-ONNX`. The mirror requires [authentication](../README.md#setup-and-pipeline); unauthenticated exports use the public upstream repository.
 
-If you want it on disk ahead of time (offline export, inspection, or to
-avoid a re-download), place it at the canonical source location the exporter
-reads from:
+If you want it on disk ahead of time (offline export, inspection, or to avoid a re-download), place it at the canonical source location the exporter reads from:
 
 ```
 models/liquid-2p5-350m/source/onnx/fp32/
@@ -50,41 +33,15 @@ python src/torq/models/liquid/download_source.py \
   --models-dir models
 ```
 
-(`download_source.py` is self-contained — no compiler-toolchain imports — and
-skips any files already present, so it's safe to re-run.)
+The download helper reuses files already present.
 
-Or, if you already have the model cached elsewhere (e.g. under
-`~/.cache/huggingface/`), point the exporter straight at it instead of the
-canonical location with `--onnx-source-dir <dir-containing-model.onnx>` (see
-the flag table below).
+Or, if you already have the model cached elsewhere (e.g. under `~/.cache/huggingface/`), point the exporter straight at it instead of the canonical location with `--onnx-source-dir <dir-containing-model.onnx>` (see the [export flags](../README.md#common-export-flags)).
 
 ---
 
-## 1. Export: HF source → bf16 ONNX
+## 1. Export and compile
 
-The exporter is the `liquid` subcommand of `torq-export-model` (installed by
-this package). It downloads the HF model on first run (or reuses the source
-from Section 0), applies all the LFM2.5 graph fix-ups required for the
-SL2610, and emits both fp32 and bf16 static ONNX models. LFM2.5 has no
-separate base (non-instruct) checkpoint, so the export validation always
-uses instruct (ChatML) inference semantics.
-
-Graph transforms applied automatically (each one used to be a separate
-host-side script; they now live as static methods on
-[`LiquidModelExporter`](export.py)):
-
-- collision-aware tensor-name sanitization
-- iterative shape propagation + negative-Slice resolution
-- **Conv1D → batched-MatMul** replacement (the SL2610's depthwise-conv path
-  takes an IOCTL timeout; bit-exact `Slice + Reshape + MatMul + Concat`
-  chain replaces it)
-- zero-bias injection into bias-less Conv ops (only those we couldn't
-  replace above)
-- **lm_head**: a single `[1024, 65536]` MatMul against a pre-transposed
-  weight constant (tile-and-fuse handles it; no export-time chunking)
-- **token_embedding** extraction (on by default; opt out with `--no-extract-embeddings`)
-- custom-op replacement for `GroupQueryAttention` /
-  `SimplifiedLayerNormalization`
+Export and compile the default 350M model:
 
 ```sh
 source .venv/bin/activate
@@ -93,46 +50,25 @@ cd torq-tools-dev
 torq-export-model liquid --models-dir models
 ```
 
-Like the other models (gemma3, smollm2), this single command **exports and
-compiles**: by default it produces the static split-lm-head ONNX set
-(embedding extraction and a 64-token batched prefill on) and then compiles it
-to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Pass
-`--convert-dtypes` to compile the converted bf16 variant instead (the VMFB is
-dtype-converted by the compiler either way). Pass `--skip-torq` to stop at the
-ONNX.
+The command produces the static split-lm-head ONNX set (embedding extraction and a 64-token batched prefill on) and then compiles it to a vmfb under `export/split_lm_head/fp32/static/compiled/`. Pass `--convert-dtypes` to compile the converted bf16 variant instead (the VMFB is dtype-converted by the compiler either way). Pass `--skip-torq` to stop at the ONNX.
 
-Flag breakdown:
+Model-specific flags:
 
 | flag | meaning |
 |---|---|
-| `liquid` | subcommand (registered in [`models/export_model.py`](../export_model.py)) |
 | `-s, --model-size {350m,230m}` | which LFM2.5 size to export (default: `350m`). `230m` pulls from `LiquidAI/LFM2.5-230M-ONNX` and reads/writes under `<dir>/liquid-2p5-230m/` |
-| `--models-dir` | base dir; the exporter reads from `<dir>/liquid-2p5-<size>/source/` and writes to `<dir>/liquid-2p5-<size>/export/` |
-| `--onnx-source-dir` | use an existing source ONNX directory instead of the canonical `<models-dir>/.../source/onnx/fp32/` (e.g. a HF cache snapshot dir). Skips the auto-download. |
-| `--convert-dtypes` | emit a converted model alongside fp32: float → bf16 **and** int64 → int32. The `convert_dtypes=["bf16","fp16"]` list passed to `add_onnx_args` in `__init__.py` only gates whether the flag exists — the targets are fixed, and fp16 is never produced |
-| `--dynamic-quantize` | dynamically quantize every exported component to int8 weights; `--dynamic-quantization-skip-model COMPONENT…` exempts components (e.g. keep the `lm_head` fp32) |
-| `--split-lm-head` | the decode `transformer.onnx` becomes the body and a standalone `lm_head.onnx` (`last_hidden_states` -> logits) is emitted. Lower-TTFT during inference as the lm_head is skipped during prefill. **On by default** — opt out with `--no-split-lm-head`. |
-| `--batch-prefill N` | also emit fixed-shape `transformer_prefill.onnx` that processes N tokens per step (default: `64`; pass `0` to disable); requires `--split-lm-head` (on by default). See [Batched prefill](#3-batched-prefill). |
-| `--extract-embeddings` | replace the embedding `Gather` with a `token_embedding` graph input and dump `token_embeddings.npy` (CPU-side LUT). Required for the demo runner. **On by default** — opt out with `--no-extract-embeddings`. |
-| `--no-read-only-kv-cache` | export the pre-2.4 KV caches (head-major, written back whole every step). By default the time-major caches are read-only inputs and the decode and prefill models output only the new rows; see the [Qwen README](../qwen/README.md#read-only-kv-cache) |
-| `--skip-torq` | stop after the ONNX export; do not compile to a vmfb |
-| `--compile-flags …` | extra flags forwarded verbatim to `torq-compile` (must be last). Takes precedence over values set by [`compile_flags.json`](compile_flags.json) |
 
 Opt-out flags for the chip-specific rewrites:
 
 | flag | meaning |
 |---|---|
-| `--keep-conv1d` | leave the original depthwise Conv1D in place (useful for CPU/ORT targets) |
-| `--chunk-lm-head` | revert to the legacy 512-chunk lm_head split (only needed for torq without tile-and-fuse) |
+| `--keep-conv1d` | Leave the original depthwise Conv1D in place for CPU/ORT targets |
 
-> [!Note]
-> `--split-lm-head` is the same concept as gemma3's flag of the same name: the lm_head is extracted into a separate file so the body (hidden output) and the head (hidden→logits) can be deployed independently.
-
-Output on disk after a successful run. As in gemma3, the topology gets its own directory level so a split export never overwrites a unified one (`export/unified/…` vs `export/split_lm_head/…`):
+Split and unified exports use separate output directories (`export/unified/…` vs `export/split_lm_head/…`):
 
 ```
 models/liquid-2p5-350m/
-├── source/onnx/fp32/model.onnx        (~1.4 GB — original HF safetensors, converted)
+├── source/onnx/fp32/model.onnx
 └── export/<unified|split_lm_head>/    (default: split_lm_head; --no-split-lm-head picks the former)
     ├── fp32/static/
     │   ├── model.onnx                (~1.4 GB; unified export only)
@@ -147,80 +83,16 @@ models/liquid-2p5-350m/
     └── bf16/static/                  (only with --convert-dtypes)
 ```
 
-The `compiled/` dir lives inside the variant that is actually compiled
-(`bf16/static/compiled/` with `--convert-dtypes`, `quantized/static/compiled/`
-with `--dynamic-quantize`), so each variant dir is a self-contained deployable
-unit and regenerating a variant's ONNX wipes its stale vmfbs alongside it.
-When the effective compile flags convert the vmfb I/O (`--torq-convert-io-dtype` —
-always, for LFM2.5's flag set), the pipeline also stages the LUT in the runtime
-dtype (bf16) into `compiled/`, next to the vmfb that consumes it. That copy is
-the one to ship to the board; the variant-root `token_embeddings.npy` stays
-fp32 for the host runner.
-
-> [!Note]
-> The fp32 export is the right artifact to validate end-to-end through onnxruntime ("What is the capital of France?" → "The capital of France is Paris."). bf16 cannot be validated through ORT because the CPU MatMul kernel has no bf16 path; compare bf16 against fp32 via the host casting tools if you need a quality check.
-
----
+See [output variants and runtime assets](../README.md#output-variants-and-runtime-assets) and [validation](../README.md#validation) for deployment file requirements and dtype restrictions.
 
 ## 2. Compile: bf16 ONNX → Torq vmfb
 
-Same as gemma3/smollm2: the Section 1 export command already compiles (unless
-you pass `--skip-torq`), writing `model.vmfb` (or `transformer.vmfb` for a
-split export) to `export/<unified|split_lm_head>/<variant>/static/compiled/`
-(`<variant>` = `bf16` with `--convert-dtypes`, else the base dtype dir). Compilation goes through the shared
-`torq.utils.compile` driver (ONNX → MLIR via `iree-import-onnx`, then
-MLIR → vmfb via `torq-compile`), and every compile applies the model's
-validated flag set ([`compile_flags.json`](compile_flags.json) in this
-model's package).
+The export command already compiles the selected variant. See [compiler setup and standalone compilation](../README.md#compiler-setup-and-flags).
 
-Each export variant dir also records the exact set it was built with in its
-own `compile_flags.json`, so a standalone ONNX/MLIR compile later (e.g. a
-diagnostic variant) needs no flags of its own:
-
-```sh
-export TORQ_COMPILER_PATH=/path/to/iree-build/third_party/iree/tools/torq-compile
-python -m torq.utils.compile \
-  models/export/bf16/static/model.onnx \
-  -o models/export/bf16/static/compiled/model.vmfb
-```
-
-Notes:
-- **`--torq-enable-split-constants-optimization`** is kept on for liquid: we
-  measured it faster (303 ms vs 432 ms/step) and lower-heap because each
-  dispatch reads its constant slice straight from the mmap'd vmfb instead of
-  staging the whole blob into anonymous DRAM.
-- For per-pass timing on a slow/hung compile, append `--torq-show-pass-progress`
-  to `--compile-flags`.
-- The compiler binary is resolved via `TORQ_COMPILER_PATH` (default:
-  `torq-compile` on `PATH`).
-
-Output: `model.vmfb` (~712 MB for the full bf16 build, ~553 MB without
-lm_head, ~258 MB without FFN).
+[`compile_flags.json`](compile_flags.json) provides the validated compiler settings, including split-constants optimization for weight access.
 
 ---
 
 ## 3. Batched prefill
 
-`--batch-prefill N` (default: `64`, `0` disables) requires `--split-lm-head`
-(on by default) and additionally emits
-`transformer_prefill.onnx`: the same static decoder with its token input pinned to
-exactly N positions. It takes `input_ids` / `token_embedding` of shape
-`[1, N]` / `[1, N, hidden]` plus a `position_ids [1, 1]` holding the chunk's
-*start* position, updates N consecutive KV-cache rows in one step, and emits
-the final position's logit (`logits [1, 1, vocab]`). The short-conv stack and
-the attention layers handle the chunk natively; RoPE rotates each sequence row
-by its own position, and the causal mask covers the N query rows. The decode
-model and the prefill model share KV-cache I/O shapes, so they can be driven
-alternately on the same cache state. The prefill component is converted to
-bf16 and compiled to the matching `*_prefill.vmfb` alongside the decode model by the
-same command.
-
-Inference (`LiquidStatic`) picks up the matching `*_prefill.onnx` /
-`*_prefill.vmfb` automatically when it sits next to the decode model, reading N from the
-prefill model's input metadata (pass `prefill_size=` explicitly for vmfb,
-which reports no shapes). Prompt processing then runs every complete N-token
-chunk through the prefill model and falls back to single-token decode for any
-remainder; generation always uses the decode model. Export validation compares
-the chunked runner against the unedited dynamic source ONNX.
-
----
+See the [batched prefill guide](../README.md#batched-prefill). Liquid keeps the prefill LM head fused and handles short-conv state alongside the attention caches.

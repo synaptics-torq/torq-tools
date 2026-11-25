@@ -119,23 +119,27 @@ python -m src.torq.utils.benchmark compare -a results_int8.json -b results_mixed
 ```
 See `src/torq/utils/benchmark/README.md` for options.
 #### Export supported ONNX models to static graphs
+
+See the [model export guide](src/torq/models/README.md) for common flags, compiler setup, output variants, cache behavior and model-specific recipes.
+
 Model export pipelines generate static graphs in the model’s original runtime.
 These pipelines also apply a range of graph edits to make models more compatible and efficient for the Torq runtime.
 ```bash
 python3 -m src.torq.models.<model>.export
 ```
-For example, to export a static bf16 Moonshine model:
+For example, to export a static Moonshine model:
 ```bash
-python3 -m src.torq.models.moonshine.export --convert-dtype bf16
+python3 -m src.torq.models.moonshine.export
 ```
-To export a static Moonshine Streaming model (fixed audio chunk, with dtype conversion):
+To export a static Moonshine Streaming model (fixed audio chunk):
 ```bash
-python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280 --convert-dtypes
+python3 -m src.torq.models.moonshine_streaming.export --chunk-len 1280
 ```
+The compiled models run in bf16: each model's validated compile flags (`compile_flags.json`) include `--torq-convert-dtypes`, so the compiler converts the dtypes.
 > [!NOTE]
 > Moonshine Streaming requires a separate virtual environment since `transformers` 5.x
 > conflicts with the base `optimum`-based exporters; see [Install extras](#moonshine-streaming-separate-environment).
-The exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
+> The exporter always produces static models and needs `--chunk-len` (audio samples per chunk,
 > e.g. `1280` = 80 ms @ 16 kHz). It emits `encoder.onnx` + `decoder.onnx` plus host-side
 > `*.npy` LUTs and a `streaming_config.json`.
 
@@ -172,8 +176,8 @@ torq-quantize-model weights quantize -i model_fp32.onnx -o model_int8.onnx --bit
 torq-quantize-model weights quantize -i model_fp32.onnx -o model_mixed.onnx --config quant_config.json --dequantize-weights
 
 # export models
-torq-export-model moonshine --convert-dtype bf16
-torq-export-model moonshine_streaming --chunk-len 1280 --convert-dtypes
+torq-export-model moonshine
+torq-export-model moonshine_streaming --chunk-len 1280
 
 # run inference
 torq-infer-model moonshine apostle.wav -m models/moonshine_tiny_onnx/ -s tiny

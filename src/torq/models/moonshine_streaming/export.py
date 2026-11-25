@@ -439,7 +439,6 @@ class MoonshineStreamingExporter(OnnxModelExporterBase):
 
         self._n_layers = getattr(self._config, "decoder_num_hidden_layers",
                                  getattr(self._config, "num_hidden_layers", 6))
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
 
         dec_heads = getattr(self._config, "num_attention_heads", 8)
         self._num_kv_heads = getattr(self._config, "num_key_value_heads", 8)
@@ -894,7 +893,6 @@ def export_moonshine_streaming_from_args(args: argparse.Namespace):
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
         split_weights=args.split_weights,
-        broadcast_ops=args.broadcast_ops,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:

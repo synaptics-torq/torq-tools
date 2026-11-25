@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
+import onnx
+import onnx_graphsurgeon as gs
+
+from ..onnx import DimMatchType, FixedDimMapping, OnnxGraphEditor
 from .arithmetic import (
     DecomposeLayerNormalization,
     DequantizeProjectionsMatMul,
@@ -10,7 +14,7 @@ from .arithmetic import (
     ReplaceConstantDivWithMul,
     ReplaceInt64FloatCast,
 )
-from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, SplitLMHead, TrimLMHeadVocab
+from .artifacts import ComputeDequantizedLUT, ExtractConstantLUT, MaterializeTiedLMHead, SplitLMHead, TrimLMHeadVocab
 from .conv import DecomposeStridedConv1D, FoldConvBatchNorm, WidenStridedDepthwiseConv
 from .padding import AbsorbPadding, ReplacePadWithConcat, RewriteNegativePads
 from .rnn import DecomposeBidirectionalRnn
@@ -31,8 +35,10 @@ from .transformer import (
     ConvertToStaticIndex,
     GroupQueryHeads,
     MaskFutureAttentionScores,
+    PrecomputeRotaryTables,
     ReadOnlyKVCache,
     ReplaceDynamicKVCache,
+    ReplaceLegacyRotaryCache,
     RetargetCrossAttnKeyLayout,
 )
 from .custom_ops import (
@@ -49,6 +55,25 @@ class CommonGraphEditsMixin:
     Must be used with OnnxGraphEditor (defines self._graph, self._graph_name, 
     self._export_dtype, self.apply_edit).
     """
+
+    def fix_io(
+        self,
+        seq_len: int,
+        dims: list[FixedDimMapping] | None = None,
+        *,
+        chunk_len: int = 1,
+        batch_dim: str = "batch_size",
+        seq_len_dim: str = "sequence_length",
+        past_seq_len_dim: str = "past_sequence_length",
+    ):
+        """Fix the batch, chunk and past-length dims of a decoder's I/O, plus any extra ``dims``."""
+        self.fix_io_dims([
+            FixedDimMapping(batch_dim, DimMatchType.EXACT, 1),
+            FixedDimMapping(seq_len_dim, DimMatchType.EXACT, chunk_len),
+            FixedDimMapping(past_seq_len_dim, DimMatchType.CONTAINS, seq_len),
+            *(dims or []),
+        ])
+        return self
 
     def replace_dynamic_kv_cache(self, cur_len, max_tokens):
         self.apply_edit(ReplaceDynamicKVCache(self._graph, self._graph_name, cur_len, max_tokens))
@@ -145,8 +170,20 @@ class CommonGraphEditsMixin:
         self.apply_edit(GroupQueryHeads(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim))
         return self
 
-    def read_only_kv_cache(self, num_heads: int, num_kv_heads: int, head_dim: int, chunk_len: int = 1):
-        self.apply_edit(ReadOnlyKVCache(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim, chunk_len))
+    def read_only_kv_cache(self, num_heads: int, num_kv_heads: int, head_dim: int, chunk_len: int = 1, sliding_window: int | None = None, sliding_layers: frozenset[int] = frozenset(), ring_buffer: bool = False):
+        self.apply_edit(ReadOnlyKVCache(self._graph, self._graph_name, num_heads, num_kv_heads, head_dim, chunk_len, sliding_window, sliding_layers, ring_buffer))
+        return self
+
+    def precompute_rotary_tables(self, max_positions: int):
+        self.apply_edit(PrecomputeRotaryTables(self._graph, self._graph_name, max_positions))
+        return self
+
+    def replace_legacy_rotary_cache(self, max_len: int):
+        self.apply_edit(ReplaceLegacyRotaryCache(self._graph, self._graph_name, max_len))
+        return self
+
+    def materialize_tied_lm_head(self, output_name="logits"):
+        self.apply_edit(MaterializeTiedLMHead(self._graph, self._graph_name, output_name))
         return self
 
     def trim_lm_head_vocab(self, kept_token_ids, save_lut=None, output_name="logits", include_argmax=False):
@@ -204,3 +241,10 @@ class CommonGraphEditsMixin:
     def fold_conv_batchnorm(self):
         self.apply_edit(FoldConvBatchNorm(self._graph, self._graph_name))
         return self
+
+
+class DecoderGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
+    """Graph editor for a decoder-only LLM exported as a single ``model`` graph."""
+
+    def __init__(self, graph: gs.Graph, export_dtype: onnx.TensorProto.DataType | None = None, **editor_kwargs):
+        super().__init__(graph, "model", export_dtype, **editor_kwargs)

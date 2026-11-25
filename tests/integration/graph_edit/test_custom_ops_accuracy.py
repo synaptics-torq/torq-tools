@@ -259,8 +259,8 @@ def test_group_query_attention_matches_reference():
     sinc = gs.Constant("sin_cache", sin_cache)
 
     attn = gs.Variable("attn", np.float32)
-    present_key = gs.Variable("present_key", np.float32)
-    present_value = gs.Variable("present_value", np.float32)
+    present_key = gs.Variable("cache_output_1", np.float32)
+    present_value = gs.Variable("cache_output_2", np.float32)
     gqa = gs.Node(
         "GroupQueryAttention", "layer/attn/GroupQueryAttention",
         inputs=[q, k, v, pk, pv, slk, tsl, cosc, sinc],
@@ -339,8 +339,8 @@ def test_group_query_attention_chunk_matches_reference():
     bias = gs.Variable("attn_bias", np.float32, [B, 1, S, total])
 
     attn = gs.Variable("attn", np.float32)
-    present_key = gs.Variable("present_key", np.float32)
-    present_value = gs.Variable("present_value", np.float32)
+    present_key = gs.Variable("cache_output_1", np.float32)
+    present_value = gs.Variable("cache_output_2", np.float32)
     gqa = gs.Node(
         "GroupQueryAttention", "layer/attn/GroupQueryAttention",
         inputs=[q, k, v, pk, pv, slk, tsl, cosc, sinc, gs.Variable.empty(), bias],

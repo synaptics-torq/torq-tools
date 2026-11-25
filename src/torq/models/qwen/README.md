@@ -1,15 +1,15 @@
 # Qwen export for Torq
 
-Export pipeline for **Qwen3-0.6B** and **Qwen2.5-0.5B-Instruct**. One command
-converts the Hugging Face model to a static, INT4 weight-quantized model and
-compiles it to Torq VMFBs.
+See the [model export guide](../README.md) for setup, common flags, compiler configuration, output variants and cache behavior.
+
+Export pipeline for **Qwen3-0.6B** and **Qwen2.5-0.5B-Instruct**. One command converts the Hugging Face model to a static, INT4 weight-quantized model and compiles it to Torq VMFBs.
 
 ## Models
 
-| `-s, --model-size` | Source (Hugging Face) | Torq model (Hugging Face) | SL2610 chat demo |
-|---|---|---|---|
-| `qwen3-0.6b` (default) | `Qwen/Qwen3-0.6B` | `Synaptics/Qwen3-0.6B-GPTQ-int4-torq` | 6.0–6.4 tok/s |
-| `qwen2.5-0.5b-instruct` | `Qwen/Qwen2.5-0.5B-Instruct` | `Synaptics/Qwen2.5-0.5B-Instruct-GPTQ-int4-torq` | 11.3 tok/s |
+| `-s, --model-size` | Source (Hugging Face) | Torq model (Hugging Face) |
+|---|---|---|
+| `qwen3-0.6b` (default) | `Qwen/Qwen3-0.6B` | `Synaptics/Qwen3-0.6B-GPTQ-int4-torq` |
+| `qwen2.5-0.5b-instruct` | `Qwen/Qwen2.5-0.5B-Instruct` | `Synaptics/Qwen2.5-0.5B-Instruct-GPTQ-int4-torq` |
 
 ## Quick start
 
@@ -22,31 +22,16 @@ The command does these steps:
 
 1. It exports the Hugging Face model to ONNX with optimum.
 2. It makes a static single-token decoder with a 256-slot KV cache.
-3. It moves the token embeddings to the host (`token_embeddings.npy`), trims
-   the output vocabulary to Latin text, punctuation and digits
-   (`token_id_lut.npy`) and writes the LM head as a separate model.
-4. It rewrites attention: grouped-query attention reads the KV heads
-   directly, and the time-major K/V caches are read-only inputs; the model
-   outputs only the new token's rows (see [Read-only KV cache](#read-only-kv-cache)).
-5. It quantizes all MatMul weights of the transformer and the LM head to INT4
-   `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from
-   GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
-6. It converts the model to bf16 and int32 and compiles `transformer.vmfb` and
-   `lm_head.vmfb.trim` with the flags in [`compile_flags.json`](compile_flags.json).
+3. It moves the token embeddings to the host (`token_embeddings.npy`), trims the output vocabulary to Latin text, punctuation and digits (`token_id_lut.npy`) and writes the LM head as a separate model.
+4. It uses read-only KV caches and outputs only the new token's cache rows (see [Read-only KV cache](../README.md#read-only-kv-cache)).
+5. It quantizes all MatMul weights of the transformer and the LM head to INT4 `DequantizeLinear` (block size 32, bf16 scales). The INT4 weights come from GPTQ, downloaded from the `gptq/` folder of the Torq model repository.
+6. It converts the model to bf16 and int32 and compiles `transformer.vmfb` and `lm_head.vmfb.trim` with the flags in [`compile_flags.json`](compile_flags.json).
 
-The Torq model repositories are private. Log in with `hf auth login` first.
-
-### Compiler
-
-The export needs torq-compiler 2.3.0 or newer. It compiles with input
-prefetch, which loads the next weights while the NPU computes. The GPTQ
-weight loader is in its Python package (`torq.lab.quantization.onnx.weights`).
+The Torq model repositories are private. See [authentication and compiler setup](../README.md#setup-and-pipeline); Qwen requires torq-compiler 2.3.0 or newer, including its GPTQ weight loader.
 
 ## Start from another Hugging Face model
 
-The hosted GPTQ weights belong to the default source of each `--model-size`.
-For another model of the same architecture (for example a fine-tune), make
-GPTQ weights for that model first:
+The hosted GPTQ weights belong to the default source of each `--model-size`. For another model of the same architecture (for example a fine-tune), make GPTQ weights for that model first:
 
 ```sh
 # 1. GPTQ calibration in its own virtualenv (see int4quant/README.md), about
@@ -60,44 +45,22 @@ torq-export-model qwen -s qwen2.5-0.5b-instruct --hf-repo <hf-repo> \
     --gptq-checkpoint gptq-<name>
 ```
 
-Use the `-s` value with the same architecture as `<hf-repo>`. Without
-`--gptq-checkpoint`, an export with another `--hf-repo` or with
-`--onnx-source-dir` uses round-to-nearest INT4 and shows a warning. It does
-not use the hosted weights, because they would replace the weights of your
-model.
+Use the `-s` value with the same architecture as `<hf-repo>`. Without `--gptq-checkpoint`, an export with another `--hf-repo` or with `--onnx-source-dir` uses round-to-nearest INT4 and shows a warning. It does not use the hosted weights, because they would replace the weights of your model.
 
 ## Compile flags
 
-[`compile_flags.json`](compile_flags.json) has one entry per validated
-torq-compiler version, as for the other models. Each entry has the flags for
-all components (`common`) and the extra flags per component (`transformer`,
-`lm_head`). The exporter uses the entry of the installed compiler version; a
-version without an entry compiles without the model's flags and shows a
-warning. Flags after `--compile-flags` come last and take precedence.
+[`compile_flags.json`](compile_flags.json) adds these Qwen-specific settings; see [compiler setup and flags](../README.md#compiler-setup-and-flags) for overrides:
 
 - `--torq-disable-slicing`: the models are compiled without LinalgSlicing.
-- `--torq-prefetch-algorithm=stream-schedule`: schedules the DMA transfers
-  over the slice compute, so that most of the compute is hidden under the
-  weight loads. Decode is DMA-bound, so this sets the token rate.
-- `--torq-max-nss-programs-size=12582912` (transformer only): the NSS
-  programs need about 11 MB.
+- `--torq-prefetch-algorithm=stream-schedule`: overlaps weight transfers with computation.
+- `--torq-max-nss-programs-size=12582912` (transformer only): sets the transformer program-size budget.
 
-## Key export flags
+## Model-specific export flags
 
 | Flag | Description |
 |---|---|
 | `-s, --model-size` | Model to export (see [Models](#models)) |
-| `-t, --max-gen-tokens N` | Static sequence length / KV-cache size (default: 256) |
-| `--split-lm-head` / `--no-split-lm-head` | Separate LM head model (default: on) |
-| `--weight-quantization {int4,int8,none}` | DequantizeLinear weight quantization (default: int4) |
-| `--gptq` / `--no-gptq` | Use the GPTQ INT4 weights from Hugging Face (default: on) |
-| `--gptq-checkpoint DIR` | Local GPTQ checkpoint, made with [`int4quant/run_gptq.py`](int4quant/README.md) |
 | `--split-model` | Also split the transformer into Part A and Part B |
-| `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings, so this fails for Qwen3-0.6B |
-| `--no-read-only-kv-cache` | Export the pre-2.4 caches: head-major, written back whole every step (see [Read-only KV cache](#read-only-kv-cache)) |
-| `--hf-repo`, `--onnx-source-dir` | Override the source model |
-| `--skip-torq` | Stop after the ONNX export |
-| `--compile-flags …` | Extra `torq-compile` flags (must be last) |
 
 ## Output layout
 
@@ -110,24 +73,11 @@ models/<hf-repo>/export/torq/converted/static/
     tokenizer.json, tokenizer_config.json, config.json, generation_config.json
 ```
 
-The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen3`
-and `qwen2_5` demos run this directory.
-
-## Read-only KV cache
-
-The transformer only reads its KV caches. Each layer's cache is a time-major `[1, 256, 2 * kv, D]` input (K heads, then V heads), and `present.{i}.key_value` holds only the step's new `[1, 1, 2 * kv, D]` rows, which the runtime writes into the cache at `position_ids` before the next step. The new token attends to the past cache and to itself in one softmax, so the output is unchanged. The cache is never blended, transposed or copied on the NPU, and the runtime makes no per-call copy of tied caches. The same `ReadOnlyKVCache` graph edit is applied by the Gemma 3, LFM2.5 and SmolLM2 exporters, including their batched prefill models. `--no-read-only-kv-cache` exports the earlier layout, which the torq-examples demos before v2.4.0 expect.
-
-Qwen3-0.6B on an SL2610 board at 1 GHz (torq-runtime 2.3.0, torq-examples chat demo):
-
-| | decode | compiler DMA estimate per step |
-|---|---|---|
-| `--no-read-only-kv-cache` | 6.0 tok/s | 410 MB |
-| default | 8.5 tok/s | 323 MB |
+The [torq-examples](https://github.com/synaptics-torq/torq-examples) `qwen3` and `qwen2_5` demos run this directory.
 
 ## Split model
 
-With `--split-model`, the Qwen transformer is divided in two halves. For
-Qwen3-0.6B the split is at layer 14:
+With `--split-model`, the Qwen transformer is divided in two halves. For Qwen3-0.6B the split is at layer 14:
 
 ```text
 Part A: layers 0–13
@@ -137,8 +87,7 @@ LM head: separate
 
 The split runtime is intended for memory-constrained Torq targets.
 
-The `--split-vmfb-dir` inference option expects a self-contained directory
-containing the split VMFBs and required runtime assets.
+The `--split-vmfb-dir` inference option expects a self-contained directory containing the split VMFBs and required runtime assets.
 
 ## Inference
 
@@ -178,11 +127,3 @@ torq-infer-model qwen \
     --max-gen-tokens 256 \
     "Hello"
 ```
-
-## Notes
-
-- The source ONNX models are large (external data, more than 2 GB of fp32
-  weights). The exporter uses path-based ONNX shape inference. It skips the
-  generic in-memory ONNX cleanup, which cannot serialize models of this size.
-- `--weight-quantization int8` applies block-size-32 INT8 DequantizeLinear
-  weights. GPTQ weights are only available for int4.

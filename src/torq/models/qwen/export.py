@@ -23,8 +23,9 @@ from transformers import AutoConfig
 
 from ._trim_vocab import build_qwen_trimmed_vocab_spec
 from . import DEFAULT_HF_REPO, QWEN_MODELS, add_qwen_export_args
-from ._graph import QwenOnnxGraphEditor
 from ._inference import QwenDynamic, QwenStatic
+from ...graph_edit.edits import DecoderGraphEditor, PrecomputeRotaryTables, ReplaceLegacyRotaryCache
+from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...utils.compile import (
     export_torq as compile_torq_model,
     get_iree_version,
@@ -128,10 +129,8 @@ class QwenModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
-        keep_individual_kv_io: bool = False,
         split_lm_head: bool = False,
         split_model: bool = False,
-        read_only_kv_cache: bool = True,
         weight_quantization: str | None = None,
         gptq_checkpoint: str | os.PathLike | None = None,
     ):
@@ -139,11 +138,9 @@ class QwenModelExporter(OnnxModelExporterBase):
         self._hf_repo_subdir = hf_repo_subdir
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
-        self._keep_individual_kv_io = keep_individual_kv_io
         # Splitting the transformer always splits off the LM head as well.
         self._split_lm_head = split_lm_head or split_model
         self._split_model = split_model
-        self._read_only_kv_cache = read_only_kv_cache
         self._weight_quantization = weight_quantization
         self._gptq_checkpoint = (
             Path(gptq_checkpoint) if gptq_checkpoint else None
@@ -153,12 +150,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             raise ValueError(
                 "`--split-model` / `--split-lm-head` are currently supported "
                 "only for static Qwen exports"
-            )
-
-        if read_only_kv_cache and static_models and (not self._split_lm_head or keep_individual_kv_io):
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O and `--split-lm-head`; "
-                "add `--no-read-only-kv-cache` otherwise"
             )
 
         if self._weight_quantization is not None and not self._split_lm_head:
@@ -320,6 +311,53 @@ class QwenModelExporter(OnnxModelExporterBase):
             "(model) Skipping ONNX Runtime optimization for large external-data model"
         )
 
+    def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
+        head_dim = getattr(self._config, "head_dim", None) or (
+            self._config.hidden_size // self._config.num_attention_heads
+        )
+        attention_args = (
+            self._config.num_attention_heads,
+            self._config.num_key_value_heads,
+            head_dim,
+        )
+        blocks = {}
+        if self._static_models:
+            blocks["model.static"] = [
+                EditSpec("RemoveRedundantCasts"),
+                EditSpec("ReplaceLegacyRotaryCache", (self._max_gen_tokens,)),
+            ]
+            blocks["model.static (KV cache)"] = [
+                EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), self._max_gen_tokens)),
+                EditSpec("MaskFutureAttentionScores", (ctx("cur_len"), self._max_gen_tokens, self._onnx_export_dtype)),
+                EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
+                EditSpec("ConvertToStaticIndex"),
+            ]
+        if self._split_lm_head:
+            blocks["model.patch (embeddings)"] = [EditSpec(
+                "ExtractConstantLUT",
+                ((self._config.vocab_size, self._config.hidden_size), ctx("embeddings_path"), "token_embedding"),
+            )]
+        blocks["model.patch"] = [
+            EditSpec("PrecomputeRotaryTables", (self._max_gen_tokens,)),
+            EditSpec("EliminateTranspose"),
+            EditSpec("CollapseReshapeChain"),
+            EditSpec("FoldScalarMatMul"),
+        ]
+        if self._split_lm_head:
+            blocks["model.patch (vocabulary)"] = [
+                EditSpec("MaterializeTiedLMHead"),
+                EditSpec("TrimLMHeadVocab", (ctx("kept_token_ids"), "logits", ctx("token_id_lut_path"))),
+            ]
+            blocks["model.patch (LM head)"] = [EditSpec("SplitLMHead", (ctx("lm_head_path"),))]
+        attention = [EditSpec("RemoveIsNaN")]
+        if self._static_models:
+            attention.append(EditSpec("GroupQueryHeads", attention_args))
+            attention.append(EditSpec("ReadOnlyKVCache", attention_args))
+        blocks["model.patch (attention)"] = attention
+        if self._split_lm_head:
+            blocks["transformer.convert"] = [EditSpec("SplitRotarySlices")]
+        return blocks
+
     def _make_model_static(
         self,
         model: onnx.ModelProto,
@@ -328,16 +366,16 @@ class QwenModelExporter(OnnxModelExporterBase):
 
         graph = gs.import_onnx(model)
 
-        editor = QwenOnnxGraphEditor(
+        editor = DecoderGraphEditor(
             graph,
             self._onnx_export_dtype,
+            **self._editor_dump_kwargs(self._export_path_for_component("model")),
         )
 
         editor.fix_io(self._max_gen_tokens)
-        editor.remove_redundant_casts()
-        # No-op for Qwen3; required for legacy Qwen2/Qwen2.5 exports.
-        if editor.fold_legacy_rotary_cache(self._max_gen_tokens):
-            editor.rotary_gather_to_onehot_matmul()
+        blocks = self.graph_edit_blocks()
+        editor.apply_specs(blocks["model.static"], self._harness)
+        graph = editor.graph
 
         position_ids = next(
             (
@@ -359,10 +397,11 @@ class QwenModelExporter(OnnxModelExporterBase):
             position_ids.dtype = np.int64
             position_ids.shape = [1, 1]
 
+        # Reshape, not Squeeze: Torch-MLIR crashes folding this Squeeze after int32 conversion.
         current_length = graph.layer(
             name="current_len_to_1d",
-            op="Squeeze",
-            inputs=[position_ids, [0]],
+            op="Reshape",
+            inputs=[position_ids, np.array([1], dtype=np.int64)],
             outputs=[
                 gs.Variable(
                     "position_ids_squeezed",
@@ -372,21 +411,12 @@ class QwenModelExporter(OnnxModelExporterBase):
             ],
         )[0]
 
-        (
-            editor
-            .replace_dynamic_kv_cache(
-                current_length,
-                self._max_gen_tokens,
-            )
-            .mask_future_attn_scores(
-                current_length,
-                self._max_gen_tokens,
-            )
-            .add_curr_len_input(current_length)
-            .convert_to_static_index()
+        editor.apply_specs(
+            blocks["model.static (KV cache)"], self._harness,
+            {"cur_len": current_length},
         )
 
-        editor.resolve_static_shape_inputs()
+        editor.freeze_shape_seeds()
 
         static_model = editor.to_onnx(
             override_ir=model.ir_version,
@@ -408,11 +438,13 @@ class QwenModelExporter(OnnxModelExporterBase):
     ) -> None:
         model = onnx.load(model_path)
 
-        editor = QwenOnnxGraphEditor.from_onnx(
+        editor = DecoderGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,
+            **self._editor_dump_kwargs(Path(model_path)),
         )
 
+        blocks = self.graph_edit_blocks()
         hidden_size = self._config.hidden_size
         # Qwen2/Qwen2.5 configs do not define head_dim.
         head_dim = getattr(self._config, "head_dim", None) or (
@@ -424,11 +456,9 @@ class QwenModelExporter(OnnxModelExporterBase):
                 Path(model_path).parent / "token_embeddings.npy"
             )
 
-            editor.extract_token_embeddings(
-                hidden_size,
-                self._config.vocab_size,
-                embeddings_npy,
-                inp_name="token_embedding",
+            editor.apply_specs(
+                blocks["model.patch (embeddings)"], self._harness,
+                {"embeddings_path": embeddings_npy},
             )
 
             token_embedding = editor.graph.tensors()["token_embedding"]
@@ -440,27 +470,21 @@ class QwenModelExporter(OnnxModelExporterBase):
                 0,
             )
 
-            if not self._keep_individual_kv_io:
-                editor.combine_kv_io_tensors(
-                    [
-                        1,
-                        self._config.num_key_value_heads,
-                        self._max_gen_tokens,
-                        head_dim,
-                    ]
-                )
-                if not self._read_only_kv_cache:
-                    # One cache write per layer instead of split, blend and concat.
-                    editor.blend_combined_kv_in_place()
-
             self._logger.info(
                 "(model) Extracted Qwen token embeddings to '%s'",
                 str(embeddings_npy),
             )
 
-        editor.eliminate_transposes()
-        editor.collapse_reshape_chains()
-        editor.fold_scalar_matmul()
+        if self._static_models:
+            editor.combine_kv_io_tensors(
+                [
+                    1,
+                    self._config.num_key_value_heads,
+                    self._max_gen_tokens,
+                    head_dim,
+                ]
+            )
+        editor.apply_specs(blocks["model.patch"], self._harness)
 
         if self._split_lm_head:
             tokenizer_path = (
@@ -507,13 +531,12 @@ class QwenModelExporter(OnnxModelExporterBase):
                 -len(kept_token_ids) % VOCAB_PAD_MULTIPLE
             )
 
-            editor.materialize_tied_lm_head()
-            editor.trim_lm_head_vocab(
-                kept_token_ids=np.array(
-                    kept_token_ids,
-                    dtype=np.int64,
-                ),
-                save_lut=token_id_lut_path,
+            editor.apply_specs(
+                blocks["model.patch (vocabulary)"], self._harness,
+                {
+                    "kept_token_ids": np.array(kept_token_ids, dtype=np.int64),
+                    "token_id_lut_path": token_id_lut_path,
+                },
             )
 
             lm_head_path = (
@@ -531,8 +554,9 @@ class QwenModelExporter(OnnxModelExporterBase):
             lm_head_matmul.inputs[0].dtype = np.float32
             lm_head_matmul.inputs[0].shape = [1, 1, hidden_size]
 
-            editor.split_lm_head(
-                lm_head_path
+            editor.apply_specs(
+                blocks["model.patch (LM head)"], self._harness,
+                {"lm_head_path": lm_head_path},
             )
 
             self._export_paths["lm_head"] = lm_head_path
@@ -546,25 +570,11 @@ class QwenModelExporter(OnnxModelExporterBase):
             )
 
         # The IsNaN guard between Softmax and the context MatMul hides the attention pattern.
-        editor.remove_isNaN()
-
-        if self._static_models:
-            editor.group_query_heads(
-                self._config.num_attention_heads,
-                self._config.num_key_value_heads,
-                head_dim,
-            )
-            if self._read_only_kv_cache:
-                editor.read_only_kv_cache(
-                    self._config.num_attention_heads,
-                    self._config.num_key_value_heads,
-                    head_dim,
-                )
+        editor.apply_specs(blocks["model.patch (attention)"], self._harness)
 
         editor.reorder_graph_input("position_ids", 1)
 
-        editor.resolve_static_shape_inputs()
-        editor.replace_current_len_squeeze()
+        editor.freeze_shape_seeds()
 
         if self._split_model:
             split_dir = Path(model_path).parent
@@ -790,12 +800,12 @@ class QwenModelExporter(OnnxModelExporterBase):
                 load_external_data=False,
             )
 
-            editor = QwenOnnxGraphEditor.from_onnx(
+            editor = DecoderGraphEditor.from_onnx(
                 inferred_model,
                 self._onnx_export_dtype,
             )
 
-            editor.resolve_static_shape_inputs()
+            editor.freeze_shape_seeds()
 
             resolved_model = editor.to_onnx(
                 override_ir=inferred_model.ir_version,
@@ -881,7 +891,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 max_gen_tokens=self._max_gen_tokens,
                 n_threads=n_threads,
                 repo_id=self._hf_repo,
-                combined_kv_io=not self._keep_individual_kv_io,
+                combined_kv_io=True,
             )
         else:
             runner = QwenDynamic.from_onnx(
@@ -1070,7 +1080,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                     model_path=inferred_fp32_path,
                     output_path=converted_model_path,
                     # One-hot rotary table lookups are not weight MatMuls.
-                    skip_layers=["rotary_emb_cache_"],
+                    skip_layers=[ReplaceLegacyRotaryCache.TABLE_NAME, PrecomputeRotaryTables.TABLE_NAME],
                 )
 
                 # Reuse the already shape-inferred model instead of loading
@@ -1148,20 +1158,21 @@ class QwenModelExporter(OnnxModelExporterBase):
             )
 
             if self._split_lm_head:
-                converted_editor = QwenOnnxGraphEditor.from_onnx(
+                converted_editor = DecoderGraphEditor.from_onnx(
                     converted_model,
                     self._onnx_export_dtype,
+                    **self._editor_dump_kwargs(converted_model_path),
                 )
-                converted_editor.convert_static_shape_params_to_int32()
 
                 if model_path.name != "lm_head.onnx":
-                    converted_editor.split_rope_qk(
-                        getattr(self._config, "head_dim", None)
-                        or self._config.hidden_size
-                        // self._config.num_attention_heads
+                    converted_editor.apply_specs(
+                        self.graph_edit_blocks()["transformer.convert"], self._harness,
                     )
 
+                # Torq takes int32 shape parameters, which ONNX shape inference rejects.
                 converted_model = converted_editor.to_onnx(
+                    check_type=False,
+                    strict_mode=False,
                     override_ir=converted_model.ir_version,
                 )
 
@@ -1411,13 +1422,15 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=convert_dtypes,
-        keep_individual_kv_io=args.keep_individual_kv_io,
         split_model=args.split_model,
-        read_only_kv_cache=args.read_only_kv_cache,
         split_lm_head=args.split_lm_head,
         weight_quantization=weight_quantization,
-        gptq_checkpoint=_resolve_gptq_checkpoint(args),
+        gptq_checkpoint=None if args.view_graph_edits else _resolve_gptq_checkpoint(args),
     )
+    exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
+    if args.view_graph_edits:
+        print(render_graph_edit_plan(exporter.describe_graph_edits()))
+        return
 
     # The generic ONNX cleanup serializes the whole model in memory. The Qwen
     # models have more than 2 GB of fp32 weights, so the cleanup cannot run.

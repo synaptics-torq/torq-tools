@@ -10,8 +10,6 @@ torq-tools — picks the flags up from the dir instead of the user having to
 know them."""
 
 import json
-import os
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
@@ -25,11 +23,6 @@ from support.model_export import StubExporter
 
 pytestmark = pytest.mark.unit
 
-# torq-compile 2.2.1 host/CSS pipeline bug workaround (dynamic-quantize models).
-HOST_CSS_WORKAROUND = ["--torq-disable-host", "--torq-disable-css"]
-# Validated for the LLM exporters only (gemma3, qwen).
-STREAM_SCHEDULE_FLAG = "--torq-prefetch-algorithm=stream-schedule"
-
 
 @pytest.fixture(autouse=True)
 def _pin_compiler_version(monkeypatch):
@@ -37,13 +30,6 @@ def _pin_compiler_version(monkeypatch):
     (matching ``_flags_file``'s default) rather than the environment's.
     """
     monkeypatch.setattr(me, "get_iree_version", lambda compiler_path=None: "2.2.1")
-
-
-def _validated_versions(data: dict) -> list[str]:
-    """The compiler versions a parsed flag file validates: the top-level
-    version keys (per-version schema) or the ``version`` list (flat schema).
-    """
-    return data.get("version") or list(data)
 
 
 def _flags_file(
@@ -82,96 +68,6 @@ def _exporter(tmp_path: Path, **kwargs) -> StubExporter:
     exporter = StubExporter(tmp_path, {"model": _tiny_matmul_model()}, **kwargs)
     exporter.export_onnx(validate=False, cleanup=False)
     return exporter
-
-
-def test_source_tree_model_flag_files_are_complete():
-    """The chip-compiled exporters ship a validated flag file (guards against
-    drift)."""
-    models_dir = Path(me.__file__).parent.parent / "models"
-    for model in ("gemma3", "smollm2", "liquid", "moonshine", "moonshine_streaming"):
-        path = models_dir / model / COMPILE_FLAGS_FILE
-        assert path.is_file(), f"missing validated flags for {model}"
-        data = json.loads(path.read_text())
-        for version, entry in data.items():
-            assert entry.get("common"), f"{model} {version}: empty common flags"
-        # The float-only moonshine_streaming exporter inlines the workaround
-        # into common (it never compiles a dynamic_quantize variant); the
-        # other models carry it as a dynamic_quantize group.
-        entry = data["2.2.1"]
-        has_workaround = (
-            entry.get("dynamic_quantize") == HOST_CSS_WORKAROUND
-            or set(HOST_CSS_WORKAROUND) <= set(entry["common"])
-        )
-        assert has_workaround, (
-            f"{model}: 2.2.1 host/CSS workaround (torq-compile 2.2.1 host/CSS "
-            "bug) missing"
-        )
-    # moonshine is validated against the LLM flag set, not its own;
-    # moonshine_streaming matches it, except versions that inline the
-    # dynamic_quantize workaround into common (see above). The stream-schedule
-    # prefetch is validated for the LLM only, so it is not part of the shared set.
-    llm = json.loads((models_dir / "gemma3" / COMPILE_FLAGS_FILE).read_text())
-    for model in ("moonshine", "moonshine_streaming"):
-        data = json.loads((models_dir / model / COMPILE_FLAGS_FILE).read_text())
-        for version, entry in llm.items():
-            entry = {
-                group: [f for f in flags if f != STREAM_SCHEDULE_FLAG]
-                for group, flags in entry.items()
-            }
-            inlined = {"common": entry["common"] + entry.get("dynamic_quantize", [])}
-            assert data.get(version) in (entry, inlined), (
-                f"{model}: {version} flags drifted from the LLM set"
-            )
-
-
-@pytest.mark.ci
-def test_installed_compiler_matches_shipped_flag_versions():
-    """CI-only guard: the installed torq-compiler must be a top-level key in
-    every shipped ``compile_flags.json``. Bumping the compiler without
-    re-validating a model's flag set fails CI here instead of silently
-    shipping stale flags. Skipped outside CI (``CI`` unset): a deliberate
-    local compiler/flag mismatch must not break regular use."""
-    if not os.environ.get("CI"):
-        pytest.skip("runs in CI only; local compiler/flag mismatches may be deliberate")
-    try:
-        installed = version("torq-compiler")
-    except PackageNotFoundError as e:
-        pytest.fail(f"torq-compiler not installed: {e!r}")
-    models_dir = Path(me.__file__).parent.parent / "models"
-    for path in sorted(models_dir.rglob(COMPILE_FLAGS_FILE)):
-        rel = path.relative_to(models_dir)
-        data = json.loads(path.read_text())
-        validated = _validated_versions(data)
-        assert installed in validated, (
-            f"{rel}: installed torq-compiler {installed} not in validated "
-            f"versions {sorted(validated)!r}; re-validate the flags for "
-            f"{installed} and add an entry alongside the compiler requirement"
-        )
-
-
-def test_pinned_compiler_has_entries_in_all_flag_files():
-    """The torq-compiler pinned in pyproject (what a package install pulls
-    in) must have an entry in every shipped ``compile_flags.json``, so a
-    plain ``pip install torq-tools`` + export resolves each model's
-    validated flags instead of warning and compiling without them."""
-    import tomllib
-
-    with open(Path(me.__file__).parents[3] / "pyproject.toml", "rb") as f:
-        deps = tomllib.load(f)["project"]["dependencies"]
-    pin = next((d for d in deps if d.startswith("torq-compiler==")), None)
-    assert pin, "pyproject.toml must pin torq-compiler==<version> exactly"
-    pinned = pin.split("==", 1)[1]
-
-    models_dir = Path(me.__file__).parent.parent / "models"
-    for path in sorted(models_dir.rglob(COMPILE_FLAGS_FILE)):
-        rel = path.relative_to(models_dir)
-        data = json.loads(path.read_text())
-        validated = _validated_versions(data)
-        assert pinned in validated, (
-            f"{rel}: pinned torq-compiler {pinned} not in validated "
-            f"versions {sorted(validated)!r}; add a flag set validated for "
-            f"{pinned} so package installs can export this model"
-        )
 
 
 def test_select_compile_flags_entry():

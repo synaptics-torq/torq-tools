@@ -95,16 +95,29 @@ class DecoderOnlyRunner(ABC):
     def _init_cache(self) -> dict[str, np.ndarray]: ...
 
     def _update_cache(self, new_values: list[np.ndarray], start_pos: int):
+        row_axis = next((a for cache, value in zip(self._kv_cache.values(), new_values)
+                         for a, (n, c) in enumerate(zip(value.shape, cache.shape)) if n < c), None)
         for k, v in zip(self._kv_cache.keys(), new_values):
             cache = self._kv_cache[k]
             rows_axis = next((a for a, (n, c) in enumerate(zip(v.shape, cache.shape)) if n < c), None)
+            if rows_axis is None and row_axis is not None and cache.shape[row_axis] < self._max_gen_tokens:
+                rows_axis = row_axis
             if rows_axis is None:
                 self._kv_cache[k] = v
             else:
                 # Read-only KV cache graphs output only the new rows.
                 index = [slice(None)] * cache.ndim
-                index[rows_axis] = slice(start_pos, start_pos + v.shape[rows_axis])
-                cache[tuple(index)] = v
+                length, count = cache.shape[rows_axis], v.shape[rows_axis]
+                offset = start_pos % length if length < self._max_gen_tokens else start_pos
+                if start_pos < 0 or count > length or (offset + count > length and length >= self._max_gen_tokens):
+                    raise ValueError("KV cache write exceeds capacity")
+                first = min(count, length - offset)
+                source = [slice(None)] * v.ndim
+                index[rows_axis], source[rows_axis] = slice(offset, offset + first), slice(0, first)
+                cache[tuple(index)] = v[tuple(source)]
+                if first < count:
+                    index[rows_axis], source[rows_axis] = slice(0, count - first), slice(first, count)
+                    cache[tuple(index)] = v[tuple(source)]
 
     @abstractmethod
     def _llm_step(self, token: int, curr_seq_len: int) -> tuple[int, list[np.ndarray]]: ...

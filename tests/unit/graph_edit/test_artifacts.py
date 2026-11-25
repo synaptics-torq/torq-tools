@@ -7,7 +7,7 @@ import onnx_graphsurgeon as gs
 import pytest
 
 from support.graph_edit import graph
-from torq.graph_edit.edits.artifacts import ExtractConstantLUT, SplitLMHead, TakeLastToken, TrimLMHeadVocab
+from torq.graph_edit.edits.artifacts import ExtractConstantLUT, MaterializeTiedLMHead, SplitLMHead, TakeLastToken, TrimLMHeadVocab
 
 
 pytestmark = pytest.mark.artifacts
@@ -105,3 +105,14 @@ def test_take_last_token_makes_prefill_share_single_token_lm_head(tmp_path):
     input_shape = [dim.dim_value for dim in lm_head.graph.input[0].type.tensor_type.shape.dim]
     assert input_shape == [1, 1, 2]
     assert g.outputs[0].shape == [1, 1, 2]
+
+
+def test_materialize_tied_lm_head_rejects_unknown_weight_producer():
+    hidden = gs.Variable("hidden", dtype=np.float32, shape=[1, 1, 2])
+    weight = gs.Variable("weight", dtype=np.float32, shape=[2, 4])
+    logits = gs.Variable("logits", dtype=np.float32, shape=[1, 1, 4])
+    matmul = gs.Node("MatMul", "lm_head", inputs=[hidden, weight], outputs=[logits])
+    g = graph(nodes=[matmul], inputs=[hidden, weight], outputs=[logits])
+
+    with pytest.raises(ValueError, match="neither a constant"):
+        MaterializeTiedLMHead(g, "unit").transform(matmul)

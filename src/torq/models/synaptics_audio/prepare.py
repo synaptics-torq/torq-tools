@@ -59,7 +59,7 @@ class _SynapticsAudioGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin):
         residual cleanup.
         """
         self.apply_fixed_input_shapes(input_shapes)
-        self.freeze_shape_seeds(input_shapes)
+        self.freeze_shape_seeds()
         self.eliminate_transposes()
         self.decompose_bidirectional_rnn(max_chunk_len=self._RNN_MAX_CHUNK_LEN)
         self.eliminate_rank0_gather()

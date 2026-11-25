@@ -3,13 +3,114 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
+import math
 import re
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
-from ..onnx import OnnxGraphEdit, rewire_consumers
+from ...utils.ort import make_cpu_session
+from ..onnx import OnnxGraphEdit, replace_node, rewire_consumers
+from ._helpers import _const_array, _const_int_list
+
+
+def _cache_input(graph: gs.Graph, tensor: gs.Tensor) -> gs.Tensor | None:
+    """Unwrap a cache view to its graph input."""
+    while tensor.inputs and tensor.inputs[0].op in ("Slice", "Cast", "Identity"):
+        tensor = tensor.inputs[0].inputs[0]
+    return tensor if any(tensor is inp for inp in graph.inputs) else None
+
+
+def _attention_cache(graph: gs.Graph, softmax: gs.Node) -> gs.Tensor | None:
+    """Find the past input of the cache update read by an attention Softmax."""
+    def unscale(tensor):
+        producer = tensor.inputs[0] if tensor.inputs else None
+        if producer is not None and producer.op in ("Mul", "Div"):
+            for i in (1, 0) if producer.op == "Mul" else (1,):
+                scale = producer.inputs[i]
+                scalar = scale.shape is not None and all(d == 1 for d in scale.shape)
+                if scale.shape is None:
+                    values = _const_array(scale)
+                    scalar = values is not None and values.size == 1
+                if scalar:
+                    return producer.inputs[1 - i]
+        return None
+
+    tensor = softmax.inputs[0]
+    while tensor.inputs:
+        node = tensor.inputs[0]
+        if node.op in ("Add", "Reshape", "Cast"):
+            tensor = node.inputs[0]
+        elif (scaled := unscale(tensor)) is not None:
+            tensor = scaled
+        else:
+            break
+    scores = _producer(tensor, "MatMul")
+    if scores is None:
+        return None
+    # Optimized exports may transpose the score product, putting K first.
+    for tensor in reversed(scores.inputs):
+        while tensor.inputs:
+            node = tensor.inputs[0]
+            if node.op in ("Transpose", "Reshape", "Unsqueeze", "Squeeze", "Expand", "Cast"):
+                tensor = node.inputs[0]
+            elif (scaled := unscale(tensor)) is not None:
+                tensor = scaled
+            elif node.op in ("Where", "Concat"):
+                if node.op == "Concat" and node.attrs.get("axis") not in (-2, 2):
+                    break
+                # The update must also supply a graph cache output (possibly
+                # through the combined-KV Concat), excluding cross-attention.
+                output = node.outputs[0]
+                exposed = any(output is out for out in graph.outputs) or any(
+                    user.op == "Concat" and any(out is user.outputs[0] for out in graph.outputs)
+                    for user in output.outputs
+                )
+                if exposed:
+                    past = node.inputs[2 if node.op == "Where" else 0]
+                    if (cache := _cache_input(graph, past)) is not None:
+                        return cache
+                break
+            else:
+                break
+    return None
+
+
+def _is_sliding_layer(cache: gs.Tensor | None, window: int | None, layers: frozenset[int]) -> bool:
+    if window is None:
+        return False
+    match = re.fullmatch(r"past_key_values\.(\d+)\.(?:key|value|key_value)", cache.name if cache is not None else "")
+    if match is None:
+        raise ValueError(f"Cannot determine attention layer from cache {cache!r}")
+    return int(match[1]) in layers
+
+
+def residual_layer_boundaries(graph: gs.Graph, num_layers: int) -> list[gs.Tensor]:
+    """Follow the two residual additions per decoder layer through IO casts."""
+    stream = next((inp for inp in graph.inputs if inp.name in ("token_embedding", "inputs_embeds")), None)
+    if stream is None:
+        embedding = next((node for node in graph.nodes if node.op == "Gather"
+                          and len(node.inputs) == 2 and node.inputs[1].name == "input_ids"), None)
+        stream = embedding.outputs[0] if embedding is not None else None
+    if stream is None:
+        raise ValueError("Cannot find decoder embedding input")
+    boundaries = []
+    for step in range(2 * num_layers):
+        views, additions = [stream], {}
+        for view in views:
+            for user in view.outputs:
+                if user.op in ("Cast", "Identity"):
+                    if not any(user.outputs[0] is seen for seen in views):
+                        views.append(user.outputs[0])
+                elif user.op == "Add" and sum(inp is view for inp in user.inputs) == 1:
+                    additions[id(user)] = user
+        if len(additions) != 1:
+            raise ValueError(f"Expected one residual Add at step {step}, found {len(additions)}")
+        stream = next(iter(additions.values())).outputs[0]
+        if step % 2:
+            boundaries.append(stream)
+    return boundaries
 
 
 @dataclass
@@ -201,22 +302,19 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         - Optimizers may CSE-deduplicate identical masks into one shared tensor
 
     Args (extra):
-        match_shape_fallback (bool): Also match self-attention Softmax nodes
-            whose name doesn't end in ``self_attn/Softmax`` (as in a dynamo
-            export where node names differ), by checking whether the input
-            shape's last dim is ``max_tokens``/``max_tokens + 1``. Off by
-            default to preserve exact matching for existing (non-dynamo)
-            exports.
         chunk_len (int): Number of consecutive query rows to mask
     """
 
     cur_len: gs.Variable
     max_tokens: int
     export_dtype: onnx.TensorProto.DataType
-    match_shape_fallback: bool = False
     chunk_len: int = 1
+    sliding_window: int | None = None
+    sliding_layers: frozenset[int] = frozenset()
 
     def __post_init__(self):
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive")
         if self.export_dtype not in onnx.TensorProto.DataType.values():
             raise RuntimeError(f"A valid export dtype is required for this edit, received {type(self.export_dtype)}")
         if not 1 <= self.chunk_len <= self.max_tokens:
@@ -224,22 +322,15 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
         return super().__post_init__()
 
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Softmax":
-            is_self_attn = node.name.endswith("self_attn/Softmax")
-            if not is_self_attn and self.match_shape_fallback and node.inputs:
-                inp_shape = getattr(node.inputs[0], "shape", None)
-                if inp_shape and len(inp_shape) >= 1:
-                    # Accept max_tokens (after KV replacement) or max_tokens+1 (traced shape)
-                    is_self_attn = inp_shape[-1] in (self.max_tokens, self.max_tokens + 1)
-            if is_self_attn:
-                return isinstance(node.i(), gs.Node)
-        return False
+        return node.op == "Softmax" and bool(node.inputs) and _attention_cache(self.graph, node) is not None
 
     def transform(self, node: gs.Node):
         if not self.export_dtype:
             raise RuntimeError("ONNX export dtype is requried for this graph edit, provide via `export_dtype`")
 
         self._check_node_op(node, "Softmax")
+
+        sliding = _is_sliding_layer(_attention_cache(self.graph, node), self.sliding_window, self.sliding_layers)
 
         # create bool mask where positions > cur_len are effectively blocked
         # by being set to a large negative value
@@ -289,16 +380,38 @@ class MaskFutureAttentionScores(OnnxGraphEdit):
                 )
             ],
         )[0]
-        mask = self.graph.layer(
-            name=node.name + "_mask_attn",
-            op="Where",
-            inputs=[mask_lte, attn_mask_keep, attn_mask_block],
-            outputs=[
-                gs.Variable(node.name + "_where",
-                            dtype=node.inputs[0].dtype or self.export_dtype,
-                            shape=mask_shape)
-            ],
-        )[0]
+        if sliding:
+            tensors = self.graph.tensors()
+            mask = tensors.get("attn_mask_sliding")
+            if mask is None:
+                lower = self.graph.layer(
+                    name="attn_window_lower", op="Sub",
+                    inputs=[query_positions, gs.Constant("attn_window", np.array(self.sliding_window, dtype=np.int64))],
+                    outputs=[gs.Variable("attn_window_lower", dtype=np.int64, shape=query_positions.shape)],
+                )[0]
+                recent = self.graph.layer(
+                    name="attn_window_recent", op="Greater", inputs=[time_axis, lower],
+                    outputs=[gs.Variable("attn_window_recent", dtype=np.bool_, shape=mask_shape)],
+                )[0]
+                within = self.graph.layer(
+                    name="attn_window_causal", op="And", inputs=[mask_lte, recent],
+                    outputs=[gs.Variable("attn_window_causal", dtype=np.bool_, shape=mask_shape)],
+                )[0]
+                mask = self.graph.layer(
+                    name="attn_mask_sliding", op="Where", inputs=[within, attn_mask_keep, attn_mask_block],
+                    outputs=[gs.Variable("attn_mask_sliding", dtype=node.inputs[0].dtype or self.export_dtype, shape=mask_shape)],
+                )[0]
+        else:
+            mask = self.graph.layer(
+                name=node.name + "_mask_attn",
+                op="Where",
+                inputs=[mask_lte, attn_mask_keep, attn_mask_block],
+                outputs=[
+                    gs.Variable(node.name + "_where",
+                                dtype=node.inputs[0].dtype or self.export_dtype,
+                                shape=mask_shape)
+                ],
+            )[0]
 
         # rewire producer node to use mask
         producer_node: gs.Node = node.i()
@@ -339,26 +452,32 @@ class AddCurrLenInput(OnnxGraphEdit):
 
     cur_len: gs.Variable
 
+    def _gathers(self, node: gs.Node):
+        if node.op != "Shape" or not node.inputs or node.attrs.get("start", 0) != 0 or "end" in node.attrs:
+            return []
+        cache = node.inputs[0]
+        if cache.shape is None or len(cache.shape) != 4 or not any(cache is inp for inp in self.graph.inputs):
+            return []
+        updates = [user for user in cache.outputs if (
+            user.op == "Concat" and user.attrs.get("axis") in (-2, 2) and user.inputs[0] is cache
+        ) or (user.op == "Where" and len(user.inputs) == 3 and user.inputs[2] is cache)]
+        if not any(any(update.outputs[0] is out for out in self.graph.outputs) for update in updates):
+            return []
+        return [user for user in node.outputs[0].outputs
+                if user.op == "Gather" and user.attrs.get("axis", 0) == 0
+                and _const_int_list(user.inputs[1]) == [2]]
+
     def match(self, node: gs.Node) -> bool:
-        if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
-            return isinstance(node.o(), gs.Node) and node.o().op == "Gather"
-        return False
+        return bool(self._gathers(node))
 
     def transform(self, node: gs.Node):
-        self._check_node_op(node, "Shape")
-        gather_node: gs.Node = node.o()
-        if not isinstance(gather_node, gs.Node) or gather_node.op != "Gather":
-            raise ValueError(f"Expected Gather node after Shape, got {gather_node}")
+        for gather in self._gathers(node):
+            output = gather.outputs[0]
+            rewire_consumers(list(output.outputs), output, self.cur_len)
+            self.graph.outputs = [self.cur_len if out is output else out for out in self.graph.outputs]
+            gather.outputs.clear()
+        self._logger.debug("Replaced dynamic sequence length at '%s'", node.name)
 
-        gather_out: gs.Variable = gather_node.outputs[0]
-        consumers: list[gs.Node] = list(gather_out.outputs)
-        rewire_consumers(consumers, gather_out, self.cur_len)
-
-        # disconnect Shape + Gather branch
-        node.inputs.clear()
-        gather_node.outputs.clear()
-
-        self._logger.debug("Replaced dynamic seq len getter at node '%s'", node.name)
 
 @dataclass
 class ConvertToStaticIndex(OnnxGraphEdit):
@@ -738,7 +857,7 @@ class GroupQueryHeads(OnnxGraphEdit):
         return q, k[1], k_cache, v_cache, mask_add, softmax, context
 
     def match(self, node: gs.Node) -> bool:
-        return node.op == "MatMul" and node.name.endswith("self_attn/MatMul") and self._pattern(node) is not None
+        return node.op == "MatMul" and self._pattern(node) is not None
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "MatMul")
@@ -826,12 +945,24 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         num_kv_heads (int): Number of key/value heads
         head_dim (int): Head dimension
         chunk_len (int): Number of new rows per step
+        ring_buffer (bool): Store only W-1 past rows for selected sliding layers.
     """
 
     num_heads: int
     num_kv_heads: int
     head_dim: int
     chunk_len: int = 1
+    sliding_window: int | None = None
+    sliding_layers: frozenset[int] = frozenset()
+    ring_buffer: bool = False
+
+    def __post_init__(self):
+        if self.ring_buffer and self.sliding_window is not None and self.sliding_window < 2:
+            raise ValueError("ring buffers require sliding_window >= 2")
+        if self.sliding_window is not None and not 1 <= self.chunk_len < self.sliding_window:
+            raise ValueError("chunk_len must be positive and less than sliding_window")
+        return super().__post_init__()
+
 
     @staticmethod
     def _cache_blend(tensor: gs.Tensor, chunk_len: int):
@@ -898,7 +1029,7 @@ class ReadOnlyKVCache(OnnxGraphEdit):
             node = node.inputs[0].inputs[0]
         return node.inputs[1]
 
-    def _masks(self, position: gs.Tensor, max_len: int, rows: int, dtype) -> tuple[gs.Tensor, gs.Tensor | None]:
+    def _masks(self, position: gs.Tensor, max_len: int, rows: int, dtype, sliding: bool = False) -> tuple[gs.Tensor, gs.Tensor | None]:
         """Past-row mask ``[1, 1, 1, L]`` and causal new-row mask ``[1, 1, rows, T]``, shared by all layers."""
         tensors = self.graph.tensors()
         keep = tensors.get("attn_mask_keep") or gs.Constant("attn_mask_keep", np.asarray(0.0, dtype=np.float32))
@@ -927,15 +1058,84 @@ class ReadOnlyKVCache(OnnxGraphEdit):
                 np.where(causal, keep.values, block.values).astype(np.float32).reshape(1, 1, rows, t),
                 export_dtype=getattr(block, "export_dtype", None),
             )
+        if sliding:
+            sliding_mask = tensors.get("kv_past_mask_sliding")
+            if sliding_mask is None:
+                shape = [1, 1, rows if self.chunk_len > 1 else 1, max_len]
+                offsets = (np.arange(shape[2]) % self.chunk_len).reshape(1, 1, -1, 1)
+                lower_shape = [1, 1, shape[2], 1]
+                if self.chunk_len == 1:
+                    # Keep scalar arithmetic at the position's rank: compiler
+                    # 2.3.0 cannot lower a rank-changing scalar Add.
+                    offsets = offsets.reshape(position.shape)
+                    lower_shape = position.shape
+                lower = self.graph.layer(
+                    name="kv_window_lower", op="Add",
+                    inputs=[position, gs.Constant("kv_window_offsets", (offsets - self.sliding_window).astype(np.dtype(position.dtype or np.int64)))],
+                    outputs=[gs.Variable("kv_window_lower", dtype=position.dtype, shape=lower_shape)],
+                )[0]
+                recent = self.graph.layer(
+                    name="kv_window_recent", op="Greater", inputs=[self.graph.tensors()["kv_time_axis"], lower],
+                    outputs=[gs.Variable("kv_window_recent", dtype=np.bool_, shape=shape)],
+                )[0]
+                sliding_mask = self.graph.layer(
+                    name="kv_past_mask_sliding", op="Where", inputs=[recent, past_mask, block],
+                    outputs=[gs.Variable("kv_past_mask_sliding", dtype=dtype, shape=shape)],
+                )[0]
+            past_mask = sliding_mask
         return past_mask, new_mask
+
+    def _ring_mask(self, position, rows, dtype):
+        """Mask physical slots using the absolute positions they held before this step."""
+        tensors = self.graph.tensors()
+        if (mask := tensors.get("kv_ring_mask")) is not None:
+            return mask
+        length = self.sliding_window - 1
+        # The accelerator compiler cannot lower this arithmetic in int64.
+        position = self.graph.layer(name="kv_ring_position", op="Cast", inputs=[position],
+            attrs={"to": onnx.TensorProto.INT32},
+            outputs=[gs.Variable("kv_ring_position", dtype=np.int32, shape=position.shape)])[0]
+        itype = np.dtype(position.dtype or np.int64)
+        shape = [1, 1, rows if self.chunk_len > 1 else 1, length]
+
+        def op(name, kind, inputs, out_shape):
+            return self.graph.layer(name=name, op=kind, inputs=inputs,
+                outputs=[gs.Variable(name, dtype=np.bool_ if kind in ("Less", "Greater", "GreaterOrEqual") else position.dtype, shape=out_shape)])[0]
+
+        period = gs.Constant("kv_ring_period", np.full(position.shape, length, dtype=itype))
+        turn = op("kv_ring_turn", "Div", [position, period], position.shape)
+        cycle = op("kv_ring_cycle", "Mul", [turn, period], position.shape)
+        start = op("kv_ring_start", "Sub", [position, cycle], position.shape)
+        slots = gs.Constant("kv_ring_slots", np.arange(length, dtype=itype).reshape(1, 1, 1, length))
+        current = op("kv_ring_current", "Add", [cycle, slots], [1, 1, 1, length])
+        previous = op("kv_ring_previous", "Sub", [current, period], [1, 1, 1, length])
+        before = op("kv_ring_before", "Less", [slots, start], [1, 1, 1, length])
+        offsets = (np.arange(shape[2]) % self.chunk_len - self.sliding_window).astype(itype)
+        offsets = offsets.reshape(1, 1, -1, 1) if self.chunk_len > 1 else offsets.reshape(position.shape)
+        lower = op("kv_ring_lower", "Add", [position, gs.Constant("kv_ring_offsets", offsets)], [1, 1, shape[2], 1] if self.chunk_len > 1 else position.shape)
+        keep, block = tensors["attn_mask_keep"], tensors["attn_mask_block"]
+
+        def mask(name, condition, yes, no, out_shape):
+            return self.graph.layer(name=name, op="Where", inputs=[condition, yes, no],
+                outputs=[gs.Variable(name, dtype=dtype, shape=out_shape)])[0]
+
+        masks = []
+        for label, absolute in (("current", current), ("previous", previous)):
+            valid = op(f"kv_ring_{label}_valid", "GreaterOrEqual", [absolute, gs.Constant(f"kv_ring_{label}_zero", np.asarray(0, dtype=itype))], [1, 1, 1, length])
+            recent = op(f"kv_ring_{label}_recent", "Greater", [absolute, lower], shape)
+            warmup = mask(f"kv_ring_{label}_warmup", valid, keep, block, [1, 1, 1, length])
+            masks.append(mask(f"kv_ring_{label}_mask", recent, warmup, block, shape))
+        return mask("kv_ring_mask", before, masks[0], masks[1], shape)
 
     def transform(self, node: gs.Node):
         self._check_node_op(node, "Softmax")
         q, k_scale, k_blend, v_blend, cache, present, context = self._pattern(node)
+        sliding = _is_sliding_layer(cache, self.sliding_window, self.sliding_layers)
         base = node.name.rsplit("/", 1)[0] + "/ReadOnlyKV/"
         heads, kv, d, t = self.num_heads, self.num_kv_heads, self.head_dim, self.chunk_len
         rows = heads // kv * t
-        max_len = cache.shape[2]
+        linear_length = cache.shape[2]
+        max_len = self.sliding_window - 1 if sliding and self.ring_buffer else cache.shape[2]
         dtype = q.dtype or np.float32
         k_new, v_new = k_blend[1], v_blend[1]
         k_offset = int(k_blend[2].inputs[1].values.ravel()[0])
@@ -959,7 +1159,12 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         cache.shape = [1, max_len, 2 * kv, d]
         k_heads = [head(cache, 2, k_offset + i, [1, max_len, d], f"k{i}") for i in range(kv)]
         v_heads = [head(cache, 2, v_offset + i, [1, max_len, d], f"v{i}") for i in range(kv)]
-        past_mask, new_mask = self._masks(self._position(k_blend[0]), max_len, rows, dtype)
+        position = self._position(k_blend[0])
+        ring = sliding and self.ring_buffer
+        # The linear masks share the global length; rings have a separate slot axis.
+        past_mask, new_mask = self._masks(position, linear_length, rows, dtype, sliding and not ring)
+        if ring:
+            past_mask = self._ring_mask(position, rows, dtype)
 
         if k_scale != 1.0:
             q = layer("Mul", "q_scaled", [q, np.array(k_scale, dtype=np.float32)], None)
@@ -1023,6 +1228,260 @@ class ReadOnlyKVCache(OnnxGraphEdit):
         node.outputs.clear()
 
         self._logger.debug("Made the KV cache '%s' read-only at '%s'", cache.name, node.name)
+
+
+@dataclass
+class PrecomputeRotaryTables(OnnxGraphEdit):
+    """
+    Replace rotary ``Sin``/``Cos`` of integer positions with exact table lookups.
+
+    Exports compute rotary angles as ``float(position) * inv_freq``. In bf16 the
+    position and the angle keep 8 mantissa bits, so positions above 256 lose their
+    phase. For each ``Sin``/``Cos`` whose angle is linear in one integer tensor, the
+    edit splits each position ``p < max_positions`` into ``p = B * h + l`` and
+    selects cos/sin of both partial angles from fp64 tables with one-hot MatMuls,
+    which are exact in any dtype (Torq has no NPU lowering for a data-dependent
+    Gather). The angle-addition identities combine the parts. The tables and one-hot
+    vectors have about ``sqrt(max_positions)`` rows, and equal angles share them.
+    Weight quantizers must skip the MatMuls whose names contain ``TABLE_NAME``.
+    Capacities up to ``EXACT_BF16_POSITIONS`` keep their graphs: bf16 holds those
+    positions exactly.
+
+    Args:
+        max_positions (int): Number of supported positions
+    """
+
+    TABLE_NAME = "/rotary_table"
+    EXACT_BF16_POSITIONS = 256
+
+    max_positions: int
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._base = math.isqrt(self.max_positions - 1) + 1
+        self._onehots: dict[str, tuple[gs.Variable, gs.Variable]] = {}
+        self._parts: dict[tuple[str, bytes, bytes], dict[str, gs.Variable]] = {}
+
+    def match(self, node: gs.Node) -> bool:
+        return self.max_positions > self.EXACT_BF16_POSITIONS and node.op in ("Sin", "Cos")
+
+    @staticmethod
+    def _np_dtype(tensor: gs.Variable) -> np.dtype | None:
+        if isinstance(tensor.dtype, int):
+            return onnx.helper.tensor_dtype_to_np_dtype(tensor.dtype)
+        return None if tensor.dtype is None else np.dtype(tensor.dtype)
+
+    @classmethod
+    def _position_subgraph(cls, node: gs.Node) -> tuple[gs.Variable, list[gs.Node]] | None:
+        nodes: dict[str, gs.Node] = {}
+        leaves: dict[str, gs.Variable] = {}
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.name in nodes:
+                continue
+            nodes[current.name] = current
+            for tensor in current.inputs:
+                if isinstance(tensor, gs.Constant) or not tensor.name:
+                    continue
+                if (dtype := cls._np_dtype(tensor)) is not None and np.issubdtype(dtype, np.integer):
+                    leaves[tensor.name] = tensor
+                elif not tensor.inputs:
+                    return None
+                else:
+                    stack.append(tensor.inputs[0])
+        positions = next(iter(leaves.values())) if len(leaves) == 1 else None
+        if positions is None or positions.shape is None or not all(isinstance(d, int) for d in positions.shape):
+            return None
+        return positions, list(nodes.values())
+
+    def _angles(self, positions: gs.Variable, nodes: list[gs.Node], angle: gs.Variable) -> tuple[np.ndarray, tuple[int, ...]]:
+        model = gs.export_onnx(gs.Graph(nodes=nodes, inputs=[positions], outputs=[angle], opset=self.graph.opset))
+        session = make_cpu_session(model.SerializeToString())
+        shape, count = positions.shape, int(np.prod(positions.shape))
+        run = lambda ids: session.run(None, {positions.name: ids.astype(self._np_dtype(positions)).reshape(shape)})[0]
+        out_shape = run(np.arange(count)).shape
+        rows = [run(np.arange(start, start + count)).reshape(count, -1) for start in range(0, self.max_positions, count)]
+        # Row i must depend only on flattened position i.
+        if not np.array_equal(run(np.arange(count)[::-1]).reshape(count, -1), rows[0][::-1]):
+            raise ValueError(f"{angle.name!r} is not position-major in {positions.name!r}")
+        return np.concatenate(rows)[:self.max_positions], out_shape
+
+    def _onehot(self, name: str, digits: gs.Variable, size: int, dtype: np.dtype) -> gs.Variable:
+        mask = self.graph.layer(
+            name=name + "/Equal", op="Equal", inputs=[digits, np.arange(size, dtype=digits.dtype)],
+            outputs=[gs.Variable(name + "/mask", dtype=np.bool_, shape=[digits.shape[0], size])],
+        )[0]
+        return self.graph.layer(
+            name=name + "/Cast", op="Cast", attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(dtype)},
+            inputs=[mask], outputs=[gs.Variable(name, dtype=dtype, shape=[digits.shape[0], size])],
+        )[0]
+
+    def _digit_onehots(self, positions: gs.Variable, count: int, dtype: np.dtype) -> tuple[gs.Variable, gs.Variable]:
+        if positions.name not in self._onehots:
+            base, int_dtype = f"{positions.name}/rotary_onehot", self._np_dtype(positions)
+            radix = np.array([self._base], dtype=int_dtype)
+            layer = lambda op, suffix, inputs: self.graph.layer(
+                name=base + suffix, op=op, inputs=inputs,
+                outputs=[gs.Variable(base + suffix + "_out", dtype=int_dtype, shape=[count, 1])],
+            )[0]
+            flat = layer("Reshape", "/positions", [positions, np.array([count, 1], dtype=np.int64)])
+            high = layer("Div", "/high", [flat, radix])
+            low = layer("Sub", "/low", [flat, layer("Mul", "/high_scaled", [high, radix])])
+            rows = -(-self.max_positions // self._base)
+            self._onehots[positions.name] = (
+                self._onehot(base + "/high_onehot", high, rows, dtype),
+                self._onehot(base + "/low_onehot", low, self._base, dtype),
+            )
+        return self._onehots[positions.name]
+
+    def _angle_parts(self, positions: gs.Variable, count: int, offset: np.ndarray, step: np.ndarray, dtype: np.dtype) -> dict[str, gs.Variable]:
+        key = (positions.name, offset.tobytes(), step.tobytes())
+        if key not in self._parts:
+            high, low = self._digit_onehots(positions, count, dtype)
+            rows = np.arange(high.shape[1])[:, None] * self._base
+            angles = {"high": offset + rows * step, "low": np.arange(self._base)[:, None] * step}
+            parts = {}
+            for part, onehot in (("high", high), ("low", low)):
+                for fn in ("cos", "sin"):
+                    name = f"{positions.name}{self.TABLE_NAME}_{len(self._parts)}/{fn}_{part}"
+                    table = getattr(np, fn)(angles[part]).astype(dtype)
+                    parts[f"{fn}_{part}"] = self.graph.layer(
+                        name=name, op="MatMul", inputs=[onehot, gs.Constant(name, table)],
+                        outputs=[gs.Variable(name + "_selected", dtype=dtype, shape=[count, table.shape[1]])],
+                    )[0]
+            self._parts[key] = parts
+        return self._parts[key]
+
+    def transform(self, node: gs.Node):
+        angle = node.inputs[0]
+        found = self._position_subgraph(angle.inputs[0]) if angle.inputs else None
+        if found is None:
+            self._logger.debug("'%s' does not depend on positions only, skipping", node.name)
+            return
+        positions, nodes = found
+        angle.dtype = angle.dtype or node.outputs[0].dtype
+        angles, shape = self._angles(positions, nodes, angle)
+        count, dtype = int(np.prod(positions.shape)), angles.dtype
+        angles = angles.astype(np.float64)
+        offset, step = angles[0], (angles[-1] - angles[0]) / (len(angles) - 1)
+        if not np.allclose(angles, offset + np.arange(len(angles))[:, None] * step, rtol=1e-5, atol=1e-5):
+            self._logger.warning("'%s' angle is not linear in '%s', skipping", node.name, positions.name)
+            return
+
+        p = self._angle_parts(positions, count, offset, step, dtype)
+        # cos(a + b) = cos a cos b - sin a sin b;  sin(a + b) = sin a cos b + cos a sin b
+        if node.op == "Cos":
+            pairs, combine = ((p["cos_high"], p["cos_low"]), (p["sin_high"], p["sin_low"])), "Sub"
+        else:
+            pairs, combine = ((p["sin_high"], p["cos_low"]), (p["cos_high"], p["sin_low"])), "Add"
+        terms = [
+            self.graph.layer(
+                name=f"{node.name}/rotary_term{i}", op="Mul", inputs=list(pair),
+                outputs=[gs.Variable(f"{node.name}/rotary_term{i}_out", dtype=dtype, shape=[count, angles.shape[1]])],
+            )[0]
+            for i, pair in enumerate(pairs)
+        ]
+        combined = self.graph.layer(
+            name=f"{node.name}/rotary_{combine.lower()}", op=combine, inputs=terms,
+            outputs=[gs.Variable(f"{node.name}/rotary_combined", dtype=dtype, shape=[count, angles.shape[1]])],
+        )[0]
+        out = node.outputs[0]
+        replacement = self.graph.layer(
+            name=node.name + "/rotary_reshape", op="Reshape", inputs=[combined, np.array(shape, dtype=np.int64)],
+            outputs=[gs.Variable(out.name + "_table", dtype=dtype, shape=list(shape))],
+        )[0]
+        rewire_consumers(out.outputs.copy(), out, replacement)
+        node.outputs.clear()
+        self._logger.debug("Replaced '%s' with %d-position rotary tables", node.name, self.max_positions)
+
+
+@dataclass
+class ReplaceLegacyRotaryCache(OnnxGraphEdit):
+    """
+    Replace legacy per-layer ``rotary_emb`` cos/sin cache lookups with one-hot MatMuls.
+
+    Exports from transformers <4.45 (e.g. Qwen2/Qwen2.5, Llama) keep a
+    ``[max_position_embeddings, head_dim]`` cos/sin cache in every layer, slice it to
+    ``Min(max_pos, past_len + seq_len)`` and gather rows by position. In the static
+    graph positions are below ``max_len``, so the slice is the constant
+    ``table[:max_len]``. Torq has no NPU lowering for a data-dependent Gather, so each
+    row Gather becomes ``onehot(positions) @ table``, which is exact (one non-zero
+    product). Identical tables are shared across layers, and each (table, positions)
+    pair shares one MatMul. Weight quantizers must skip the MatMuls whose names
+    contain ``TABLE_NAME``.
+
+    Args:
+        max_len (int): Number of supported positions
+    """
+
+    TABLE_NAME = "rotary_emb_cache_"
+
+    max_len: int
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._tables: dict[bytes, gs.Constant] = {}
+        self._onehots: dict[str, gs.Variable] = {}
+        self._selected: dict[tuple[str, str], gs.Variable] = {}
+
+    def match(self, node: gs.Node) -> bool:
+        if node.op != "Slice" or "/rotary_emb/" not in node.name or len(node.inputs) < 2:
+            return False
+        table, starts = node.inputs[:2]
+        return (
+            isinstance(table, gs.Constant) and table.values.ndim == 2
+            and isinstance(starts, gs.Constant) and not np.any(starts.values)
+        )
+
+    def _onehot(self, positions: gs.Variable, size: int, dtype: np.dtype) -> gs.Variable:
+        if positions.name not in self._onehots:
+            base = f"{positions.name}/rotary_cache_onehot"
+            shape = None if positions.shape is None else [*positions.shape, size]
+            unsqueezed = self.graph.layer(
+                name=base + "/Unsqueeze", op="Unsqueeze", inputs=[positions, np.array([-1], dtype=np.int64)],
+                outputs=[gs.Variable(base + "/positions", dtype=positions.dtype)],
+            )[0]
+            mask = self.graph.layer(
+                name=base + "/Equal", op="Equal",
+                inputs=[unsqueezed, gs.Constant(base + "/arange", np.arange(size, dtype=positions.dtype or np.int64))],
+                outputs=[gs.Variable(base + "/mask", dtype=np.bool_, shape=shape)],
+            )[0]
+            self._onehots[positions.name] = self.graph.layer(
+                name=base + "/Cast", op="Cast", attrs={"to": onnx.helper.np_dtype_to_tensor_dtype(dtype)},
+                inputs=[mask], outputs=[gs.Variable(base, dtype=dtype, shape=shape)],
+            )[0]
+        return self._onehots[positions.name]
+
+    def transform(self, node: gs.Node):
+        self._check_node_op(node, "Slice")
+        source = node.inputs[0]
+        if source.values.shape[0] < self.max_len:
+            raise ValueError(
+                f"Rotary cache '{source.name}' has {source.values.shape[0]} positions, fewer than max_len={self.max_len}"
+            )
+        values = np.ascontiguousarray(source.values[:self.max_len])
+        if (key := values.tobytes()) not in self._tables:
+            self._tables[key] = gs.Constant(f"{self.TABLE_NAME}{len(self._tables)}", values)
+        table = self._tables[key]
+
+        out = node.outputs[0]
+        for consumer in list(out.outputs):
+            if consumer.op != "Gather" or consumer.inputs[0] is not out or consumer.attrs.get("axis", 0) != 0:
+                rewire_consumers([consumer], out, table)
+                continue
+            positions = consumer.inputs[1]
+            if (pair := (table.name, positions.name)) not in self._selected:
+                name = f"{table.name}/{positions.name}/OneHotMatMul"
+                shape = None if positions.shape is None else [*positions.shape, values.shape[1]]
+                self._selected[pair] = self.graph.layer(
+                    name=name, op="MatMul", inputs=[self._onehot(positions, self.max_len, values.dtype), table],
+                    outputs=[gs.Variable(name + "_out", dtype=values.dtype, shape=shape)],
+                )[0]
+            replace_node(consumer, [self._selected[pair]])
+        node.outputs.clear()
+        self._logger.debug("Replaced legacy rotary cache '%s' with %d-position one-hot lookups", node.name, self.max_len)
+
 
 class CombineKVCacheMixin:
     """
@@ -1252,3 +1711,119 @@ class CombineKVCacheMixin:
             remove_unused_node_outputs=True,
         ).toposort()
         return self
+
+    def blend_combined_kv_in_place(self):
+        """
+        Update each combined ``key_value`` cache with one Where per layer.
+
+        ``combine_kv_io_tensors`` splits each ``[1, 2 * kv, S, D]`` cache input into K
+        and V, blends the new token into each with a Where, and concatenates the
+        results back into the cache output. Every step this copies the whole cache
+        three times. This rewrites each layer to::
+
+            present = Where(mask, Concat(new_k, new_v), past)   # one cache write
+            K, V    = Slice(present, heads [0, kv)), Slice(present, heads [kv, 2 kv))
+
+        Only the new ``[1, 2 * kv, 1, D]`` rows are concatenated. K and V are
+        contiguous head ranges of the cache, so the slices need no reshuffle.
+        """
+
+        tensors = self._graph.tensors()
+        layer = 0
+        while (combined_out := tensors.get(f"present.{layer}.key_value")) is not None:
+            concat = combined_out.inputs[0] if combined_out.inputs else None
+            past = tensors.get(f"past_key_values.{layer}.key_value")
+            key, value = tensors.get(f"present.{layer}.key"), tensors.get(f"present.{layer}.value")
+            if concat is None or concat.op != "Concat" or past is None or key is None or value is None:
+                raise ValueError(f"Layer {layer} does not have the combined KV pattern")
+
+            key_blend, value_blend = key.inputs[0], value.inputs[0]
+            if key_blend.op != "Where" or value_blend.op != "Where":
+                raise ValueError(f"Layer {layer} KV update is not a Where")
+            mask, new_key = key_blend.inputs[0], key_blend.inputs[1]
+            new_value = value_blend.inputs[1]
+
+            kv_heads = key.shape[1]
+            new_rows = self._graph.layer(
+                name=f"present.{layer}_new_kv_concat",
+                op="Concat",
+                attrs={"axis": 1},
+                inputs=[new_key, new_value],
+                outputs=[gs.Variable(f"present.{layer}.new_key_value", dtype=past.dtype,
+                                     shape=[1, 2 * kv_heads, 1, key.shape[3]])],
+            )[0]
+
+            # The combined Where writes the cache output directly.
+            concat.outputs.clear()
+            self._graph.layer(
+                name=f"present.{layer}_blend_kv",
+                op="Where",
+                inputs=[mask, new_rows, past],
+                outputs=[combined_out],
+            )
+
+            # Attention reads K and V as head ranges of the updated cache.
+            for tensor, blend, start in ((key, key_blend, 0), (value, value_blend, kv_heads)):
+                blend.outputs.clear()
+                self._graph.layer(
+                    name=f"{tensor.name}_from_present",
+                    op="Slice",
+                    inputs=[
+                        combined_out,
+                        np.array([start], dtype=np.int64),
+                        np.array([start + kv_heads], dtype=np.int64),
+                        np.array([1], dtype=np.int64),
+                    ],
+                    outputs=[tensor],
+                )
+            layer += 1
+
+        self._graph.cleanup().toposort()
+        self._logger.info("Blended %d combined KV caches in place", layer)
+        return self
+
+    def split_transformer_layers(
+        self,
+        split_at: int,
+        num_layers: int,
+        hidden_size: int,
+    ) -> tuple[gs.Graph, gs.Graph]:
+        """
+        Split a combined-KV decoder into two graphs between layers ``split_at - 1`` and ``split_at``.
+
+        Part A maps ``token_embedding``, ``position_ids`` and the caches of layers
+        ``[0, split_at)`` to their updated caches and the residual stream after layer
+        ``split_at - 1``. Part B maps that residual, ``position_ids`` and the remaining
+        caches to their updated caches and ``last_hidden_states``.
+        """
+        if not 0 < split_at < num_layers:
+            raise ValueError(f"split_at must be between 1 and {num_layers - 1}, got {split_at}")
+        boundary_name = residual_layer_boundaries(self._graph, num_layers)[split_at - 1].name
+
+        def partition(first_input: str, layers: range, last_output: str) -> gs.Graph:
+            # Each partition gets its own independent graph copy.
+            graph = self._graph.copy()
+            tensors = graph.tensors()
+            position_ids, boundary = tensors["position_ids"], tensors[boundary_name]
+            position_ids.inputs.clear()
+            position_ids.shape = [1, 1]
+            boundary.shape, boundary.dtype = [1, 1, hidden_size], np.float32
+            if first_input == boundary_name:
+                boundary.inputs.clear()
+            graph.inputs = [
+                tensors[first_input],
+                position_ids,
+                *(tensors[f"past_key_values.{i}.key_value"] for i in layers),
+            ]
+            graph.outputs = [*(tensors[f"present.{i}.key_value"] for i in layers), tensors[last_output]]
+            return graph.cleanup(remove_unused_graph_inputs=True, remove_unused_node_outputs=False).toposort()
+
+        parts = (
+            partition("token_embedding", range(split_at), boundary_name),
+            partition(boundary_name, range(split_at, num_layers), "last_hidden_states"),
+        )
+        self._logger.info(
+            "Split transformer at layer %d: part A layers 0-%d, part B layers %d-%d",
+            split_at, split_at - 1, split_at, num_layers - 1,
+        )
+        return parts

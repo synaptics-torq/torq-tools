@@ -49,17 +49,21 @@ Most edits subclass `OnnxGraphEdit` from `src/torq/graph_edit/onnx.py` and imple
 If the edit should be part of the public graph-edit API, export it from `src/torq/graph_edit/edits/__init__.py`. Add a convenience method to `CommonGraphEditsMixin` when model exporters should call the edit through the fluent editor API.
 
 > [!TIP]
-> If a graph edit is only useful for one model exporter, keep it close to that model in `src/torq/models/<model>/_graph.py` instead of promoting it to the shared `torq.graph_edit.edits` package. See [Model Export Pipelines](#model-export-pipelines) for how model-specific graph editors fit into the exporter flow.
+> Put graph edits that do not depend on one model's node names in the shared `torq.graph_edit.edits` package (with a `CommonGraphEditsMixin` method, or in `CombineKVCacheMixin` when they work on its combined caches), even when only one exporter uses them. Keep only edits tied to one model's node names in `src/torq/models/<model>/_graph.py`. See [Model Export Pipelines](#model-export-pipelines) for how model-specific graph editors fit into the exporter flow.
 
 A few details make graph edits easier to review and safer to reuse:
 
+- Match operators, connections, constant parameters and graph interfaces rather than exporter-generated internal names. Keep generated names stable when changing only selection. Attention edits trace the cache update to distinguish self-attention from cross-attention; sliding layers use the cache input index.
 - Keep the changed subgraph as small as practical.
 - Preserve tensor names, shapes, dtypes, and `export_dtype` intentionally.
 - Use `requires_shape_inference = True` when later logic needs inferred shapes; shape inference reimports the graph, so it is worth being deliberate.
+- Use `torq.utils.onnx.infer_shapes` rather than `onnx.shape_inference.infer_shapes`: it also handles models above the 2 GB protobuf limit. To make shape arithmetic static after fixing I/O dimensions, call `OnnxGraphEditor.freeze_shape_seeds()` instead of writing a model-specific evaluator.
 - Let `OnnxGraphEditor` handle cleanup and topological sorting unless the edit creates an artifact that needs an immediate check.
 - Write generated ONNX or NumPy files to `tmp_path` in tests unless the fixture is intentionally stable and shared under `tests/data/graph_edit/`.
 
 ### Graph Edit Tests
+
+For a matching-only change, run A/B edits on the same real model input with `--dump-after-edit` (or the editor’s `dump_path` and `dump_after_edit` arguments). Compare serialized `GraphProto` values exactly, including node order, names, shapes and attributes, and check that each edit matches the expected nonzero node count. Dumps omit weight payloads, so compare initializer values separately in the final models. Include renamed-node and unrelated-pattern cases in unit tests.
 
 Every graph edit should have unit coverage under `tests/unit/graph_edit/test_<domain>.py`. The existing tests build tiny synthetic graphs with `onnx_graphsurgeon` and helpers from `tests/support/graph_edit.py`; that pattern is usually easier to understand than using a full exported model. Good unit tests cover the expected rewrite, no-match behavior, metadata, constants, and useful error paths without requiring ONNX Runtime.
 
@@ -80,42 +84,49 @@ For bug fixes, it is helpful to add the failing test first. A small graph that r
 
 ## Model Export Pipelines
 
+Common user-facing flags, compiler setup, cache conventions and standalone quantization recipes live in the [shared model export guide](src/torq/models/README.md). Keep model READMEs focused on model-specific defaults, recipes and limitations; link to shared instructions instead of duplicating them. Public READMEs should explain supported workflows and actionable limitations; keep implementation history, experiment logs and speculative debugging notes out of them.
+
 Model exporters live under `src/torq/models/<model>/` and usually extend `OnnxModelExporterBase` from `src/torq/model_export/onnx.py`. A complete exporter normally handles source model loading, static conversion, post-static graph patches, validation, dtype conversion, and optional Torq export.
 
 The existing model directories use this layout:
 
 - `export.py`: CLI argument handling and the exporter class.
-- `_graph.py`: model-specific `OnnxGraphEditor` subclass and IO-shape helpers.
+- `_graph.py`: optional model-specific `OnnxGraphEditor` subclass and IO-shape helpers. Decoder-only exporters using only shared behavior instantiate `DecoderGraphEditor` directly; keep a local subclass only when it adds behavior. `DecoderGraphEditor` names the graph `model` and includes the common and combined-KV edits; every editor gets `from_onnx` from `OnnxGraphEditor`.
 - `_inference.py`: runtime wrappers used for validation and demos.
 - `infer.py` or `validate.py`: user-facing inference and validation entry points.
 
 For decoder-only models, implement `validate_onnx()` by calling `validate_decoder_only_onnx()` from `src/torq/model_export/validation.py` with the model's static and dynamic runner classes, rather than writing the prompt loop by hand. It compares the export against the unedited source ONNX and keeps the prompt set and pass/fail reporting consistent across models.
 
+For sliding-window models, pass `sliding_window` to the shared validator when the static capacity (`--max-gen-tokens`) exceeds the sliding window length defined in the model's configuration.
+
 Architecture-compatible checkpoints should share an exporter. FunctionGemma uses `torq-export-model gemma3 --functiongemma`, with optional source overrides, rather than a separate model package. Its validation supplies tool definitions through `runner_kwargs` and a tool prompt through `prompts`; `max_inp_len` covers the complete prompt independently of the prefill chunk size. Never reuse a quantized checkpoint from another source model.
 
 Each exported variant must carry its runtime sidecars so its directory can be staged independently. The shared ONNX exporter copies JSON metadata, Jinja templates, tokenizer model/vocabulary files, and NumPy tables through export, quantization, conversion, and compilation with `_copy_runtime_assets()`. Keep stage-specific `compile_flags.json` snapshots separate. Copy tables before dtype conversion so converted tables win; compilation preserves their dtype unless `--torq-convert-io-dtype` requests runtime dtype conversion.
 
-Static decoders read their KV caches without writing them: after `combine_kv_io_tensors` (and, for Hugging Face GQA exports, `group_query_heads`), call `read_only_kv_cache` with the step's chunk length. Each cache becomes a time-major `[1, L, 2 * kv, D]` input and each `present.*` output holds only the step's new rows, so exporters that support it register `--read-only-kv-cache` (on by default) through `add_onnx_args(read_only_kv_cache=True)`. `DecoderOnlyRunner._update_cache` writes a cache output that is shorter than its input into the cache at the step's position, and replaces the cache with any other output; static runners take cache shapes from the model's inputs (`_kv_cache_zeros`).
+Rotary decoders must apply `PrecomputeRotaryTables` (with the static capacity) in their post-static patches, before dtype conversion. bf16 holds integers exactly only up to 256 and rounds the rotary angle, so `Sin`/`Cos` computed from `position_ids` lose their phase at longer contexts. The edit splits each position into high and low digits, selects cos/sin of both partial angles from small fp64 tables with one-hot MatMuls (exact in bf16), and combines them with the angle-addition identities. Weight quantizers must skip the table MatMuls (`PrecomputeRotaryTables.TABLE_NAME`). Capacities up to 256 keep their original graphs. Exports from transformers older than 4.45 instead gather rows of a per-layer cos/sin cache; `ReplaceLegacyRotaryCache` turns those into one-hot MatMuls over a static table, and quantizers skip them by `ReplaceLegacyRotaryCache.TABLE_NAME`.
+
+Exporter options should represent useful deployment choices. Keep host embedding extraction and LM-head splitting optional: embedding lookup in the compiled model saves host memory at a performance cost, and a unified decoder remains valid with slower prefill. Let the compiler handle implicit broadcasting, integer-to-bf16 casts and LM-head tiling rather than adding exporter workaround switches. Moonshine exports use separate KV tensors and fold encoder-cache generation into the encoder.
+
+Supported static decoders read their KV caches without writing them: after `combine_kv_io_tensors` (and, for Hugging Face GQA exports, `group_query_heads`), call `read_only_kv_cache` with the step's chunk length. Each cache becomes a time-major `[1, L, 2 * kv, D]` input and each `present.*` output holds only the step's new rows, and exporters that support this layout always enable it. Liquid VL retains full-cache writeback for its runtime and image-prefill chain. `DecoderOnlyRunner._update_cache` writes a cache output that is shorter than its input into the cache at the step's position, and replaces the cache with any other output; static runners take cache shapes from the model's inputs (`_kv_cache_zeros`).
 
 Exporters keep weights on disk between pipeline stages, so models far beyond the 2 GiB protobuf limit export without materializing every weight at every stage. Load sources and saved components with `load_onnx_lazy` (`torq/utils/onnx.py`): it reads only the graph and tags each external tensor with its data directory. `gs.import_onnx` wraps those tensors in `LazyValues`, so an edit reads a weight only when it touches `Constant.values`. Prefer `.shape` / `.dtype` in `match()`; `.values` loads the array and keeps it for the editor's lifetime. Save lazy models with `save_onnx` (or `self._save_component_model`), never plain `onnx.save`: it copies untouched weights file-to-file and writes edited or new ones. Run the in-memory onnx checker or an ORT session built from a lazy model's bytes inside `with external_data_cwd(model):`, since both resolve external data from the working directory.
 
-Exporter tests should be fast and deterministic by default. Prefer local synthetic data or mocked downloads for path naming, config handling, asset copying, graph patch decisions, and validation helpers. Full Hugging Face downloads, full ONNX export, and Torq compiler runs are useful manual checks, but they are usually too heavy for normal tests.
+Tests under `tests/unit/model_export/` cover shared export infrastructure using synthetic models and `tests/support/model_export.py`, without importing concrete model exporters or pinning their graph-edit plans, checkpoint mappings or compiler flag sets. Test graph rewrites once under `tests/unit/graph_edit/`. Model-specific export validation, full Hugging Face downloads and Torq compiler runs belong to the separate model-validation CI or manual checks.
 
 For pipeline-level changes, please run a manual end-to-end export when the dependencies are available and record the exact command and result in the PR notes or patch summary. Common checks include:
 
 ```bash
 python -m torq.models.<model>.export --skip-torq
-python -m torq.models.<model>.export --convert-dtype bf16 --skip-torq
 torq-export-model <model> --skip-torq
 ```
 
-If the change affects Torq compilation, also run the exporter without `--skip-torq` with `torq-compiler` installed, or point the run at a compiler with `TORQ_COMPILER_PATH` / `--compiler-path`.
+The compiler converts dtypes for the standard exports: each model's validated flags in `compile_flags.json` include `--torq-convert-dtypes`, so exporter-side `--convert-dtypes` is not needed. If the change affects Torq compilation, also run the exporter without `--skip-torq` with `torq-compiler` installed, or point the run at a compiler with `TORQ_COMPILER_PATH` / `--compiler-path`.
 
 ### Graph Edit Harness
 
 Exporters declare their default graph edits *declaratively* rather than calling editor methods imperatively. Each exporter overrides `graph_edit_blocks()` (on `OnnxModelExporterBase`) to return an ordered `dict[str, list[EditSpec]]`, where each block is a contiguous run of edits applied to one component/graph. An `EditSpec` is just an edit's registered name (its `OnnxGraphEdit` class name) plus positional constructor args. Args that are only known at export time (e.g. a `cur_len` tensor) are written as `ctx("name")` placeholders and resolved from a context mapping passed to `OnnxGraphEditor.apply_specs(specs, harness, context)`.
 
-Inside `make_static` / post-static patches, replace imperative edit calls with `editor.apply_specs(self.graph_edit_blocks()[block], self._harness, context)`. Non-edit editor operations (IO fixing, KV combining, input reordering, `to_onnx`) stay imperative and simply bracket the `apply_specs` calls.
+Inside `make_static` / post-static patches, replace imperative edit calls with `editor.apply_specs(self.graph_edit_blocks()[block], self._harness, context)`. Non-edit editor operations (IO fixing, KV combining, input reordering, `to_onnx`) stay imperative and simply bracket the `apply_specs` calls. Include edits applied after dtype conversion as well; Qwen declares its rotary Slice-to-Split rewrite in a separate conversion block. Use context placeholders for output paths and vocabulary arrays so viewing the plan does not require loading the graph or generating runtime assets.
 
 This wires up the shared CLI flags automatically once you call `add_graph_edit_harness_args(parser)` and, in `export_<model>_from_args`, `exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))` plus the `--view-graph-edits` short-circuit:
 
@@ -125,6 +136,8 @@ if args.view_graph_edits:
     print(render_graph_edit_plan(exporter.describe_graph_edits()))
     return
 ```
+
+The view path must return before export, dtype conversion, compilation, or quantization-checkpoint downloads. When migrating an imperative exporter, compare before/after per-edit dumps on the same source and compare final initializer values and runtime tables separately.
 
 Users then get `--apply-graph-edit NAME[:ARGS]` (repeatable, YAML args), `--apply-graph-edits-from-file FILE`, their `--exclude-graph-edit` / `--exclude-graph-edits-from-file` counterparts, and `--view-graph-edits`. Precedence when merging is flags > file > defaults: an overriding edit keeps the default's position, brand-new edits are appended (once per editor instance), and excluded edits are removed last.
 

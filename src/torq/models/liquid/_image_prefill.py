@@ -18,7 +18,7 @@ the rank-2 variant is numerically broken on the NPU (see image_prefill.md §3c).
 
 The full 16-layer model is too large to co-fit in NPU SRAM, so it is cut at
 layer boundaries into N parts, each ``[1,64,1024] -> [1,64,1024]`` chained by
-the layer-boundary hidden ``/model/layers.{k}/Add_2/output_0`` and emitting the
+the residual stream at each layer boundary and emitting the
 caches for the layers it owns.
 """
 import re
@@ -26,6 +26,8 @@ import re
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+
+from ...graph_edit.edits.transformer import residual_layer_boundaries
 
 S_IMAGE = 64
 NLAYERS = 16
@@ -86,21 +88,8 @@ def build_image_decoder(dynamic_decoder, replace_conv1d, propagate_shapes):
     # a Split output and fail shape inference.
     g2 = gs.import_onnx(m)
     g2.outputs = [o for o in g2.outputs if o.name != "logits"]
-    # Keep the last decoder layer alive so its conv Split stays 3-output (else
-    # the last part loses a Split slice). Prefer the highest-index layer-boundary
-    # Add_2; fall back to the final-norm hidden (the lm_head's activation input).
-    tmap = g2.tensors()
-    boundaries = sorted(
-        (t for name, t in tmap.items()
-         if re.fullmatch(r"/model/layers\.\d+/Add_2/output_0", name)),
-        key=lambda t: int(re.search(r"layers\.(\d+)", t.name).group(1)))
-    keep_alive = boundaries[-1] if boundaries else None
-    if keep_alive is None:
-        logits_t = next((o for o in gs.import_onnx(m).outputs if o.name == "logits"), None)
-        if logits_t is not None and logits_t.inputs:
-            keep_alive = next((tmap.get(i.name) for i in logits_t.inputs[0].inputs
-                               if getattr(i, "name", None) in tmap
-                               and not isinstance(tmap.get(i.name), gs.Constant)), None)
+    # Keep the final residual alive so the final conv Split remains valid.
+    keep_alive = residual_layer_boundaries(g2, NLAYERS)[-1]
     if keep_alive is not None and keep_alive not in g2.outputs:
         g2.outputs.append(keep_alive)
     g2.cleanup().toposort()
@@ -134,11 +123,12 @@ def split_image_decoder(full_model, nparts):
     ranges = PART_LAYER_RANGES[nparts]
     all_out = [o.name for o in full_model.graph.output]
 
+    boundaries = residual_layer_boundaries(gs.import_onnx(full_model), NLAYERS)
     parts = []
     for i, (a, b) in enumerate(ranges):
         g = gs.import_onnx(full_model)
         tmap = g.tensors()
-        in_name = "token_embedding" if a == 0 else f"/model/layers.{a - 1}/Add_2/output_0"
+        in_name = "token_embedding" if a == 0 else boundaries[a - 1].name
         in_t = tmap[in_name]
         in_t.inputs.clear()          # detach producer -> pure graph input
         in_t.dtype = np.float32
@@ -153,7 +143,7 @@ def split_image_decoder(full_model, nparts):
         # invalid split-count / -outputs mismatch.
         caches = [o for o in all_out if (_layer_of(o) is not None and a <= _layer_of(o) <= b)]
         if b < NLAYERS - 1:
-            out_names = caches + [f"/model/layers.{b}/Add_2/output_0"]
+            out_names = caches + [boundaries[b].name]
         else:
             out_names = caches
         g.inputs = [in_t]

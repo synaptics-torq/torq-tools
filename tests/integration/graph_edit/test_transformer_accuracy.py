@@ -8,7 +8,7 @@ import pytest
 
 from support.graph_edit import clone_graph, graph, run_model
 from torq.graph_edit.edits.transformer import MaskFutureAttentionScores, ReplaceDynamicKVCache
-from torq.models.qwen._graph import QwenOnnxGraphEditor
+from torq.graph_edit.edits import DecoderGraphEditor
 
 
 pytestmark = [pytest.mark.transformer, pytest.mark.ort]
@@ -130,8 +130,8 @@ def _gqa_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) ->
     return graph(nodes=nodes, inputs=inputs, outputs=[attn, *(n.outputs[0] for n in nodes if n.op == "Concat")])
 
 
-def _static_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> QwenOnnxGraphEditor:
-    editor = QwenOnnxGraphEditor(_gqa_decode_layer(heads, kv_heads, max_len, head_dim), onnx.TensorProto.FLOAT)
+def _static_decode_layer(heads: int, kv_heads: int, max_len: int, head_dim: int) -> DecoderGraphEditor:
+    editor = DecoderGraphEditor(_gqa_decode_layer(heads, kv_heads, max_len, head_dim), onnx.TensorProto.FLOAT)
     cur_len = editor.graph.layer(
         name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
         outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],
@@ -206,12 +206,14 @@ def _attention_layer(style: str, heads: int, kv_heads: int, max_len: int, head_d
     ("style", "heads", "kv_heads", "chunk"),
     [("hf", 4, 2, 1), ("grouped", 6, 2, 1), ("grouped", 6, 2, 2), ("broadcast", 4, 1, 1), ("broadcast", 4, 1, 3)],
 )
-def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk):
-    max_len, head_dim = 6, 4
+@pytest.mark.parametrize("window", [None, 4])
+@pytest.mark.parametrize("ring", [False, True])
+def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk, window, ring):
+    max_len, head_dim = 16, 4
     if style == "hf":
         editor = _static_decode_layer(heads, kv_heads, max_len, head_dim)
     else:
-        editor = QwenOnnxGraphEditor(_attention_layer(style, heads, kv_heads, max_len, head_dim, chunk), onnx.TensorProto.FLOAT)
+        editor = DecoderGraphEditor(_attention_layer(style, heads, kv_heads, max_len, head_dim, chunk), onnx.TensorProto.FLOAT)
         cur_len = editor.graph.layer(
             name="current_len_to_1d", op="Squeeze", inputs=[editor.graph.tensors()["position_ids"], [0]],
             outputs=[gs.Variable("position_ids_squeezed", dtype=np.int64, shape=[1])],
@@ -222,10 +224,17 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk)
             export_dtype=onnx.TensorProto.FLOAT, chunk_len=chunk,
         ))
     editor.combine_kv_io_tensors([1, kv_heads, max_len, head_dim])
+    for index, node in enumerate(editor.graph.nodes):
+        node.name = f"anonymous_{index}"
     if style == "hf":
         editor.group_query_heads(heads, kv_heads, head_dim)
+    if window is not None:
+        editor.apply_edit(MaskFutureAttentionScores(
+            editor.graph, "test", editor.graph.tensors()["position_ids_squeezed"], max_len,
+            onnx.TensorProto.FLOAT, chunk_len=chunk, sliding_window=window, sliding_layers=frozenset({0}),
+        ))
     blended = clone_graph(editor.graph)
-    editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk)
+    editor.read_only_kv_cache(heads, kv_heads, head_dim, chunk, window, frozenset({0}), ring_buffer=ring)
     read_only = editor.to_onnx()
     assert not [n for n in editor.graph.nodes if n.op == "Where" and n.outputs[0].name.startswith("present")]
     # torq-compile 2.3.0 miscompiles a Where over a constant condition, so the causal mask is a float constant.
@@ -233,7 +242,8 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk)
 
     rng = np.random.default_rng(0)
     blended_cache = rng.standard_normal((1, 2 * kv_heads, max_len, head_dim)).astype(np.float32)  # stale rows must not leak in
-    read_only_cache = blended_cache.transpose(0, 2, 1, 3).copy()
+    length = window - 1 if ring and window else max_len
+    read_only_cache = blended_cache[:, :, :length].transpose(0, 2, 1, 3).copy()
     for pos in range(0, max_len - chunk + 1, chunk):
         feeds = {
             "q": rng.standard_normal((1, heads, chunk, head_dim)).astype(np.float32),
@@ -246,5 +256,63 @@ def test_read_only_kv_cache_matches_blended_cache(style, heads, kv_heads, chunk)
         np.testing.assert_allclose(actual["attn"], expected["attn"], rtol=1e-5, atol=1e-6)
         assert actual["present.0.key_value"].shape == (1, chunk, 2 * kv_heads, head_dim)
         blended_cache = expected["present.0.key_value"]
-        read_only_cache[:, pos:pos + chunk] = actual["present.0.key_value"]
-    np.testing.assert_array_equal(read_only_cache, blended_cache.transpose(0, 2, 1, 3))
+        for row in range(chunk):
+            read_only_cache[:, (pos + row) % length] = actual["present.0.key_value"][:, row]
+    if not (ring and window):
+        np.testing.assert_array_equal(read_only_cache, blended_cache.transpose(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("chunk", [1, 3])
+@pytest.mark.parametrize("position", [0, 3, 4, 15])
+@pytest.mark.parametrize("window", [None, 4])
+def test_sliding_attention_mask(chunk, position, window):
+    length = 16
+    scores = gs.Variable("scores", dtype=np.float32, shape=[1, 1, chunk, length])
+    position_input = gs.Variable("position", dtype=np.int64, shape=[1])
+    nodes, outputs = [], []
+    for index in range(3):
+        past = gs.Variable(f"past_key_values.{index}.key", dtype=np.float32, shape=[1, 1, length - 1, length])
+        present = gs.Variable(f"present.{index}.key", dtype=np.float32, shape=[1, 1, length, length])
+        kt = gs.Variable(f"kt{index}", dtype=np.float32, shape=[1, 1, length, length])
+        product = gs.Variable(f"product{index}", dtype=np.float32, shape=scores.shape)
+        output = gs.Variable(f"output{index}", dtype=np.float32, shape=scores.shape)
+        nodes.extend([
+            gs.Node("Concat", f"update{index}", inputs=[past, gs.Constant(f"new{index}", np.eye(length, dtype=np.float32)[-1:].reshape(1, 1, 1, length))], outputs=[present], attrs={"axis": -2}),
+            gs.Node("Transpose", f"transpose{index}", inputs=[present], outputs=[kt], attrs={"perm": [0, 1, 3, 2]}),
+            gs.Node("MatMul", f"matmul{index}", inputs=[scores, kt], outputs=[product]),
+            gs.Node("Softmax", f"anonymous{index}", inputs=[product], outputs=[output], attrs={"axis": -1}),
+        ])
+        outputs.extend([output, present])
+    caches = [node.inputs[0] for node in nodes if node.op == "Concat"]
+    g = graph(nodes=nodes, inputs=[scores, position_input, *caches], outputs=outputs)
+    edit = MaskFutureAttentionScores(g, "test", position_input, length, onnx.TensorProto.FLOAT,
+                                     chunk_len=chunk, sliding_window=window, sliding_layers=frozenset({0, 2}))
+    for node in [n for n in nodes if n.op == "Softmax"]:
+        assert edit.match(node)
+        edit.transform(node)
+    values = np.random.default_rng(0).normal(size=scores.shape).astype(np.float32)
+    result = run_model(g, {"scores": values, "position": np.array([position], dtype=np.int64),
+                           **{cache.name: np.eye(length, dtype=np.float32)[:-1].reshape(1, 1, length - 1, length) for cache in caches}})
+    q = position + np.arange(chunk)[:, None]
+    for index in range(3):
+        keep = np.arange(length) <= q
+        if window is not None and index != 1:
+            keep &= np.arange(length) > q - window
+        masked = np.where(keep, values, -1e9)
+        expected = np.exp(masked - masked.max(axis=-1, keepdims=True))
+        expected /= expected.sum(axis=-1, keepdims=True)
+        np.testing.assert_allclose(result[f"output{index}"], expected, atol=1e-6)
+    masks = [n for n in g.nodes if n.name == "attn_mask_sliding"]
+    assert len(masks) == (window is not None)
+
+
+def test_sliding_attention_rejects_unknown_layer_and_large_chunk():
+    from torq.graph_edit.edits.transformer import ReadOnlyKVCache
+
+    g = graph(nodes=[], inputs=[], outputs=[])
+    with pytest.raises(ValueError, match="less than sliding_window"):
+        ReadOnlyKVCache(g, "test", 4, 1, 4, chunk_len=4, sliding_window=4)
+    node = gs.Node("Softmax", "unknown", inputs=[gs.Variable("scores")])
+    edit = MaskFutureAttentionScores(g, "test", gs.Variable("position"), 16, onnx.TensorProto.FLOAT, sliding_window=4)
+    with pytest.raises(ValueError, match="Cannot determine"):
+        edit.transform(node)

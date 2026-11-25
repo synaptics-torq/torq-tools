@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright © 2025 Synaptics Incorporated.
 
 from dataclasses import dataclass
-import os
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
 from ...graph_edit import OnnxGraphEdit, OnnxGraphEditor, FixedDimMapping, DimMatchType
 from ...graph_edit.edits import CommonGraphEditsMixin, CombineKVCacheMixin
-from ...graph_edit.edits.transformer import MaskFutureAttentionScores
 from ...graph_edit.edits.arithmetic import DecomposeLayerNormalization
 
 # Finite sentinel for blocked attention entries, matching MaskFutureAttentionScores.
@@ -108,38 +106,6 @@ class DecomposeGelu(OnnxGraphEdit):
 
 class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, CombineKVCacheMixin):
 
-    def __init__(
-        self,
-        graph: gs.Graph,
-        component: str,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ):
-        super().__init__(
-            graph,
-            component,
-            export_dtype=export_dtype,
-            **editor_kwargs,
-        )
-
-    @classmethod
-    def from_onnx(
-        cls,
-        onnx_model: str | os.PathLike | onnx.ModelProto,
-        component: str,
-        export_dtype: onnx.TensorProto.DataType | None = None,
-        **editor_kwargs,
-    ) -> "MoonshineStreamingOnnxGraphEditor":
-        if not isinstance(onnx_model, onnx.ModelProto):
-            onnx_model = onnx.load(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        return cls(
-            graph,
-            component,
-            export_dtype,
-            **editor_kwargs,
-        )
-
     def fix_encoder_io(
         self,
         chunk_len: int,
@@ -186,25 +152,6 @@ class MoonshineStreamingOnnxGraphEditor(OnnxGraphEditor, CommonGraphEditsMixin, 
         for t in self._graph.outputs:
             if isinstance(t, gs.Variable):
                 t.shape = None
-        return self
-
-    # Streaming-specialised overrides
-    # This shadows CommonGraphEditsMixin so the shared edit is instantiated with
-    # its opt-in shape-based fallback matching: dynamo doesn't preserve
-    # hierarchical node names, so the name-based primary match the shared
-    # (non-streaming) class relies on never fires here — confirmed empirically
-    # against real decoder exports; see duplicated.md. ``replace_dynamic_kv_cache``
-    # and ``decompose_strided_conv1d`` are intentionally NOT overridden — the
-    # shared edits are functionally identical here and are inherited from the
-    # mixin.
-
-    def mask_future_attn_scores(self, cur_len, max_tokens):
-        self.apply_edit(
-            MaskFutureAttentionScores(
-                self._graph, self._graph_name, cur_len, max_tokens, self._export_dtype,
-                match_shape_fallback=True,
-            )
-        )
         return self
 
     # New decompositions (model-local edits)

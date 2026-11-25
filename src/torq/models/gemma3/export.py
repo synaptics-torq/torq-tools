@@ -19,13 +19,13 @@ from tokenizers import Tokenizer
 from transformers import AutoConfig
 
 from . import FUNCTIONGEMMA_HF_REPO, GPTQ_HF_REPO, GPTQ_SOURCE_REPO, add_gemma3_export_args
-from ._graph import Gemma3OnnxGraphEditor
 from ._inference import Gemma3Dynamic, Gemma3Static
 from ._trim_vocab import (
     TrimmedVocabSpec,
     build_trimmed_vocab_spec,
     load_json,
 )
+from ...graph_edit.edits import DecoderGraphEditor, PrecomputeRotaryTables
 from ...graph_edit.harness import EditSpec, GraphEditHarness, ctx, render_graph_edit_plan
 from ...model_export.onnx import OnnxModelExporterBase, ORTOptimizerConfig
 from ...model_export.validation import validate_decoder_only_onnx
@@ -64,7 +64,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         model_size: Literal["270m", "1b"] = "270m",
         instruct_model: bool = False,
         extract_embeddings: bool = False,
-        keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
         functiongemma: bool = False,
@@ -84,15 +83,9 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         split_weights: bool = False,
         weight_quantization: Literal["int4", "int8"] | None = None,
         gptq_checkpoint: str | os.PathLike | None = None,
-        read_only_kv_cache: bool = True,
         **edit_args
     ):
         self._hf_repo = _resolve_hf_repo(model_size, instruct_model, hf_repo, functiongemma)
-        if read_only_kv_cache and keep_individual_kv_io:
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O; "
-                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
-            )
         if gptq_checkpoint is not None and weight_quantization != "int4":
             raise ValueError("--gptq-checkpoint needs --weight-quantization int4")
         if weight_quantization is not None and (dynamic_quantize or convert_dtypes):
@@ -105,8 +98,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         self._functiongemma = functiongemma
         self._instruct_model = instruct_model or functiongemma
         self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
-        self._read_only_kv_cache = read_only_kv_cache
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
@@ -138,8 +129,6 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                     self._config = AutoConfig.from_pretrained(self._hf_repo)
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
-        self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._trimmed_vocab_spec: TrimmedVocabSpec | None = None
         self._source_tokenizer_json: dict | None = None
         self._source_config_json: dict | None = None
@@ -333,6 +322,18 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if not updated:
             raise ValueError("Could not find logits output metadata for trimmed-vocab export")
 
+    def _sliding_attention(self) -> tuple[int | None, frozenset[int]]:
+        window = getattr(self._config, "sliding_window", None)
+        if window is None or self._max_gen_tokens <= window:
+            return None, frozenset()
+        types = getattr(self._config, "layer_types", None)
+        if types is not None:
+            layers = frozenset(i for i, kind in enumerate(types) if kind == "sliding_attention")
+        else:
+            pattern = self._config.sliding_window_pattern
+            layers = frozenset(i for i in range(self._config.num_hidden_layers) if (i + 1) % pattern)
+        return window, layers
+
     def graph_edit_blocks(self) -> dict[str, list[EditSpec]]:
         blocks: dict[str, list[EditSpec]] = {}
         blocks["model.static"] = [
@@ -343,22 +344,20 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             EditSpec("ReplaceDynamicKVCache", (ctx("cur_len"), ctx("max_tokens"), ctx("chunk_len"))),
             EditSpec(
                 "MaskFutureAttentionScores",
-                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), False, ctx("chunk_len")),
+                (ctx("cur_len"), ctx("max_tokens"), ctx("export_dtype"), ctx("chunk_len"), *self._sliding_attention()),
             ),
             EditSpec("AddCurrLenInput", (ctx("cur_len"),)),
             EditSpec("ConvertToStaticIndex", (ctx("chunk_len"),)),
         ]
 
         patch = [
+            EditSpec("PrecomputeRotaryTables", (self._max_gen_tokens,)),
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("CollapseGQABroadcast"),
             EditSpec("FoldScalarMatMul"),
         ]
-        if self._broadcast_ops is not None:
-            patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
-        else:
-            patch.append(EditSpec("EliminateExpand", (["Mul", "MatMul", "Where", "Transpose"],)))
+        patch.append(EditSpec("EliminateExpand", (["Mul", "MatMul", "Where", "Transpose"],)))
         if self._extract_embeddings:
             patch.append(EditSpec(
                 "ExtractConstantLUT",
@@ -405,7 +404,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             onnx.helper.tensor_dtype_to_string(self._onnx_export_dtype), self._model_dtype
         )
         
-        editor = Gemma3OnnxGraphEditor(
+        editor = DecoderGraphEditor(
             graph,
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(self._export_path_for_component(component)),
@@ -447,7 +446,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
 
     def _patch_static_model(self, model_path: str | os.PathLike, component: str):
         model = load_onnx_lazy(model_path)
-        editor = Gemma3OnnxGraphEditor.from_onnx(
+        editor = DecoderGraphEditor.from_onnx(
             model,
             self._onnx_export_dtype,
             **self._editor_dump_kwargs(Path(model_path)),
@@ -467,20 +466,20 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             editor.reorder_graph_input("token_embedding", 0)
 
-        if not self._keep_individual_kv_io:
-            editor.combine_kv_io_tensors([
-                1,                                                              # B
-                self._config.num_key_value_heads,                               # H
-                self._max_gen_tokens,                                           # L
-                self._config.head_dim                                           # D
-            ])
-            if self._read_only_kv_cache:
-                editor.read_only_kv_cache(
-                    self._config.num_attention_heads,
-                    self._config.num_key_value_heads,
-                    self._config.head_dim,
-                    self._batch_prefill if component == "model_prefill" else 1,
-                )
+        editor.combine_kv_io_tensors([
+            1,                                                              # B
+            self._config.num_key_value_heads,                               # H
+            self._max_gen_tokens,                                           # L
+            self._config.head_dim                                           # D
+        ])
+        editor.read_only_kv_cache(
+            self._config.num_attention_heads,
+            self._config.num_key_value_heads,
+            self._config.head_dim,
+            self._batch_prefill if component == "model_prefill" else 1,
+            *self._sliding_attention(),
+            ring_buffer=True,
+        )
 
         if self._trim_vocab:
             spec = self._get_trimmed_vocab_spec()
@@ -565,6 +564,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
             lm_head_path=self._export_paths.get("lm_head"),
             prefill_model_path=self._export_paths.get("model_prefill"),
             prefill_size=self._batch_prefill,
+            sliding_window=self._sliding_attention()[0],
             **validation_kwargs,
         )
 
@@ -612,7 +612,7 @@ class Gemma3ModelExporter(OnnxModelExporterBase):
                 str(model_path), bits, " (GPTQ)" if self._gptq_checkpoint else "",
             )
             model = onnx.load(str(model_path), load_external_data=True)
-            quantizer = WeightQuantizer()
+            quantizer = WeightQuantizer(skip_layers=[PrecomputeRotaryTables.TABLE_NAME])
             matmul_info = quantizer._find_matmul_weights(model)
             precomputed = None
             if self._gptq_checkpoint is not None:
@@ -701,7 +701,6 @@ def export_gemma3_from_args(args: argparse.Namespace):
         args.model_size,
         args.instruct_model,
         args.extract_embeddings,
-        args.keep_individual_kv_io,
         not args.dynamic_models,
         functiongemma=args.functiongemma,
         hf_repo=args.hf_repo,
@@ -718,11 +717,8 @@ def export_gemma3_from_args(args: argparse.Namespace):
         trim_vocab_groups=args.trim_vocab_groups,
         trim_byte_fallback=args.trim_byte_fallback,
         split_weights=args.split_weights,
-        replace_int_bf16_cast=args.replace_int_bf16_cast,
-        broadcast_ops=args.broadcast_ops,
         weight_quantization=weight_quantization,
         gptq_checkpoint=gptq_checkpoint,
-        read_only_kv_cache=args.read_only_kv_cache,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:

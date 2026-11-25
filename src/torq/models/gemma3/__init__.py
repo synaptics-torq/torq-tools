@@ -81,9 +81,6 @@ def add_gemma3_export_args(parser: argparse.ArgumentParser):
         allow_no_opt=False,
         extract_embeddings=True,
         dynamic_models=True,
-        keep_individual_kv_io=True,
-        read_only_kv_cache=True,
-        replace_int_bf16_cast=True,
     )
     parser.add_argument(
         "--trim-vocab",
