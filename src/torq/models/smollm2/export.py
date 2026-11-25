@@ -33,7 +33,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         model_size: Literal["135M", "360M", "1.7B"] = "135M",
         instruct_model: bool = False,
         extract_embeddings: bool = False,
-        keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
         max_gen_tokens: int = 64,
@@ -43,18 +42,9 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         split_weights: bool = False,
-        read_only_kv_cache: bool = True,
-        **edit_args
     ):
-        if read_only_kv_cache and keep_individual_kv_io:
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O; "
-                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
-            )
         self._instruct_model = instruct_model
         self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
-        self._read_only_kv_cache = read_only_kv_cache
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = validate_onnx_source_dir(
             onnx_source_dir, required_files=("tokenizer.json",)
@@ -66,8 +56,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         )
         self._hidden_size = int(self._config.hidden_size)
         self._vocab_size = int(self._config.vocab_size)
-        self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
 
         super().__init__(
             "fp32",
@@ -140,8 +128,6 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
                 self._config.hidden_size // self._config.num_attention_heads,
             )),
         ]
-        if self._broadcast_ops is not None:
-            patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
         if self._extract_embeddings:
             patch.append(EditSpec(
                 "ExtractConstantLUT",
@@ -232,19 +218,17 @@ class SmolLM2ModelExporter(OnnxModelExporterBase):
         if self._extract_embeddings:
             editor.reorder_graph_input("token_embedding", 0)
 
-        if not self._keep_individual_kv_io:
-            editor.combine_kv_io_tensors([
-                1,                                                              # B
-                self._config.num_key_value_heads,                               # H
-                self._max_gen_tokens,                                           # L
-                self._config.hidden_size // self._config.num_attention_heads    # D
-            ])
-            if self._read_only_kv_cache:
-                editor.read_only_kv_cache(
-                    self._config.num_attention_heads,
-                    self._config.num_key_value_heads,
-                    self._config.hidden_size // self._config.num_attention_heads,
-                )
+        editor.combine_kv_io_tensors([
+            1,                                                              # B
+            self._config.num_key_value_heads,                               # H
+            self._max_gen_tokens,                                           # L
+            self._config.hidden_size // self._config.num_attention_heads    # D
+        ])
+        editor.read_only_kv_cache(
+            self._config.num_attention_heads,
+            self._config.num_key_value_heads,
+            self._config.hidden_size // self._config.num_attention_heads,
+        )
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         self._save_component_model(new_model, model_path)
@@ -295,7 +279,6 @@ def export_smollm2_from_args(args: argparse.Namespace):
         args.model_size,
         args.instruct_model,
         args.extract_embeddings,
-        args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
         models_dir=args.models_dir,
@@ -304,9 +287,6 @@ def export_smollm2_from_args(args: argparse.Namespace):
         dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         split_weights=args.split_weights,
-        read_only_kv_cache=args.read_only_kv_cache,
-        replace_int_bf16_cast=args.replace_int_bf16_cast,
-        broadcast_ops=args.broadcast_ops
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:

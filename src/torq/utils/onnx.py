@@ -61,11 +61,9 @@ def add_onnx_args(
     dynamic_quantize: bool = True,
     convert_dtypes: bool = False,
     allow_no_opt: bool = True,
+    allow_no_cleanup: bool = True,
     extract_embeddings: bool = False,
     dynamic_models: bool = False,
-    keep_individual_kv_io: bool = False,
-    read_only_kv_cache: bool = False,
-    replace_int_bf16_cast: bool = False,
 ):
     """Shared export-pipeline args for every model exporter.
 
@@ -109,14 +107,15 @@ def add_onnx_args(
         default=False,
         help="Skip validation for edited ONNX models"
     )
-    group.add_argument(
-        "--no-onnx-cleanup",
-        action="store_true",
-        default=False,
-        help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
-             "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
-             "exported component before dtype conversion",
-    )
+    if allow_no_cleanup:
+        group.add_argument(
+            "--no-onnx-cleanup",
+            action="store_true",
+            default=False,
+            help="Skip the torq.model_export.cleanup pipeline (collapse unrolled "
+                 "Concats, fold constants, fold Conv+BatchNorm) that runs on each "
+                 "exported component before dtype conversion",
+        )
     group.add_argument(
         "--split-weights",
         action="store_true",
@@ -128,14 +127,6 @@ def add_onnx_args(
             "constants stay inline so onnxruntime can still resolve shape-op "
             "inputs (Squeeze/Reshape axes, Slice/Pad parameters) at load time."
         ),
-    )
-    group.add_argument(
-        "--broadcast-ops",
-        type=str,
-        metavar="OP",
-        nargs="*",
-        default=None,
-        help="Broadcast op inputs: specify ops or pass with no args to broadcast for all ops",
     )
     if allow_no_opt:
         group.add_argument(
@@ -206,30 +197,6 @@ def add_onnx_args(
             action="store_true",
             default=False,
             help="Export dynamic models for CPU"
-        )
-    if keep_individual_kv_io:
-        group.add_argument(
-            "--keep-individual-kv-io",
-            action="store_true",
-            default=False,
-            help="Keep KV I/O as separate key, value tensors instead of combining"
-        )
-    if read_only_kv_cache:
-        group.add_argument(
-            "--read-only-kv-cache",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help=(
-                "Read the time-major KV caches without writing them and output only the new rows, "
-                "which the runtime writes into the caches at position_ids (default: %(default)s)"
-            ),
-        )
-    if replace_int_bf16_cast:
-        group.add_argument(
-            "--replace-int-bf16-cast",
-            action="store_true",
-            default=False,
-            help="Replace int64 -> bf16 casts with a look-up table"
         )
 
 

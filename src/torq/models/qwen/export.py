@@ -129,10 +129,8 @@ class QwenModelExporter(OnnxModelExporterBase):
         onnx_source_dir: str | os.PathLike | None = None,
         show_model_info: bool = False,
         convert_dtypes: bool = False,
-        keep_individual_kv_io: bool = False,
         split_lm_head: bool = False,
         split_model: bool = False,
-        read_only_kv_cache: bool = True,
         weight_quantization: str | None = None,
         gptq_checkpoint: str | os.PathLike | None = None,
     ):
@@ -140,11 +138,9 @@ class QwenModelExporter(OnnxModelExporterBase):
         self._hf_repo_subdir = hf_repo_subdir
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
-        self._keep_individual_kv_io = keep_individual_kv_io
         # Splitting the transformer always splits off the LM head as well.
         self._split_lm_head = split_lm_head or split_model
         self._split_model = split_model
-        self._read_only_kv_cache = read_only_kv_cache
         self._weight_quantization = weight_quantization
         self._gptq_checkpoint = (
             Path(gptq_checkpoint) if gptq_checkpoint else None
@@ -154,12 +150,6 @@ class QwenModelExporter(OnnxModelExporterBase):
             raise ValueError(
                 "`--split-model` / `--split-lm-head` are currently supported "
                 "only for static Qwen exports"
-            )
-
-        if read_only_kv_cache and static_models and (not self._split_lm_head or keep_individual_kv_io):
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O and `--split-lm-head`; "
-                "add `--no-read-only-kv-cache` otherwise"
             )
 
         if self._weight_quantization is not None and not self._split_lm_head:
@@ -362,8 +352,7 @@ class QwenModelExporter(OnnxModelExporterBase):
         attention = [EditSpec("RemoveIsNaN")]
         if self._static_models:
             attention.append(EditSpec("GroupQueryHeads", attention_args))
-            if self._read_only_kv_cache:
-                attention.append(EditSpec("ReadOnlyKVCache", attention_args))
+            attention.append(EditSpec("ReadOnlyKVCache", attention_args))
         blocks["model.patch (attention)"] = attention
         if self._split_lm_head:
             blocks["transformer.convert"] = [EditSpec("SplitRotarySlices")]
@@ -481,24 +470,20 @@ class QwenModelExporter(OnnxModelExporterBase):
                 0,
             )
 
-            if not self._keep_individual_kv_io:
-                editor.combine_kv_io_tensors(
-                    [
-                        1,
-                        self._config.num_key_value_heads,
-                        self._max_gen_tokens,
-                        head_dim,
-                    ]
-                )
-                if not self._read_only_kv_cache:
-                    # One cache write per layer instead of split, blend and concat.
-                    editor.blend_combined_kv_in_place()
-
             self._logger.info(
                 "(model) Extracted Qwen token embeddings to '%s'",
                 str(embeddings_npy),
             )
 
+        if self._static_models:
+            editor.combine_kv_io_tensors(
+                [
+                    1,
+                    self._config.num_key_value_heads,
+                    self._max_gen_tokens,
+                    head_dim,
+                ]
+            )
         editor.apply_specs(blocks["model.patch"], self._harness)
 
         if self._split_lm_head:
@@ -906,7 +891,7 @@ class QwenModelExporter(OnnxModelExporterBase):
                 max_gen_tokens=self._max_gen_tokens,
                 n_threads=n_threads,
                 repo_id=self._hf_repo,
-                combined_kv_io=not self._keep_individual_kv_io,
+                combined_kv_io=True,
             )
         else:
             runner = QwenDynamic.from_onnx(
@@ -1437,9 +1422,7 @@ def export_qwen_from_args(args: argparse.Namespace) -> None:
         onnx_source_dir=args.onnx_source_dir,
         show_model_info=args.show_model_info,
         convert_dtypes=convert_dtypes,
-        keep_individual_kv_io=args.keep_individual_kv_io,
         split_model=args.split_model,
-        read_only_kv_cache=args.read_only_kv_cache,
         split_lm_head=args.split_lm_head,
         weight_quantization=weight_quantization,
         gptq_checkpoint=None if args.view_graph_edits else _resolve_gptq_checkpoint(args),

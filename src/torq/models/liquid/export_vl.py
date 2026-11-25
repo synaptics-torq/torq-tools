@@ -99,7 +99,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         convert_dtypes: bool = False,
         split_weights: bool = False,
         compile_vision: bool = False,
-        keep_individual_kv_io: bool = False,
         static_models: bool = True,
         **edit_args,
     ):
@@ -108,7 +107,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # extract.  The token-embedding LUT lives in embed_tokens.onnx and is
         # handled separately (see _extract_embed_lut).
         self._extract_embeddings = False
-        self._keep_individual_kv_io = keep_individual_kv_io
         # The VL demo engine writes whole caches back, and the image prefill chain shares them.
         self._read_only_kv_cache = False
         self._max_gen_tokens = max_gen_tokens
@@ -120,7 +118,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # --convert-dtypes / --dynamic-quantize each apply to every component
         # independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
-        self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
         if batch_prefill is not None:
@@ -147,7 +144,6 @@ class LiquidVLModelExporter(LiquidModelExporter):
         # layer-boundary parts (decoder_image_<N>part_<A..>.vmfb). 2, 3 or 5.
         self._image_decoder_parts = edit_args.get("image_decoder_parts", None)
         self._dynamic_decoder = None  # captured pre-static for the image build
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
 
@@ -887,12 +883,9 @@ def export_liquid_vl_from_args(args: argparse.Namespace):
         convert_dtypes=args.convert_dtypes,
         split_weights=args.split_weights,
         compile_vision=args.compile_vision,
-        keep_individual_kv_io=args.keep_individual_kv_io,
         static_models=not args.dynamic_models,
-        broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
-        chunk_lm_head=args.chunk_lm_head,
         split_lm_head=args.split_lm_head,
         vision_res=args.vision_res,
         image_decoder_parts=args.image_decoder_parts,

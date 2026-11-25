@@ -91,7 +91,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         self,
         model_size: Literal["350m", "230m"] = "350m",
         extract_embeddings: bool = False,
-        keep_individual_kv_io: bool = False,
         static_models: bool = True,
         *,
         max_gen_tokens: int = 256,
@@ -103,30 +102,22 @@ class LiquidModelExporter(OnnxModelExporterBase):
         dynamic_quantize: bool = False,
         convert_dtypes: bool = False,
         split_weights: bool = False,
-        read_only_kv_cache: bool = True,
         **edit_args
     ):
-        if read_only_kv_cache and keep_individual_kv_io:
-            raise ValueError(
-                "`--read-only-kv-cache` needs the combined KV cache I/O; "
-                "add `--no-read-only-kv-cache` to `--keep-individual-kv-io`"
-            )
         self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
-        self._read_only_kv_cache = read_only_kv_cache
+        self._read_only_kv_cache = True
         self._max_gen_tokens = max_gen_tokens
         self._onnx_source_dir = onnx_source_dir
         self._model_size = model_size
         self._hf_repo = HF_REPO_BASE[model_size]
         self._hf_repo_onnx = HF_REPO_ONNX[model_size]
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._simulate_bf16 = edit_args.get("simulate_bf16", False)
         # Chip-specific graph rewrites. The SL2610's depthwise-conv path
         # crashes torq-compile (Kernel.cpp DType::none assertion) on LFM2.5's
         # short conv, so by default we replace each depthwise Conv1D with a
         # bit-exact batched-MatMul chain.  The 512-chunk lm_head split is no
         # longer needed now that tile-and-fuse is default — the exporter emits
-        # a single [1024, 65536] MatMul unless --chunk-lm-head is passed.
+        # a single [1024, 65536] MatMul.
         self._replace_conv1d = not edit_args.get("keep_conv1d", False)
         # --split-lm-head (gemma3-style) turns the decode model and, when
         # exported, the batch-prefill model into bodies (lm_head dropped,
@@ -135,7 +126,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
         # at ONNX-export time, so --convert-dtypes / --dynamic-quantize each
         # apply to every component independently.
         self._split_lm_head = edit_args.get("split_lm_head", False)
-        self._chunk_lm_head = edit_args.get("chunk_lm_head", False)
         if self._split_lm_head and not static_models:
             raise ValueError("`--split-lm-head` is currently supported only for static LFM exports")
         if batch_prefill is not None:
@@ -529,8 +519,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             EditSpec("CollapseGQABroadcast"),
             EditSpec("FoldScalarMatMul"),
         ]
-        if self._broadcast_ops is not None:
-            patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
         blocks["model.patch"] = patch
         if self._extract_embeddings:
             blocks["model.patch (embeddings)"] = [EditSpec(
@@ -750,105 +738,6 @@ class LiquidModelExporter(OnnxModelExporterBase):
             new_model.ir_version = model.ir_version
             return new_model, folded
         return model, 0
-
-    @staticmethod
-    def _split_lm_head_matmul(model: onnx.ModelProto, chunk_size: int = 128) -> tuple[onnx.ModelProto, int]:
-        """Split the lm_head MatMul along the vocab axis into chunks that fit
-        in the SL2610's 512 KB LRAM.
-
-        LFM2.5's lm_head is ``MatMul(hidden[1,1,1024], Transpose(W))`` where
-        ``W = model.embed_tokens.weight`` of shape ``[vocab=65536, hidden=1024]``.
-        The transposed weight ``[1024, 65536]`` is 134 MB in bf16 — far
-        larger than the 512 KB LRAM, so torq-compile cannot allocate it
-        and fails ``failed to allocate LRAM addresses``.  Splitting the
-        vocab dim into chunks of ``chunk_size`` columns (default 128 →
-        ``[1024, 128] = 256 KB`` per chunk, comfortably under 512 KB)
-        produces ``vocab/chunk_size`` smaller MatMuls whose results are
-        concatenated back into the original ``[1, 1, vocab]`` logits.
-        """
-        graph = gs.import_onnx(model)
-        target = None
-        for node in graph.nodes:
-            if node.op != "MatMul" or len(node.inputs) < 2:
-                continue
-            rhs = node.inputs[1]
-            if not isinstance(rhs, gs.Variable):
-                continue
-            producer_inputs = getattr(rhs, "inputs", None) or []
-            if not producer_inputs:
-                continue
-            producer = producer_inputs[0]
-            if producer.op != "Transpose":
-                continue
-            w = producer.inputs[0]
-            if not isinstance(w, gs.Constant) or w.values.ndim != 2:
-                continue
-            # Heuristic: a [vocab, hidden] tensor whose vocab dim is the
-            # largest dim in the model — that's the LM head weight.
-            if max(w.values.shape) < 16384:
-                continue
-            target = (node, producer, w)
-            break
-
-        if target is None:
-            return model, 0
-
-        matmul_node, transpose_node, weight = target
-        V, H = int(weight.values.shape[0]), int(weight.values.shape[1])
-        lhs_input = matmul_node.inputs[0]
-        original_output = matmul_node.outputs[0]
-        original_output_name = original_output.name
-        original_output_shape = list(original_output.shape) if original_output.shape else None
-        original_output_dtype = original_output.dtype
-
-        chunk_outputs: list[gs.Variable] = []
-        for ci, start in enumerate(range(0, V, chunk_size)):
-            end = min(start + chunk_size, V)
-            # Pre-transpose the chunk at export time so the MatMul can
-            # consume a [H, chunk_size] constant directly — no Transpose
-            # op needed in the graph.
-            chunk_t = weight.values[start:end].T.copy()  # [H, end-start]
-            chunk_const = gs.Constant(
-                name=f"{weight.name}_chunkT_{ci}",
-                values=chunk_t,
-            )
-            m_out = gs.Variable(
-                name=f"{matmul_node.name}_chunk_{ci}",
-                dtype=weight.values.dtype,
-                shape=(original_output_shape[:-1] + [end - start])
-                if original_output_shape else None,
-            )
-            m_node = gs.Node(
-                op="MatMul",
-                name=f"{matmul_node.name}_chunk_{ci}",
-                inputs=[lhs_input, chunk_const],
-                outputs=[m_out],
-            )
-            graph.nodes.append(m_node)
-            chunk_outputs.append(m_out)
-
-        concat_axis = (len(original_output_shape) - 1) if original_output_shape else -1
-        concat_node = gs.Node(
-            op="Concat",
-            name=f"{matmul_node.name}_concat",
-            inputs=chunk_outputs,
-            outputs=[original_output],
-            attrs={"axis": concat_axis},
-        )
-        graph.nodes.append(concat_node)
-
-        # Detach the original MatMul and Transpose so cleanup removes them.
-        matmul_node.outputs.clear()
-        matmul_node.inputs.clear()
-        transpose_node.outputs.clear()
-        transpose_node.inputs.clear()
-
-        graph.cleanup(
-            remove_unused_graph_inputs=True, remove_unused_node_outputs=True
-        ).toposort()
-        new_model = gs.export_onnx(graph)
-        new_model.ir_version = model.ir_version
-        return new_model, len(chunk_outputs)
 
     @staticmethod
     def _unsplit_lm_head_matmul(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
@@ -1212,20 +1101,19 @@ class LiquidModelExporter(OnnxModelExporterBase):
             )
             editor.reorder_graph_input("token_embedding", 0)
 
-        if not self._keep_individual_kv_io:
-            editor.combine_kv_io_tensors([
-                1,                          # B
-                self._num_key_value_heads,  # H
-                self._max_gen_tokens,       # L
-                self._head_dim              # D
-            ])
-            if self._read_only_kv_cache:
-                editor.read_only_kv_cache(
-                    self._num_attention_heads,
-                    self._num_key_value_heads,
-                    self._head_dim,
-                    self._batch_prefill if component.endswith("_prefill") else 1,
-                )
+        editor.combine_kv_io_tensors([
+            1,                          # B
+            self._num_key_value_heads,  # H
+            self._max_gen_tokens,       # L
+            self._head_dim              # D
+        ])
+        if self._read_only_kv_cache:
+            editor.read_only_kv_cache(
+                self._num_attention_heads,
+                self._num_key_value_heads,
+                self._head_dim,
+                self._batch_prefill if component.endswith("_prefill") else 1,
+            )
 
         editor.reorder_graph_input("position_ids", 1)
         new_model = editor.to_onnx(override_ir=model.ir_version, strict_mode=False)
@@ -1246,19 +1134,13 @@ class LiquidModelExporter(OnnxModelExporterBase):
         new_model, n_bias = self._inject_zero_bias_into_conv(new_model)
         if n_bias:
             self._logger.info("(conv-bias) Injected zero bias into %d Conv op(s)", n_bias)
-        # lm_head: default to a single [1024, 65536] MatMul (tile-and-fuse
-        # handles it); --chunk-lm-head keeps the legacy 512-chunk split.
-        if self._chunk_lm_head:
-            new_model, n_chunks = self._split_lm_head_matmul(new_model, chunk_size=128)
-            if n_chunks:
-                self._logger.info("(lm-head) Split lm_head MatMul into %d chunks", n_chunks)
-        else:
-            new_model, n_unsplit = self._unsplit_lm_head_matmul(new_model)
-            if n_unsplit:
-                self._logger.info(
-                    "(lm-head) Folded Transpose into pre-transposed weight; "
-                    "single [H, V] MatMul")
-        # Re-run shape inference once more so the new chunks have full
+        # Tile-and-fuse handles a single LM-head MatMul.
+        new_model, n_unsplit = self._unsplit_lm_head_matmul(new_model)
+        if n_unsplit:
+            self._logger.info(
+                "(lm-head) Folded Transpose into pre-transposed weight; "
+                "single [H, V] MatMul")
+        # Re-run shape inference once more so the folded MatMul has full
         # value_info for downstream consumers / static-shape checks.
         del new_model.graph.value_info[:]
         try:
@@ -1266,13 +1148,12 @@ class LiquidModelExporter(OnnxModelExporterBase):
                 new_model, check_type=False, strict_mode=False, data_prop=True
             )
         except Exception as e:
-            self._logger.warning("(lm-head) shape inference after split: %s", e)
+            self._logger.warning("(lm-head) shape inference after LM-head folding: %s", e)
 
         if component.endswith("_prefill"):
             # The prefill model's LM head only needs the final position's
             # logit; slice its input before the head.  No-op when the head
-            # isn't a direct MatMul (chunked --chunk-lm-head or a
-            # num_logits_to_keep slice), which already emits last-token logits.
+            # already emits last-token logits through a num_logits_to_keep slice.
             new_model = self._take_last_token(new_model, Path(model_path))
 
         self._save_component_model(new_model, model_path)
@@ -1545,8 +1426,7 @@ class LiquidModelExporter(OnnxModelExporterBase):
         TakeLastToken or the source model's own Slice, so the head is identical to the
         decode model's and ``write_lm_head=False`` reuses the existing
         ``lm_head.onnx`` instead of re-writing it.
-        Works on the single-MatMul head and the legacy --chunk-lm-head
-        512-chunk split alike. Structure-based: the lm_head is the node(s)
+        Structure-based: the lm_head is the node(s)
         producing the vocab-logits graph output, and its non-weight
         activation input is the split boundary."""
         import copy
@@ -1662,7 +1542,6 @@ def export_liquid_from_args(args: argparse.Namespace):
     exporter = LiquidModelExporter(
         args.model_size,
         args.extract_embeddings,
-        args.keep_individual_kv_io,
         not args.dynamic_models,
         max_gen_tokens=args.max_gen_tokens,
         batch_prefill=args.batch_prefill or None,
@@ -1673,11 +1552,8 @@ def export_liquid_from_args(args: argparse.Namespace):
         dynamic_quantize=args.dynamic_quantize,
         convert_dtypes=args.convert_dtypes,
         split_weights=args.split_weights,
-        read_only_kv_cache=args.read_only_kv_cache,
-        broadcast_ops=args.broadcast_ops,
         simulate_bf16=args.simulate_bf16,
         keep_conv1d=args.keep_conv1d,
-        chunk_lm_head=args.chunk_lm_head,
         split_lm_head=args.split_lm_head,
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))

@@ -26,8 +26,6 @@ A normal run loads or exports source ONNX, makes the model static, applies graph
 | `--trim-vocab-groups` | Groups to keep: `latin`, `punct`, `digits`, `digits-non-latin`, `other` (default: `latin punct digits`) |
 | `--split-lm-head` / `--no-split-lm-head` | Write `transformer.onnx` (hidden states) and `lm_head.onnx` (hidden states → logits) separately; enabled by default where offered |
 | `--batch-prefill N` | Also emit fixed-shape `transformer_prefill.onnx` (default: 64, `0` disables); requires a split LM head |
-| `--keep-individual-kv-io` | Keep separate K and V tensors instead of combined caches; target dispatch-binding limits may prevent this |
-| `--no-read-only-kv-cache` | Use the earlier head-major caches written back whole each step; see [Read-only KV cache](#read-only-kv-cache) |
 | `--dynamic-models` | Export dynamic CPU models; disable static-only options such as split LM head and batched prefill when required |
 | `--weight-quantization {int4,int8,none}` | Block-size-32 DequantizeLinear MatMul weight quantization; Qwen and Gemma default to INT4 |
 | `--gptq` / `--no-gptq` | Use hosted GPTQ INT4 weights for a supported default source, or round-to-nearest weights |
@@ -39,6 +37,8 @@ A normal run loads or exports source ONNX, makes the model static, applies graph
 | `--compile-flags …` | Extra compiler flags, placed last on the command line; override the validated model flags |
 
 Hosted GPTQ weights must match the source model. Source overrides use round-to-nearest unless you supply a matching local checkpoint. See the model guide for supported hosted checkpoints and [Qwen calibration](qwen/int4quant/README.md) for a calibration recipe.
+
+Embedding extraction can be disabled to trade inference speed for lower host memory usage. LM-head splitting can also be disabled to produce a unified decoder, at the cost of slower prefill.
 
 ## Graph-edit controls
 
@@ -85,9 +85,7 @@ The Gemma prefill model shares the separate LM head. Liquid's prefill stays fuse
 
 ## Read-only KV cache
 
-Qwen, Gemma 3, LFM2.5 and SmolLM2 support read-only KV caches. Each combined cache is a time-major `[1, L, 2 * kv, D]` input (K heads, then V heads). The `present.*.key_value` output contains only the step's new rows, which the runtime writes at `position_ids` before the next step. Decode outputs one row; batched prefill outputs N.
-
-`--no-read-only-kv-cache` restores the head-major, full-writeback layout expected by torq-examples demos before v2.4.0. Gemma sliding layers can use bounded ring caches rather than the full context capacity.
+Qwen, Gemma 3, LFM2.5 and SmolLM2 support read-only KV caches. Each combined cache is a time-major `[1, L, 2 * kv, D]` input (K heads, then V heads). The `present.*.key_value` output contains only the step's new rows, which the runtime writes at `position_ids` before the next step. Decode outputs one row; batched prefill outputs N. This cache layout is always enabled for these static exports.
 
 ## Validation
 

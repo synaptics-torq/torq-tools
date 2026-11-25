@@ -63,7 +63,6 @@ Opt-out flags for the chip-specific rewrites:
 | flag | meaning |
 |---|---|
 | `--keep-conv1d` | Leave the original depthwise Conv1D in place for CPU/ORT targets |
-| `--chunk-lm-head` | Use the legacy 512-chunk LM-head split for compilers without tile-and-fuse |
 
 Split and unified exports use separate output directories (`export/unified/…` vs `export/split_lm_head/…`):
 

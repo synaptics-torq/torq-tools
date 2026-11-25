@@ -3,7 +3,6 @@
 
 import argparse
 import os
-import shutil
 from pathlib import Path
 from typing import Literal, Final
 
@@ -18,7 +17,6 @@ from . import (
     ONNX_DTYPES,
     OPTIMUM_DTYPES,
     STATIC_MODEL_COMPONENTS,
-    STATIC_MODEL_COMPONENTS_UNFOLDED,
     DEFAULT_CONV_KERNEL_SIZES,
     DEFAULT_CONV_STRIDES,
     add_moonshine_export_args,
@@ -55,9 +53,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         model_dtype: str = "float",
         split_encoder: bool = False,
         extract_embeddings: bool = False,
-        keep_individual_kv_io: bool = True,
         static_models: bool = True,
-        fold_encoder_cache: bool = True,
         *,
         hf_repo: str | None = None,
         max_audio_s: int = 5,
@@ -70,7 +66,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         convert_dtypes: bool = False,
         skip_export: list[str] | None = None,
         split_weights: bool = False,
-        **edit_args
     ):
         if model_dtype in ("quantized", "quantized_4bit") and dynamic_quantize:
             raise ValueError(
@@ -79,9 +74,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             )
         self._model_size = model_size
         self._split_encoder = split_encoder
-        self._fold_encoder_cache = fold_encoder_cache
         self._extract_embeddings = extract_embeddings
-        self._keep_individual_kv_io = keep_individual_kv_io
         self._onnx_source_dir = validate_onnx_source_dir(onnx_source_dir)
         self._use_optimum = use_optimum
         self._hf_repo = hf_repo or f"UsefulSensors/moonshine-{self._model_size}"
@@ -98,17 +91,14 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._num_samples, self._conv_kernel_sizes, self._conv_strides
         )
         self._vocab_size = int(self._config.vocab_size)
-        self._replace_int_bf16_cast = edit_args.get("replace_int_bf16_cast", False)
-        self._broadcast_ops = edit_args.get("broadcast_ops", None)
         self._merged_decoder = True
-        static_comps = STATIC_MODEL_COMPONENTS if self._fold_encoder_cache else STATIC_MODEL_COMPONENTS_UNFOLDED
         opt_configs = {
             comp: ORTOptimizerConfig(
                 num_heads=self._config.encoder_num_attention_heads 
                 if comp == "encoder" else
                 self._config.decoder_num_attention_heads,
                 hidden_size=self._config.hidden_size
-            ) for comp in static_comps
+            ) for comp in STATIC_MODEL_COMPONENTS
         }
 
         super().__init__(
@@ -200,17 +190,7 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             EditSpec("ConvertToStaticIndex"),
         ]
 
-        if (self._model_dtype == "bf16" or self._convert_dtypes) and self._replace_int_bf16_cast:
-            blocks["*.replace_int_bf16_cast"] = [
-                EditSpec("ReplaceInt64FloatCast", (self._max_tokens,))
-            ]
-
         blocks["preprocessor.patch"] = [EditSpec("DecomposeStridedConv1D")]
-
-        gen_cache = []
-        if self._keep_individual_kv_io:
-            gen_cache.append(EditSpec("RetargetCrossAttnKeyLayout"))
-        blocks["gen_encoder_cache.patch"] = gen_cache
 
         encoder_patch = []
         if not self._split_encoder:
@@ -219,19 +199,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             EditSpec("ReplaceConstantDivWithMul", (ctx("export_dtype"),)),
             EditSpec("EliminateTranspose"),
             EditSpec("CollapseReshapeChain"),
+            EditSpec("RetargetCrossAttnKeyLayout"),
         ]
-        if self._keep_individual_kv_io:
-            encoder_patch.append(EditSpec("RetargetCrossAttnKeyLayout"))
-        if self._broadcast_ops is not None:
-            encoder_patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
         blocks["encoder.patch"] = encoder_patch
 
         decoder_patch = [
             EditSpec("EliminateTranspose"),
-        ]
-        if self._keep_individual_kv_io:
-            decoder_patch.append(EditSpec("RetargetCrossAttnKeyLayout"))
-        decoder_patch += [
+            EditSpec("RetargetCrossAttnKeyLayout"),
             EditSpec("CollapseReshapeChain"),
             EditSpec("FoldScalarMatMul"),
         ]
@@ -240,8 +214,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
                 "DequantizeProjectionsMatMul",
                 (self._hidden_size, self._vocab_size, ctx("export_dtype")),
             ))
-        if self._broadcast_ops is not None:
-            decoder_patch.append(EditSpec("BroadcastOpInputs", (self._broadcast_ops,)))
         if self._extract_embeddings:
             decoder_patch.append(EditSpec(
                 "ExtractConstantLUT",
@@ -351,23 +323,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         new_model = editor.to_onnx(override_ir=decoder_model.ir_version)
         return new_model
 
-    def _replace_int_to_bf16_casts(self, model_path: str | os.PathLike, component: str):
-        model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(
-            model,
-            component,
-            self._onnx_export_dtype,
-            **self._editor_dump_kwargs(Path(model_path)),
-        )
-
-        # Replace potentially unsupported int64 -> float cast with lookup table
-        editor.apply_specs(
-            self.graph_edit_blocks().get("*.replace_int_bf16_cast", []), self._harness
-        )
-
-        new_model = editor.to_onnx(override_ir=model.ir_version)
-        self._save_component_model(new_model, model_path)
-
     def _patch_static_preprocessor(self, model_path: str | os.PathLike):
         model = onnx.load(model_path)
         editor = MoonshineOnnxGraphEditor.from_onnx(
@@ -379,22 +334,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
         # Decompose large strided Conv1D into im2col + MatMul
         editor.apply_specs(self.graph_edit_blocks()["preprocessor.patch"], self._harness)
-
-        new_model = editor.to_onnx(override_ir=model.ir_version)
-        self._save_component_model(new_model, model_path)
-
-    def _patch_static_gen_encoder_cache(self, model_path: str | os.PathLike):
-        model = onnx.load(model_path)
-        editor = MoonshineOnnxGraphEditor.from_onnx(
-            model,
-            "gen_encoder_cache",
-            self._onnx_export_dtype,
-            **self._editor_dump_kwargs(Path(model_path)),
-        )
-
-        # Emit cross-attn key cache in [B, H, D, L] so the decoder can drop its
-        # matching re-transpose (incompatible with combined KV I/O)
-        editor.apply_specs(self.graph_edit_blocks()["gen_encoder_cache.patch"], self._harness)
 
         new_model = editor.to_onnx(override_ir=model.ir_version)
         self._save_component_model(new_model, model_path)
@@ -435,22 +374,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
 
         if self._extract_embeddings:
             editor.reorder_graph_input("token_embedding", 0)
-
-        if not self._keep_individual_kv_io:
-            n_kv_heads = self._config.decoder_num_attention_heads
-            head_dim = self._hidden_size // n_kv_heads
-            # Combine decoder (self-attn) key+value into single tensor per layer
-            editor.combine_kv_io_tensors(
-                [1, n_kv_heads, self._max_tokens, head_dim],
-                kv_layer_re=r"\.(\d+)\.decoder\.(key|value)$",
-                combined_name_fmt="{prefix}.{layer}.decoder"
-            )
-            # Combine encoder (cross-attn) key+value into single tensor per layer
-            editor.combine_kv_io_tensors(
-                [1, n_kv_heads, self._enc_seq_len, head_dim],
-                kv_layer_re=r"\.(\d+)\.encoder\.(key|value)$",
-                combined_name_fmt="{prefix}.{layer}.encoder"
-            )
 
         editor.reorder_graph_input("current_len", 1)
 
@@ -701,21 +624,18 @@ class MoonshineModelExporter(OnnxModelExporterBase):
         self._logger.info("(gen_encoder_cache) Extracting cross-attn KV cache subgraph...")
         gen_encoder_cache = self.extract_encoder_cache(static_full_decoder)
 
-        if self._fold_encoder_cache:
-            # Fold gen_encoder_cache into encoder
-            self._logger.info("(encoder) Folding gen_encoder_cache into encoder...")
-            self._components["encoder"] = self.fold_encoder_cache(
-                self._components["encoder"], gen_encoder_cache
-            )
-        else:
-            self._components["gen_encoder_cache"] = gen_encoder_cache
+        # Fold gen_encoder_cache into encoder
+        self._logger.info("(encoder) Folding gen_encoder_cache into encoder...")
+        self._components["encoder"] = self.fold_encoder_cache(
+            self._components["encoder"], gen_encoder_cache
+        )
 
         # Use decoder_with_past as the unified decoder
         self._logger.info("(decoder) Making unified decoder static...")
         self._components["decoder"] = self._make_decoder_model_static(
             decoder_with_past, True
         )
-        expected = set(STATIC_MODEL_COMPONENTS if self._fold_encoder_cache else STATIC_MODEL_COMPONENTS_UNFOLDED)
+        expected = set(STATIC_MODEL_COMPONENTS)
         assert set(self._components) >= expected
 
     def apply_post_static_patches(self, model_path: str | os.PathLike, component: str):
@@ -723,8 +643,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             self._patch_static_preprocessor(model_path)
         elif component == "encoder":
             self._patch_static_encoder(model_path)
-        elif component == "gen_encoder_cache":
-            self._patch_static_gen_encoder_cache(model_path)
         elif component == "decoder":
             self._patch_static_decoder(model_path, component)
 
@@ -740,14 +658,13 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             return inputs["input_values"]
 
         if self._static_models:
-            gen_encoder_cache_model = None if self._fold_encoder_cache else self._export_dir / "gen_encoder_cache.onnx"
             runner = MoonshineStatic.from_onnx(
                 encoder_model=self._export_dir / "encoder.onnx",
-                gen_encoder_cache_model=gen_encoder_cache_model,
+                gen_encoder_cache_model=None,
                 decoder_model=self._export_dir / "decoder.onnx",
                 model_size=self._model_size,
                 preprocessor_model=self._export_dir / "preprocessor.onnx" if self._split_encoder else None,
-                combined_kv_io=not self._keep_individual_kv_io
+                combined_kv_io=False,
             )
         else:
             runner = MoonshineDynamic.from_onnx(
@@ -815,29 +732,6 @@ class MoonshineModelExporter(OnnxModelExporterBase):
             external_data=external_data,
         )
 
-    def export_torq(
-        self,
-        torq_export_dir: str | os.PathLike | None = None,
-        torq_compile_args: list[str] | None = None,
-        use_binary: bool = False,
-        skip: list[str] | None = None,
-        local_compile: bool = False,
-        compiler_path: str | Path | None = None,
-    ):
-        skip = skip or []
-        for comp, onnx_path in self._export_paths.items():
-            if comp in skip:
-                continue
-            if (self._model_dtype == "bf16" or self._convert_dtypes) and self._replace_int_bf16_cast:
-                self._replace_int_to_bf16_casts(onnx_path, comp)
-        return super().export_torq(
-            torq_export_dir,
-            torq_compile_args,
-            use_binary,
-            skip,
-            local_compile=local_compile,
-            compiler_path=compiler_path,
-        )
 
 def export_moonshine_from_args(args: argparse.Namespace):
     configure_logging(args.logging)
@@ -846,9 +740,7 @@ def export_moonshine_from_args(args: argparse.Namespace):
         args.dtype,
         args.split_encoder,
         args.extract_embeddings,
-        not args.combine_kv_io,
         not args.dynamic_models,
-        not args.no_fold_encoder_cache,
         hf_repo=args.hf_repo,
         max_audio_s=args.input_seconds,
         max_tok_per_s=args.tokens_per_sec,
@@ -860,8 +752,6 @@ def export_moonshine_from_args(args: argparse.Namespace):
         convert_dtypes=args.convert_dtypes,
         skip_export=args.skip_export,
         split_weights=args.split_weights,
-        replace_int_bf16_cast=args.replace_int_bf16_cast,
-        broadcast_ops=args.broadcast_ops
     )
     exporter.set_graph_edit_harness(GraphEditHarness.from_args(args))
     if args.view_graph_edits:

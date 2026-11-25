@@ -18,7 +18,6 @@ MODEL_SIZES: Final[list[str]] = ["base", "tiny"]
 ONNX_DTYPES: Final[list[str]] = ["float", "quantized", "quantized_4bit"]
 OPTIMUM_DTYPES: Final[list[str]] = ["fp32", "fp16", "bf16"]
 STATIC_MODEL_COMPONENTS: Final[list[str]] = ["encoder", "decoder"]
-STATIC_MODEL_COMPONENTS_UNFOLDED: Final[list[str]] = ["encoder", "gen_encoder_cache", "decoder"]
 DEFAULT_CONV_KERNEL_SIZES: Final[list[int]] = [127, 7, 3]
 DEFAULT_CONV_STRIDES: Final[list[int]] = [64, 3, 2]
 
@@ -51,7 +50,6 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         allow_no_opt=False,
         extract_embeddings=True,
         dynamic_models=True,
-        replace_int_bf16_cast=True,
     )
     parser.add_argument(
         "--split-encoder",
@@ -66,16 +64,10 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
     )
     parser.add_argument(
-        "--no-fold-encoder-cache",
-        action="store_true",
-        default=False,
-        help="Keep gen_encoder_cache as a separate model instead of folding into encoder"
-    )
-    parser.add_argument(
         "--skip-torq",
         type=str,
         nargs="+",
-        choices=["all", "encoder", "preprocessor", "gen_encoder_cache", "decoder"],
+        choices=["all", "encoder", "preprocessor", "decoder"],
         default=None,
         help="Skip Torq export/compile: 'all' to skip entirely, or specify components to skip."
     )
@@ -85,12 +77,6 @@ def add_moonshine_export_args(parser: argparse.ArgumentParser):
         nargs="+",
         choices=["encoder", "gen_encoder_cache", "decoder", "decoder_merged"],
         help="Skip export of specific components"
-    )
-    parser.add_argument(
-        "--combine-kv-io",
-        action="store_true",
-        default=False,
-        help="Combine KV I/O into a single tensor instead of separate key, value tensors"
     )
     parser.add_argument(
         "--hf-repo",

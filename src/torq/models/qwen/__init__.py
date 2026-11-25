@@ -52,9 +52,8 @@ def add_qwen_export_args(parser: argparse.ArgumentParser) -> None:
         dynamic_quantize=False,
         convert_dtypes=True,
         allow_no_opt=False,
+        allow_no_cleanup=False,
         dynamic_models=True,
-        keep_individual_kv_io=True,
-        read_only_kv_cache=True,
     )
     add_graph_edit_harness_args(parser)
 

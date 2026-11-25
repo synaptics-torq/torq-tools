@@ -61,7 +61,6 @@ Use the `-s` value with the same architecture as `<hf-repo>`. Without `--gptq-ch
 |---|---|
 | `-s, --model-size` | Model to export (see [Models](#models)) |
 | `--split-model` | Also split the transformer into Part A and Part B |
-| `--keep-individual-kv-io` | Keep separate K and V cache tensors. The SL2610 runtime allows at most 64 dispatch bindings, so this fails for Qwen3-0.6B |
 
 ## Output layout
 

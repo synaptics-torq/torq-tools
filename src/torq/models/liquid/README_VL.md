@@ -56,7 +56,6 @@ torq-export-model liquid-vl \
 | `--compile-vision` | Attempt to compile the dynamic source encoder directly; experimental, prefer `--vision-res` |
 | `--dynamic-quantize` | Dynamically quantize decoder components; the dynamic vision encoder is skipped unless vision compilation is requested |
 | `--keep-conv1d` | Keep the original Conv1D operators for CPU/ONNX Runtime targets |
-| `--chunk-lm-head` | Use the legacy chunked LM head for compilers without tile-and-fuse |
 
 ## Output and deployment
 
