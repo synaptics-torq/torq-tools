@@ -6,7 +6,9 @@
       "--iree-flow-inline-constants-max-byte-length=300000000",
       "--torq-convert-dtypes",
       "--torq-convert-io-dtype",
-      "--torq-disable-slicing"
+      "--torq-disable-slicing",
+      "--torq-dma-in-mtu=6",
+      "--torq-dma-out-mtu=6"
     ],
     "transformer": [
       "--torq-max-nss-programs-size=12582912",
